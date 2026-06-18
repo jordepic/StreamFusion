@@ -1,5 +1,11 @@
 package io.github.jordepic.streamfusion;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import io.github.jordepic.streamfusion.planner.NativePlanner;
+import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -7,11 +13,56 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.TableResult;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
+import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.Test;
 
 class FlinkWindowSqlHarnessTest {
+
+  @Test
+  void intValueAggregateFallsBackToHost() throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
+    PhysicalPlanScan scan = NativePlanner.install(tEnv);
+
+    DataStream<Row> source =
+        env.fromData(
+                Types.ROW_NAMED(new String[] {"value", "ts"}, Types.INT, Types.LONG),
+                Row.of(1, 0L),
+                Row.of(2, 500L))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forMonotonousTimestamps()
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+    tEnv.createTemporaryView(
+        "ints",
+        source,
+        Schema.newBuilder()
+            .column("value", DataTypes.INT())
+            .column("ts", DataTypes.BIGINT())
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
+
+    TableResult result =
+        tEnv.executeSql(
+            "SELECT window_start, window_end, SUM(`value`) AS total "
+                + "FROM TABLE(TUMBLE(TABLE ints, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+                + "GROUP BY window_start, window_end");
+    List<Long> totals = new ArrayList<>();
+    try (CloseableIterator<Row> rows = result.collect()) {
+      while (rows.hasNext()) {
+        totals.add(((Number) rows.next().getField(2)).longValue());
+      }
+    }
+
+    // The int value column is not natively supported, so it must run on the host, not crash.
+    assertEquals(0, scan.substitutions(), "int value column should fall back");
+    assertEquals(List.of(3L), totals);
+  }
 
   @Test
   void tumblingSumMatchesHost() throws Exception {

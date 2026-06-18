@@ -46,7 +46,13 @@ final class WindowAggregateMatcher {
       return false;
     }
     AggregateCall call = aggCalls.apply(0);
-    return call.getArgList().size() == 1 && aggregateKind(aggCalls) >= 0;
+    if (call.getArgList().size() != 1 || aggregateKind(aggCalls) < 0) {
+      return false;
+    }
+    // The operators read the value column as a long, so only a bigint value is safe; anything else
+    // (int, double, decimal, ...) falls back to the host rather than being mis-read.
+    return inputType.getFieldList().get(call.getArgList().get(0)).getType().getSqlTypeName()
+        == SqlTypeName.BIGINT;
   }
 
   static long windowMillis(WindowingStrategy windowing) {

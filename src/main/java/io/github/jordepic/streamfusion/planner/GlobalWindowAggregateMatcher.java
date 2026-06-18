@@ -43,7 +43,18 @@ final class GlobalWindowAggregateMatcher {
     AggregateCall call = aggregate.aggCalls().apply(0);
     int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
     // Single-field mergeable partial only: sum (also count's merge), min, max.
-    return call.getArgList().size() == 1 && kind >= 0 && kind != WindowAggregateMatcher.KIND_AVG;
+    if (call.getArgList().size() != 1 || kind < 0 || kind == WindowAggregateMatcher.KIND_AVG) {
+      return false;
+    }
+    // The global operator reads the partial column as a long, so it must be a bigint.
+    return aggregate
+            .getInput()
+            .getRowType()
+            .getFieldList()
+            .get(call.getArgList().get(0))
+            .getType()
+            .getSqlTypeName()
+        == SqlTypeName.BIGINT;
   }
 
   static long windowMillis(StreamPhysicalGlobalWindowAggregate aggregate) {
