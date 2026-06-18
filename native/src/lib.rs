@@ -368,14 +368,21 @@ impl TumblingAggregator {
         let partials: Vec<&Int64Array> =
             (0..n).map(|i| column_i64(batch, &format!("partial{i}"))).collect();
 
+        // A slice belongs to `window_millis / slide_millis` windows — one for a tumbling global
+        // (slide == size), several for a hopping global where slices are shared across the
+        // overlapping windows. Merge each slice partial into every window that contains it.
+        let num_windows = self.window_millis / self.slide_millis;
         for row in 0..batch.num_rows() {
-            let end = slice_ends.value(row);
-            let start = end - self.window_millis;
+            let slice_end = slice_ends.value(row);
             let key = keys.map_or(0, |column| column.value(row));
-            for (i, accumulator) in self.accumulators(start, end, key).iter_mut().enumerate() {
-                accumulator
-                    .merge_batch(&[Arc::new(Int64Array::from(vec![partials[i].value(row)]))])
-                    .expect("failed to merge partial");
+            for j in 0..num_windows {
+                let end = slice_end + j * self.slide_millis;
+                let start = end - self.window_millis;
+                for (i, accumulator) in self.accumulators(start, end, key).iter_mut().enumerate() {
+                    accumulator
+                        .merge_batch(&[Arc::new(Int64Array::from(vec![partials[i].value(row)]))])
+                        .expect("failed to merge partial");
+                }
             }
         }
     }

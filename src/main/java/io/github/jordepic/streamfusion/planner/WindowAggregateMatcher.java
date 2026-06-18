@@ -51,6 +51,52 @@ final class WindowAggregateMatcher {
     return windowing.getWindow() instanceof CumulativeWindowSpec;
   }
 
+  /**
+   * The local half of a two-phase hopping aggregation: the same user aggregates as the single-phase
+   * matcher (bigint values, single arg, no AVG) over a hopping window whose slide divides its size.
+   * The local pre-aggregates per slice (width = slide). The planner's intermediate also carries a
+   * synthetic {@code COUNT(*)} column between the partials and the slice end; it is not an aggregate
+   * call here, so {@link #hoppingLocalKinds} appends a count to fill that column (the global ignores
+   * it). Restricted to bigint values, matching the global half.
+   */
+  static boolean matchesHoppingLocal(
+      WindowingStrategy windowing,
+      int[] grouping,
+      scala.collection.Seq<AggregateCall> aggCalls,
+      RelDataType inputType) {
+    if (!(windowing.getWindow() instanceof HoppingWindowSpec)) {
+      return false;
+    }
+    HoppingWindowSpec hop = (HoppingWindowSpec) windowing.getWindow();
+    long slide = hop.getSlide().toMillis();
+    if (slide == 0 || hop.getSize().toMillis() % slide != 0) {
+      return false;
+    }
+    return supportedAggregation(windowing, grouping, aggCalls, inputType)
+        && valueTypeCode(aggCalls, inputType) == 0
+        && !containsAvg(aggCalls);
+  }
+
+  /**
+   * Local-half aggregate kinds for a hopping window: the user aggregates plus a trailing
+   * {@code COUNT} that fills the planner's synthetic {@code count1$1} intermediate column.
+   */
+  static int[] hoppingLocalKinds(scala.collection.Seq<AggregateCall> aggCalls) {
+    int[] user = kinds(aggCalls);
+    int[] withCount = new int[user.length + 1];
+    System.arraycopy(user, 0, withCount, 0, user.length);
+    withCount[user.length] = aggregateKind(SqlKind.COUNT);
+    return withCount;
+  }
+
+  /** Slice width for the local half: the window size for tumbling, the slide for hopping. */
+  static long sliceSize(WindowingStrategy windowing) {
+    WindowSpec spec = windowing.getWindow();
+    return spec instanceof HoppingWindowSpec
+        ? ((HoppingWindowSpec) spec).getSlide().toMillis()
+        : windowSize(windowing);
+  }
+
   /** A session-window aggregate the native operator handles (single-phase only by construction). */
   static boolean matchesSession(
       WindowingStrategy windowing,

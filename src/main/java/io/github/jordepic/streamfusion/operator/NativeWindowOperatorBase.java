@@ -80,7 +80,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
     this.batchSize = batchSize;
   }
 
-  /** Number of aggregates this window computes. */
+  /** Number of aggregates this window computes (and the partial columns it carries). */
   protected final int aggregateCount() {
     return aggregateKinds.length;
   }
