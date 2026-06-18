@@ -15,6 +15,9 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       slice-sharing is a follow-up (ticket 13)
 - [x] Session window (`session_aggregating_window.rs`) — dynamic merge on gap,
       including late elements that bridge two open sessions (ticket 14)
+- [x] Cumulative window (`CUMULATE`) — one-phase; nested windows sharing a start.
+      Net-new: Arroyo has no cumulative window (see divergences/05). Two-phase
+      slice-sharing is a follow-up (ticket 13).
 - [ ] Wider value/key types beyond int (ticket 04)
 
 ## Other stateful operators

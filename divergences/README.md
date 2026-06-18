@@ -40,6 +40,7 @@ host — verified by the parity harness.
 - [02 — Two-phase local/global aggregation](02-two-phase-local-global-aggregation.md) — structural; mirror Flink's plan split, not Arroyo's single stage.
 - [03 — Incremental session/sliding merge](03-incremental-window-merge.md) — algorithmic; merge accumulators instead of re-aggregating raw rows like Arroyo.
 - [04 — Synchronous stateful execution](04-synchronous-stateful-execution.md) — runtime model; run on Flink's mailbox, not Arroyo's async actors.
+- [05 — Cumulative windows](05-cumulative-windows.md) — net-new operator neither influence has; built against Flink's semantics alone.
 
 ## Known transitional gap (not yet a deliberate divergence)
 
