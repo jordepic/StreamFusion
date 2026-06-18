@@ -1,4 +1,6 @@
-use arrow::array::{make_array, Array, Int32Array, Int64Array, RecordBatch, StructArray};
+use arrow::array::{
+    make_array, new_empty_array, Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray,
+};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -156,29 +158,66 @@ impl TumblingAggregator {
         .expect("failed to build result batch")
     }
 
-    /// Serializes each open window's partial accumulator state as (start, partial) i64 pairs. A
-    /// sum's partial state is a single int64, so the checkpoint stays a flat pair sequence.
+    /// Serializes every open window's partial accumulator state as an Arrow batch (one row per
+    /// window: the window start followed by the accumulator's state columns) encoded with Arrow
+    /// IPC. This carries arbitrary accumulator state, not just a single value, so aggregates with
+    /// multi-field state checkpoint through the same path.
     fn snapshot(&mut self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.windows.len() * 16);
+        let state_fields = self.aggregate.state_fields().expect("state fields");
+
         let starts: Vec<i64> = self.windows.keys().copied().collect();
-        for start in starts {
-            let state = self.windows.get_mut(&start).expect("window present").state().expect("state");
-            let partial = scalar_to_i64(state.into_iter().next().expect("sum state"));
-            bytes.extend_from_slice(&start.to_le_bytes());
-            bytes.extend_from_slice(&partial.to_le_bytes());
+        let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(starts.len()); state_fields.len()];
+        for start in &starts {
+            let state = self.windows.get_mut(start).expect("window present").state().expect("state");
+            for (column, scalar) in state.into_iter().enumerate() {
+                state_columns[column].push(scalar);
+            }
         }
-        bytes
+
+        let mut fields = vec![Field::new("window_start", DataType::Int64, false)];
+        fields.extend(state_fields.iter().map(|field| field.as_ref().clone()));
+
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+        columns.push(Arc::new(Int64Array::from(starts)));
+        for (index, scalars) in state_columns.into_iter().enumerate() {
+            columns.push(if scalars.is_empty() {
+                new_empty_array(state_fields[index].data_type())
+            } else {
+                ScalarValue::iter_to_array(scalars).expect("state array")
+            });
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build snapshot batch");
+
+        let mut buffer = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
+            .expect("failed to open snapshot writer");
+        writer.write(&batch).expect("failed to write snapshot");
+        writer.finish().expect("failed to finish snapshot");
+        drop(writer);
+        buffer
     }
 
     fn restore(window_millis: i64, kind: i64, bytes: &[u8]) -> Self {
         let mut aggregator = TumblingAggregator::new(window_millis, kind);
-        for pair in bytes.chunks_exact(16) {
-            let start = i64::from_le_bytes(pair[0..8].try_into().expect("8 bytes"));
-            let partial = i64::from_le_bytes(pair[8..16].try_into().expect("8 bytes"));
-            aggregator
-                .accumulator(start)
-                .merge_batch(&[Arc::new(Int64Array::from(vec![partial]))])
-                .expect("failed to restore window");
+        let reader = arrow::ipc::reader::StreamReader::try_new(bytes, None)
+            .expect("failed to open snapshot reader");
+        for batch in reader {
+            let batch = batch.expect("failed to read snapshot");
+            let starts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("window_start must be int64");
+            for row in 0..batch.num_rows() {
+                let state: Vec<ArrayRef> =
+                    (1..batch.num_columns()).map(|column| batch.column(column).slice(row, 1)).collect();
+                aggregator
+                    .accumulator(starts.value(row))
+                    .merge_batch(&state)
+                    .expect("failed to restore window");
+            }
         }
         aggregator
     }
