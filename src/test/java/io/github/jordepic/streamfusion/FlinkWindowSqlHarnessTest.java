@@ -227,6 +227,17 @@ class FlinkWindowSqlHarnessTest {
             + "GROUP BY window_start, window_end");
   }
 
+  @Test
+  void intValueMinMaxCountMatchesHost() throws Exception {
+    // MIN/MAX/COUNT preserve their semantics over a 32-bit int, so they are parity-safe natively
+    // (SUM/AVG over int would widen/truncate and stay on the host).
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, MIN(qty) AS lo, MAX(qty) AS hi, COUNT(qty) AS c "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
   private static void assertWindowParity(String aggregate) throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,
@@ -285,16 +296,17 @@ class FlinkWindowSqlHarnessTest {
     DataStream<Row> source =
         env.fromData(
                 Types.ROW_NAMED(
-                    new String[] {"k", "value", "ts", "amount"},
+                    new String[] {"k", "value", "ts", "amount", "qty"},
                     Types.LONG,
                     Types.LONG,
                     Types.LONG,
-                    Types.DOUBLE),
-                Row.of(7L, 1L, 0L, 1.5),
-                Row.of(7L, 2L, 500L, 2.5),
-                Row.of(9L, 3L, 600L, 3.0),
-                Row.of(7L, 4L, 1500L, 4.5),
-                Row.of(9L, 5L, 2500L, 5.5))
+                    Types.DOUBLE,
+                    Types.INT),
+                Row.of(7L, 1L, 0L, 1.5, 10),
+                Row.of(7L, 2L, 500L, 2.5, 20),
+                Row.of(9L, 3L, 600L, 3.0, 30),
+                Row.of(7L, 4L, 1500L, 4.5, 40),
+                Row.of(9L, 5L, 2500L, 5.5, 50))
             .assignTimestampsAndWatermarks(
                 WatermarkStrategy.<Row>forMonotonousTimestamps()
                     .withTimestampAssigner((row, ts) -> (Long) row.getField(2)));
@@ -307,6 +319,7 @@ class FlinkWindowSqlHarnessTest {
             .column("value", DataTypes.BIGINT())
             .column("ts", DataTypes.BIGINT())
             .column("amount", DataTypes.DOUBLE())
+            .column("qty", DataTypes.INT())
             .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
             .watermark("rt", "SOURCE_WATERMARK()")
             .build());

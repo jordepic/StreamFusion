@@ -15,6 +15,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -47,6 +48,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   /** Value-type codes matching the native side. */
   protected static final int TYPE_BIGINT = 0;
   protected static final int TYPE_DOUBLE = 1;
+  protected static final int TYPE_INT = 2;
 
   private final String stateName;
   private final String timeZoneId;
@@ -201,10 +203,14 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
       List<RowData> rows, int timeColumn, int valueColumn, int keyColumn) {
     boolean keyed = keyColumn >= 0;
     BigIntVector ts = new BigIntVector("ts", allocator);
-    FieldVector value =
-        valueType == TYPE_DOUBLE
-            ? new Float8Vector("value", allocator)
-            : new BigIntVector("value", allocator);
+    FieldVector value;
+    if (valueType == TYPE_DOUBLE) {
+      value = new Float8Vector("value", allocator);
+    } else if (valueType == TYPE_INT) {
+      value = new IntVector("value", allocator);
+    } else {
+      value = new BigIntVector("value", allocator);
+    }
     BigIntVector key = keyed ? new BigIntVector("key", allocator) : null;
     List<FieldVector> vectors = keyed ? List.of(ts, value, key) : List.of(ts, value);
     try (VectorSchemaRoot root = new VectorSchemaRoot(vectors);
@@ -215,6 +221,8 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
         ts.setSafe(i, row.getTimestamp(timeColumn, TIMESTAMP_PRECISION).getMillisecond());
         if (valueType == TYPE_DOUBLE) {
           ((Float8Vector) value).setSafe(i, row.getDouble(valueColumn));
+        } else if (valueType == TYPE_INT) {
+          ((IntVector) value).setSafe(i, row.getInt(valueColumn));
         } else {
           ((BigIntVector) value).setSafe(i, row.getLong(valueColumn));
         }
@@ -232,6 +240,9 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   protected static Object readScalar(FieldVector vector, int row) {
     if (vector instanceof Float8Vector) {
       return ((Float8Vector) vector).get(row);
+    }
+    if (vector instanceof IntVector) {
+      return ((IntVector) vector).get(row);
     }
     return ((BigIntVector) vector).get(row);
   }

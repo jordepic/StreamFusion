@@ -23,6 +23,7 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
  */
 final class WindowAggregateMatcher {
 
+  static final int KIND_SUM = 0;
   static final int KIND_AVG = 4;
 
   private WindowAggregateMatcher() {}
@@ -134,14 +135,16 @@ final class WindowAggregateMatcher {
       return false;
     }
 
-    // Every aggregate must read the same single value column (bigint or double) with a supported
-    // kind.
+    // Every aggregate must read the same single value column of a supported type with a supported
+    // kind. See docs/aggregate-type-support.md for the parity intersection enforced here.
     int valueColumn = aggCalls.apply(0).getArgList().isEmpty() ? -1 : aggCalls.apply(0).getArgList().get(0);
     if (valueColumn < 0) {
       return false;
     }
     SqlTypeName valueType = inputType.getFieldList().get(valueColumn).getType().getSqlTypeName();
-    if (valueType != SqlTypeName.BIGINT && valueType != SqlTypeName.DOUBLE) {
+    if (valueType != SqlTypeName.BIGINT
+        && valueType != SqlTypeName.DOUBLE
+        && valueType != SqlTypeName.INTEGER) {
       return false;
     }
     boolean multiple = aggCalls.size() > 1;
@@ -156,16 +159,26 @@ final class WindowAggregateMatcher {
       if (kind == KIND_AVG && (multiple || valueType != SqlTypeName.BIGINT)) {
         return false;
       }
+      // SUM and AVG diverge from Flink over a 32-bit int (DataFusion widens to int64 and never
+      // wraps at 2^31; integer AVG truncates), so only MIN/MAX/COUNT are safe over INTEGER.
+      if (valueType == SqlTypeName.INTEGER && (kind == KIND_SUM || kind == KIND_AVG)) {
+        return false;
+      }
     }
     return true;
   }
 
-  /** Value-type code matching the native side: 0 = bigint, 1 = double. */
+  /** Value-type code matching the native side: 0 = bigint, 1 = double, 2 = int. */
   static int valueTypeCode(scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType) {
     int valueColumn = aggCalls.apply(0).getArgList().get(0);
-    return inputType.getFieldList().get(valueColumn).getType().getSqlTypeName() == SqlTypeName.DOUBLE
-        ? 1
-        : 0;
+    switch (inputType.getFieldList().get(valueColumn).getType().getSqlTypeName()) {
+      case DOUBLE:
+        return 1;
+      case INTEGER:
+        return 2;
+      default:
+        return 0;
+    }
   }
 
   static boolean containsAvg(scala.collection.Seq<AggregateCall> aggCalls) {

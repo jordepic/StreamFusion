@@ -55,6 +55,7 @@ fn value_data_type(code: i64) -> DataType {
     match code {
         0 => DataType::Int64,
         1 => DataType::Float64,
+        2 => DataType::Int32,
         other => panic!("unsupported value type: {other}"),
     }
 }
