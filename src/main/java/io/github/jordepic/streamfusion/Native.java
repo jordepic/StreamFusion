@@ -80,4 +80,22 @@ public final class Native {
    */
   public static native void echoBatch(
       long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
+
+  /**
+   * Runs an event-time tumbling-window sum over a batch the JVM exported. The input batch has a
+   * {@code ts} column (event time in millis) and a {@code value} column; the result has a {@code
+   * window_start} column and a {@code total} column, one row per window.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param windowMillis width of each tumbling window in milliseconds
+   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
+   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   */
+  public static native void tumblingSum(
+      long inArrayAddress,
+      long inSchemaAddress,
+      long windowMillis,
+      long outArrayAddress,
+      long outSchemaAddress);
 }
