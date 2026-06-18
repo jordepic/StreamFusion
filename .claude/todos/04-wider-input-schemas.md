@@ -7,11 +7,19 @@
 The window operator is keyed by `(window, key)` and supports one integer
 grouping key in addition to the window (`GROUP BY k, window_start, window_end`),
 matching the host's per-key results and output column order. Multiple aggregates
-per window are supported. The native engine is value-type agnostic; bigint and
-double value columns are wired through (double on the one-phase path only —
-two-phase double partials are not yet wired through the merge). Remaining below:
-additional/non-integer keys, more value types (decimal, etc.), and double
-through the two-phase split.
+per window are supported. The native engine is value-type agnostic; the
+accelerated value types are the parity intersection in
+`docs/aggregate-type-support.md` — all aggregates over bigint/double, and
+`MIN`/`MAX`/`COUNT` over int (double one-phase only). Remaining below:
+
+- **More value types via the parity table:** extend `MIN`/`MAX`/`COUNT` to
+  smallint/tinyint/float/decimal (mechanical — an Arrow vector class + getter +
+  a value-type code each).
+- **`SUM`/`AVG` over narrow ints:** needs custom wrapping/truncating accumulators
+  to match Flink's type-preserving overflow and integer-truncating average.
+- **More grouping keys:** additional and non-integer keys — the native key is a
+  single `i64`; multiple/non-integer keys need a composite (byte-encoded) key.
+- **Double through the two-phase split** (local/global partials are bigint).
 
 ## Problem
 The native operators assume a narrow shape: a single int value column, and
