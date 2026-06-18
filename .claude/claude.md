@@ -22,7 +22,8 @@ Comments should not be necessary unless they explain something non-obvious to th
 principles like DRY and KISS. All changes should be tested, and you should look for uncovered significant edge cases
 in tests. When adding new functionality to accelerate streaming, we should be able to benchmark it vs. before and
 add those improvements to our commit message. If our benchmarks don't improve, we should seriously reconsider whether
-the feature is worth it, or if it is the precursor to more optimizations.
+the feature is worth it, or if it is the precursor to more optimizations. We also need to confirm compatibility with
+existing Flink results.
 
 At a high level:
 We are ripping code out of Arroyo, which itself already uses DataFusion
