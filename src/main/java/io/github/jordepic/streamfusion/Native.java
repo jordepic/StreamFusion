@@ -157,4 +157,48 @@ public final class Native {
    */
   public static native long restoreTumblingAggregator(
       long windowMillis, long slideMillis, int valueType, int[] aggregateKinds, byte[] snapshot);
+
+  /**
+   * Creates a stateful session-window aggregator and returns an opaque handle, released with {@link
+   * #closeSessionAggregator(long)}. Sessions are dynamic per-key windows that merge on the gap, so
+   * there is no fixed size or slide.
+   *
+   * @param gapMillis the inactivity gap in milliseconds that separates sessions
+   * @param valueType value column type: 0=bigint, 1=double
+   * @param aggregateKinds one code per aggregate: 0=SUM, 1=MIN, 2=MAX, 3=COUNT, 4=AVG
+   */
+  public static native long createSessionAggregator(
+      long gapMillis, int valueType, int[] aggregateKinds);
+
+  /**
+   * Folds a batch (columns {@code ts}, {@code value}, optional {@code key}) into the aggregator's
+   * sessions, merging any the new elements bridge. Closed sessions are emitted by {@link
+   * #flushSessionAggregator}.
+   */
+  public static native void updateSessionAggregator(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
+   * Emits the sessions the watermark has closed as a batch (columns {@code key}, {@code
+   * window_start}, {@code window_end}, {@code result0..}) and drops them from state.
+   */
+  public static native void flushSessionAggregator(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a session aggregator handle and its native state. */
+  public static native void closeSessionAggregator(long handle);
+
+  /** Serializes a session aggregator's open sessions so they can be stored in a checkpoint. */
+  public static native byte[] snapshotSessionAggregator(long handle);
+
+  /**
+   * Rebuilds a session aggregator from a snapshot and returns a fresh handle.
+   *
+   * @param gapMillis the inactivity gap, supplied again since it is configuration, not state
+   * @param valueType value column type (see {@link #createSessionAggregator})
+   * @param aggregateKinds aggregate codes (see {@link #createSessionAggregator})
+   * @param snapshot bytes produced by {@link #snapshotSessionAggregator(long)}
+   */
+  public static native long restoreSessionAggregator(
+      long gapMillis, int valueType, int[] aggregateKinds, byte[] snapshot);
 }

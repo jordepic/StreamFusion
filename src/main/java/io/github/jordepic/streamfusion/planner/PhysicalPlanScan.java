@@ -77,6 +77,21 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType()),
             WindowAggregateMatcher.kinds(agg.aggCalls()));
       }
+      if (WindowAggregateMatcher.matchesSession(
+          agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())) {
+        substitutions++;
+        return new StreamPhysicalNativeSessionWindowAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            WindowAggregateMatcher.gapMillis(agg.windowing()),
+            WindowAggregateMatcher.timeColumn(agg.windowing()),
+            WindowAggregateMatcher.valueColumn(agg.aggCalls()),
+            WindowAggregateMatcher.keyColumn(agg.grouping()),
+            WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType()),
+            WindowAggregateMatcher.kinds(agg.aggCalls()));
+      }
     }
 
     if (current instanceof StreamPhysicalLocalWindowAggregate) {

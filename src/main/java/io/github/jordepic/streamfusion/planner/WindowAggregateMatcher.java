@@ -5,6 +5,7 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.flink.table.planner.plan.logical.HoppingWindowSpec;
+import org.apache.flink.table.planner.plan.logical.SessionWindowSpec;
 import org.apache.flink.table.planner.plan.logical.TimeAttributeWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.WindowSpec;
@@ -29,6 +30,30 @@ final class WindowAggregateMatcher {
       int[] grouping,
       scala.collection.Seq<AggregateCall> aggCalls,
       RelDataType inputType) {
+    WindowSpec spec = windowing.getWindow();
+    return (spec instanceof TumblingWindowSpec || spec instanceof HoppingWindowSpec)
+        && supportedAggregation(windowing, grouping, aggCalls, inputType);
+  }
+
+  /** A session-window aggregate the native operator handles (single-phase only by construction). */
+  static boolean matchesSession(
+      WindowingStrategy windowing,
+      int[] grouping,
+      scala.collection.Seq<AggregateCall> aggCalls,
+      RelDataType inputType) {
+    return windowing.getWindow() instanceof SessionWindowSpec
+        && supportedAggregation(windowing, grouping, aggCalls, inputType);
+  }
+
+  /**
+   * The window-shape-independent terms: an event-time rowtime over a local-time-zone attribute,
+   * at most one bigint grouping key, and aggregates that all read the same supported value column.
+   */
+  private static boolean supportedAggregation(
+      WindowingStrategy windowing,
+      int[] grouping,
+      scala.collection.Seq<AggregateCall> aggCalls,
+      RelDataType inputType) {
     if (!(windowing instanceof TimeAttributeWindowingStrategy) || !windowing.isRowtime()) {
       return false;
     }
@@ -36,10 +61,6 @@ final class WindowAggregateMatcher {
     // local-time-zone event-time attribute.
     if (windowing.getTimeAttributeType().getTypeRoot()
         != LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
-      return false;
-    }
-    WindowSpec spec = windowing.getWindow();
-    if (!(spec instanceof TumblingWindowSpec) && !(spec instanceof HoppingWindowSpec)) {
       return false;
     }
     if (grouping.length > 1 || aggCalls.isEmpty()) {
@@ -110,6 +131,10 @@ final class WindowAggregateMatcher {
     return spec instanceof TumblingWindowSpec
         ? ((TumblingWindowSpec) spec).getSize().toMillis()
         : ((HoppingWindowSpec) spec).getSlide().toMillis();
+  }
+
+  static long gapMillis(WindowingStrategy windowing) {
+    return ((SessionWindowSpec) windowing.getWindow()).getGap().toMillis();
   }
 
   static int timeColumn(WindowingStrategy windowing) {

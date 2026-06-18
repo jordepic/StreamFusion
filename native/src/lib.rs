@@ -430,6 +430,218 @@ impl TumblingAggregator {
     }
 }
 
+/// One open session for a key: its end (the latest element's timestamp plus the gap) and the
+/// incremental accumulators folding in its rows. The start is the map key that holds it.
+struct Session {
+    end: i64,
+    accumulators: Vec<Box<dyn Accumulator>>,
+}
+
+/// Folds the state of one accumulator set into another, used when two sessions merge into one.
+fn merge_into(into: &mut [Box<dyn Accumulator>], mut from: Vec<Box<dyn Accumulator>>) {
+    for (target, source) in into.iter_mut().zip(from.iter_mut()) {
+        let state: Vec<ArrayRef> =
+            source.state().expect("state").into_iter().map(|s| s.to_array().expect("scalar")).collect();
+        target.merge_batch(&state).expect("failed to merge session");
+    }
+}
+
+/// Event-time session-window aggregation. Unlike the fixed-bin tumbling/hopping windows, sessions
+/// are dynamic and per key: each element opens a `[ts, ts + gap)` window that merges with any
+/// existing session it intersects, so a single element can bridge two sessions into one. A session
+/// is finalized once a watermark passes its end. The connected-components result this produces is
+/// order-independent, matching the host's merging window assigner.
+struct SessionAggregator {
+    gap_millis: i64,
+    aggregates: Vec<WindowAggregate>,
+    sessions: HashMap<i64, BTreeMap<i64, Session>>,
+}
+
+impl SessionAggregator {
+    fn new(gap_millis: i64, value_type: i64, kinds: Vec<i64>) -> Self {
+        let value_type = value_data_type(value_type);
+        SessionAggregator {
+            gap_millis,
+            aggregates: kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    fn update(&mut self, batch: &RecordBatch) {
+        let ts = column_i64(batch, "ts");
+        let value = batch.column_by_name("value").expect("missing value column");
+        let keys = batch
+            .column_by_name("key")
+            .map(|column| column.as_any().downcast_ref::<Int64Array>().expect("key must be int64"));
+
+        for row in 0..batch.num_rows() {
+            let key = keys.map_or(0, |column| column.value(row));
+            let candidate_start = ts.value(row);
+            let candidate_end = candidate_start + self.gap_millis;
+            let value = take(value, &UInt32Array::from(vec![row as u32]), None).expect("take value");
+
+            let map = self.sessions.entry(key).or_default();
+            // Existing sessions are maximal and pairwise separated, but a `gap`-wide candidate can
+            // still straddle more than one, so absorb every session it intersects. Intersection is
+            // inclusive at the bounds (a gap of exactly `gap` still merges), matching the host's
+            // `TimeWindow.intersects`.
+            let overlapping: Vec<i64> = map
+                .iter()
+                .filter(|(start, session)| **start <= candidate_end && candidate_start <= session.end)
+                .map(|(start, _)| *start)
+                .collect();
+
+            let mut start = candidate_start;
+            let mut end = candidate_end;
+            let mut accumulators: Vec<Box<dyn Accumulator>> =
+                self.aggregates.iter().map(WindowAggregate::create_accumulator).collect();
+            for overlap in overlapping {
+                let session = map.remove(&overlap).expect("session present");
+                start = start.min(overlap);
+                end = end.max(session.end);
+                merge_into(&mut accumulators, session.accumulators);
+            }
+            for accumulator in accumulators.iter_mut() {
+                accumulator.update_batch(std::slice::from_ref(&value)).expect("failed to update");
+            }
+            map.insert(start, Session { end, accumulators });
+        }
+    }
+
+    /// Finalizes and removes sessions the watermark has closed, emitting
+    /// `[key, window_start, window_end, result0..resultN-1]`. The end is the session's own bound,
+    /// not a fixed offset, so it travels as its own column.
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        let n = self.aggregates.len();
+        let mut rows: Vec<(i64, i64, i64, Vec<ScalarValue>)> = Vec::new();
+        for (key, map) in self.sessions.iter_mut() {
+            let closed: Vec<i64> =
+                map.iter().filter(|(_, s)| s.end <= watermark).map(|(start, _)| *start).collect();
+            for start in closed {
+                let mut session = map.remove(&start).expect("session present");
+                let results = session
+                    .accumulators
+                    .iter_mut()
+                    .map(|a| a.evaluate().expect("failed to finalize"))
+                    .collect();
+                rows.push((*key, start, session.end, results));
+            }
+        }
+        self.sessions.retain(|_, map| !map.is_empty());
+        rows.sort_by_key(|(key, start, _, _)| (*key, *start));
+
+        let keys: Vec<i64> = rows.iter().map(|(key, ..)| *key).collect();
+        let starts: Vec<i64> = rows.iter().map(|(_, start, ..)| *start).collect();
+        let ends: Vec<i64> = rows.iter().map(|(_, _, end, _)| *end).collect();
+        let mut fields = vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(starts)),
+            Arc::new(Int64Array::from(ends)),
+        ];
+        for i in 0..n {
+            let scalars: Vec<ScalarValue> = rows.iter().map(|(_, _, _, r)| r[i].clone()).collect();
+            fields.push(Field::new(format!("result{i}"), self.aggregates[i].result_type(), false));
+            columns.push(scalars_to_array(scalars, &self.aggregates[i].result_type()));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build result batch")
+    }
+
+    /// Serializes every open session (one row per (key, session): key, start, end, then each
+    /// accumulator's state fields) with Arrow IPC, mirroring the tumbling checkpoint path.
+    fn snapshot(&mut self) -> Vec<u8> {
+        let state_fields: Vec<Field> =
+            self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
+
+        let mut keys: Vec<i64> = Vec::new();
+        let mut starts: Vec<i64> = Vec::new();
+        let mut ends: Vec<i64> = Vec::new();
+        let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_fields.len()];
+        for (key, map) in self.sessions.iter_mut() {
+            for (start, session) in map.iter_mut() {
+                keys.push(*key);
+                starts.push(*start);
+                ends.push(session.end);
+                let mut column = 0;
+                for accumulator in session.accumulators.iter_mut() {
+                    for scalar in accumulator.state().expect("state") {
+                        state_columns[column].push(scalar);
+                        column += 1;
+                    }
+                }
+            }
+        }
+
+        let mut fields = vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ];
+        fields.extend(state_fields.iter().cloned());
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(starts)),
+            Arc::new(Int64Array::from(ends)),
+        ];
+        for (index, scalars) in state_columns.into_iter().enumerate() {
+            columns.push(if scalars.is_empty() {
+                new_empty_array(state_fields[index].data_type())
+            } else {
+                ScalarValue::iter_to_array(scalars).expect("state array")
+            });
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build snapshot batch");
+        let mut buffer = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
+            .expect("failed to open snapshot writer");
+        writer.write(&batch).expect("failed to write snapshot");
+        writer.finish().expect("failed to finish snapshot");
+        drop(writer);
+        buffer
+    }
+
+    fn restore(gap_millis: i64, value_type: i64, kinds: Vec<i64>, bytes: &[u8]) -> Self {
+        let mut aggregator = SessionAggregator::new(gap_millis, value_type, kinds);
+        let field_counts: Vec<usize> =
+            aggregator.aggregates.iter().map(|a| a.state_fields().len()).collect();
+        let reader = arrow::ipc::reader::StreamReader::try_new(bytes, None)
+            .expect("failed to open snapshot reader");
+        for batch in reader {
+            let batch = batch.expect("failed to read snapshot");
+            let keys = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("key int64");
+            let starts =
+                batch.column(1).as_any().downcast_ref::<Int64Array>().expect("window_start int64");
+            let ends =
+                batch.column(2).as_any().downcast_ref::<Int64Array>().expect("window_end int64");
+            for row in 0..batch.num_rows() {
+                let mut accumulators: Vec<Box<dyn Accumulator>> =
+                    aggregator.aggregates.iter().map(WindowAggregate::create_accumulator).collect();
+                let mut column = 3;
+                for (i, accumulator) in accumulators.iter_mut().enumerate() {
+                    let count = field_counts[i];
+                    let state: Vec<ArrayRef> =
+                        (column..column + count).map(|c| batch.column(c).slice(row, 1)).collect();
+                    accumulator.merge_batch(&state).expect("failed to restore session");
+                    column += count;
+                }
+                aggregator
+                    .sessions
+                    .entry(keys.value(row))
+                    .or_default()
+                    .insert(starts.value(row), Session { end: ends.value(row), accumulators });
+            }
+        }
+        aggregator
+    }
+}
+
 /// Downcasts a named int64 column, with a clear message if it is missing or the wrong type.
 fn column_i64<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
     batch
@@ -876,4 +1088,88 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTumbli
         kinds,
         &bytes,
     ))) as jlong
+}
+
+/// Creates a stateful session-window aggregator and returns an opaque handle. As with the tumbling
+/// handle, the JVM owns the native state across calls and must release it with the matching close.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createSessionAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gap_millis: jlong,
+    value_type: jint,
+    aggregate_kinds: JIntArray<'local>,
+) -> jlong {
+    let kinds = read_kinds(&env, &aggregate_kinds);
+    Box::into_raw(Box::new(SessionAggregator::new(gap_millis, value_type as i64, kinds))) as jlong
+}
+
+/// Folds a batch from the JVM into the session aggregator, merging sessions as elements bridge them.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateSessionAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut SessionAggregator) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    aggregator.update(&batch);
+}
+
+/// Emits the sessions the given watermark has closed as a batch and drops them from state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushSessionAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut SessionAggregator) };
+    let result = aggregator.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases the session aggregator and its native state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSessionAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut SessionAggregator));
+    }
+}
+
+/// Serializes the aggregator's open sessions so the JVM can store them in a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotSessionAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let aggregator = unsafe { &mut *(handle as *mut SessionAggregator) };
+    env.byte_array_from_slice(&aggregator.snapshot())
+        .expect("failed to allocate snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds a session aggregator from a snapshot taken by a prior run and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreSessionAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gap_millis: jlong,
+    value_type: jint,
+    aggregate_kinds: JIntArray<'local>,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let kinds = read_kinds(&env, &aggregate_kinds);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read snapshot");
+    Box::into_raw(Box::new(SessionAggregator::restore(gap_millis, value_type as i64, kinds, &bytes)))
+        as jlong
 }
