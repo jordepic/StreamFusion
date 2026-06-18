@@ -126,6 +126,20 @@ public final class Native {
   /** Releases an aggregator handle and its native state. */
   public static native void closeTumblingAggregator(long handle);
 
+  /**
+   * Local two-phase half: merges a batch of partials ({@code key}, {@code partial}, {@code
+   * slice_end}) into the aggregator's windows.
+   */
+  public static native void updatePartialTumblingAggregator(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
+   * Local two-phase half: emits the partial state of windows the watermark has closed as a batch
+   * ({@code key}, {@code partial}, {@code slice_end}).
+   */
+  public static native void flushPartialTumblingAggregator(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
   /** Serializes an aggregator's open windows so they can be stored in a checkpoint. */
   public static native byte[] snapshotTumblingAggregator(long handle);
 

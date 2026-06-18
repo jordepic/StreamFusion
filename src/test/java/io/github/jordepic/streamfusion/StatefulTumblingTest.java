@@ -67,6 +67,44 @@ class StatefulTumblingTest {
     }
   }
 
+  @Test
+  void twoPhaseMatchesSinglePhase() {
+    try (BufferAllocator allocator = new RootAllocator();
+        CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
+
+      long local = Native.createTumblingAggregator(1000, 0); // SUM
+      long global = Native.createTumblingAggregator(1000, 0);
+      try {
+        // Local pre-aggregates raw values into per-window partials.
+        update(allocator, provider, local, new long[] {0, 500, 1500}, new long[] {1, 2, 3});
+
+        try (ArrowArray partialArray = ArrowArray.allocateNew(allocator);
+            ArrowSchema partialSchema = ArrowSchema.allocateNew(allocator)) {
+          Native.flushPartialTumblingAggregator(
+              local, 2000, partialArray.memoryAddress(), partialSchema.memoryAddress());
+
+          // The partials cross to the global half, which merges them.
+          try (VectorSchemaRoot partials =
+              Data.importVectorSchemaRoot(allocator, partialArray, partialSchema, provider)) {
+            try (ArrowArray mergeArray = ArrowArray.allocateNew(allocator);
+                ArrowSchema mergeSchema = ArrowSchema.allocateNew(allocator)) {
+              Data.exportVectorSchemaRoot(allocator, partials, provider, mergeArray, mergeSchema);
+              Native.updatePartialTumblingAggregator(
+                  global, mergeArray.memoryAddress(), mergeSchema.memoryAddress());
+            }
+          }
+        }
+
+        // Global's final result must equal a single-phase aggregation of the same data.
+        assertEquals(
+            List.of(window(0, 3), window(1000, 3)), flush(allocator, provider, global, 2000));
+      } finally {
+        Native.closeTumblingAggregator(local);
+        Native.closeTumblingAggregator(global);
+      }
+    }
+  }
+
   private static void update(
       BufferAllocator allocator,
       CDataDictionaryProvider provider,

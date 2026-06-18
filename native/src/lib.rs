@@ -259,6 +259,79 @@ impl TumblingAggregator {
         .expect("failed to build result batch")
     }
 
+    /// Local half of two-phase aggregation: finalizes closed windows to their partial accumulator
+    /// state rather than a final value, emitting `[key, partial, slice_end]`. Single-field partial
+    /// only (sum/min/max/count); `slice_end` is the window end, matching the host's local output.
+    fn flush_partial(&mut self, watermark: i64) -> RecordBatch {
+        let closed: Vec<i64> = self
+            .windows
+            .keys()
+            .copied()
+            .take_while(|start| start + self.window_millis <= watermark)
+            .collect();
+
+        let mut keys = Vec::new();
+        let mut partials = Vec::new();
+        let mut slice_ends = Vec::new();
+        for start in closed {
+            let mut group: Vec<(i64, Box<dyn Accumulator>)> =
+                self.windows.remove(&start).expect("window present").into_iter().collect();
+            group.sort_by_key(|(key, _)| *key);
+            let slice_end = start + self.window_millis;
+            for (key, mut accumulator) in group {
+                let state = accumulator.state().expect("state");
+                keys.push(key);
+                partials.push(scalar_to_i64(
+                    state.into_iter().next().expect("single-field partial state"),
+                ));
+                slice_ends.push(slice_end);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("partial", DataType::Int64, false),
+            Field::new("slice_end", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from(partials)),
+                Arc::new(Int64Array::from(slice_ends)),
+            ],
+        )
+        .expect("failed to build partial batch")
+    }
+
+    /// Global half of two-phase aggregation: merges incoming partials `[key, partial, slice_end]`
+    /// into the accumulator for the window the slice belongs to. A later `flush` finalizes them.
+    fn update_partial(&mut self, batch: &RecordBatch) {
+        let keys = batch
+            .column_by_name("key")
+            .map(|column| column.as_any().downcast_ref::<Int64Array>().expect("key int64"));
+        let partials = batch
+            .column_by_name("partial")
+            .expect("missing partial column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("partial int64");
+        let slice_ends = batch
+            .column_by_name("slice_end")
+            .expect("missing slice_end column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("slice_end int64");
+
+        for row in 0..batch.num_rows() {
+            let window_start = slice_ends.value(row) - self.window_millis;
+            let key = keys.map_or(0, |column| column.value(row));
+            self.accumulator(window_start, key)
+                .merge_batch(&[Arc::new(Int64Array::from(vec![partials.value(row)]))])
+                .expect("failed to merge partial");
+        }
+    }
+
     /// Serializes every open window's partial accumulator state as an Arrow batch (one row per
     /// window: the window start followed by the accumulator's state columns) encoded with Arrow
     /// IPC. This carries arbitrary accumulator state, not just a single value, so aggregates with
@@ -669,6 +742,39 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushTumbling
 ) {
     let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
     let result = aggregator.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Local two-phase half: merges a batch of partials `[key, partial, slice_end]` into the windows.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updatePartialTumblingAggregator<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    aggregator.update_partial(&batch);
+}
+
+/// Local two-phase half: emits the partial state of the windows the watermark has closed.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushPartialTumblingAggregator<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let result = aggregator.flush_partial(watermark_millis);
     export_record_batch(result, out_array_address, out_schema_address);
 }
 
