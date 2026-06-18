@@ -98,4 +98,30 @@ public final class Native {
       long windowMillis,
       long outArrayAddress,
       long outSchemaAddress);
+
+  /**
+   * Creates a stateful tumbling-window aggregator and returns an opaque handle. The handle owns
+   * native state that persists across calls and must be released with {@link
+   * #closeTumblingAggregator(long)}.
+   *
+   * @param windowMillis width of each tumbling window in milliseconds
+   */
+  public static native long createTumblingAggregator(long windowMillis);
+
+  /**
+   * Folds a batch (columns {@code ts} and {@code value}) into the aggregator's open windows.
+   * Produces no output; closed windows are emitted by {@link #flushTumblingAggregator}.
+   */
+  public static native void updateTumblingAggregator(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
+   * Emits the windows the watermark has closed as a batch (columns {@code window_start} and {@code
+   * total}) and drops them from state.
+   */
+  public static native void flushTumblingAggregator(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases an aggregator handle and its native state. */
+  public static native void closeTumblingAggregator(long handle);
 }
