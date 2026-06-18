@@ -1,6 +1,6 @@
-use arrow::array::{make_array, Array, Int32Array, RecordBatch, StructArray};
+use arrow::array::{make_array, Array, Int32Array, Int64Array, RecordBatch, StructArray};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{binary, col, lit};
@@ -9,8 +9,96 @@ use futures::StreamExt;
 use jni::objects::JClass;
 use jni::sys::{jint, jlong, jstring};
 use jni::JNIEnv;
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
+
+/// Takes ownership of a batch the JVM exported through the C Data Interface, swapping in released
+/// placeholders so the producer's release callbacks fire once when the imported data drops.
+fn import_record_batch(array_address: jlong, schema_address: jlong) -> RecordBatch {
+    let ffi_array = unsafe {
+        std::ptr::replace(array_address as *mut FFI_ArrowArray, FFI_ArrowArray::empty())
+    };
+    let ffi_schema = unsafe {
+        std::ptr::replace(schema_address as *mut FFI_ArrowSchema, FFI_ArrowSchema::empty())
+    };
+    let mut data = unsafe { from_ffi(ffi_array, &ffi_schema) }.expect("failed to import Arrow batch");
+    data.align_buffers();
+    RecordBatch::from(StructArray::from(data))
+}
+
+/// Exports a batch into consumer-allocated C structs; the JVM owns and releases it after import.
+fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address: jlong) {
+    let out_data = StructArray::from(batch).to_data();
+    let out_array = FFI_ArrowArray::new(&out_data);
+    let out_schema =
+        FFI_ArrowSchema::try_from(out_data.data_type()).expect("failed to export Arrow schema");
+    unsafe {
+        std::ptr::write(array_address as *mut FFI_ArrowArray, out_array);
+        std::ptr::write(schema_address as *mut FFI_ArrowSchema, out_schema);
+    }
+}
+
+/// Event-time tumbling-window sum that holds open windows across batches. Mirrors the upstream
+/// streaming engine's window operator: windows are keyed by their start in an ordered map, each
+/// incoming batch folds into the running per-window totals, and a window is emitted and dropped
+/// only once a watermark guarantees no earlier data can still arrive.
+struct TumblingAggregator {
+    window_millis: i64,
+    totals: BTreeMap<i64, i64>,
+}
+
+impl TumblingAggregator {
+    fn new(window_millis: i64) -> Self {
+        TumblingAggregator { window_millis, totals: BTreeMap::new() }
+    }
+
+    fn update(&mut self, batch: &RecordBatch) {
+        let ts = batch
+            .column_by_name("ts")
+            .expect("missing ts column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ts must be int64");
+        let value = batch
+            .column_by_name("value")
+            .expect("missing value column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("value must be int64");
+        for row in 0..batch.num_rows() {
+            let window_start = ts.value(row) - ts.value(row).rem_euclid(self.window_millis);
+            *self.totals.entry(window_start).or_insert(0) += value.value(row);
+        }
+    }
+
+    /// Emits and removes every window whose end is at or before the watermark.
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        let closed: Vec<i64> = self
+            .totals
+            .keys()
+            .copied()
+            .take_while(|start| start + self.window_millis <= watermark)
+            .collect();
+
+        let mut starts = Vec::with_capacity(closed.len());
+        let mut totals = Vec::with_capacity(closed.len());
+        for start in closed {
+            starts.push(start);
+            totals.push(self.totals.remove(&start).expect("window present"));
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("total", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(starts)), Arc::new(Int64Array::from(totals))],
+        )
+        .expect("failed to build result batch")
+    }
+}
 
 /// The native data plane runs stateful operators as asynchronous plans, so the work is driven on a
 /// shared multi-threaded runtime that outlives any single call rather than spun up per batch.
@@ -309,5 +397,58 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_tumblingSum<'
     unsafe {
         std::ptr::write(out_array_address as *mut FFI_ArrowArray, out_array);
         std::ptr::write(out_schema_address as *mut FFI_ArrowSchema, out_schema);
+    }
+}
+
+/// Creates a stateful tumbling-window aggregator and returns an opaque handle to it. The handle
+/// owns native state that lives across calls; the JVM must release it with the matching close.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTumblingAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    window_millis: jlong,
+) -> jlong {
+    Box::into_raw(Box::new(TumblingAggregator::new(window_millis))) as jlong
+}
+
+/// Folds a batch from the JVM into the aggregator's open windows. Produces no output; results are
+/// emitted later when a watermark closes windows.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateTumblingAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    aggregator.update(&batch);
+}
+
+/// Emits the windows the given watermark has closed as a batch and drops them from state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushTumblingAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let result = aggregator.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases the aggregator and its native state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTumblingAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut TumblingAggregator));
     }
 }
