@@ -189,6 +189,26 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
+  void twoPhaseHoppingSumMatchesHost() throws Exception {
+    // Default-planned HOP is two-phase and slice-shared: a local per-slice pre-aggregate, the
+    // shuffle, and a global that combines each window's slices must agree with the host.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT window_start, window_end, SUM(`value`) AS s "
+            + "FROM TABLE(HOP(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseKeyedHoppingMultiAggregateMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT k, window_start, window_end, SUM(`value`) AS s, COUNT(`value`) AS c "
+            + "FROM TABLE(HOP(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void twoPhaseMultiAggregateMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentTwoPhase,
