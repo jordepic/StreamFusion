@@ -46,17 +46,16 @@ fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address:
     }
 }
 
-/// Builds the per-window aggregate over an int64 `value` column, selected by kind, driven through
-/// DataFusion's accumulator machinery rather than hand-rolled arithmetic. These all reduce an int64
-/// column to a single int64 with single-scalar partial state, so they share one state and output
-/// shape; aggregates with wider output or multi-field state are a later step.
-fn build_aggregate(kind: i64) -> AggregateFunctionExpr {
+/// Builds a built-in aggregate over an int64 `value` column. SUM/MIN/MAX/COUNT all reduce an int64
+/// column to a single int64 with single-scalar partial state, driven through DataFusion's
+/// accumulator machinery.
+fn build_builtin(kind: i64) -> AggregateFunctionExpr {
     let function: Arc<AggregateUDF> = match kind {
         0 => sum_udaf(),
         1 => min_udaf(),
         2 => max_udaf(),
         3 => count_udaf(),
-        other => panic!("unsupported aggregate kind: {other}"),
+        other => panic!("unsupported builtin aggregate kind: {other}"),
     };
     let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, true)]));
     let value = col("value", &schema).expect("value column");
@@ -65,6 +64,88 @@ fn build_aggregate(kind: i64) -> AggregateFunctionExpr {
         .alias("result")
         .build()
         .expect("failed to build aggregate")
+}
+
+/// Average of an int64 column matching the host engine's semantics: integer division of the sum by
+/// the count, truncating toward zero (Flink returns the integer type for AVG of integers, not a
+/// float). The two-field partial state (sum, count) rides the general checkpoint path.
+#[derive(Debug, Default)]
+struct IntegerAvgAccumulator {
+    sum: i64,
+    count: i64,
+}
+
+impl Accumulator for IntegerAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array = values[0].as_any().downcast_ref::<Int64Array>().expect("value must be int64");
+        for value in array.iter().flatten() {
+            self.sum += value;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<Int64Array>().expect("sum state int64");
+        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
+        self.sum += sums.iter().flatten().sum::<i64>();
+        self.count += counts.iter().flatten().sum::<i64>();
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Int64(Some(self.sum)), ScalarValue::Int64(Some(self.count))])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        Ok(ScalarValue::Int64((self.count != 0).then(|| self.sum / self.count)))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// The per-window aggregate. Built-in aggregates come from DataFusion; integer average is a small
+/// custom accumulator so its result matches the host exactly. Both expose mergeable partial state,
+/// so windows accumulate incrementally and checkpoint uniformly.
+enum WindowAggregate {
+    Builtin(AggregateFunctionExpr),
+    IntegerAvg,
+}
+
+impl WindowAggregate {
+    fn new(kind: i64) -> Self {
+        match kind {
+            0..=3 => WindowAggregate::Builtin(build_builtin(kind)),
+            4 => WindowAggregate::IntegerAvg,
+            other => panic!("unsupported aggregate kind: {other}"),
+        }
+    }
+
+    fn create_accumulator(&self) -> Box<dyn Accumulator> {
+        match self {
+            WindowAggregate::Builtin(aggregate) => {
+                aggregate.create_accumulator().expect("failed to create accumulator")
+            }
+            WindowAggregate::IntegerAvg => Box::<IntegerAvgAccumulator>::default(),
+        }
+    }
+
+    fn state_fields(&self) -> Vec<Field> {
+        match self {
+            WindowAggregate::Builtin(aggregate) => aggregate
+                .state_fields()
+                .expect("state fields")
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+            WindowAggregate::IntegerAvg => vec![
+                Field::new("sum", DataType::Int64, true),
+                Field::new("count", DataType::Int64, true),
+            ],
+        }
+    }
 }
 
 fn scalar_to_i64(scalar: ScalarValue) -> i64 {
@@ -81,7 +162,7 @@ fn scalar_to_i64(scalar: ScalarValue) -> i64 {
 /// and dropped only once a watermark guarantees no earlier data can still arrive.
 struct TumblingAggregator {
     window_millis: i64,
-    aggregate: AggregateFunctionExpr,
+    aggregate: WindowAggregate,
     windows: BTreeMap<i64, Box<dyn Accumulator>>,
 }
 
@@ -89,7 +170,7 @@ impl TumblingAggregator {
     fn new(window_millis: i64, kind: i64) -> Self {
         TumblingAggregator {
             window_millis,
-            aggregate: build_aggregate(kind),
+            aggregate: WindowAggregate::new(kind),
             windows: BTreeMap::new(),
         }
     }
@@ -125,9 +206,7 @@ impl TumblingAggregator {
 
     fn accumulator(&mut self, window_start: i64) -> &mut Box<dyn Accumulator> {
         let aggregate = &self.aggregate;
-        self.windows
-            .entry(window_start)
-            .or_insert_with(|| aggregate.create_accumulator().expect("failed to create accumulator"))
+        self.windows.entry(window_start).or_insert_with(|| aggregate.create_accumulator())
     }
 
     /// Finalizes and removes every window whose end is at or before the watermark.
@@ -163,7 +242,7 @@ impl TumblingAggregator {
     /// IPC. This carries arbitrary accumulator state, not just a single value, so aggregates with
     /// multi-field state checkpoint through the same path.
     fn snapshot(&mut self) -> Vec<u8> {
-        let state_fields = self.aggregate.state_fields().expect("state fields");
+        let state_fields = self.aggregate.state_fields();
 
         let starts: Vec<i64> = self.windows.keys().copied().collect();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(starts.len()); state_fields.len()];
@@ -175,7 +254,7 @@ impl TumblingAggregator {
         }
 
         let mut fields = vec![Field::new("window_start", DataType::Int64, false)];
-        fields.extend(state_fields.iter().map(|field| field.as_ref().clone()));
+        fields.extend(state_fields.iter().cloned());
 
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
         columns.push(Arc::new(Int64Array::from(starts)));

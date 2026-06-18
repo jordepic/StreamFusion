@@ -41,6 +41,32 @@ class StatefulTumblingTest {
     }
   }
 
+  @Test
+  void restoresMultiFieldAvgStateFromSnapshot() {
+    try (BufferAllocator allocator = new RootAllocator();
+        CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
+
+      // Integer average; its partial state is (sum, count), exercising multi-field checkpoint.
+      long handle = Native.createTumblingAggregator(1000, 4);
+      byte[] snapshot;
+      try {
+        update(allocator, provider, handle, new long[] {0, 500}, new long[] {1, 2});
+        snapshot = Native.snapshotTumblingAggregator(handle);
+      } finally {
+        Native.closeTumblingAggregator(handle);
+      }
+
+      long restored = Native.restoreTumblingAggregator(1000, 4, snapshot);
+      try {
+        // Same window gets another value: sum 1+2+6=9 over count 3 -> integer avg 3.
+        update(allocator, provider, restored, new long[] {700}, new long[] {6});
+        assertEquals(List.of(window(0, 3)), flush(allocator, provider, restored, 1000));
+      } finally {
+        Native.closeTumblingAggregator(restored);
+      }
+    }
+  }
+
   private static void update(
       BufferAllocator allocator,
       CDataDictionaryProvider provider,
