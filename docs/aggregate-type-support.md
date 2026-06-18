@@ -20,25 +20,26 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 |---|---|---|---|---|---|
 | BIGINT  | ✓ | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | DOUBLE  | ✓ | ✓ | ✓ | ✓ | ✓ |
-| INT     | ✗ widen/wrap | ✗ truncate | ✓ | ✓ | ✓ |
+| INT     | ✓ (custom wrapping) | ✗ truncate | ✓ | ✓ | ✓ |
 | SMALLINT / TINYINT | ✗ | ✗ | ✓ | ✓ | ✓ |
 | FLOAT (REAL) | ✗ FLOAT≠DOUBLE | ✗ | ✓ | ✓ | ✓ |
 | DECIMAL | ✗ precision rules | ✗ | ✓ | ✓ | ✓ |
 
 Notes / divergences this avoids:
-- **SUM over narrow ints** widens (Int64) and never wraps at 2³¹ in DataFusion, so
-  it disagrees with Flink. Matching Flink needs a custom wrapping accumulator per
-  width (i32/i16/i8) — a future item, not yet built.
+- **SUM over int** is matched with a custom wrapping int32 accumulator (keeps the
+  narrow type, wraps at 2³¹). The same pattern would extend to smallint/tinyint
+  (i16/i8) — not yet built.
 - **AVG over integers** is DataFusion `Float64`; Flink truncates to the input
-  type. We already match this for `BIGINT` with a custom accumulator; extending to
-  narrower ints means casting the truncated result back to that width.
+  type. We match this for `BIGINT` with a custom accumulator; extending to int
+  means casting the truncated result back to int32 — not yet wired.
 - **DECIMAL** SUM/AVG precision/scale derivation is exotic; excluded.
 
 ## Status
 - Implemented value types: `BIGINT`, `DOUBLE` (all five aggregates), and `INT`
-  for `MIN`/`MAX`/`COUNT`. The native value path is type-general; adding the
-  remaining MIN/MAX/COUNT types (SMALLINT/TINYINT/FLOAT/DECIMAL) is mechanical
-  (an Arrow vector class + getter + a value-type code).
-- SUM/AVG over non-`BIGINT`/`DOUBLE` await the custom wrapping/truncating
+  for `SUM`/`MIN`/`MAX`/`COUNT` (all but `AVG`). The native value path is
+  type-general; adding the remaining MIN/MAX/COUNT types
+  (SMALLINT/TINYINT/FLOAT/DECIMAL) is mechanical (an Arrow vector class + getter +
+  a value-type code).
+- `AVG` over int, and `SUM`/`AVG` over smallint/tinyint/float, await the custom
   accumulators above.
 - Grouping keys beyond a single bigint key are tracked separately in ticket 04.

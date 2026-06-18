@@ -10,13 +10,14 @@ matching the host's per-key results and output column order. Multiple aggregates
 per window are supported. The native engine is value-type agnostic; the
 accelerated value types are the parity intersection in
 `docs/aggregate-type-support.md` — all aggregates over bigint/double, and
-`MIN`/`MAX`/`COUNT` over int (double one-phase only). Remaining below:
+`SUM`/`MIN`/`MAX`/`COUNT` over int (`SUM` via a custom wrapping int32
+accumulator; double one-phase only). Remaining below:
 
 - **More value types via the parity table:** extend `MIN`/`MAX`/`COUNT` to
   smallint/tinyint/float/decimal (mechanical — an Arrow vector class + getter +
   a value-type code each).
-- **`SUM`/`AVG` over narrow ints:** needs custom wrapping/truncating accumulators
-  to match Flink's type-preserving overflow and integer-truncating average.
+- **`AVG` over int, and `SUM`/`AVG` over smallint/tinyint/float:** need the
+  remaining custom truncating/wrapping accumulators to match Flink.
 - **More grouping keys:** additional and non-integer keys — the native key is a
   single `i64`; multiple/non-integer keys need a composite (byte-encoded) key.
 - **Double through the two-phase split** (local/global partials are bigint).
