@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
@@ -129,6 +130,37 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
+  void sessionSumMatchesHost() throws Exception {
+    // Session windows: consecutive rows within the gap form one window; a larger gap splits them.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, SUM(`value`) AS s, COUNT(`value`) AS c "
+            + "FROM TABLE(SESSION(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void keyedSessionMultiAggregateMatchesHost() throws Exception {
+    // Per-key sessions: each key's gaps are independent, partitioned by the session TVF.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT k, window_start, window_end, SUM(`value`) AS s, MAX(`value`) AS m "
+            + "FROM TABLE(SESSION(TABLE src PARTITION BY k, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
+  void sessionMergeMatchesHost() throws Exception {
+    // An out-of-order element lands between two open sessions and bridges them into one; the native
+    // merge of the two windows' accumulators must match the host's merging assigner.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentForSessionMerge,
+        "SELECT window_start, window_end, SUM(`value`) AS s, COUNT(`value`) AS c "
+            + "FROM TABLE(SESSION(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
   void multiAggregateMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,
@@ -168,6 +200,35 @@ class FlinkWindowSqlHarnessTest {
 
   private static TableEnvironment environmentWithSource() {
     return buildEnvironment(true);
+  }
+
+  private static TableEnvironment environmentForSessionMerge() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+
+    // Out-of-order: the row at ts=700 arrives after the rows at 0 and 1500, which would otherwise
+    // be separate sessions (gap 1s), and its [700, 1700) window bridges them into [0, 2500).
+    DataStream<Row> source =
+        env.fromData(
+                Types.ROW_NAMED(new String[] {"value", "ts"}, Types.LONG, Types.LONG),
+                Row.of(1L, 0L),
+                Row.of(2L, 1500L),
+                Row.of(4L, 700L),
+                Row.of(9L, 5000L))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forBoundedOutOfOrderness(Duration.ofSeconds(2))
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+    tEnv.createTemporaryView(
+        "src",
+        source,
+        Schema.newBuilder()
+            .column("value", DataTypes.BIGINT())
+            .column("ts", DataTypes.BIGINT())
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
+    return tEnv;
   }
 
   private static TableEnvironment environmentTwoPhase() {

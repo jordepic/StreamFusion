@@ -51,9 +51,9 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   private final String stateName;
   private final String timeZoneId;
   private final int batchSize;
-  private final int[] aggregateKinds;
   private final long slideMillis;
-  private final int valueType;
+  protected final int[] aggregateKinds;
+  protected final int valueType;
   protected final long windowMillis;
 
   private transient ZoneId zone;
@@ -91,6 +91,40 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   /** Emits the windows the watermark has closed, fetched from the native aggregator. */
   protected abstract void emitClosedWindows(long watermark);
 
+  // The native handle's lifecycle is delegated so operators can back themselves with a different
+  // native aggregator (tumbling vs session) while sharing all the buffering, state, and emit logic.
+
+  /** Creates a fresh native aggregator handle. */
+  protected long createHandle() {
+    return Native.createTumblingAggregator(windowMillis, slideMillis, valueType, aggregateKinds);
+  }
+
+  /** Restores a native aggregator handle from a checkpoint snapshot. */
+  protected long restoreHandle(byte[] snapshot) {
+    return Native.restoreTumblingAggregator(
+        windowMillis, slideMillis, valueType, aggregateKinds, snapshot);
+  }
+
+  /** Folds an exported batch into the native aggregator. */
+  protected void updateHandle(long arrayAddress, long schemaAddress) {
+    Native.updateTumblingAggregator(handle, arrayAddress, schemaAddress);
+  }
+
+  /** Fetches the windows the watermark has closed from the native aggregator. */
+  protected void flushHandle(long watermark, long arrayAddress, long schemaAddress) {
+    Native.flushTumblingAggregator(handle, watermark, arrayAddress, schemaAddress);
+  }
+
+  /** Serializes the native aggregator's open state for a checkpoint. */
+  protected byte[] snapshotHandle() {
+    return Native.snapshotTumblingAggregator(handle);
+  }
+
+  /** Releases the native aggregator handle. */
+  protected void closeHandle() {
+    Native.closeTumblingAggregator(handle);
+  }
+
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
@@ -104,11 +138,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
     for (byte[] entry : windowState.get()) {
       snapshot = entry;
     }
-    handle =
-        snapshot == null
-            ? Native.createTumblingAggregator(windowMillis, slideMillis, valueType, aggregateKinds)
-            : Native.restoreTumblingAggregator(
-                windowMillis, slideMillis, valueType, aggregateKinds, snapshot);
+    handle = snapshot == null ? createHandle() : restoreHandle(snapshot);
   }
 
   @Override
@@ -116,7 +146,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
     super.snapshotState(context);
     flush();
     windowState.clear();
-    windowState.add(Native.snapshotTumblingAggregator(handle));
+    windowState.add(snapshotHandle());
   }
 
   @Override
@@ -146,7 +176,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   @Override
   public void close() throws Exception {
     if (handle != 0) {
-      Native.closeTumblingAggregator(handle);
+      closeHandle();
       handle = 0;
     }
     if (dictionaries != null) {
@@ -194,7 +224,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
       }
       root.setRowCount(rows.size());
       Data.exportVectorSchemaRoot(allocator, root, dictionaries, array, schema);
-      Native.updateTumblingAggregator(handle, array.memoryAddress(), schema.memoryAddress());
+      updateHandle(array.memoryAddress(), schema.memoryAddress());
     }
   }
 
@@ -208,26 +238,39 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
 
   /**
    * Emits the final per-window rows the watermark has closed:
-   * {@code [key?, agg0..aggN-1, window_start, window_end]} — the host's column order. Shared by the
-   * single-phase and global operators, which both produce finals.
+   * {@code [key?, agg0..aggN-1, window_start, window_end]} — the host's column order. The window end
+   * is the start plus the fixed window size. Shared by the single-phase and global operators.
    */
   protected final void emitFinal(long watermark, int keyColumn) {
+    emitClosed(watermark, keyColumn, false);
+  }
+
+  /**
+   * Like {@link #emitFinal} but for session windows, whose end is dynamic: the native flush carries
+   * a {@code window_end} column read directly rather than derived from a fixed size.
+   */
+  protected final void emitSessions(long watermark, int keyColumn) {
+    emitClosed(watermark, keyColumn, true);
+  }
+
+  private void emitClosed(long watermark, int keyColumn, boolean explicitEnd) {
     boolean keyed = keyColumn >= 0;
     int aggregates = aggregateCount();
     try (ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-      Native.flushTumblingAggregator(
-          handle, watermark, array.memoryAddress(), schema.memoryAddress());
+      flushHandle(watermark, array.memoryAddress(), schema.memoryAddress());
       try (VectorSchemaRoot result =
           Data.importVectorSchemaRoot(allocator, array, schema, dictionaries)) {
         BigIntVector key = keyed ? (BigIntVector) result.getVector("key") : null;
         BigIntVector windowStart = (BigIntVector) result.getVector("window_start");
+        BigIntVector windowEnd = explicitEnd ? (BigIntVector) result.getVector("window_end") : null;
         FieldVector[] results = new FieldVector[aggregates];
         for (int a = 0; a < aggregates; a++) {
           results[a] = (FieldVector) result.getVector("result" + a);
         }
         for (int i = 0; i < result.getRowCount(); i++) {
           long start = windowStart.get(i);
+          long end = explicitEnd ? windowEnd.get(i) : start + windowMillis;
           GenericRowData row = new GenericRowData((keyed ? 1 : 0) + aggregates + 2);
           int field = 0;
           if (keyed) {
@@ -237,7 +280,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
             row.setField(field++, readScalar(results[a], i));
           }
           row.setField(field++, TimestampData.fromLocalDateTime(toLocal(start)));
-          row.setField(field, TimestampData.fromLocalDateTime(toLocal(start + windowMillis)));
+          row.setField(field, TimestampData.fromLocalDateTime(toLocal(end)));
           output.collect(new StreamRecord<>(row, start));
         }
       }
