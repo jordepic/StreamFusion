@@ -6,6 +6,7 @@ import org.apache.flink.table.planner.plan.logical.TimeAttributeWindowingStrateg
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 /**
  * Recognizes the window aggregations the native operator implements: an event-time tumbling window
@@ -20,6 +21,12 @@ final class WindowAggregateMatcher {
   static boolean matches(StreamPhysicalWindowAggregate aggregate) {
     WindowingStrategy windowing = aggregate.windowing();
     if (!(windowing instanceof TimeAttributeWindowingStrategy) || !windowing.isRowtime()) {
+      return false;
+    }
+    // The operator emits window bounds by converting epoch millis through the session zone, which
+    // matches the host only for a local-time-zone event-time attribute.
+    if (windowing.getTimeAttributeType().getTypeRoot()
+        != LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
       return false;
     }
     if (!(windowing.getWindow() instanceof TumblingWindowSpec)) {

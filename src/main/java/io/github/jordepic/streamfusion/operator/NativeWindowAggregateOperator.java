@@ -1,6 +1,9 @@
 package io.github.jordepic.streamfusion.operator;
 
 import io.github.jordepic.streamfusion.Native;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.arrow.c.ArrowArray;
@@ -44,7 +47,9 @@ public class NativeWindowAggregateOperator extends AbstractStreamOperator<RowDat
   private final int timeColumn;
   private final int valueColumn;
   private final int aggregateKind;
+  private final String timeZoneId;
   private final int batchSize;
+  private transient ZoneId zone;
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient List<RowData> buffer;
@@ -52,11 +57,17 @@ public class NativeWindowAggregateOperator extends AbstractStreamOperator<RowDat
   private transient ListState<byte[]> windowState;
 
   public NativeWindowAggregateOperator(
-      long windowMillis, int timeColumn, int valueColumn, int aggregateKind, int batchSize) {
+      long windowMillis,
+      int timeColumn,
+      int valueColumn,
+      int aggregateKind,
+      String timeZoneId,
+      int batchSize) {
     this.windowMillis = windowMillis;
     this.timeColumn = timeColumn;
     this.valueColumn = valueColumn;
     this.aggregateKind = aggregateKind;
+    this.timeZoneId = timeZoneId;
     this.batchSize = batchSize;
   }
 
@@ -90,6 +101,7 @@ public class NativeWindowAggregateOperator extends AbstractStreamOperator<RowDat
   @Override
   public void open() throws Exception {
     super.open();
+    zone = ZoneId.of(timeZoneId);
     allocator = new RootAllocator();
     dictionaries = new CDataDictionaryProvider();
     buffer = new ArrayList<>(batchSize);
@@ -151,6 +163,10 @@ public class NativeWindowAggregateOperator extends AbstractStreamOperator<RowDat
     buffer.clear();
   }
 
+  private LocalDateTime toLocal(long epochMillis) {
+    return Instant.ofEpochMilli(epochMillis).atZone(zone).toLocalDateTime();
+  }
+
   private void emitClosedWindows(long watermark) {
     try (ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
@@ -162,11 +178,13 @@ public class NativeWindowAggregateOperator extends AbstractStreamOperator<RowDat
         BigIntVector total = (BigIntVector) result.getVector("total");
         for (int i = 0; i < result.getRowCount(); i++) {
           long start = windowStart.get(i);
-          // Output schema is [total, window_start, window_end].
+          // Output schema is [total, window_start, window_end]. The window bounds are emitted as
+          // local wall-clock timestamps in the session zone, matching how the host renders the
+          // boundaries of an event-time (local-time-zone) window.
           GenericRowData row = new GenericRowData(3);
           row.setField(0, total.get(i));
-          row.setField(1, TimestampData.fromEpochMillis(start));
-          row.setField(2, TimestampData.fromEpochMillis(start + windowMillis));
+          row.setField(1, TimestampData.fromLocalDateTime(toLocal(start)));
+          row.setField(2, TimestampData.fromLocalDateTime(toLocal(start + windowMillis)));
           output.collect(new StreamRecord<>(row, start));
         }
       }

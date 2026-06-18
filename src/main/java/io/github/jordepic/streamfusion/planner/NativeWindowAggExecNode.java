@@ -60,11 +60,12 @@ public class NativeWindowAggExecNode extends ExecNodeBase<RowData>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<RowData> input =
         (Transformation<RowData>) getInputEdges().get(0).translateToPlan(planner);
+    String timeZoneId = planner.getTableConfig().getLocalTimeZone().getId();
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeWindowAggregateOperator(
-            windowMillis, timeColumn, valueColumn, aggregateKind, BATCH_SIZE),
+            windowMillis, timeColumn, valueColumn, aggregateKind, timeZoneId, BATCH_SIZE),
         InternalTypeInfo.of(getOutputType()),
         input.getParallelism(),
         false);
