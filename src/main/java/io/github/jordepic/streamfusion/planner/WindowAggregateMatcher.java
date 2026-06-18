@@ -10,7 +10,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalW
 /**
  * Recognizes the window aggregations the native operator implements: an event-time tumbling window
  * with no extra grouping keys and a single aggregate over one column that reduces an int column to
- * an int ({@code SUM}, {@code MIN}, {@code MAX}, {@code COUNT}). Matching only these keeps results
+ * an int ({@code SUM}, {@code MIN}, {@code MAX}, {@code COUNT}, {@code AVG}). Matching only these keeps results
  * identical and lets every other windowing fall back to the host engine.
  */
 final class WindowAggregateMatcher {
@@ -43,6 +43,8 @@ final class WindowAggregateMatcher {
         return 2;
       case COUNT:
         return 3;
+      case AVG:
+        return 4;
       default:
         return -1;
     }

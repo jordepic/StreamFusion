@@ -33,6 +33,12 @@ class FlinkWindowSqlHarnessTest {
     assertRoutesToNative("MAX(`value`)", List.of(2L, 4L, 5L));
   }
 
+  @Test
+  void routesTumblingAvgToNative() throws Exception {
+    // Flink AVG of integers is integer division: [0,1k)=avg(1,2)=1, [1k,2k)=avg(3,4)=3, [2k,3k)=5.
+    assertRoutesToNative("AVG(`value`)", List.of(1L, 3L, 5L));
+  }
+
   private static void assertRoutesToNative(String aggregate, List<Long> expectedSorted)
       throws Exception {
     StreamTableEnvironment tEnv = environmentWithSource();
