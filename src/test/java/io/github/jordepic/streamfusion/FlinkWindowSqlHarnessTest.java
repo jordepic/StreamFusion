@@ -161,6 +161,25 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
+  void cumulativeSumMatchesHost() throws Exception {
+    // Cumulative windows: nested windows sharing a bucket start, ends growing by the step.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, SUM(`value`) AS s, COUNT(`value`) AS c "
+            + "FROM TABLE(CUMULATE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void keyedCumulativeMultiAggregateMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT k, window_start, window_end, SUM(`value`) AS s, MAX(`value`) AS m "
+            + "FROM TABLE(CUMULATE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void multiAggregateMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,

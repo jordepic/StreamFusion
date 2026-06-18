@@ -27,6 +27,7 @@ public class NativeWindowAggExecNode extends ExecNodeBase<RowData>
   private static final int BATCH_SIZE = 1024;
   private static final String TRANSFORMATION = "native-window-aggregate";
 
+  private final boolean cumulative;
   private final long windowMillis;
   private final long slideMillis;
   private final int timeColumn;
@@ -40,6 +41,7 @@ public class NativeWindowAggExecNode extends ExecNodeBase<RowData>
       InputProperty inputProperty,
       RowType outputType,
       String description,
+      boolean cumulative,
       long windowMillis,
       long slideMillis,
       int timeColumn,
@@ -54,6 +56,7 @@ public class NativeWindowAggExecNode extends ExecNodeBase<RowData>
         Collections.singletonList(inputProperty),
         outputType,
         description);
+    this.cumulative = cumulative;
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.timeColumn = timeColumn;
@@ -74,6 +77,7 @@ public class NativeWindowAggExecNode extends ExecNodeBase<RowData>
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeWindowAggregateOperator(
+            cumulative,
             windowMillis,
             slideMillis,
             timeColumn,

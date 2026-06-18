@@ -20,6 +20,7 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 public class StreamPhysicalNativeWindowAggregate extends SingleRel implements StreamPhysicalRel {
 
   private final RelDataType outputRowType;
+  private final boolean cumulative;
   private final long windowMillis;
   private final long slideMillis;
   private final int timeColumn;
@@ -33,6 +34,7 @@ public class StreamPhysicalNativeWindowAggregate extends SingleRel implements St
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
+      boolean cumulative,
       long windowMillis,
       long slideMillis,
       int timeColumn,
@@ -42,6 +44,7 @@ public class StreamPhysicalNativeWindowAggregate extends SingleRel implements St
       int[] aggregateKinds) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
+    this.cumulative = cumulative;
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.timeColumn = timeColumn;
@@ -68,6 +71,7 @@ public class StreamPhysicalNativeWindowAggregate extends SingleRel implements St
         traitSet,
         inputs.get(0),
         outputRowType,
+        cumulative,
         windowMillis,
         slideMillis,
         timeColumn,
@@ -84,6 +88,7 @@ public class StreamPhysicalNativeWindowAggregate extends SingleRel implements St
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
+        cumulative,
         windowMillis,
         slideMillis,
         timeColumn,

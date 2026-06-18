@@ -69,6 +69,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             agg.getTraitSet(),
             agg.getInputs().get(0),
             agg.getRowType(),
+            WindowAggregateMatcher.isCumulative(agg.windowing()),
             WindowAggregateMatcher.windowSize(agg.windowing()),
             WindowAggregateMatcher.windowSlide(agg.windowing()),
             WindowAggregateMatcher.timeColumn(agg.windowing()),

@@ -176,57 +176,84 @@ fn scalars_to_array(scalars: Vec<ScalarValue>, data_type: &DataType) -> ArrayRef
     }
 }
 
-/// Event-time tumbling-window aggregation that holds open windows across batches. Mirrors the
-/// upstream streaming engine's window operator: windows are keyed by their start in an ordered map,
-/// each holding an incremental accumulator that folds in matching rows, and a window is finalized
-/// and dropped only once a watermark guarantees no earlier data can still arrive.
+/// One open aligned window: its start, plus the per-key accumulators folding in matching rows. The
+/// owning map keys windows by their *end*, which is unique even for cumulative windows that share a
+/// start, so the start is carried here.
+struct AlignedWindow {
+    start: i64,
+    keys: HashMap<i64, Vec<Box<dyn Accumulator>>>,
+}
+
+/// Event-time aligned-window aggregation that holds open windows across batches: tumbling and
+/// hopping (fixed-size windows at a slide interval) and cumulative (nested windows sharing a start,
+/// growing by a step up to a max size). Mirrors the upstream streaming engine's window operator:
+/// windows live in an ordered map keyed by end, each an incremental accumulator that folds in
+/// matching rows, and a window is finalized and dropped once a watermark passes its end.
 struct TumblingAggregator {
     window_millis: i64,
     slide_millis: i64,
+    cumulative: bool,
     aggregates: Vec<WindowAggregate>,
-    windows: BTreeMap<i64, HashMap<i64, Vec<Box<dyn Accumulator>>>>,
+    windows: BTreeMap<i64, AlignedWindow>,
 }
 
 impl TumblingAggregator {
-    fn new(window_millis: i64, slide_millis: i64, value_type: i64, kinds: Vec<i64>) -> Self {
+    fn new(
+        window_millis: i64,
+        slide_millis: i64,
+        cumulative: bool,
+        value_type: i64,
+        kinds: Vec<i64>,
+    ) -> Self {
         let value_type = value_data_type(value_type);
         TumblingAggregator {
             window_millis,
             slide_millis,
+            cumulative,
             aggregates: kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect(),
             windows: BTreeMap::new(),
         }
     }
 
-    /// Every window a timestamp belongs to. For a tumbling window (slide == size) this is one
-    /// window; for a hopping window the timestamp falls in `size / slide` overlapping windows.
-    fn windows_for(&self, timestamp: i64) -> Vec<i64> {
-        let mut starts = Vec::new();
-        let mut start = timestamp - timestamp.rem_euclid(self.slide_millis);
-        while start + self.window_millis > timestamp {
-            starts.push(start);
-            start -= self.slide_millis;
+    /// Every window a timestamp belongs to, as (start, end) pairs. Tumbling yields one window;
+    /// hopping yields the `size / slide` overlapping windows; cumulative yields the nested windows
+    /// `[base, base + k*step)` whose end is past the timestamp, all sharing the bucket start.
+    fn windows_for(&self, timestamp: i64) -> Vec<(i64, i64)> {
+        let mut windows = Vec::new();
+        if self.cumulative {
+            let base = timestamp - timestamp.rem_euclid(self.window_millis);
+            let mut end = base + self.slide_millis;
+            while end <= base + self.window_millis {
+                if end > timestamp {
+                    windows.push((base, end));
+                }
+                end += self.slide_millis;
+            }
+        } else {
+            let mut start = timestamp - timestamp.rem_euclid(self.slide_millis);
+            while start + self.window_millis > timestamp {
+                windows.push((start, start + self.window_millis));
+                start -= self.slide_millis;
+            }
         }
-        starts
+        windows
     }
 
-    /// The N accumulators (one per aggregate) for a (window, key), created on first touch.
-    fn accumulators(&mut self, window_start: i64, key: i64) -> &mut Vec<Box<dyn Accumulator>> {
+    /// The N accumulators (one per aggregate) for a (window, key), created on first touch. Windows
+    /// are keyed by end; the start is stored on first creation.
+    fn accumulators(&mut self, start: i64, end: i64, key: i64) -> &mut Vec<Box<dyn Accumulator>> {
         let aggregates = &self.aggregates;
         self.windows
-            .entry(window_start)
-            .or_default()
+            .entry(end)
+            .or_insert_with(|| AlignedWindow { start, keys: HashMap::new() })
+            .keys
             .entry(key)
             .or_insert_with(|| aggregates.iter().map(WindowAggregate::create_accumulator).collect())
     }
 
-    /// Windows whose end is at or before the watermark, in ascending order.
+    /// Window ends at or before the watermark, in ascending order (the map is keyed by end).
     fn closed_windows(&self, watermark: i64) -> Vec<i64> {
-        self.windows
-            .keys()
-            .copied()
-            .take_while(|start| start + self.window_millis <= watermark)
-            .collect()
+        self.windows.keys().copied().take_while(|end| *end <= watermark).collect()
     }
 
     fn update(&mut self, batch: &RecordBatch) {
@@ -238,35 +265,40 @@ impl TumblingAggregator {
 
         // Group the row positions for each (window, key); the value column is sliced by type-
         // agnostic take, so the accumulators see the value column's own type (int, double, ...).
-        let mut grouped: HashMap<(i64, i64), Vec<u32>> = HashMap::new();
+        let mut grouped: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
         for row in 0..batch.num_rows() {
             let key = keys.map_or(0, |column| column.value(row));
-            for window_start in self.windows_for(ts.value(row)) {
-                grouped.entry((window_start, key)).or_default().push(row as u32);
+            for (start, end) in self.windows_for(ts.value(row)) {
+                grouped.entry((start, end, key)).or_default().push(row as u32);
             }
         }
-        for ((window_start, key), rows) in grouped {
+        for ((start, end, key), rows) in grouped {
             let column = take(value, &UInt32Array::from(rows), None).expect("failed to take values");
-            for accumulator in self.accumulators(window_start, key) {
+            for accumulator in self.accumulators(start, end, key) {
                 accumulator.update_batch(std::slice::from_ref(&column)).expect("failed to update");
             }
         }
     }
 
-    /// Finalizes and removes closed windows, emitting `[key, window_start, result0..resultN-1]`.
-    /// Each result column takes the aggregate's own output type.
+    /// Finalizes and removes closed windows, emitting
+    /// `[key, window_start, window_end, result0..resultN-1]`. The end is carried explicitly since
+    /// cumulative windows sharing a start differ by it; each result column takes the aggregate's
+    /// own output type.
     fn flush(&mut self, watermark: i64) -> RecordBatch {
         let n = self.aggregates.len();
         let mut keys = Vec::new();
         let mut starts = Vec::new();
+        let mut ends = Vec::new();
         let mut results: Vec<Vec<ScalarValue>> = vec![Vec::new(); n];
-        for start in self.closed_windows(watermark) {
-            let mut group: Vec<(i64, Vec<Box<dyn Accumulator>>)> =
-                self.windows.remove(&start).expect("window present").into_iter().collect();
+        for end in self.closed_windows(watermark) {
+            let window = self.windows.remove(&end).expect("window present");
+            let start = window.start;
+            let mut group: Vec<(i64, Vec<Box<dyn Accumulator>>)> = window.keys.into_iter().collect();
             group.sort_by_key(|(key, _)| *key);
             for (key, mut accumulators) in group {
                 keys.push(key);
                 starts.push(start);
+                ends.push(end);
                 for (i, accumulator) in accumulators.iter_mut().enumerate() {
                     results[i].push(accumulator.evaluate().expect("failed to finalize"));
                 }
@@ -276,9 +308,13 @@ impl TumblingAggregator {
         let mut fields = vec![
             Field::new("key", DataType::Int64, false),
             Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
         ];
-        let mut columns: Vec<ArrayRef> =
-            vec![Arc::new(Int64Array::from(keys)), Arc::new(Int64Array::from(starts))];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(Int64Array::from(starts)),
+            Arc::new(Int64Array::from(ends)),
+        ];
         for (i, scalars) in results.into_iter().enumerate() {
             fields.push(Field::new(format!("result{i}"), self.aggregates[i].result_type(), false));
             columns.push(scalars_to_array(scalars, &self.aggregates[i].result_type()));
@@ -294,14 +330,13 @@ impl TumblingAggregator {
         let mut keys = Vec::new();
         let mut slice_ends = Vec::new();
         let mut partials: Vec<Vec<ScalarValue>> = vec![Vec::new(); n];
-        for start in self.closed_windows(watermark) {
-            let mut group: Vec<(i64, Vec<Box<dyn Accumulator>>)> =
-                self.windows.remove(&start).expect("window present").into_iter().collect();
+        for end in self.closed_windows(watermark) {
+            let window = self.windows.remove(&end).expect("window present");
+            let mut group: Vec<(i64, Vec<Box<dyn Accumulator>>)> = window.keys.into_iter().collect();
             group.sort_by_key(|(key, _)| *key);
-            let slice_end = start + self.window_millis;
             for (key, mut accumulators) in group {
                 keys.push(key);
-                slice_ends.push(slice_end);
+                slice_ends.push(end);
                 for (i, accumulator) in accumulators.iter_mut().enumerate() {
                     let state = accumulator.state().expect("state");
                     partials[i].push(state.into_iter().next().expect("single-field partial"));
@@ -334,9 +369,10 @@ impl TumblingAggregator {
             (0..n).map(|i| column_i64(batch, &format!("partial{i}"))).collect();
 
         for row in 0..batch.num_rows() {
-            let window_start = slice_ends.value(row) - self.window_millis;
+            let end = slice_ends.value(row);
+            let start = end - self.window_millis;
             let key = keys.map_or(0, |column| column.value(row));
-            for (i, accumulator) in self.accumulators(window_start, key).iter_mut().enumerate() {
+            for (i, accumulator) in self.accumulators(start, end, key).iter_mut().enumerate() {
                 accumulator
                     .merge_batch(&[Arc::new(Int64Array::from(vec![partials[i].value(row)]))])
                     .expect("failed to merge partial");
@@ -345,18 +381,20 @@ impl TumblingAggregator {
     }
 
     /// Serializes every open window's accumulator state as an Arrow batch (one row per (window,
-    /// key): window start, key, then every accumulator's state fields in order), encoded with Arrow
-    /// IPC. Carries arbitrary multi-aggregate, multi-field state through one path.
+    /// key): window end, window start, key, then every accumulator's state fields in order), encoded
+    /// with Arrow IPC. Carries arbitrary multi-aggregate, multi-field state through one path.
     fn snapshot(&mut self) -> Vec<u8> {
         let state_fields: Vec<Field> =
             self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
 
+        let mut ends: Vec<i64> = Vec::new();
         let mut starts: Vec<i64> = Vec::new();
         let mut keys: Vec<i64> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_fields.len()];
-        for (start, group) in self.windows.iter_mut() {
-            for (key, accumulators) in group.iter_mut() {
-                starts.push(*start);
+        for (end, window) in self.windows.iter_mut() {
+            for (key, accumulators) in window.keys.iter_mut() {
+                ends.push(*end);
+                starts.push(window.start);
                 keys.push(*key);
                 let mut column = 0;
                 for accumulator in accumulators.iter_mut() {
@@ -369,13 +407,17 @@ impl TumblingAggregator {
         }
 
         let mut fields = vec![
+            Field::new("window_end", DataType::Int64, false),
             Field::new("window_start", DataType::Int64, false),
             Field::new("key", DataType::Int64, false),
         ];
         fields.extend(state_fields.iter().cloned());
 
-        let mut columns: Vec<ArrayRef> =
-            vec![Arc::new(Int64Array::from(starts)), Arc::new(Int64Array::from(keys))];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(ends)),
+            Arc::new(Int64Array::from(starts)),
+            Arc::new(Int64Array::from(keys)),
+        ];
         for (index, scalars) in state_columns.into_iter().enumerate() {
             columns.push(if scalars.is_empty() {
                 new_empty_array(state_fields[index].data_type())
@@ -399,24 +441,30 @@ impl TumblingAggregator {
     fn restore(
         window_millis: i64,
         slide_millis: i64,
+        cumulative: bool,
         value_type: i64,
         kinds: Vec<i64>,
         bytes: &[u8],
     ) -> Self {
-        let mut aggregator = TumblingAggregator::new(window_millis, slide_millis, value_type, kinds);
+        let mut aggregator =
+            TumblingAggregator::new(window_millis, slide_millis, cumulative, value_type, kinds);
         let field_counts: Vec<usize> =
             aggregator.aggregates.iter().map(|a| a.state_fields().len()).collect();
         let reader = arrow::ipc::reader::StreamReader::try_new(bytes, None)
             .expect("failed to open snapshot reader");
         for batch in reader {
             let batch = batch.expect("failed to read snapshot");
+            let ends =
+                batch.column(0).as_any().downcast_ref::<Int64Array>().expect("window_end int64");
             let starts =
-                batch.column(0).as_any().downcast_ref::<Int64Array>().expect("window_start int64");
-            let keys = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("key int64");
+                batch.column(1).as_any().downcast_ref::<Int64Array>().expect("window_start int64");
+            let keys = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("key int64");
             for row in 0..batch.num_rows() {
-                let mut column = 2;
-                for (i, accumulator) in
-                    aggregator.accumulators(starts.value(row), keys.value(row)).iter_mut().enumerate()
+                let mut column = 3;
+                for (i, accumulator) in aggregator
+                    .accumulators(starts.value(row), ends.value(row), keys.value(row))
+                    .iter_mut()
+                    .enumerate()
                 {
                     let count = field_counts[i];
                     let state: Vec<ArrayRef> =
@@ -967,6 +1015,29 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTumblin
     Box::into_raw(Box::new(TumblingAggregator::new(
         window_millis,
         slide_millis,
+        false,
+        value_type as i64,
+        kinds,
+    ))) as jlong
+}
+
+/// Creates a stateful cumulative-window aggregator (nested windows of `step` up to `max_size`) and
+/// returns an opaque handle. It shares the aligned-window engine and every other call (update,
+/// flush, snapshot, close) with the tumbling handle; only the window assignment differs.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createCumulativeAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    max_size_millis: jlong,
+    step_millis: jlong,
+    value_type: jint,
+    aggregate_kinds: JIntArray<'local>,
+) -> jlong {
+    let kinds = read_kinds(&env, &aggregate_kinds);
+    Box::into_raw(Box::new(TumblingAggregator::new(
+        max_size_millis,
+        step_millis,
+        true,
         value_type as i64,
         kinds,
     ))) as jlong
@@ -1084,6 +1155,30 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTumbli
     Box::into_raw(Box::new(TumblingAggregator::restore(
         window_millis,
         slide_millis,
+        false,
+        value_type as i64,
+        kinds,
+        &bytes,
+    ))) as jlong
+}
+
+/// Rebuilds a cumulative-window aggregator from a snapshot taken by a prior run.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreCumulativeAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    max_size_millis: jlong,
+    step_millis: jlong,
+    value_type: jint,
+    aggregate_kinds: JIntArray<'local>,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let kinds = read_kinds(&env, &aggregate_kinds);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read snapshot");
+    Box::into_raw(Box::new(TumblingAggregator::restore(
+        max_size_millis,
+        step_millis,
+        true,
         value_type as i64,
         kinds,
         &bytes,

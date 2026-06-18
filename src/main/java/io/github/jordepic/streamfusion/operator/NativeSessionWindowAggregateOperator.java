@@ -77,6 +77,6 @@ public class NativeSessionWindowAggregateOperator extends NativeWindowOperatorBa
 
   @Override
   protected void emitClosedWindows(long watermark) {
-    emitSessions(watermark, keyColumn);
+    emitFinal(watermark, keyColumn);
   }
 }
