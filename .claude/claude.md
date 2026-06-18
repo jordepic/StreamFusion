@@ -39,3 +39,7 @@ The todos directory in this folder is effectively a JIRA board of tickets to com
 These can be deleted as soon as tickets get knocked out. As we knock things out, we should add to the "Compatibility
 Chart" section of the readme.md so we know what operators are currently accelerated and the terms under which they
 are.
+
+I'm adding a "divergences" directory - I want this project to be heavily influenced by datafusion-comet and
+arroyo, meaning that to start we should have little divergence from already made architectural decisions.
+If you make such a decision, describe it in this folder and why.
