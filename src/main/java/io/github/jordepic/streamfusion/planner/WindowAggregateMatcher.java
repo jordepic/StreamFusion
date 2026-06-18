@@ -1,60 +1,76 @@
 package io.github.jordepic.streamfusion.planner;
 
 import org.apache.calcite.rel.core.AggregateCall;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.flink.table.planner.plan.logical.TimeAttributeWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
-import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
-import org.apache.flink.table.types.logical.LogicalTypeRoot;
 
 /**
  * Recognizes the window aggregations the native operator implements: an event-time tumbling window
- * with no extra grouping keys and a single aggregate over one column that reduces an int column to
- * an int ({@code SUM}, {@code MIN}, {@code MAX}, {@code COUNT}, {@code AVG}). Matching only these keeps results
- * identical and lets every other windowing fall back to the host engine.
+ * over a local-time-zone attribute, with no extra grouping keys or a single integer key, and a
+ * single aggregate over one column reducing an int to an int (SUM/MIN/MAX/COUNT/AVG). Works on the
+ * windowing/grouping/aggregate components so the single-phase and local-phase nodes share it.
  */
 final class WindowAggregateMatcher {
 
+  static final int KIND_AVG = 4;
+
   private WindowAggregateMatcher() {}
 
-  static boolean matches(StreamPhysicalWindowAggregate aggregate) {
-    WindowingStrategy windowing = aggregate.windowing();
+  static boolean matches(
+      WindowingStrategy windowing,
+      int[] grouping,
+      scala.collection.Seq<AggregateCall> aggCalls,
+      RelDataType inputType) {
     if (!(windowing instanceof TimeAttributeWindowingStrategy) || !windowing.isRowtime()) {
       return false;
     }
-    // The operator emits window bounds by converting epoch millis through the session zone, which
-    // matches the host only for a local-time-zone event-time attribute.
+    // Window bounds are emitted via the session zone, which matches the host only for a
+    // local-time-zone event-time attribute.
     if (windowing.getTimeAttributeType().getTypeRoot()
-        != LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
+        != org.apache.flink.table.types.logical.LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
       return false;
     }
     if (!(windowing.getWindow() instanceof TumblingWindowSpec)) {
       return false;
     }
-    // Group by the window only, or by the window plus a single integer key.
-    int[] grouping = aggregate.grouping();
-    if (grouping.length > 1 || aggregate.aggCalls().size() != 1) {
+    if (grouping.length > 1 || aggCalls.size() != 1) {
       return false;
     }
     if (grouping.length == 1
-        && aggregate.getInput().getRowType().getFieldList().get(grouping[0]).getType().getSqlTypeName()
+        && inputType.getFieldList().get(grouping[0]).getType().getSqlTypeName()
             != SqlTypeName.BIGINT) {
       return false;
     }
-    AggregateCall call = aggregate.aggCalls().apply(0);
-    return call.getArgList().size() == 1 && aggregateKind(call.getAggregation().getKind()) >= 0;
+    AggregateCall call = aggCalls.apply(0);
+    return call.getArgList().size() == 1 && aggregateKind(aggCalls) >= 0;
   }
 
-  /** Index of the single grouping key column, or -1 when grouping by the window only. */
-  static int keyColumn(StreamPhysicalWindowAggregate aggregate) {
-    int[] grouping = aggregate.grouping();
+  static long windowMillis(WindowingStrategy windowing) {
+    return ((TumblingWindowSpec) windowing.getWindow()).getSize().toMillis();
+  }
+
+  static int timeColumn(WindowingStrategy windowing) {
+    return ((TimeAttributeWindowingStrategy) windowing).getTimeAttributeIndex();
+  }
+
+  static int valueColumn(scala.collection.Seq<AggregateCall> aggCalls) {
+    return aggCalls.apply(0).getArgList().get(0);
+  }
+
+  static int keyColumn(int[] grouping) {
     return grouping.length == 1 ? grouping[0] : -1;
   }
 
+  static int aggregateKind(scala.collection.Seq<AggregateCall> aggCalls) {
+    return aggregateKind(aggCalls.apply(0).getAggregation().getKind());
+  }
+
   /** Native code for the aggregate, or -1 if unsupported. Mirrors the kinds in {@code Native}. */
-  private static int aggregateKind(SqlKind kind) {
+  static int aggregateKind(SqlKind kind) {
     switch (kind) {
       case SUM:
         return 0;
@@ -65,25 +81,9 @@ final class WindowAggregateMatcher {
       case COUNT:
         return 3;
       case AVG:
-        return 4;
+        return KIND_AVG;
       default:
         return -1;
     }
-  }
-
-  static int aggregateKind(StreamPhysicalWindowAggregate aggregate) {
-    return aggregateKind(aggregate.aggCalls().apply(0).getAggregation().getKind());
-  }
-
-  static long windowMillis(StreamPhysicalWindowAggregate aggregate) {
-    return ((TumblingWindowSpec) aggregate.windowing().getWindow()).getSize().toMillis();
-  }
-
-  static int timeColumn(StreamPhysicalWindowAggregate aggregate) {
-    return ((TimeAttributeWindowingStrategy) aggregate.windowing()).getTimeAttributeIndex();
-  }
-
-  static int valueColumn(StreamPhysicalWindowAggregate aggregate) {
-    return aggregate.aggCalls().apply(0).getArgList().get(0);
   }
 }

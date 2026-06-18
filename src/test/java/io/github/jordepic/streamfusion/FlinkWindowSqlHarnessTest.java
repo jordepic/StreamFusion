@@ -37,6 +37,27 @@ class FlinkWindowSqlHarnessTest {
             + "GROUP BY k, window_start, window_end");
   }
 
+  @Test
+  void twoPhaseTumblingSumMatchesHost() throws Exception {
+    // Default (two-phase) planning: a native local pre-aggregate and global merge must agree
+    // with the host's local+global aggregation.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT k, window_start, window_end, SUM(`value`) AS total "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseTumblingCountMatchesHost() throws Exception {
+    // COUNT exercises the local=count / global=sum split.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT window_start, window_end, COUNT(`value`) AS total "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
   private static void assertWindowParity(String aggregate) throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,
@@ -48,10 +69,20 @@ class FlinkWindowSqlHarnessTest {
   }
 
   private static TableEnvironment environmentWithSource() {
+    return buildEnvironment(true);
+  }
+
+  private static TableEnvironment environmentTwoPhase() {
+    return buildEnvironment(false);
+  }
+
+  private static TableEnvironment buildEnvironment(boolean onePhase) {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
-    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
+    if (onePhase) {
+      tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
+    }
 
     DataStream<Row> source =
         env.fromData(

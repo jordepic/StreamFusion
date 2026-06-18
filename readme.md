@@ -17,16 +17,19 @@ otherwise it runs on Flink unchanged.
 | Projection | Demo only | Single integer input column; the projection is exactly `col * 2`. (A proof of the projection path, not a general projection yet.) |
 | Tumbling window aggregate | Yes | Event-time `TUMBLE` over a local-time-zone (rowtime) attribute; a single integer value column; one of `SUM` / `MIN` / `MAX` / `COUNT` / `AVG`; grouped by the window, optionally plus a single integer key; a single aggregate call. `AVG` follows Flink's integer-division semantics for integer inputs. |
 
+Two-phase (local + global) tumbling aggregation is accelerated too: the native
+local pre-aggregate emits partial state, the host shuffles by key, and the
+native global merges — for `SUM`/`MIN`/`MAX`/`COUNT` (not `AVG`, whose partial
+is multi-field). This is the default planning, so window aggregation no longer
+needs `ONE_PHASE`.
+
 ### Global terms (all native execution)
 
 - **Insert-only streams.** Retracting or updating (changelog) streams fall back to Flink.
-- **Single-phase aggregation.** With the engine's default two-phase (local + global) window
-  aggregation, the window falls back; set `table.optimizer.agg-phase-strategy = ONE_PHASE`
-  to make window aggregation eligible.
 
 ### Not yet accelerated (falls back to Flink)
 
 - SQL filters (a native filter exists but is not yet wired into planning)
 - Hopping, session, and cumulative windows
 - More than one grouping key, non-integer keys, multiple aggregates per window, or non-integer value columns
-- Two-phase (local + global) aggregation across a shuffle
+- Two-phase `AVG` (multi-field partial state)

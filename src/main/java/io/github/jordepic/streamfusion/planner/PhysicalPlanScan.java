@@ -5,6 +5,8 @@ import java.util.List;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
@@ -57,20 +59,59 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           current.getRowType());
     }
 
-    if (current instanceof StreamPhysicalWindowAggregate
-        && WindowAggregateMatcher.matches((StreamPhysicalWindowAggregate) current)) {
-      substitutions++;
-      StreamPhysicalWindowAggregate aggregate = (StreamPhysicalWindowAggregate) current;
-      return new StreamPhysicalNativeWindowAggregate(
-          aggregate.getCluster(),
-          aggregate.getTraitSet(),
-          aggregate.getInputs().get(0),
-          aggregate.getRowType(),
-          WindowAggregateMatcher.windowMillis(aggregate),
-          WindowAggregateMatcher.timeColumn(aggregate),
-          WindowAggregateMatcher.valueColumn(aggregate),
-          WindowAggregateMatcher.keyColumn(aggregate),
-          WindowAggregateMatcher.aggregateKind(aggregate));
+    if (current instanceof StreamPhysicalWindowAggregate) {
+      StreamPhysicalWindowAggregate agg = (StreamPhysicalWindowAggregate) current;
+      if (WindowAggregateMatcher.matches(
+          agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())) {
+        substitutions++;
+        return new StreamPhysicalNativeWindowAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            WindowAggregateMatcher.windowMillis(agg.windowing()),
+            WindowAggregateMatcher.timeColumn(agg.windowing()),
+            WindowAggregateMatcher.valueColumn(agg.aggCalls()),
+            WindowAggregateMatcher.keyColumn(agg.grouping()),
+            WindowAggregateMatcher.aggregateKind(agg.aggCalls()));
+      }
+    }
+
+    if (current instanceof StreamPhysicalLocalWindowAggregate) {
+      StreamPhysicalLocalWindowAggregate agg = (StreamPhysicalLocalWindowAggregate) current;
+      // Single-field partial only (no AVG): the local emits one partial column.
+      if (WindowAggregateMatcher.matches(
+              agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())
+          && WindowAggregateMatcher.aggregateKind(agg.aggCalls()) != WindowAggregateMatcher.KIND_AVG) {
+        substitutions++;
+        return new StreamPhysicalNativeLocalWindowAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            WindowAggregateMatcher.windowMillis(agg.windowing()),
+            WindowAggregateMatcher.timeColumn(agg.windowing()),
+            WindowAggregateMatcher.valueColumn(agg.aggCalls()),
+            WindowAggregateMatcher.keyColumn(agg.grouping()),
+            WindowAggregateMatcher.aggregateKind(agg.aggCalls()));
+      }
+    }
+
+    if (current instanceof StreamPhysicalGlobalWindowAggregate) {
+      StreamPhysicalGlobalWindowAggregate agg = (StreamPhysicalGlobalWindowAggregate) current;
+      if (GlobalWindowAggregateMatcher.matches(agg)) {
+        substitutions++;
+        return new StreamPhysicalNativeGlobalWindowAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            GlobalWindowAggregateMatcher.windowMillis(agg),
+            GlobalWindowAggregateMatcher.keyColumn(agg),
+            GlobalWindowAggregateMatcher.partialColumn(agg),
+            GlobalWindowAggregateMatcher.sliceEndColumn(agg),
+            GlobalWindowAggregateMatcher.aggregateKind(agg));
+      }
     }
     return current;
   }
