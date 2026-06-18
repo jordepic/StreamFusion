@@ -68,4 +68,16 @@ public final class Native {
       long outArrayAddress,
       long outSchemaAddress,
       int threshold);
+
+  /**
+   * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the
+   * consumer-allocated C structs, exercising batch transfer beyond a single column.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
+   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   */
+  public static native void echoBatch(
+      long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
 }

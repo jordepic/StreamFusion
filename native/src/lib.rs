@@ -1,4 +1,4 @@
-use arrow::array::{make_array, Array, Int32Array, RecordBatch};
+use arrow::array::{make_array, Array, Int32Array, RecordBatch, StructArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{Field, Schema};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -154,6 +154,40 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_doubleColumn<
         .expect("failed to realize projected column");
 
     let out_data = projected.to_data();
+    let out_array = FFI_ArrowArray::new(&out_data);
+    let out_schema =
+        FFI_ArrowSchema::try_from(out_data.data_type()).expect("failed to export Arrow schema");
+    unsafe {
+        std::ptr::write(out_array_address as *mut FFI_ArrowArray, out_array);
+        std::ptr::write(out_schema_address as *mut FFI_ArrowSchema, out_schema);
+    }
+}
+
+/// Imports a whole multi-column batch from the JVM and exports it back. A batch crosses the
+/// boundary as a single struct, so importing it yields one struct array that unwraps into a record
+/// batch and re-wraps on the way out. This is the columnar shape operators that read several
+/// columns at once need, beyond the single-column path.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_echoBatch<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let ffi_array = unsafe {
+        std::ptr::replace(in_array_address as *mut FFI_ArrowArray, FFI_ArrowArray::empty())
+    };
+    let ffi_schema = unsafe {
+        std::ptr::replace(in_schema_address as *mut FFI_ArrowSchema, FFI_ArrowSchema::empty())
+    };
+
+    let mut data = unsafe { from_ffi(ffi_array, &ffi_schema) }.expect("failed to import Arrow batch");
+    data.align_buffers();
+    let batch = RecordBatch::from(StructArray::from(data));
+
+    let out_data = StructArray::from(batch).to_data();
     let out_array = FFI_ArrowArray::new(&out_data);
     let out_schema =
         FFI_ArrowSchema::try_from(out_data.data_type()).expect("failed to export Arrow schema");
