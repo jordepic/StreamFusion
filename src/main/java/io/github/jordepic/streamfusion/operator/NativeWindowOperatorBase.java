@@ -51,7 +51,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   private final String stateName;
   private final String timeZoneId;
   private final int batchSize;
-  private final long slideMillis;
+  protected final long slideMillis;
   protected final int[] aggregateKinds;
   protected final int valueType;
   protected final long windowMillis;
@@ -238,22 +238,11 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
 
   /**
    * Emits the final per-window rows the watermark has closed:
-   * {@code [key?, agg0..aggN-1, window_start, window_end]} — the host's column order. The window end
-   * is the start plus the fixed window size. Shared by the single-phase and global operators.
+   * {@code [key?, agg0..aggN-1, window_start, window_end]} — the host's column order. The flush
+   * carries the window end explicitly (windows of the same start can differ by it), so every window
+   * operator — single-phase, global, and session — shares this path.
    */
   protected final void emitFinal(long watermark, int keyColumn) {
-    emitClosed(watermark, keyColumn, false);
-  }
-
-  /**
-   * Like {@link #emitFinal} but for session windows, whose end is dynamic: the native flush carries
-   * a {@code window_end} column read directly rather than derived from a fixed size.
-   */
-  protected final void emitSessions(long watermark, int keyColumn) {
-    emitClosed(watermark, keyColumn, true);
-  }
-
-  private void emitClosed(long watermark, int keyColumn, boolean explicitEnd) {
     boolean keyed = keyColumn >= 0;
     int aggregates = aggregateCount();
     try (ArrowArray array = ArrowArray.allocateNew(allocator);
@@ -263,14 +252,14 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
           Data.importVectorSchemaRoot(allocator, array, schema, dictionaries)) {
         BigIntVector key = keyed ? (BigIntVector) result.getVector("key") : null;
         BigIntVector windowStart = (BigIntVector) result.getVector("window_start");
-        BigIntVector windowEnd = explicitEnd ? (BigIntVector) result.getVector("window_end") : null;
+        BigIntVector windowEnd = (BigIntVector) result.getVector("window_end");
         FieldVector[] results = new FieldVector[aggregates];
         for (int a = 0; a < aggregates; a++) {
           results[a] = (FieldVector) result.getVector("result" + a);
         }
         for (int i = 0; i < result.getRowCount(); i++) {
           long start = windowStart.get(i);
-          long end = explicitEnd ? windowEnd.get(i) : start + windowMillis;
+          long end = windowEnd.get(i);
           GenericRowData row = new GenericRowData((keyed ? 1 : 0) + aggregates + 2);
           int field = 0;
           if (keyed) {

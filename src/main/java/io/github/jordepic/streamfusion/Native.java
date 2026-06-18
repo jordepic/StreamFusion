@@ -159,6 +159,25 @@ public final class Native {
       long windowMillis, long slideMillis, int valueType, int[] aggregateKinds, byte[] snapshot);
 
   /**
+   * Creates a stateful cumulative-window aggregator and returns an opaque handle. Cumulative windows
+   * are nested windows of {@code stepMillis} growing up to {@code maxSizeMillis}, all sharing a
+   * start. It shares the aligned-window engine — {@link #updateTumblingAggregator}, {@link
+   * #flushTumblingAggregator}, {@link #snapshotTumblingAggregator}, {@link
+   * #closeTumblingAggregator} all apply to the returned handle; only the window assignment differs.
+   *
+   * @param maxSizeMillis the full (maximum) window size in milliseconds
+   * @param stepMillis the step between successive cumulative window ends
+   * @param valueType value column type: 0=bigint, 1=double
+   * @param aggregateKinds one code per aggregate: 0=SUM, 1=MIN, 2=MAX, 3=COUNT, 4=AVG
+   */
+  public static native long createCumulativeAggregator(
+      long maxSizeMillis, long stepMillis, int valueType, int[] aggregateKinds);
+
+  /** Rebuilds a cumulative-window aggregator from a snapshot and returns a fresh handle. */
+  public static native long restoreCumulativeAggregator(
+      long maxSizeMillis, long stepMillis, int valueType, int[] aggregateKinds, byte[] snapshot);
+
+  /**
    * Creates a stateful session-window aggregator and returns an opaque handle, released with {@link
    * #closeSessionAggregator(long)}. Sessions are dynamic per-key windows that merge on the gap, so
    * there is no fixed size or slide.

@@ -1,9 +1,11 @@
 package io.github.jordepic.streamfusion.planner;
 
+import java.time.Duration;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.flink.table.planner.plan.logical.CumulativeWindowSpec;
 import org.apache.flink.table.planner.plan.logical.HoppingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.SessionWindowSpec;
 import org.apache.flink.table.planner.plan.logical.TimeAttributeWindowingStrategy;
@@ -31,8 +33,22 @@ final class WindowAggregateMatcher {
       scala.collection.Seq<AggregateCall> aggCalls,
       RelDataType inputType) {
     WindowSpec spec = windowing.getWindow();
-    return (spec instanceof TumblingWindowSpec || spec instanceof HoppingWindowSpec)
-        && supportedAggregation(windowing, grouping, aggCalls, inputType);
+    boolean aligned;
+    if (spec instanceof TumblingWindowSpec || spec instanceof HoppingWindowSpec) {
+      aligned = true;
+    } else if (spec instanceof CumulativeWindowSpec) {
+      // The native cumulative assignment buckets on the max size from epoch, so only a zero offset
+      // matches the host.
+      Duration offset = ((CumulativeWindowSpec) spec).getOffset();
+      aligned = offset == null || offset.isZero();
+    } else {
+      aligned = false;
+    }
+    return aligned && supportedAggregation(windowing, grouping, aggCalls, inputType);
+  }
+
+  static boolean isCumulative(WindowingStrategy windowing) {
+    return windowing.getWindow() instanceof CumulativeWindowSpec;
   }
 
   /** A session-window aggregate the native operator handles (single-phase only by construction). */
@@ -119,18 +135,28 @@ final class WindowAggregateMatcher {
     return windowing.getWindow() instanceof TumblingWindowSpec;
   }
 
+  /** Window size in millis: tumbling/hopping size, or a cumulative window's max size. */
   static long windowSize(WindowingStrategy windowing) {
     WindowSpec spec = windowing.getWindow();
-    return spec instanceof TumblingWindowSpec
-        ? ((TumblingWindowSpec) spec).getSize().toMillis()
-        : ((HoppingWindowSpec) spec).getSize().toMillis();
+    if (spec instanceof TumblingWindowSpec) {
+      return ((TumblingWindowSpec) spec).getSize().toMillis();
+    }
+    if (spec instanceof HoppingWindowSpec) {
+      return ((HoppingWindowSpec) spec).getSize().toMillis();
+    }
+    return ((CumulativeWindowSpec) spec).getMaxSize().toMillis();
   }
 
+  /** Slide in millis: the tumbling size, the hopping slide, or a cumulative window's step. */
   static long windowSlide(WindowingStrategy windowing) {
     WindowSpec spec = windowing.getWindow();
-    return spec instanceof TumblingWindowSpec
-        ? ((TumblingWindowSpec) spec).getSize().toMillis()
-        : ((HoppingWindowSpec) spec).getSlide().toMillis();
+    if (spec instanceof TumblingWindowSpec) {
+      return ((TumblingWindowSpec) spec).getSize().toMillis();
+    }
+    if (spec instanceof HoppingWindowSpec) {
+      return ((HoppingWindowSpec) spec).getSlide().toMillis();
+    }
+    return ((CumulativeWindowSpec) spec).getStep().toMillis();
   }
 
   static long gapMillis(WindowingStrategy windowing) {
