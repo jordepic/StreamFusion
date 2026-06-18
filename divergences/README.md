@@ -1,0 +1,51 @@
+# Divergences
+
+StreamFusion is meant to be heavily influenced by two existing systems:
+
+- **datafusion-comet** — how to be a *guest accelerator inside a host engine*:
+  plug in via a post-optimization rule, cross the boundary with the Arrow C data
+  interface over JNI, fall back to the host for anything unsupported, and keep
+  the host's plan structure intact so results are identical.
+- **Arroyo** — how to do *streaming, stateful, windowed aggregation in Rust over
+  Arrow/DataFusion*: the window operators, the accumulator machinery, watermark
+  firing, and checkpointing idioms.
+
+The default is to copy their already-made architectural decisions rather than
+invent our own. This folder records the cases where we deliberately did *not* —
+each file states the influence's decision, what we did instead, and why.
+
+## The root cause of most divergences
+
+Comet and Arroyo play different roles, and where they conflict we resolve it the
+Comet way:
+
+> **We are a guest inside Flink. Flink is the control plane and owns the
+> semantics; the native engine is only a faster data plane. When Arroyo's
+> decision and Flink's behavior disagree, we follow Flink, because byte-for-byte
+> parity with the host is the prime directive.**
+
+Arroyo is a *standalone* engine — it owns its SQL semantics, its runtime, and its
+checkpoint coordination, so it can choose whatever is simplest or fastest. We
+cannot: our output has to equal what stock Flink would have produced for the same
+query. So several of the divergences below are "diverge from Arroyo because Flink
+requires it," which is really "follow Comet's guest-accelerator principle."
+
+A divergence that is *not* forced by parity (e.g. an internal algorithm choice)
+needs a stronger justification, and should still produce identical results to the
+host — verified by the parity harness.
+
+## Index
+
+- [01 — Integer-truncating AVG](01-integer-truncating-avg.md) — semantic; match Flink, not DataFusion/Arroyo.
+- [02 — Two-phase local/global aggregation](02-two-phase-local-global-aggregation.md) — structural; mirror Flink's plan split, not Arroyo's single stage.
+- [03 — Incremental session/sliding merge](03-incremental-window-merge.md) — algorithmic; merge accumulators instead of re-aggregating raw rows like Arroyo.
+- [04 — Synchronous stateful execution](04-synchronous-stateful-execution.md) — runtime model; run on Flink's mailbox, not Arroyo's async actors.
+
+## Known transitional gap (not yet a deliberate divergence)
+
+We currently substitute native operators individually and transpose Arrow↔RowData
+at each operator boundary. Comet's architecture keeps *full columnar chains*
+native and only transposes at the native↔host edges. We agree with Comet here and
+intend to converge; this is tracked in `.claude/todos/09-acceleration-policy-keep-chains.md`
+and `.claude/todos/10-native-columnar-shuffle.md`, not recorded as a divergence,
+because it is an unfinished optimization rather than a decision to differ.
