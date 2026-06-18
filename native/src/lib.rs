@@ -254,3 +254,60 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterGreater
         std::ptr::write(out_schema_address as *mut FFI_ArrowSchema, out_schema);
     }
 }
+
+/// Runs an event-time tumbling-window sum over a batch from the JVM: rows are bucketed by the start
+/// of the `window_millis`-wide window their `ts` falls in, and `value` is summed per bucket. This
+/// is the first aggregating operator and the core of the initial target envelope.
+///
+/// The window assignment and grouped aggregation run as a DataFusion plan on the shared runtime,
+/// and the per-window result batch is exported back. Aggregation across batch boundaries, where the
+/// operator must hold partial windows until a watermark closes them, is a later step.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_tumblingSum<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    window_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let ffi_array = unsafe {
+        std::ptr::replace(in_array_address as *mut FFI_ArrowArray, FFI_ArrowArray::empty())
+    };
+    let ffi_schema = unsafe {
+        std::ptr::replace(in_schema_address as *mut FFI_ArrowSchema, FFI_ArrowSchema::empty())
+    };
+
+    let mut data = unsafe { from_ffi(ffi_array, &ffi_schema) }.expect("failed to import Arrow batch");
+    data.align_buffers();
+    let batch = RecordBatch::from(StructArray::from(data));
+
+    let window = format!("ts - (ts % {window_millis})");
+    let query = format!(
+        "SELECT {window} AS window_start, SUM(value) AS total \
+         FROM events GROUP BY {window} ORDER BY window_start"
+    );
+
+    let result = runtime().block_on(async move {
+        let ctx = SessionContext::new();
+        ctx.register_batch("events", batch).expect("failed to register batch");
+        let frame = ctx.sql(&query).await.expect("failed to plan aggregation");
+        let mut stream = frame.execute_stream().await.expect("failed to execute plan");
+        let schema = stream.schema();
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.expect("failed to pull batch"));
+        }
+        concat_batches(&schema, &batches).expect("failed to assemble result")
+    });
+
+    let out_data = StructArray::from(result).to_data();
+    let out_array = FFI_ArrowArray::new(&out_data);
+    let out_schema =
+        FFI_ArrowSchema::try_from(out_data.data_type()).expect("failed to export Arrow schema");
+    unsafe {
+        std::ptr::write(out_array_address as *mut FFI_ArrowArray, out_array);
+        std::ptr::write(out_schema_address as *mut FFI_ArrowSchema, out_schema);
+    }
+}
