@@ -64,9 +64,30 @@ slices the value column one row at a time (a `take` per row) rather than once pe
 batching that slice is its first optimization target. Its grouping hash is a negligible
 fraction here, so the `ahash` swap was deliberately not applied to it.
 
-## End-to-end parity timing
+## End to end vs. Flink
 
-The parity harness already runs every checked query twice (host and native). Wall-clock
-there is dominated by minicluster startup, so it is not a reliable operator-level
-signal; the Criterion benches above are the operator measurement. End-to-end timing is
-tracked separately when a representative streaming benchmark (e.g. Nexmark) is stood up.
+`ThroughputBenchmark` (opt-in: `SF_BENCHMARK=true mvn test -Dtest=ThroughputBenchmark`)
+runs the same query over a large generated source (5M rows) into a `blackhole` sink,
+once with native substitution installed and once on stock Flink, single slot. It reports
+best-of-3 rows/s for each and the native/Flink ratio. The discarding sink keeps the
+operator the bottleneck, not client transfer; a warmup run absorbs JIT and minicluster
+startup so the measured runs reflect execution.
+
+| Operator | Query | Flink | Native | Native vs. Flink |
+|---|---|---|---|---|
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.07 M rows/s | 1.79 M rows/s | 0.58× |
+| Tumbling | `SUM` by 1s window | 1.54 M rows/s | 1.24 M rows/s | 0.81× |
+
+**Native is currently slower than Flink end to end**, even though the native compute is
+fast in isolation (above). The cost is the per-operator `RowData ↔ Arrow` conversion: a
+single substituted operator converts in and back out, and that round-trip outweighs the
+native saving. The ratio improves with compute intensity (filter 0.58× → tumbling 0.81×),
+which is the tell — the conversion is a fixed per-row tax and only amortizes when more
+work rides on each converted batch.
+
+The implication is architectural, not a tuning knob: substitution pays off when adjacent
+native operators **stay in Arrow** rather than converting at every boundary (native
+operator chaining, and later Arrow over the shuffle — the Iron Vector model). Until then
+these single-operator numbers are expected to sit below 1×; they are the baseline the
+chaining work has to beat. Worth re-running this benchmark whenever the boundary or the
+conversion path changes.

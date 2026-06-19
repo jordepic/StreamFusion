@@ -42,16 +42,43 @@ model (a per-slice local, a global that combines each window's slices).
 
 ## Benchmarks
 
-Each operator is benchmarked in isolation so its acceleration is measured, not asserted,
-and regressions show up commit-to-commit. These are native operator hot loops over an
-in-memory Arrow batch (no JVM bridge, no job scheduling), via Criterion — run with
-`cd native && cargo bench`. Method and the running table: [docs/benchmarks.md](docs/benchmarks.md).
+Two measurements per operator: the native hot loop in isolation, and the whole job
+against stock Flink. Both matter, and right now they tell different stories.
+
+### Native operator hot loop (Criterion)
+
+The native compute over an in-memory Arrow batch (no JVM bridge, no job scheduling) —
+run with `cd native && cargo bench`. Method and running table:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 | Operator | Benchmark | Batch | Time | Throughput |
 |---|---|---|---|---|
 | Filter (`WHERE`) | compiled predicate `v > 0`, ~50% pass | 4096 rows | 2.56 µs | ~1.60 Gelem/s |
 | Tumbling window aggregate | `SUM` over 16 windows, no key | 4096 rows | 110 µs | ~37.4 Melem/s |
 | Tumbling window aggregate | `SUM` over 16 windows, 64 bigint keys | 4096 rows | 262 µs | ~15.7 Melem/s |
+
+The native compute itself is fast (a filter clears ~1.6 G elements/s).
+
+### End to end vs. Flink
+
+The same query over 5M rows into a discarding sink, native substitution on vs. off,
+single slot — run with `SF_BENCHMARK=true mvn test -Dtest=ThroughputBenchmark`.
+
+| Operator | Query | Flink | Native | Native vs. Flink |
+|---|---|---|---|---|
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.07 M rows/s | 1.79 M rows/s | **0.58×** |
+| Tumbling window aggregate | `SUM` by 1s window | 1.54 M rows/s | 1.24 M rows/s | **0.81×** |
+
+**Today, substituting a single operator is slower than Flink, not faster** — and we
+report it rather than hide it. The native compute is quick, but every substituted
+operator converts the whole row `RowData → Arrow` on the way in and back on the way out,
+and for one operator that round-trip costs more than the native execution saves. The
+gap narrows as the operator does more work per converted byte (filter 0.58× → tumbling
+0.81×), which points at the fix: the architecture only pays off when **adjacent native
+operators stay in Arrow** instead of round-tripping at every boundary — keeping columnar
+chains, and eventually exchanging Arrow over the network (the model
+[Iron Vector](#related-work) uses). These per-operator numbers are the precursor to that
+work; the chained numbers are the ones that will justify the project.
 
 _Apple M1 Max; numbers are comparable only within a machine._
 

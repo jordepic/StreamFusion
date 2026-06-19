@@ -24,9 +24,11 @@ vs. Flink fallback, tracked over time so a regression is visible.
 2. **A lightweight native timing/counter hook** behind a feature flag — per-operator
    batch count, row count, and wall time, dumpable on close — so we can profile a
    real job without a full tracing dependency. Keep it zero-cost when the flag is off.
-3. **End-to-end harness timing.** Extend the parity harness to also record wall time
-   for the native vs. fallback run of the same query, so every parity test doubles as
-   a (rough) A/B throughput check. Parity stays the gate; timing is informational.
+3. **End-to-end native-vs-Flink throughput.** ✅ STARTED — an opt-in benchmark
+   (`ThroughputBenchmark`, enable with `SF_BENCHMARK=true`) runs the same query over a
+   large generated source into a blackhole sink, native-substituted vs stock Flink, and
+   reports rows/s and the speedup. Required by the project: the readme carries a vs-Flink
+   number per operator. Remaining: session/cumulative cases, and a parallelism sweep.
 4. **A short `docs/benchmarks.md`** with the method and a results table, kept in step
    as operators land — the auditable counterpart to the README's throughput claims.
 
