@@ -40,8 +40,8 @@ import org.apache.flink.table.types.logical.RowType;
  * checkpoint are committed on recovery (the rename is idempotent), so a row appears in the output
  * exactly once across failures.
  */
-public class NativeParquetSinkOperator extends AbstractStreamOperator<Void>
-    implements OneInputStreamOperator<RowData, Void>, BoundedOneInput, CheckpointListener {
+public class NativeParquetSinkOperator extends AbstractStreamOperator<Object>
+    implements OneInputStreamOperator<RowData, Object>, BoundedOneInput, CheckpointListener {
 
   private static final String IN_PROGRESS_PREFIX = "_";
   private static final String IN_PROGRESS_SUFFIX = ".inprogress";
