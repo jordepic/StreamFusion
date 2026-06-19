@@ -116,6 +116,24 @@ assignment, checkpoint-aligned commits, exactly-once, watermark generation); wor
 only if we can lift those from Arroyo's Rust Kafka connector rather than reimplement them.
 On the back burner until the JVM-side source and the sink prove the columnar win.
 
+## Sink substitution (#2) — the planner integration, scoped
+Foundation is in place: the connector/format/Hadoop deps resolve and run together
+(test-scoped), and a host Parquet write is verified as the baseline. What remains is the
+planner wiring, a deep integration to do carefully:
+- **Matcher.** Off `StreamPhysicalSink` (base `…/nodes/calcite/Sink.scala`, which carries
+  `contextResolvedTable` and `tableSink`), read the resolved table options; match
+  `connector = filesystem` + `format = parquet` and extract `path`. Fall back otherwise.
+- **Native sink rel + exec node.** A `StreamPhysicalNativeParquetSink` whose exec node
+  produces a `LegacySinkTransformation` wrapping `NativeParquetSinkOperator` via
+  `SimpleOperatorFactory.of(operator)` (the operator is `OneInputStreamOperator<RowData,
+  Void>`; `LegacySinkTransformation` is the construct that makes an operator a real sink).
+  Mind the `Transformation<RowData>` / `StreamOperatorFactory<Object>` typing.
+- **Root substitution.** `PhysicalPlanScan` handles the sink at the plan root (it is the
+  root for an `INSERT`); swap the matched sink, leave others to the host.
+- **Parity test.** `INSERT INTO parquet_sink SELECT …` with substitution on vs off; read
+  both outputs back and assert identical rows. The host baseline pattern is in
+  `FlinkParquetSinkSmokeTest`.
+
 ## Later phases
 - **Columnar source (Iceberg/Parquet) as Arrow** — a DataFusion scan instead of Flink
   deserializing to `RowData`; turns the source transpose into zero and unlocks
