@@ -29,6 +29,7 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
   private final int[] opCodes;
   private final double[] literals;
   private final String[] stringLiterals;
+  private final int[] groups;
 
   public NativeFilterExecNode(
       ReadableConfig tableConfig,
@@ -40,7 +41,8 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
-      String[] stringLiterals) {
+      String[] stringLiterals,
+      int[] groups) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-filter_1"),
@@ -54,6 +56,7 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
     this.opCodes = opCodes;
     this.literals = literals;
     this.stringLiterals = stringLiterals;
+    this.groups = groups;
   }
 
   @Override
@@ -66,7 +69,14 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeFilterOperator(
-            inputType, projection, columnIndices, opCodes, literals, stringLiterals, BATCH_SIZE),
+            inputType,
+            projection,
+            columnIndices,
+            opCodes,
+            literals,
+            stringLiterals,
+            groups,
+            BATCH_SIZE),
         InternalTypeInfo.of(getOutputType()),
         input.getParallelism(),
         false);

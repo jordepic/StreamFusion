@@ -25,6 +25,7 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
   private final int[] opCodes;
   private final double[] literals;
   private final String[] stringLiterals;
+  private final int[] groups;
 
   public StreamPhysicalNativeFilter(
       RelOptCluster cluster,
@@ -35,7 +36,8 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
-      String[] stringLiterals) {
+      String[] stringLiterals,
+      int[] groups) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.projection = projection;
@@ -43,6 +45,7 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
     this.opCodes = opCodes;
     this.literals = literals;
     this.stringLiterals = stringLiterals;
+    this.groups = groups;
   }
 
   @Override
@@ -66,7 +69,8 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         columnIndices,
         opCodes,
         literals,
-        stringLiterals);
+        stringLiterals,
+        groups);
   }
 
   @Override
@@ -81,6 +85,7 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         columnIndices,
         opCodes,
         literals,
-        stringLiterals);
+        stringLiterals,
+        groups);
   }
 }

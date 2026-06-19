@@ -35,6 +35,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
   private final int[] opCodes;
   private final double[] literals;
   private final String[] stringLiterals;
+  private final int[] groups;
   private final int batchSize;
 
   private transient BufferAllocator allocator;
@@ -48,6 +49,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
       int[] opCodes,
       double[] literals,
       String[] stringLiterals,
+      int[] groups,
       int batchSize) {
     this.inputRowType = inputRowType;
     this.projection = projection;
@@ -55,6 +57,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     this.opCodes = opCodes;
     this.literals = literals;
     this.stringLiterals = stringLiterals;
+    this.groups = groups;
     this.batchSize = batchSize;
   }
 
@@ -114,7 +117,8 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
           columnIndices,
           opCodes,
           literals,
-          stringLiterals);
+          stringLiterals,
+          groups);
       try (VectorSchemaRoot out =
           Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
         for (RowData survivor : RowDataArrowConverter.read(out, inputRowType)) {

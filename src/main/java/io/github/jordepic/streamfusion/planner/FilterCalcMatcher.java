@@ -52,56 +52,100 @@ final class FilterCalcMatcher {
     if (program.getCondition() == null || projection(calc) == null) {
       return false;
     }
-    RelDataType inputType = calc.getInput().getRowType();
-    if (!convertibleRow(inputType)) {
+    if (!convertibleRow(calc.getInput().getRowType())) {
       return false;
     }
-    List<Comparison> comparisons = flatten(condition(calc), inputType);
-    return comparisons != null && !comparisons.isEmpty();
+    return disjuncts(calc) != null;
   }
 
   static int[] columnIndices(Calc calc) {
-    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
-    int[] columns = new int[comparisons.size()];
+    List<Comparison> all = flattenAll(calc);
+    int[] columns = new int[all.size()];
     for (int i = 0; i < columns.length; i++) {
-      columns[i] = comparisons.get(i).column;
+      columns[i] = all.get(i).column;
     }
     return columns;
   }
 
   static int[] opCodes(Calc calc) {
-    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
-    int[] ops = new int[comparisons.size()];
+    List<Comparison> all = flattenAll(calc);
+    int[] ops = new int[all.size()];
     for (int i = 0; i < ops.length; i++) {
-      ops[i] = comparisons.get(i).op;
+      ops[i] = all.get(i).op;
     }
     return ops;
   }
 
   static double[] literals(Calc calc) {
-    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
-    double[] values = new double[comparisons.size()];
+    List<Comparison> all = flattenAll(calc);
+    double[] values = new double[all.size()];
     for (int i = 0; i < values.length; i++) {
-      values[i] = comparisons.get(i).literal;
+      values[i] = all.get(i).literal;
     }
     return values;
   }
 
   static String[] stringLiterals(Calc calc) {
-    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
-    String[] values = new String[comparisons.size()];
+    List<Comparison> all = flattenAll(calc);
+    String[] values = new String[all.size()];
     for (int i = 0; i < values.length; i++) {
-      values[i] = comparisons.get(i).stringLiteral;
+      values[i] = all.get(i).stringLiteral;
     }
     return values;
+  }
+
+  /** The OR-group id of each comparison, in the same order as the other extractors. */
+  static int[] groups(Calc calc) {
+    List<List<Comparison>> disjuncts = disjuncts(calc);
+    List<Integer> ids = new ArrayList<>();
+    for (int group = 0; group < disjuncts.size(); group++) {
+      for (int i = 0; i < disjuncts.get(group).size(); i++) {
+        ids.add(group);
+      }
+    }
+    int[] result = new int[ids.size()];
+    for (int i = 0; i < result.length; i++) {
+      result[i] = ids.get(i);
+    }
+    return result;
+  }
+
+  /** All comparisons across the disjuncts, in group-then-position order. */
+  private static List<Comparison> flattenAll(Calc calc) {
+    List<Comparison> all = new ArrayList<>();
+    for (List<Comparison> group : disjuncts(calc)) {
+      all.addAll(group);
+    }
+    return all;
+  }
+
+  /**
+   * The predicate as a disjunction of conjunctions of comparisons, or null if it contains anything
+   * else. Each inner list is one OR-group (a conjunction).
+   */
+  private static List<List<Comparison>> disjuncts(Calc calc) {
+    RexNode dnf = condition(calc);
+    RelDataType inputType = calc.getInput().getRowType();
+    List<RexNode> terms =
+        dnf.getKind() == SqlKind.OR ? ((RexCall) dnf).getOperands() : List.of(dnf);
+    List<List<Comparison>> result = new ArrayList<>();
+    for (RexNode term : terms) {
+      List<Comparison> conjunction = flatten(term, inputType);
+      if (conjunction == null || conjunction.isEmpty()) {
+        return null;
+      }
+      result.add(conjunction);
+    }
+    return result;
   }
 
   private static RexNode condition(Calc calc) {
     RexProgram program = calc.getProgram();
     RexNode condition = program.expandLocalRef(program.getCondition());
-    // Calcite folds `col = literal`, IN, and ranges into a SEARCH/Sarg; expand it back so a point
-    // search becomes an equality and a range becomes an AND of comparisons the matcher understands.
-    return RexUtil.expandSearch(calc.getCluster().getRexBuilder(), null, condition);
+    // Calcite folds `col = literal`, IN, and ranges into a SEARCH/Sarg; expand it back, then put the
+    // predicate in disjunctive normal form so the native side can OR conjunctions of comparisons.
+    RexNode expanded = RexUtil.expandSearch(calc.getCluster().getRexBuilder(), null, condition);
+    return RexUtil.toDnf(calc.getCluster().getRexBuilder(), expanded);
   }
 
   /**

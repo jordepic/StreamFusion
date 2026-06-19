@@ -46,6 +46,20 @@ class FlinkFilterSqlHarnessTest {
   }
 
   @Test
+  void disjunctionFilterMatchesHost() throws Exception {
+    // OR of comparisons across columns — disjunctive normal form, ORed in the native filter.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v > 35 OR k < 2");
+  }
+
+  @Test
+  void mixedAndOrFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment,
+        "SELECT * FROM f WHERE (v >= 30 AND k <> 4) OR s <> 'a'");
+  }
+
+  @Test
   void rangeFilterMatchesHost() throws Exception {
     // BETWEEN folds to a SEARCH range, which expands to an AND of two comparisons.
     NativeParity.assertParity(

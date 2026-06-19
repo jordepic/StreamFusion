@@ -79,10 +79,14 @@ public final class Native {
    * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
    * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
    * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   * <p>The predicate is in disjunctive normal form: comparisons are ANDed within their {@code
+   * groups} id and the groups are ORed together.
+   *
    * @param columnIndices the column each comparison tests
    * @param opCodes the comparison operator code for each
    * @param literals the numeric value each comparison tests against (ignored where a string is set)
    * @param stringLiterals the string value for string comparisons, null for numeric ones
+   * @param groups the OR-group id of each comparison
    */
   public static native void filterBatch(
       long inArrayAddress,
@@ -92,7 +96,8 @@ public final class Native {
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
-      String[] stringLiterals);
+      String[] stringLiterals,
+      int[] groups);
 
   /**
    * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the

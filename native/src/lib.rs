@@ -1099,15 +1099,20 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'
     op_codes: JIntArray<'local>,
     literals: JDoubleArray<'local>,
     string_literals: JObjectArray<'local>,
+    groups: JIntArray<'local>,
 ) {
     let columns = read_kinds(&env, &column_indices);
     let ops = read_kinds(&env, &op_codes);
     let values = read_doubles(&env, &literals);
     let strings = read_strings(&mut env, &string_literals);
+    let group_ids = read_kinds(&env, &groups);
     let batch = import_record_batch(in_array_address, in_schema_address);
     let schema = batch.schema();
 
-    let mut predicate: Option<datafusion::prelude::Expr> = None;
+    // The predicate is a disjunction of conjunctions (DNF): comparisons are ANDed within their
+    // group id and the groups are ORed together.
+    let mut conjunctions: std::collections::BTreeMap<i64, datafusion::prelude::Expr> =
+        std::collections::BTreeMap::new();
     for index in 0..columns.len() {
         let column = logical_col(schema.field(columns[index] as usize).name());
         // A non-null string literal means a string comparison (equality only); otherwise numeric.
@@ -1124,12 +1129,15 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'
             5 => column.not_eq(value),
             other => panic!("unsupported filter op code: {other}"),
         };
-        predicate = Some(match predicate {
-            Some(existing) => existing.and(term),
-            None => term,
-        });
+        conjunctions
+            .entry(group_ids[index])
+            .and_modify(|existing| *existing = existing.clone().and(term.clone()))
+            .or_insert(term);
     }
-    let predicate = predicate.expect("filter needs at least one comparison");
+    let predicate = conjunctions
+        .into_values()
+        .reduce(|a, b| a.or(b))
+        .expect("filter needs at least one comparison");
 
     let result = runtime().block_on(async move {
         let ctx = SessionContext::new();
