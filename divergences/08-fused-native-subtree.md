@@ -37,6 +37,12 @@ operators, which is the prerequisite for beating Flink. The plan and phases live
 ## Scope / consequences
 - The unit of substitution becomes a connected component, not a single node; the planner
   grows a fusion pass over the native-able nodes between shuffles.
+- The columnar region is anchored by the **endpoint formats**: a columnar source/sink
+  (Iceberg/Parquet) joins the region for free, and the row↔columnar transpose sits only at
+  row-based endpoints (Kafka). Columnar→columnar runs with no transpose at all; row→row is
+  worth converting only when the native compute outweighs both transposes. Same principle
+  as Comet (its columnar Parquet scan anchors the region); we generalize it to whichever
+  endpoints are columnar. Detailed in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
 - A fused operator that contains a stateful node (a window) owns that node's state and
   checkpointing, exactly as the standalone operator did — fusion changes the input path
   (a native prefix runs before the aggregation, in Arrow), not the state model
