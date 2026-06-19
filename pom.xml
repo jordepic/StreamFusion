@@ -82,6 +82,33 @@
             <version>${flink.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Defining a filesystem+parquet sink (to exercise native sink substitution, and as the
+             baseline for the throughput comparison) needs the connector and format on the test
+             classpath; Flink's Parquet writer in turn pulls in Hadoop. -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-connector-files</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-parquet</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <version>3.3.4</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-mapreduce-client-core</artifactId>
+            <version>3.3.4</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
