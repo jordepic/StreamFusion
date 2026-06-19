@@ -27,27 +27,22 @@ is no `supportsColumnar` contract and no framework that auto-inserts transitions
 cannot lean on the engine the way Comet leans on Spark — we have to provide the
 columnar boundary ourselves.
 
-## Decision — fuse, don't exchange
-Two ways to keep data columnar between native operators:
+## Decision — columnar flow with transitions (not fusion)
+Each native operator is **columnar**: it consumes and produces Arrow batches over a
+columnar stream-record type, not `RowData`. Adjacent columnar operators flow Arrow
+straight through (object passing within a chained task; Arrow IPC across a network edge),
+and the planner inserts a **transpose** operator only at a rowwise↔columnar boundary
+(`RowData → Arrow` entering, `Arrow → RowData` leaving). An operator is simply rowwise or
+columnar; nothing about its neighbours matters beyond whether the edge crosses the
+boundary. This is Comet's model; Flink has no columnar framework (no `supportsColumnar`,
+no `ColumnarRule`), so we supply the two missing pieces — the columnar record type and the
+transition insertion — ourselves.
 
-1. **Columnar stream element + transitions.** Make Arrow a `StreamRecord` payload type
-   between native operators and insert conversion operators at native↔host boundaries —
-   a hand-built version of Comet's transition pass. Cost: a columnar record type,
-   serializers for it (Arrow IPC across any non-chained edge), and transition
-   insertion in the planner. Fights Flink's row-based runtime at every turn.
-2. **Fuse a native subtree into one Flink operator** (chosen). The planner replaces a
-   maximal **shuffle-free connected component** of native-able operators with a *single*
-   Flink operator that runs the whole sub-pipeline in Arrow internally, converting
-   `RowData → Arrow` once at the component's outer input and `Arrow → RowData` once at
-   its outer output. Within the operator there is no boundary, so no inter-op conversion.
-   This is Comet's "native subtree as one `CometExec`" mapped onto Flink without needing
-   a framework columnar API.
-
-Fusion is chosen because it works *with* Flink's row-based operator model (one operator
-in, one operator out, RowData on the wire) and needs no columnar serializer until we
-tackle the shuffle. It also yields the maximal win (zero conversion inside the subtree).
-This is a deliberate divergence from Comet's framework-assisted transitions — see the
-divergences note.
+**Rejected: fusing a subtree into one operator.** Pattern-matching specific operator
+*combinations* (source+sink, filter+window, …) into a bespoke fused node per shape is a
+hardcoded replacement rule that does not generalize — a smell. Columnar flow composes any
+sequence of columnar operators with no per-combination knowledge. See
+[divergences/08](../../divergences/08-fused-native-subtree.md).
 
 ## What anchors the columnar region — the source and sink formats
 The conversion is a tax whose *placement* is dictated by the endpoint formats, not by the
@@ -76,35 +71,29 @@ with no columnar endpoint to amortize it (hence 0.58×). The favorable cases nee
 columnar endpoint, which means native columnar source/sink support is on the critical
 path, not just operator fusion.
 
-## First pipeline: Kafka source → Parquet sink (row → columnar)
-The first end-to-end target is a row source feeding a columnar sink, so the transpose
-sits once at the Kafka source (record → Arrow) and the region stays columnar through to a
-native Arrow → Parquet write. This is a real ingest pipeline and the cleanest place to
-show the columnar-sink win, since Flink's filesystem+parquet sink encodes `RowData →
-Parquet` at the boundary while we write Arrow batches directly.
+## Build order (columnar flow)
+Each green + benchmarked vs Flink.
 
-Flink baselines exist to compare against: `flink-parquet` (vectorized reader that still
-yields `RowData`, and the writer) via the filesystem connector, and `flink-connector-kafka`.
-Add those deps for the A/B; the native side adds a Kafka→Arrow source and an Arrow→Parquet
-sink.
+1. **Columnar stream-record type + transpose operators.** An Arrow-batch stream record,
+   plus two operators: `RowData → Arrow` (entering a columnar region) and `Arrow → RowData`
+   (leaving it). These are the only places conversion happens.
+2. **Native operators present an `Arrow → Arrow` interface.** Refactor the existing native
+   operators (filter, window aggregates, sink) so they consume and produce the columnar
+   record type instead of converting `RowData` internally at both ends. The sink consumes
+   Arrow; a columnar source produces Arrow.
+3. **Planner inserts transitions at boundaries.** When the substituted plan has a columnar
+   operator adjacent to a rowwise one, insert a transpose; adjacent columnar operators flow
+   Arrow with none. No per-combination rules — just "is this edge columnar on both sides?".
+4. **Native columnar Parquet source.** A source that reads Parquet → Arrow batches and
+   emits them into the columnar stream (no `RowData`). With the native Parquet sink (done),
+   a `Parquet → Parquet` job is then two columnar operators flowing end to end — zero
+   transpose — while Flink round-trips through `RowData`. **This is the first case expected
+   to cross 1×**, and it falls out of the general mechanism, not a fused copy node.
+5. **Arrow across the shuffle.** Two-phase aggregation's `keyBy` carries the columnar record
+   over the network (Arrow IPC). Hardest; gated on the rest.
 
-Build order (each green + benchmarked vs Flink):
-1. **Native Parquet sink.** Arrow `RecordBatch` → Parquet via the `parquet` crate (done,
-   round-trip tested); a Flink sink operator that batches its input to Arrow and writes
-   natively (done); exactly-once two-phase commit — in-progress files committed on
-   checkpoint completion, pending files re-committed on recovery (done, harness-tested).
-   Remaining: planner sink substitution (new — only operators are substituted today), and
-   the benchmark vs Flink's filesystem+parquet sink. **Benchmark blocker:** Flink's Parquet
-   writer is built on `parquet-hadoop`, so the baseline needs `hadoop-common` on the
-   classpath (declared `provided` in `flink-parquet`); adding Hadoop is a deliberate
-   dependency decision, and Flink finalizes Parquet files only on checkpoint, so the
-   comparison must run with checkpointing on.
-2. **Native Kafka → Arrow source.** Batch Kafka records, deserialize, transpose to Arrow
-   once at the source. Deserialization format is the main scoping fork — the cluster uses
-   Avro + schema registry (heavy); a first cut may use a simpler/known schema. This is the
-   single source-side transpose in the row→columnar case.
-3. **Join them.** Kafka → (optional native filter) → Parquet, fully columnar between the
-   two transposes; benchmark vs the equivalent Flink job.
+Then the row→columnar pipelines (Kafka → Parquet) compose for free: a `RowData → Arrow`
+transpose at the row source, columnar flow through to the columnar sink.
 
 ## Back burner: a fully native Kafka source (no JNI)
 The Kafka→Arrow source above batches and transposes *on the JVM side*, then hands Arrow

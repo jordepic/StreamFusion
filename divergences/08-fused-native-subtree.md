@@ -1,51 +1,51 @@
-# Keep columnar by fusing a native subtree, not by a columnar exchange type
+# Keep columnar by tagging operators columnar/rowwise, with transitions at the boundaries
 
 **Kind:** structural — how adjacent native operators avoid re-converting.
-**Diverges from:** Comet (mechanism, not goal).
-**Forced by parity:** no — forced by Flink's runtime model and a throughput finding.
+**Diverges from:** nothing (it *follows* Comet); Flink just lacks the framework Comet leans on.
+**Supersedes:** an earlier draft of this note that chose subtree *fusion* — see "Why not fusion".
 
-## Their decision
-Comet keeps data columnar between native operators by riding Spark's built-in columnar
-execution framework: operators advertise `supportsColumnar`, exchange `ColumnarBatch`,
-and a `ColumnarRule` transition pass inserts `ColumnarToRow`/`RowToColumnar` only where a
-columnar operator meets a row operator. Adjacent Comet operators never convert.
+## Their decision (Comet)
+Comet keeps data columnar between native operators by riding Spark's columnar execution
+framework: each operator advertises whether it is columnar, columnar operators exchange
+`ColumnarBatch`, and a `ColumnarRule` inserts `ColumnarToRow`/`RowToColumnar` transitions
+*only* where a columnar operator meets a row operator. Adjacent columnar operators never
+convert; no operator knows anything about its neighbours beyond "is this edge columnar?".
 
-## What we do, and why
-Flink has no columnar execution framework — its runtime exchanges `RowData` rows, with
-no `supportsColumnar` contract and no transition pass to lean on. So we cannot reproduce
-Comet's mechanism. Instead we **fuse a maximal shuffle-free connected component of
-native operators into a single Flink operator** that runs the whole sub-pipeline in Arrow
-internally, converting `RowData → Arrow` once at its outer input and back once at its
-outer output. No boundary exists inside the fused operator, so no inter-operator
-conversion happens — the same outcome as Comet's adjacent-columnar operators, reached
-without a framework columnar type.
+## What we do
+The same model. Each native operator is **columnar**: it consumes and produces Arrow
+batches (a columnar stream-record type), not `RowData`. Adjacent columnar operators flow
+Arrow straight through — within a chained task Flink passes the batch object directly (no
+serialization); across a network edge the batch is carried by an Arrow IPC serializer. At
+a **rowwise↔columnar boundary** the planner inserts a transpose operator (`RowData →
+Arrow` entering the columnar region, `Arrow → RowData` leaving it). A columnar source
+produces Arrow with no input transpose; a columnar sink consumes Arrow with no output
+transpose. An operator is simply rowwise or columnar — *no further detail about what it is
+adjacent to matters*, and the framework composes them.
 
-The alternative — making Arrow a `StreamRecord` payload type between native operators and
-hand-inserting row↔columnar transitions — was rejected: it fights Flink's row-based
-runtime (a columnar record type, its serializers, transition insertion) for no extra
-benefit over fusion within a shuffle-free segment, and it still needs Arrow IPC the
-moment an edge crosses the network. Fusion works *with* the one-in/one-out operator model
-and defers network serialization to the one place it is unavoidable (the shuffle).
+Flink has no columnar-execution framework to lean on (its runtime exchanges `RowData`),
+so we provide the two missing pieces ourselves: the columnar stream-record type, and the
+transition insertion in the planner. That is the whole of it — everything else is just
+operators flowing into operators.
 
-## Why this exists at all
-Per-operator substitution measured *slower* than Flink (filter 0.58×, tumbling 0.81× —
-see [ticket 20](../.claude/todos/20-profiling-and-benchmarks.md)) because each operator
-pays a `RowData ↔ Arrow` round-trip. Fusion removes the round-trips between native
-operators, which is the prerequisite for beating Flink. The plan and phases live in
-[ticket 21](../.claude/todos/21-native-operator-chaining.md).
+## Why not fusion
+An earlier version of this note chose to *fuse* a maximal native subtree into one Flink
+operator. That was wrong: fusion means pattern-matching specific operator *combinations*
+(a Parquet source feeding a Parquet sink, a filter feeding a window, …) and emitting a
+bespoke fused node for each — a hardcoded replacement rule per shape, which does not
+generalize and is a smell. Tagging each operator columnar/rowwise and letting them flow,
+with transitions only at the boundary, needs no per-combination knowledge: a columnar
+source, a columnar filter, and a columnar sink compose because they are all columnar, not
+because the planner recognizes the trio.
 
 ## Scope / consequences
-- The unit of substitution becomes a connected component, not a single node; the planner
-  grows a fusion pass over the native-able nodes between shuffles.
-- The columnar region is anchored by the **endpoint formats**: a columnar source/sink
-  (Iceberg/Parquet) joins the region for free, and the row↔columnar transpose sits only at
-  row-based endpoints (Kafka). Columnar→columnar runs with no transpose at all; row→row is
-  worth converting only when the native compute outweighs both transposes. Same principle
-  as Comet (its columnar Parquet scan anchors the region); we generalize it to whichever
-  endpoints are columnar. Detailed in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
-- A fused operator that contains a stateful node (a window) owns that node's state and
-  checkpointing, exactly as the standalone operator did — fusion changes the input path
-  (a native prefix runs before the aggregation, in Arrow), not the state model
-  ([04](04-synchronous-stateful-execution.md)).
-- Arrow across the shuffle (two-phase local→global) is a later phase and is where a
-  columnar serializer finally becomes necessary.
+- Native operators move from a `RowData → RowData` interface (converting internally at
+  both ends, as they do today) to an `Arrow → Arrow` interface over the columnar
+  stream-record type. The internal per-operator conversion goes away; conversion lives
+  only in the transpose operators at region boundaries.
+- The planner inserts a transpose wherever a substituted (columnar) operator meets a
+  rowwise one — including at columnar sources/sinks, where there is none to insert.
+- A fused operator that contains a stateful node still owns that node's state/checkpointing
+  ([04](04-synchronous-stateful-execution.md)); columnar flow changes the *edge* type, not
+  the state model.
+- Arrow across a shuffle (two-phase local→global) is where the columnar record type needs
+  its IPC serializer; within a chained task no serializer is invoked.
