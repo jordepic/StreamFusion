@@ -26,6 +26,11 @@ final class RexExpression {
   private static final int KIND_LIT_STRING = 3;
   private static final int KIND_LIT_BOOL = 4;
   private static final int KIND_CALL = 6;
+  // Narrow integer literals keep their declared width (the value still rides in the long pool) so
+  // native arithmetic evaluates in the same type as the host rather than a widened one.
+  private static final int KIND_LIT_INT = 7;
+  private static final int KIND_LIT_SMALL = 8;
+  private static final int KIND_LIT_TINY = 9;
 
   private final List<Integer> kinds = new ArrayList<>();
   private final List<Integer> payload = new ArrayList<>();
@@ -101,7 +106,7 @@ final class RexExpression {
           if (value == null) {
             return false;
           }
-          add(KIND_LIT_LONG, longs.size(), 0);
+          add(integerLiteralKind(type), longs.size(), 0);
           longs.add(value);
           return true;
         }
@@ -180,6 +185,20 @@ final class RexExpression {
         }
         add(KIND_CALL, op, 2);
         return emit(operands.get(0)) && emit(operands.get(1));
+    }
+  }
+
+  /** The literal kind for an exact-integer SQL type, preserving its declared width. */
+  private static int integerLiteralKind(SqlTypeName type) {
+    switch (type) {
+      case TINYINT:
+        return KIND_LIT_TINY;
+      case SMALLINT:
+        return KIND_LIT_SMALL;
+      case INTEGER:
+        return KIND_LIT_INT;
+      default:
+        return KIND_LIT_LONG;
     }
   }
 

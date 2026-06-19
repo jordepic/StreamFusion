@@ -1110,6 +1110,11 @@ fn build_expr(
         2 => logical_lit(doubles[arg]),
         3 => logical_lit(strings[arg].clone().expect("string literal")),
         4 => logical_lit(longs[arg] != 0),
+        // Narrow integer literals carry their declared width so arithmetic evaluates in the same
+        // type as the host (e.g. `int * 2` stays int32 and wraps), not a widened type.
+        7 => logical_lit(longs[arg] as i32),
+        8 => logical_lit(longs[arg] as i16),
+        9 => logical_lit(longs[arg] as i8),
         6 => {
             let op = payload[node];
             let count = child_counts[node] as usize;
@@ -1676,6 +1681,31 @@ mod tests {
         };
         let out = expression.filter(sample_batch());
         assert_eq!(values(&out, 0), vec![1, 3, 9]);
+    }
+
+    // An int32 literal keeps the arithmetic in int32, so `v * 2` wraps on overflow like the host
+    // rather than widening: CALL gt ( CALL times ( INPUT_REF v , LIT_INT 2 ) , LIT_INT 50 ).
+    #[test]
+    fn integer_arithmetic_wraps_in_declared_width() {
+        let v: ArrayRef = Arc::new(Int32Array::from(vec![30i32, 2_000_000_000]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)])),
+            vec![v],
+        )
+        .unwrap();
+        let mut expression = FilterExpression {
+            kinds: vec![6, 6, 0, 7, 7],
+            payload: vec![10, 2, 0, 0, 1],
+            child_counts: vec![2, 2, 0, 0, 0],
+            longs: vec![2, 50],
+            doubles: vec![],
+            strings: vec![],
+            compiled: None,
+        };
+        let out = expression.filter(batch);
+        let kept = out.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        // 30*2=60 > 50 keeps 30; 2e9*2 overflows int32 to a negative value, excluded.
+        assert_eq!(kept.values(), &[30]);
     }
 
     // The compiled predicate is cached after the first batch and reused.

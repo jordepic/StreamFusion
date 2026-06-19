@@ -35,15 +35,19 @@ Notes / divergences this avoids:
 - **DECIMAL** SUM/AVG precision/scale derivation is exotic; excluded.
 
 ## Predicate arithmetic (filter expressions)
-The native expression engine admits `+`/`-`/`*` in filter predicates. DataFusion's
-type coercion widens mixed-width integer arithmetic (e.g. `INT + BIGINT`) to the
-wider type and evaluates there, whereas Flink computes in the SQL result type and
-wraps on overflow (Java integer semantics). For values that do not overflow the
-declared type the two agree (and the parity tests exercise that range), but
-**overflow-wrapping parity is not yet guaranteed** — a true `INT` overflow would
-wrap on Flink and either widen or error natively. The fix mirrors the wrapping int
-SUM accumulator: evaluate integer arithmetic in the declared narrow type with
-wrapping. Until then, treat native arithmetic as parity-safe only within range.
+The native expression engine admits `+`/`-`/`*` in filter predicates. DataFusion
+evaluates integer arithmetic with the wrapping kernels (`add_wrapping` etc.) — the
+same two's-complement wrap as Flink's Java integer arithmetic — so the only thing
+that has to match is the *type* the arithmetic is computed in. Integer literals are
+therefore encoded at their declared width (`TINYINT`/`SMALLINT`/`INTEGER`/`BIGINT`
+→ i8/i16/i32/i64), so `int * 2` stays int32 and wraps exactly as the host does
+rather than widening to int64. A parity test at the `INT` overflow boundary
+(`v * 2` near `INT_MAX`) confirms native and Flink agree, wrap and all.
+
+Residual: arithmetic *between* narrow-integer columns (`TINYINT`/`SMALLINT`) depends
+on DataFusion's result-type coercion matching Flink's promotion, which is unverified
+(such columns rarely appear in arithmetic, and a narrow literal only arises through a
+`CAST`, which falls back). Comparisons are width-insensitive and always safe.
 
 ## Status
 - Implemented value types: `BIGINT`, `DOUBLE`, and `INT` — all five aggregates.

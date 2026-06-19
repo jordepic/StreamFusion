@@ -72,11 +72,13 @@ public final class Native {
   /**
    * Compiles a general predicate expression into a reusable handle. The predicate is the encoded
    * tree (pre-order parallel arrays — see the expression encoder): {@code kinds} tags each node
-   * (0=input ref, 1=long literal, 2=double literal, 3=string literal, 4=bool literal, 6=call),
-   * {@code payload} carries the column index / op code / literal-pool index, and {@code childCounts}
-   * the operand count of each call; literals are drawn from {@code longs}/{@code doubles}/{@code
-   * strings} by index. The handle compiles the plan once (against the first batch's schema) and
-   * reuses it, and must be released with {@link #closeFilterExpression(long)}.
+   * (0=input ref, 1=long literal, 2=double literal, 3=string literal, 4=bool literal, 6=call,
+   * 7/8/9=int/smallint/tinyint literal — narrow integer literals whose value still rides in the
+   * long pool but keep their declared width so arithmetic matches the host), {@code payload} carries
+   * the column index / op code / literal-pool index, and {@code childCounts} the operand count of
+   * each call; literals are drawn from {@code longs}/{@code doubles}/{@code strings} by index. The
+   * handle compiles the plan once (against the first batch's schema) and reuses it, and must be
+   * released with {@link #closeFilterExpression(long)}.
    *
    * <p>Call op codes: 0=+, 1=-, 2=*, 10=&gt;, 11=&gt;=, 12=&lt;, 13=&lt;=, 14==, 15=&lt;&gt;, 20=AND,
    * 21=OR, 22=NOT.

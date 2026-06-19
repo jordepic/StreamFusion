@@ -94,6 +94,14 @@ class FlinkFilterSqlHarnessTest {
   }
 
   @Test
+  void integerOverflowArithmeticMatchesHost() throws Exception {
+    // `v * 2` on an int near INT_MAX overflows; native must wrap in int32 exactly as the host does,
+    // not evaluate in a widened type. The large row wraps negative and is excluded by both.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::overflowEnvironment, "SELECT v FROM o WHERE v * 2 > 50");
+  }
+
+  @Test
   void unsupportedFunctionFallsBack() throws Exception {
     // A function the expression encoder does not admit makes the whole filter fall back to the host.
     NativeParity.assertFallback(
@@ -105,6 +113,17 @@ class FlinkFilterSqlHarnessTest {
     // The row carries a TIMESTAMP column through the whole-row converter while filtering on another.
     NativeParity.assertParity(
         FlinkFilterSqlHarnessTest::timestampEnvironment, "SELECT * FROM g WHERE v > 15");
+  }
+
+  private static TableEnvironment overflowEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(Types.ROW_NAMED(new String[] {"v"}, Types.INT), Row.of(30), Row.of(2_000_000_000));
+    tEnv.createTemporaryView(
+        "o", source, Schema.newBuilder().column("v", DataTypes.INT()).build());
+    return tEnv;
   }
 
   private static TableEnvironment timestampEnvironment() {

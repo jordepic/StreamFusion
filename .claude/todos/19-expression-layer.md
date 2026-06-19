@@ -10,10 +10,12 @@ pass via the general path, plus new arithmetic-predicate tests and an unsupporte
 function fallback test. The encoding follows Comet over Substrait and compiles once
 per operator — see [divergences/07](../../divergences/07-expression-encoding-and-compile-once.md).
 
-**Next gate before widening arithmetic:** integer-overflow parity (DataFusion widens
-via coercion / errors; Flink wraps in the declared type). Evaluate integer `+`/`-`/`*`
-in the narrow type with wrapping, mirroring the wrapping int SUM accumulator. Tracked
-in the type-support doc.
+**Integer-overflow parity: CLOSED.** DataFusion already evaluates `+`/`-`/`*` with
+wrapping kernels, matching Flink's Java integer semantics; the remaining mismatch was
+that the encoder promoted every integer literal to i64, so `int * 2` computed in i64.
+Literals now carry their declared width (i8/i16/i32/i64) so the arithmetic stays in the
+host's type. Verified by a parity test at the `INT` overflow boundary. Residual: narrow-
+int (`TINYINT`/`SMALLINT`) column arithmetic promotion — see the type-support doc.
 
 **Source:** the foundational piece for general projections and richer predicates
 (unblocks equality filters, computed columns, arithmetic/function predicates).
