@@ -26,7 +26,7 @@ class FlinkFilterSqlHarnessTest {
   }
 
   @Test
-  void bigintEqualityFilterMatchesHost() throws Exception {
+  void bigintInequalityFilterMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE k <> 2");
   }
@@ -36,6 +36,26 @@ class FlinkFilterSqlHarnessTest {
     // A conjunction of comparisons across two columns; the native filter ANDs the masks.
     NativeParity.assertParity(
         FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v > 15 AND k <= 3");
+  }
+
+  @Test
+  void rangeFilterMatchesHost() throws Exception {
+    // BETWEEN folds to a SEARCH range, which expands to an AND of two comparisons.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v BETWEEN 20 AND 35");
+  }
+
+  @Test
+  void stringInequalityFilterMatchesHost() throws Exception {
+    // `<>` preserves the column (no constant folding), so a string inequality routes.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE s <> 'b'");
+  }
+
+  @Test
+  void mixedStringAndNumericFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE s <> 'a' AND v >= 20");
   }
 
   private static TableEnvironment environment() {

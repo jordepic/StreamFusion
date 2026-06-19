@@ -32,6 +32,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
   private final int[] columnIndices;
   private final int[] opCodes;
   private final double[] literals;
+  private final String[] stringLiterals;
   private final int batchSize;
 
   private transient BufferAllocator allocator;
@@ -39,11 +40,17 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
   private transient List<RowData> buffer;
 
   public NativeFilterOperator(
-      RowType rowType, int[] columnIndices, int[] opCodes, double[] literals, int batchSize) {
+      RowType rowType,
+      int[] columnIndices,
+      int[] opCodes,
+      double[] literals,
+      String[] stringLiterals,
+      int batchSize) {
     this.rowType = rowType;
     this.columnIndices = columnIndices;
     this.opCodes = opCodes;
     this.literals = literals;
+    this.stringLiterals = stringLiterals;
     this.batchSize = batchSize;
   }
 
@@ -102,7 +109,8 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
           outSchema.memoryAddress(),
           columnIndices,
           opCodes,
-          literals);
+          literals,
+          stringLiterals);
       try (VectorSchemaRoot out =
           Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
         for (RowData row : RowDataArrowConverter.read(out, rowType)) {

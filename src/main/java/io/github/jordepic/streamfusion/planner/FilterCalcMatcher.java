@@ -10,6 +10,7 @@ import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexLocalRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexProgram;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 
@@ -24,21 +25,30 @@ final class FilterCalcMatcher {
 
   private FilterCalcMatcher() {}
 
-  /** One {@code column op literal} comparison: op codes 0=&gt;, 1=&gt;=, 2=&lt;, 3=&lt;=, 4==, 5=&lt;&gt;. */
+  /**
+   * One {@code column op literal} comparison: op codes 0=&gt;, 1=&gt;=, 2=&lt;, 3=&lt;=, 4==, 5=&lt;&gt;.
+   * A string comparison (equality only) carries its value in {@code stringLiteral}; a numeric one in
+   * {@code literal} with {@code stringLiteral} null.
+   */
   private static final class Comparison {
     final int column;
     final int op;
     final double literal;
+    final String stringLiteral;
 
-    Comparison(int column, int op, double literal) {
+    Comparison(int column, int op, double literal, String stringLiteral) {
       this.column = column;
       this.op = op;
       this.literal = literal;
+      this.stringLiteral = stringLiteral;
     }
   }
 
   static boolean matches(Calc calc) {
     RexProgram program = calc.getProgram();
+    // Identity projection only — a pure filter. Note that `col = literal` constant-folds the column
+    // into the projection (making it non-identity), so equality on the filtered column falls back
+    // until projection support lands; column-preserving comparisons (<, <=, >, >=, <>, ranges) stay.
     if (program.getCondition() == null || !isIdentityProjection(program)) {
       return false;
     }
@@ -77,9 +87,21 @@ final class FilterCalcMatcher {
     return values;
   }
 
+  static String[] stringLiterals(Calc calc) {
+    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
+    String[] values = new String[comparisons.size()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = comparisons.get(i).stringLiteral;
+    }
+    return values;
+  }
+
   private static RexNode condition(Calc calc) {
     RexProgram program = calc.getProgram();
-    return program.expandLocalRef(program.getCondition());
+    RexNode condition = program.expandLocalRef(program.getCondition());
+    // Calcite folds `col = literal`, IN, and ranges into a SEARCH/Sarg; expand it back so a point
+    // search becomes an equality and a range becomes an AND of comparisons the matcher understands.
+    return RexUtil.expandSearch(calc.getCluster().getRexBuilder(), null, condition);
   }
 
   /**
@@ -136,14 +158,21 @@ final class FilterCalcMatcher {
     } else {
       return null;
     }
-    if (!numeric(inputType.getFieldList().get(ref.getIndex()).getType().getSqlTypeName())) {
-      return null;
+    SqlTypeName columnType = inputType.getFieldList().get(ref.getIndex()).getType().getSqlTypeName();
+    int finalOp = literalOnLeft ? flip(op) : op;
+    if (numeric(columnType)) {
+      Double literal = value.getValueAs(Double.class);
+      return literal == null ? null : new Comparison(ref.getIndex(), finalOp, literal, null);
     }
-    Double literal = value.getValueAs(Double.class);
-    if (literal == null) {
-      return null;
+    if (columnType == SqlTypeName.VARCHAR || columnType == SqlTypeName.CHAR) {
+      // Strings support equality only (= and <>, which are symmetric under operand flip).
+      if (finalOp != 4 && finalOp != 5) {
+        return null;
+      }
+      String literal = value.getValueAs(String.class);
+      return literal == null ? null : new Comparison(ref.getIndex(), finalOp, 0.0, literal);
     }
-    return new Comparison(ref.getIndex(), literalOnLeft ? flip(op) : op, literal);
+    return null;
   }
 
   private static boolean isIdentityProjection(RexProgram program) {

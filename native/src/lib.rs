@@ -14,7 +14,7 @@ use datafusion::physical_expr::expressions::{binary, col, lit};
 use datafusion::prelude::{col as logical_col, lit as logical_lit, SessionContext};
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
-use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray};
+use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray, JObjectArray, JString};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::collections::{BTreeMap, HashMap};
@@ -1089,7 +1089,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterGreater
 /// so null cells fail the predicate, as SQL `WHERE` requires.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     in_array_address: jlong,
     in_schema_address: jlong,
@@ -1098,18 +1098,24 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'
     column_indices: JIntArray<'local>,
     op_codes: JIntArray<'local>,
     literals: JDoubleArray<'local>,
+    string_literals: JObjectArray<'local>,
 ) {
     let columns = read_kinds(&env, &column_indices);
     let ops = read_kinds(&env, &op_codes);
     let values = read_doubles(&env, &literals);
+    let strings = read_strings(&mut env, &string_literals);
     let batch = import_record_batch(in_array_address, in_schema_address);
     let schema = batch.schema();
 
     let mut predicate: Option<datafusion::prelude::Expr> = None;
-    for ((&column_index, &op_code), &literal) in columns.iter().zip(&ops).zip(&values) {
-        let column = logical_col(schema.field(column_index as usize).name());
-        let value = logical_lit(literal);
-        let term = match op_code {
+    for index in 0..columns.len() {
+        let column = logical_col(schema.field(columns[index] as usize).name());
+        // A non-null string literal means a string comparison (equality only); otherwise numeric.
+        let value = match &strings[index] {
+            Some(text) => logical_lit(text.clone()),
+            None => logical_lit(values[index]),
+        };
+        let term = match ops[index] {
             0 => column.gt(value),
             1 => column.gt_eq(value),
             2 => column.lt(value),
@@ -1253,6 +1259,23 @@ fn read_doubles(env: &JNIEnv, values: &JDoubleArray) -> Vec<f64> {
     let mut buffer = vec![0f64; length as usize];
     env.get_double_array_region(values, 0, &mut buffer).expect("failed to read doubles");
     buffer
+}
+
+/// Reads a JVM String[] into a Vec, mapping a Java null element to None (a numeric comparison).
+fn read_strings(env: &mut JNIEnv, values: &JObjectArray) -> Vec<Option<String>> {
+    let length = env.get_array_length(values).expect("failed to read strings length");
+    let mut out = Vec::with_capacity(length as usize);
+    for index in 0..length {
+        let element = env.get_object_array_element(values, index).expect("failed to read string");
+        if element.is_null() {
+            out.push(None);
+        } else {
+            let text: String =
+                env.get_string(&JString::from(element)).expect("failed to decode string").into();
+            out.push(Some(text));
+        }
+    }
+    out
 }
 
 /// Folds a batch from the JVM into the aggregator's open windows. Produces no output; results are

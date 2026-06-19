@@ -81,7 +81,8 @@ public final class Native {
    * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
    * @param columnIndices the column each comparison tests
    * @param opCodes the comparison operator code for each
-   * @param literals the value each comparison tests against
+   * @param literals the numeric value each comparison tests against (ignored where a string is set)
+   * @param stringLiterals the string value for string comparisons, null for numeric ones
    */
   public static native void filterBatch(
       long inArrayAddress,
@@ -90,7 +91,8 @@ public final class Native {
       long outSchemaAddress,
       int[] columnIndices,
       int[] opCodes,
-      double[] literals);
+      double[] literals,
+      String[] stringLiterals);
 
   /**
    * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the
