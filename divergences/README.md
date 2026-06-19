@@ -43,16 +43,16 @@ host — verified by the parity harness.
 - [05 — Cumulative windows](05-cumulative-windows.md) — net-new operator neither influence has; built against Flink's semantics alone.
 - [06 — Two-phase slice-sharing](06-two-phase-slice-sharing.md) — hopping's local/global intermediate reverse-engineered from Flink, not Arroyo's raw re-aggregation.
 - [07 — Expression encoding + compile-once](07-expression-encoding-and-compile-once.md) — hand-encoded IR following Comet (not Substrait), compiled once per operator.
-- [08 — Fused native subtree](08-fused-native-subtree.md) — keep columnar by fusing a native subtree into one operator, since Flink has no columnar exchange framework to lean on like Comet does.
+- [08 — Columnar flow with transitions](08-fused-native-subtree.md) — keep columnar by tagging operators columnar/rowwise and transposing only at boundaries (following Comet), not by fusing subtrees; Flink lacks the columnar framework so we supply the record type + transition insertion.
 
 ## Known transitional gap (not yet a deliberate divergence)
 
 We currently substitute native operators individually and transpose Arrow↔RowData
 at each operator boundary — which the end-to-end benchmark showed makes a single
-substituted operator *slower* than Flink. Comet keeps *full columnar chains* native
-and only transposes at the native↔host edges; we agree with the goal but reach it by
-fusing a native subtree (Flink has no columnar exchange framework to lean on) — see
-[08](08-fused-native-subtree.md) for the mechanism and
-`.claude/todos/21-native-operator-chaining.md` for the phased plan. It stays a tracked
-optimization rather than a divergence in *intent*; only the *mechanism* (fusion vs a
-columnar exchange type) is the recorded divergence.
+substituted operator *slower* than Flink. Comet keeps *full columnar chains* native and
+only transposes at the native↔host edges; we adopt the same model — operators tagged
+columnar/rowwise, flowing Arrow between columnar ones, transposing only at the boundary —
+supplying the columnar record type and transition insertion ourselves since Flink has no
+columnar framework. See [08](08-fused-native-subtree.md) for the mechanism and
+`.claude/todos/21-native-operator-chaining.md` for the plan. It stays a tracked
+optimization rather than a divergence in *intent*; only the *mechanism* is recorded.
