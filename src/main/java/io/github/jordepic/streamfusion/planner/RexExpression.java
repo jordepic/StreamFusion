@@ -1,0 +1,231 @@
+package io.github.jordepic.streamfusion.planner;
+
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexInputRef;
+import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeName;
+
+/**
+ * Encodes a {@link RexNode} into the compact pre-order form the native engine decodes (see {@link
+ * io.github.jordepic.streamfusion.Native#createFilterExpression}): parallel {@code kinds}/{@code
+ * payload}/{@code childCounts} arrays plus typed literal pools. The encoding is the JVM counterpart
+ * of the native expression builder, and admits only the operations the native side evaluates with
+ * verified Flink parity; an unsupported node makes the whole encode fail (returning null), so the
+ * containing operator falls back to Flink.
+ */
+final class RexExpression {
+
+  // Node kinds, mirrored on the native side.
+  private static final int KIND_INPUT_REF = 0;
+  private static final int KIND_LIT_LONG = 1;
+  private static final int KIND_LIT_DOUBLE = 2;
+  private static final int KIND_LIT_STRING = 3;
+  private static final int KIND_LIT_BOOL = 4;
+  private static final int KIND_CALL = 6;
+
+  private final List<Integer> kinds = new ArrayList<>();
+  private final List<Integer> payload = new ArrayList<>();
+  private final List<Integer> childCounts = new ArrayList<>();
+  private final List<Long> longs = new ArrayList<>();
+  private final List<Double> doubles = new ArrayList<>();
+  private final List<String> strings = new ArrayList<>();
+
+  private RexExpression() {}
+
+  /** The encoded expression, or null if {@code node} contains an unsupported operation. */
+  static RexExpression encode(RexNode node) {
+    RexExpression encoder = new RexExpression();
+    return encoder.emit(node) ? encoder : null;
+  }
+
+  int[] kinds() {
+    return toIntArray(kinds);
+  }
+
+  int[] payload() {
+    return toIntArray(payload);
+  }
+
+  int[] childCounts() {
+    return toIntArray(childCounts);
+  }
+
+  long[] longs() {
+    long[] out = new long[longs.size()];
+    for (int i = 0; i < out.length; i++) {
+      out[i] = longs.get(i);
+    }
+    return out;
+  }
+
+  double[] doubles() {
+    double[] out = new double[doubles.size()];
+    for (int i = 0; i < out.length; i++) {
+      out[i] = doubles.get(i);
+    }
+    return out;
+  }
+
+  String[] strings() {
+    return strings.toArray(new String[0]);
+  }
+
+  /** Appends {@code node} in pre-order; returns false (abandoning the encode) on an unsupported node. */
+  private boolean emit(RexNode node) {
+    if (node instanceof RexInputRef) {
+      add(KIND_INPUT_REF, ((RexInputRef) node).getIndex(), 0);
+      return true;
+    }
+    if (node instanceof RexLiteral) {
+      return emitLiteral((RexLiteral) node);
+    }
+    if (node instanceof RexCall) {
+      return emitCall((RexCall) node);
+    }
+    return false;
+  }
+
+  private boolean emitLiteral(RexLiteral literal) {
+    SqlTypeName type = literal.getType().getSqlTypeName();
+    switch (type) {
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+      case BIGINT:
+        {
+          Long value = literal.getValueAs(Long.class);
+          if (value == null) {
+            return false;
+          }
+          add(KIND_LIT_LONG, longs.size(), 0);
+          longs.add(value);
+          return true;
+        }
+      case FLOAT:
+      case REAL:
+      case DOUBLE:
+      case DECIMAL:
+        {
+          Double value = literal.getValueAs(Double.class);
+          if (value == null) {
+            return false;
+          }
+          add(KIND_LIT_DOUBLE, doubles.size(), 0);
+          doubles.add(value);
+          return true;
+        }
+      case CHAR:
+      case VARCHAR:
+        {
+          String value = literal.getValueAs(String.class);
+          if (value == null) {
+            return false;
+          }
+          add(KIND_LIT_STRING, strings.size(), 0);
+          strings.add(value);
+          return true;
+        }
+      case BOOLEAN:
+        {
+          Boolean value = literal.getValueAs(Boolean.class);
+          if (value == null) {
+            return false;
+          }
+          add(KIND_LIT_BOOL, longs.size(), 0);
+          longs.add(value ? 1L : 0L);
+          return true;
+        }
+      default:
+        return false;
+    }
+  }
+
+  private boolean emitCall(RexCall call) {
+    int op = opCode(call.getKind());
+    if (op < 0) {
+      return false;
+    }
+    List<RexNode> operands = call.getOperands();
+    switch (call.getKind()) {
+      case NOT:
+        if (operands.size() != 1) {
+          return false;
+        }
+        add(KIND_CALL, op, 1);
+        return emit(operands.get(0));
+      case AND:
+      case OR:
+        // Calcite leaves AND/OR n-ary; the native binary op needs a left-deep nesting, which a
+        // pre-order stream encodes as (n-1) call headers followed by the operands in order.
+        if (operands.size() < 2) {
+          return false;
+        }
+        for (int i = 0; i < operands.size() - 1; i++) {
+          add(KIND_CALL, op, 2);
+        }
+        for (RexNode operand : operands) {
+          if (!emit(operand)) {
+            return false;
+          }
+        }
+        return true;
+      default:
+        // The remaining admitted ops (arithmetic and comparisons) are strictly binary.
+        if (operands.size() != 2) {
+          return false;
+        }
+        add(KIND_CALL, op, 2);
+        return emit(operands.get(0)) && emit(operands.get(1));
+    }
+  }
+
+  /** The native op code for a call kind, or -1 if the operation is not admitted. */
+  private static int opCode(SqlKind kind) {
+    switch (kind) {
+      case PLUS:
+        return 0;
+      case MINUS:
+        return 1;
+      case TIMES:
+        return 2;
+      case GREATER_THAN:
+        return 10;
+      case GREATER_THAN_OR_EQUAL:
+        return 11;
+      case LESS_THAN:
+        return 12;
+      case LESS_THAN_OR_EQUAL:
+        return 13;
+      case EQUALS:
+        return 14;
+      case NOT_EQUALS:
+        return 15;
+      case AND:
+        return 20;
+      case OR:
+        return 21;
+      case NOT:
+        return 22;
+      default:
+        return -1;
+    }
+  }
+
+  private void add(int kind, int payloadValue, int childCount) {
+    kinds.add(kind);
+    payload.add(payloadValue);
+    childCounts.add(childCount);
+  }
+
+  private static int[] toIntArray(List<Integer> values) {
+    int[] out = new int[values.size()];
+    for (int i = 0; i < out.length; i++) {
+      out[i] = values.get(i);
+    }
+    return out;
+  }
+}

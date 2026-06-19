@@ -81,6 +81,26 @@ class FlinkFilterSqlHarnessTest {
   }
 
   @Test
+  void arithmeticPredicateMatchesHost() throws Exception {
+    // Arithmetic in the predicate (across columns of different width) — the general expression path.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT k, v FROM f WHERE v + k > 25");
+  }
+
+  @Test
+  void multiplicationPredicateMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v * 2 > 50");
+  }
+
+  @Test
+  void unsupportedFunctionFallsBack() throws Exception {
+    // A function the expression encoder does not admit makes the whole filter fall back to the host.
+    NativeParity.assertFallback(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE ABS(v) > 20");
+  }
+
+  @Test
   void filterCarriesTimestampColumnMatchesHost() throws Exception {
     // The row carries a TIMESTAMP column through the whole-row converter while filtering on another.
     NativeParity.assertParity(

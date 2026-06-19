@@ -61,6 +61,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
 
     if (current instanceof StreamPhysicalCalc && FilterCalcMatcher.matches((Calc) current)) {
       Calc calc = (Calc) current;
+      RexExpression condition = FilterCalcMatcher.encodedCondition(calc);
       substitutions++;
       return new StreamPhysicalNativeFilter(
           calc.getCluster(),
@@ -68,11 +69,12 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           calc.getInputs().get(0),
           calc.getRowType(),
           FilterCalcMatcher.projection(calc),
-          FilterCalcMatcher.columnIndices(calc),
-          FilterCalcMatcher.opCodes(calc),
-          FilterCalcMatcher.literals(calc),
-          FilterCalcMatcher.stringLiterals(calc),
-          FilterCalcMatcher.groups(calc));
+          condition.kinds(),
+          condition.payload(),
+          condition.childCounts(),
+          condition.longs(),
+          condition.doubles(),
+          condition.strings());
     }
 
     if (current instanceof StreamPhysicalWindowAggregate) {

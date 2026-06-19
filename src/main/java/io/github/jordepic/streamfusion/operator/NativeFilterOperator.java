@@ -20,44 +20,47 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 
 /**
- * Stateless native filter: buffers rows into a batch, converts the whole batch to Arrow, applies a
- * single-comparison predicate ({@code column op literal}) natively, and emits the surviving rows
- * unchanged. The output schema is the input schema (a pure filter), so rows round-trip through the
- * whole-row converter. Watermarks pass through after the buffer is flushed, preserving their order
- * relative to the records.
+ * Stateless native filter: buffers rows into a batch, converts the whole batch to Arrow, applies the
+ * encoded predicate natively, and emits the surviving rows (an input-column subset/reorder). The
+ * predicate is compiled once into a native handle reused across batches. Watermarks pass through
+ * after the buffer is flushed, preserving their order relative to the records.
  */
 public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     implements OneInputStreamOperator<RowData, RowData>, BoundedOneInput {
 
   private final RowType inputRowType;
   private final int[] projection;
-  private final int[] columnIndices;
-  private final int[] opCodes;
-  private final double[] literals;
-  private final String[] stringLiterals;
-  private final int[] groups;
+  private final int[] kinds;
+  private final int[] payload;
+  private final int[] childCounts;
+  private final long[] longs;
+  private final double[] doubles;
+  private final String[] strings;
   private final int batchSize;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient List<RowData> buffer;
+  private transient long predicate;
 
   public NativeFilterOperator(
       RowType inputRowType,
       int[] projection,
-      int[] columnIndices,
-      int[] opCodes,
-      double[] literals,
-      String[] stringLiterals,
-      int[] groups,
+      int[] kinds,
+      int[] payload,
+      int[] childCounts,
+      long[] longs,
+      double[] doubles,
+      String[] strings,
       int batchSize) {
     this.inputRowType = inputRowType;
     this.projection = projection;
-    this.columnIndices = columnIndices;
-    this.opCodes = opCodes;
-    this.literals = literals;
-    this.stringLiterals = stringLiterals;
-    this.groups = groups;
+    this.kinds = kinds;
+    this.payload = payload;
+    this.childCounts = childCounts;
+    this.longs = longs;
+    this.doubles = doubles;
+    this.strings = strings;
     this.batchSize = batchSize;
   }
 
@@ -67,6 +70,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     allocator = new RootAllocator();
     dictionaries = new CDataDictionaryProvider();
     buffer = new ArrayList<>(batchSize);
+    predicate = Native.createFilterExpression(kinds, payload, childCounts, longs, doubles, strings);
   }
 
   @Override
@@ -90,6 +94,10 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
 
   @Override
   public void close() throws Exception {
+    if (predicate != 0) {
+      Native.closeFilterExpression(predicate);
+      predicate = 0;
+    }
     if (dictionaries != null) {
       dictionaries.close();
     }
@@ -109,16 +117,12 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
         ArrowArray outArray = ArrowArray.allocateNew(allocator);
         ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, in, dictionaries, inArray, inSchema);
-      Native.filterBatch(
+      Native.filterExpression(
+          predicate,
           inArray.memoryAddress(),
           inSchema.memoryAddress(),
           outArray.memoryAddress(),
-          outSchema.memoryAddress(),
-          columnIndices,
-          opCodes,
-          literals,
-          stringLiterals,
-          groups);
+          outSchema.memoryAddress());
       try (VectorSchemaRoot out =
           Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
         for (RowData survivor : RowDataArrowConverter.read(out, inputRowType)) {

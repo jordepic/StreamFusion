@@ -15,17 +15,19 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 /**
  * Physical node standing in for a pure filter the native operator runs. It keeps the replaced node's
  * output type (the input type — a filter does not rewrite columns) and traits, and carries the
- * single-comparison predicate the operator applies. Stateless, so it needs no watermark.
+ * encoded predicate expression the operator compiles and applies. Stateless, so it needs no
+ * watermark.
  */
 public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysicalRel {
 
   private final RelDataType outputRowType;
   private final int[] projection;
-  private final int[] columnIndices;
-  private final int[] opCodes;
-  private final double[] literals;
-  private final String[] stringLiterals;
-  private final int[] groups;
+  private final int[] kinds;
+  private final int[] payload;
+  private final int[] childCounts;
+  private final long[] longs;
+  private final double[] doubles;
+  private final String[] strings;
 
   public StreamPhysicalNativeFilter(
       RelOptCluster cluster,
@@ -33,19 +35,21 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
       RelNode input,
       RelDataType outputRowType,
       int[] projection,
-      int[] columnIndices,
-      int[] opCodes,
-      double[] literals,
-      String[] stringLiterals,
-      int[] groups) {
+      int[] kinds,
+      int[] payload,
+      int[] childCounts,
+      long[] longs,
+      double[] doubles,
+      String[] strings) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.projection = projection;
-    this.columnIndices = columnIndices;
-    this.opCodes = opCodes;
-    this.literals = literals;
-    this.stringLiterals = stringLiterals;
-    this.groups = groups;
+    this.kinds = kinds;
+    this.payload = payload;
+    this.childCounts = childCounts;
+    this.longs = longs;
+    this.doubles = doubles;
+    this.strings = strings;
   }
 
   @Override
@@ -66,11 +70,12 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         inputs.get(0),
         outputRowType,
         projection,
-        columnIndices,
-        opCodes,
-        literals,
-        stringLiterals,
-        groups);
+        kinds,
+        payload,
+        childCounts,
+        longs,
+        doubles,
+        strings);
   }
 
   @Override
@@ -82,10 +87,11 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         getRelDetailedDescription(),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getInput().getRowType()),
         projection,
-        columnIndices,
-        opCodes,
-        literals,
-        stringLiterals,
-        groups);
+        kinds,
+        payload,
+        childCounts,
+        longs,
+        doubles,
+        strings);
   }
 }

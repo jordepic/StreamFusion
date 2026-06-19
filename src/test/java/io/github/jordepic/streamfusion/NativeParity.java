@@ -36,6 +36,22 @@ final class NativeParity {
     assertEquals(sorted(host), sorted(nativeRows), "native result differs from host");
   }
 
+  /**
+   * Asserts the query does <em>not</em> route to native (every operator stays on the host) and still
+   * produces the host result — the contract for an unsupported operation: a clean fallback, not a
+   * wrong native answer.
+   */
+  static void assertFallback(Supplier<TableEnvironment> environment, String sql) throws Exception {
+    List<List<Object>> host = collect(environment.get(), sql);
+
+    TableEnvironment nativeEnvironment = environment.get();
+    PhysicalPlanScan scan = NativePlanner.install(nativeEnvironment);
+    List<List<Object>> nativeRows = collect(nativeEnvironment, sql);
+
+    assertEquals(0, scan.substitutions(), "query unexpectedly routed to native");
+    assertEquals(sorted(host), sorted(nativeRows), "fallback result differs from host");
+  }
+
   private static List<List<Object>> collect(TableEnvironment environment, String sql)
       throws Exception {
     List<List<Object>> rows = new ArrayList<>();

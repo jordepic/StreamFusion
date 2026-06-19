@@ -1,13 +1,20 @@
 # Native expression layer (general RexNode evaluation)
 
-**Status:** in progress — stage 1 native decoder DONE (the `Expr` builder, op codes,
-and a compile-once `createFilterExpression`/`filterExpression`/`closeFilterExpression`
-handle that caches a `PhysicalExpr` and evaluates synchronously; Rust-tested for
-`col > lit` and `a + b > lit`). The encoding follows Comet over Substrait and compiles
-once per operator — see [divergences/07](../../divergences/07-expression-encoding-and-compile-once.md).
-What remains in stage 1: the planner-side `RexNode` encoder and re-routing the existing
-filter through the handle. The compile-once lifecycle came out of the perf sweep in
-ticket 20.
+**Status:** stage 1 DONE. Native decoder + compile-once handle
+(`createFilterExpression`/`filterExpression`/`closeFilterExpression`, caching a
+coerced `PhysicalExpr`, evaluated synchronously). Planner-side `RexExpression`
+encoder translates the (SEARCH-expanded) `RexNode` condition to the encoding; the
+filter matcher/operator route through the handle, replacing the old comparison/DNF
+arrays and the per-batch `filterBatch` plan (now removed). All filter parity tests
+pass via the general path, plus new arithmetic-predicate tests and an unsupported-
+function fallback test. The encoding follows Comet over Substrait and compiles once
+per operator — see [divergences/07](../../divergences/07-expression-encoding-and-compile-once.md).
+
+**Next gate before widening arithmetic:** integer-overflow parity (DataFusion widens
+via coercion / errors; Flink wraps in the declared type). Evaluate integer `+`/`-`/`*`
+in the narrow type with wrapping, mirroring the wrapping int SUM accumulator. Tracked
+in the type-support doc.
+
 **Source:** the foundational piece for general projections and richer predicates
 (unblocks equality filters, computed columns, arithmetic/function predicates).
 
@@ -49,11 +56,11 @@ whole Calc fall back. This is the same parity-first stance as the rest of the
 project; record any deliberate semantic choice in `divergences/`.
 
 ## Stages (each green + parity-tested)
-1. **Encoding + native decoder.** The `RexExpression` encoder (planner) and the
-   native `Expr` builder, plus a `filterByExpression(batch, encoded…)` JNI fn.
-   Re-route the existing filter through it (the current comparison/DNF arrays
-   become one boolean expression), so all existing filter tests pass via the
-   general path. Add arithmetic-predicate tests (`WHERE a + b > 10`).
+1. **Encoding + native decoder.** ✅ DONE — `RexExpression` encoder (planner) and
+   the native `Expr` builder, plus the compile-once `createFilterExpression`/
+   `filterExpression` handle. The filter routes through it; all existing filter
+   tests pass via the general path, with added arithmetic-predicate and
+   unsupported-function-fallback tests.
 2. **General projection.** The Calc projection becomes a list of expressions
    evaluated via `select`; output rows built from the result. Subsumes the
    column-subset projection and unlocks computed columns and equality (the folded

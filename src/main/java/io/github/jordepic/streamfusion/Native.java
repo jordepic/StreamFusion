@@ -70,36 +70,6 @@ public final class Native {
       int threshold);
 
   /**
-   * Filters a whole batch the JVM exported, keeping rows that satisfy every comparison {@code
-   * column op literal} (the conjunction of the parallel arrays; op codes 0=&gt;, 1=&gt;=, 2=&lt;,
-   * 3=&lt;=, 4==, 5=&lt;&gt;), and writes the surviving rows into the consumer-allocated output C
-   * structs. Null cells fail the predicate, as SQL {@code WHERE} requires.
-   *
-   * @param inArrayAddress address of the input {@code ArrowArray} C struct
-   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
-   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
-   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
-   * <p>The predicate is in disjunctive normal form: comparisons are ANDed within their {@code
-   * groups} id and the groups are ORed together.
-   *
-   * @param columnIndices the column each comparison tests
-   * @param opCodes the comparison operator code for each
-   * @param literals the numeric value each comparison tests against (ignored where a string is set)
-   * @param stringLiterals the string value for string comparisons, null for numeric ones
-   * @param groups the OR-group id of each comparison
-   */
-  public static native void filterBatch(
-      long inArrayAddress,
-      long inSchemaAddress,
-      long outArrayAddress,
-      long outSchemaAddress,
-      int[] columnIndices,
-      int[] opCodes,
-      double[] literals,
-      String[] stringLiterals,
-      int[] groups);
-
-  /**
    * Compiles a general predicate expression into a reusable handle. The predicate is the encoded
    * tree (pre-order parallel arrays — see the expression encoder): {@code kinds} tags each node
    * (0=input ref, 1=long literal, 2=double literal, 3=string literal, 4=bool literal, 6=call),

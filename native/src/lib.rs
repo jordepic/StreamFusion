@@ -11,6 +11,7 @@ use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::{Accumulator, AggregateUDF, Operator};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion::physical_expr::expressions::{binary, col, lit};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
@@ -1088,76 +1089,6 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterGreater
     }
 }
 
-/// Filters a whole batch from the JVM: keeps rows satisfying every comparison `column op literal`
-/// (the conjunction of the parallel `column_indices`/`op_codes`/`literals` arrays; op codes 0=gt,
-/// 1=ge, 2=lt, 3=le, 4=eq, 5=ne). The surviving rows are exported back. Runs as a DataFusion filter
-/// so null cells fail the predicate, as SQL `WHERE` requires.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    in_array_address: jlong,
-    in_schema_address: jlong,
-    out_array_address: jlong,
-    out_schema_address: jlong,
-    column_indices: JIntArray<'local>,
-    op_codes: JIntArray<'local>,
-    literals: JDoubleArray<'local>,
-    string_literals: JObjectArray<'local>,
-    groups: JIntArray<'local>,
-) {
-    let columns = read_kinds(&env, &column_indices);
-    let ops = read_kinds(&env, &op_codes);
-    let values = read_doubles(&env, &literals);
-    let strings = read_strings(&mut env, &string_literals);
-    let group_ids = read_kinds(&env, &groups);
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    let schema = batch.schema();
-
-    // The predicate is a disjunction of conjunctions (DNF): comparisons are ANDed within their
-    // group id and the groups are ORed together.
-    let mut conjunctions: std::collections::BTreeMap<i64, datafusion::prelude::Expr> =
-        std::collections::BTreeMap::new();
-    for index in 0..columns.len() {
-        let column = logical_col(schema.field(columns[index] as usize).name());
-        // A non-null string literal means a string comparison (equality only); otherwise numeric.
-        let value = match &strings[index] {
-            Some(text) => logical_lit(text.clone()),
-            None => logical_lit(values[index]),
-        };
-        let term = match ops[index] {
-            0 => column.gt(value),
-            1 => column.gt_eq(value),
-            2 => column.lt(value),
-            3 => column.lt_eq(value),
-            4 => column.eq(value),
-            5 => column.not_eq(value),
-            other => panic!("unsupported filter op code: {other}"),
-        };
-        conjunctions
-            .entry(group_ids[index])
-            .and_modify(|existing| *existing = existing.clone().and(term.clone()))
-            .or_insert(term);
-    }
-    let predicate = conjunctions
-        .into_values()
-        .reduce(|a, b| a.or(b))
-        .expect("filter needs at least one comparison");
-
-    let result = runtime().block_on(async move {
-        let ctx = SessionContext::new();
-        let frame =
-            ctx.read_batch(batch).expect("failed to read batch").filter(predicate).expect("filter");
-        let mut stream = frame.execute_stream().await.expect("failed to execute plan");
-        let mut batches = Vec::new();
-        while let Some(batch) = stream.next().await {
-            batches.push(batch.expect("failed to pull batch"));
-        }
-        concat_batches(&schema, &batches).expect("failed to assemble result")
-    });
-    export_record_batch(result, out_array_address, out_schema_address);
-}
-
 /// Builds a DataFusion expression from the JVM's pre-order encoding (ticket 19): `kinds`, `payload`,
 /// and `child_counts` describe each node, with literals drawn from the typed pools by `payload`.
 fn build_expr(
@@ -1253,8 +1184,15 @@ impl FilterExpression {
             &self.strings,
             &mut cursor,
         );
-        let df_schema = DFSchema::try_from(schema.as_ref().clone()).expect("failed to build schema");
-        let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())
+        let df_schema =
+            Arc::new(DFSchema::try_from(schema.as_ref().clone()).expect("failed to build schema"));
+        // Match the planner's logical pipeline: coerce operand types (e.g. an int column against a
+        // bigint literal) before building the physical expression, which assumes coerced types.
+        let context = SimplifyContext::default().with_schema(df_schema.clone());
+        let coerced = ExprSimplifier::new(context)
+            .coerce(logical, df_schema.as_ref())
+            .expect("failed to coerce predicate");
+        let physical = create_physical_expr(&coerced, df_schema.as_ref(), &ExecutionProps::new())
             .expect("failed to compile predicate");
         self.compiled = Some(physical.clone());
         physical

@@ -34,6 +34,17 @@ Notes / divergences this avoids:
   in int64 and casts the truncated result back to the input integer type.
 - **DECIMAL** SUM/AVG precision/scale derivation is exotic; excluded.
 
+## Predicate arithmetic (filter expressions)
+The native expression engine admits `+`/`-`/`*` in filter predicates. DataFusion's
+type coercion widens mixed-width integer arithmetic (e.g. `INT + BIGINT`) to the
+wider type and evaluates there, whereas Flink computes in the SQL result type and
+wraps on overflow (Java integer semantics). For values that do not overflow the
+declared type the two agree (and the parity tests exercise that range), but
+**overflow-wrapping parity is not yet guaranteed** — a true `INT` overflow would
+wrap on Flink and either widen or error natively. The fix mirrors the wrapping int
+SUM accumulator: evaluate integer arithmetic in the declared narrow type with
+wrapping. Until then, treat native arithmetic as parity-safe only within range.
+
 ## Status
 - Implemented value types: `BIGINT`, `DOUBLE`, and `INT` — all five aggregates.
   The native value path is type-general; adding the remaining MIN/MAX/COUNT types

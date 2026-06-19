@@ -25,11 +25,12 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
 
   private final RowType inputType;
   private final int[] projection;
-  private final int[] columnIndices;
-  private final int[] opCodes;
-  private final double[] literals;
-  private final String[] stringLiterals;
-  private final int[] groups;
+  private final int[] kinds;
+  private final int[] payload;
+  private final int[] childCounts;
+  private final long[] longs;
+  private final double[] doubles;
+  private final String[] strings;
 
   public NativeFilterExecNode(
       ReadableConfig tableConfig,
@@ -38,11 +39,12 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
       String description,
       RowType inputType,
       int[] projection,
-      int[] columnIndices,
-      int[] opCodes,
-      double[] literals,
-      String[] stringLiterals,
-      int[] groups) {
+      int[] kinds,
+      int[] payload,
+      int[] childCounts,
+      long[] longs,
+      double[] doubles,
+      String[] strings) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-filter_1"),
@@ -52,11 +54,12 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
         description);
     this.inputType = inputType;
     this.projection = projection;
-    this.columnIndices = columnIndices;
-    this.opCodes = opCodes;
-    this.literals = literals;
-    this.stringLiterals = stringLiterals;
-    this.groups = groups;
+    this.kinds = kinds;
+    this.payload = payload;
+    this.childCounts = childCounts;
+    this.longs = longs;
+    this.doubles = doubles;
+    this.strings = strings;
   }
 
   @Override
@@ -69,14 +72,7 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeFilterOperator(
-            inputType,
-            projection,
-            columnIndices,
-            opCodes,
-            literals,
-            stringLiterals,
-            groups,
-            BATCH_SIZE),
+            inputType, projection, kinds, payload, childCounts, longs, doubles, strings, BATCH_SIZE),
         InternalTypeInfo.of(getOutputType()),
         input.getParallelism(),
         false);
