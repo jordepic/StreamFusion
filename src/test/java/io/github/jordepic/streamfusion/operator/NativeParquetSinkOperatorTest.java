@@ -39,7 +39,7 @@ class NativeParquetSinkOperatorTest {
     Path directory = Files.createTempDirectory("streamfusion-sink");
     NativeParquetSinkOperator operator =
         new NativeParquetSinkOperator(SCHEMA, directory.toString(), 2);
-    try (OneInputStreamOperatorTestHarness<RowData, Void> harness =
+    try (OneInputStreamOperatorTestHarness<RowData, Object> harness =
         new OneInputStreamOperatorTestHarness<>(operator)) {
       harness.open();
       for (int i = 0; i < 5; i++) {
@@ -63,7 +63,7 @@ class NativeParquetSinkOperatorTest {
   void commitsPendingFilesOnRecovery() throws Exception {
     Path directory = Files.createTempDirectory("streamfusion-sink");
     OperatorSubtaskState snapshot;
-    try (OneInputStreamOperatorTestHarness<RowData, Void> harness =
+    try (OneInputStreamOperatorTestHarness<RowData, Object> harness =
         new OneInputStreamOperatorTestHarness<>(
             new NativeParquetSinkOperator(SCHEMA, directory.toString(), 2))) {
       harness.open();
@@ -75,7 +75,7 @@ class NativeParquetSinkOperatorTest {
     assertEquals(0, visibleFiles(directory).length, "a crash before completion leaves nothing visible");
 
     // A fresh operator restored from the snapshot commits the files the checkpoint recorded.
-    try (OneInputStreamOperatorTestHarness<RowData, Void> restored =
+    try (OneInputStreamOperatorTestHarness<RowData, Object> restored =
         new OneInputStreamOperatorTestHarness<>(
             new NativeParquetSinkOperator(SCHEMA, directory.toString(), 2))) {
       restored.initializeState(snapshot);

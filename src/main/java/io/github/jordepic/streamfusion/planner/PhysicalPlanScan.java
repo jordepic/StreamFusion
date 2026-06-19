@@ -8,6 +8,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSink;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
@@ -42,6 +43,21 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       changed |= rewritten != input;
     }
     RelNode current = changed ? node.copy(node.getTraitSet(), inputs) : node;
+
+    // A sink is terminal, so the changelog guard below (which protects operator substitution within a
+    // stream) does not apply; it is eligible as long as its input is insert-only.
+    if (current instanceof StreamPhysicalSink
+        && ParquetSinkMatcher.matches((StreamPhysicalSink) current)
+        && ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
+      StreamPhysicalSink sink = (StreamPhysicalSink) current;
+      substitutions++;
+      return new StreamPhysicalNativeParquetSink(
+          sink.getCluster(),
+          sink.getTraitSet(),
+          sink.getInputs().get(0),
+          sink.getRowType(),
+          ParquetSinkMatcher.path(sink));
+    }
 
     // Native operators emit insert-only rows; substituting into a retracting or updating stream
     // would drop changelog semantics, so only insert-only nodes are eligible.

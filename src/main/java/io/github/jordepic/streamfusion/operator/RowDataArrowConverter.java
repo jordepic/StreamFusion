@@ -79,7 +79,13 @@ public final class RowDataArrowConverter {
     int rowCount = rows.size();
     List<FieldVector> vectors = new ArrayList<>();
     for (int column = 0; column < rowType.getFieldCount(); column++) {
-      vectors.add(writeColumn(rowType.getTypeAt(column), column, rows, allocator));
+      vectors.add(
+          writeColumn(
+              rowType.getTypeAt(column),
+              rowType.getFieldNames().get(column),
+              column,
+              rows,
+              allocator));
     }
     VectorSchemaRoot root = new VectorSchemaRoot(vectors);
     root.setRowCount(rowCount);
@@ -100,8 +106,7 @@ public final class RowDataArrowConverter {
   }
 
   private static FieldVector writeColumn(
-      LogicalType type, int column, List<RowData> rows, BufferAllocator allocator) {
-    String name = "f" + column;
+      LogicalType type, String name, int column, List<RowData> rows, BufferAllocator allocator) {
     int n = rows.size();
     switch (type.getTypeRoot()) {
       case TINYINT: {

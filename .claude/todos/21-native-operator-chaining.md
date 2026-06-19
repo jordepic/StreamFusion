@@ -116,7 +116,18 @@ assignment, checkpoint-aligned commits, exactly-once, watermark generation); wor
 only if we can lift those from Arroyo's Rust Kafka connector rather than reimplement them.
 On the back burner until the JVM-side source and the sink prove the columnar win.
 
-## Sink substitution (#2) — the planner integration, scoped
+## Sink substitution (#2) — DONE
+A `filesystem`+`parquet` sink to a local path now routes to the native writer: a matcher
+reads the sink's resolved-table options and local path, a `StreamPhysicalNativeParquetSink`
+replaces the sink at the plan root, and its exec node emits a `LegacySinkTransformation`
+wrapping the native sink operator (which preserves the operator's checkpoint-complete
+commit). Parity verified end to end: native-written and host-written Parquet read back
+identical. Two fixes found along the way — the path option is a URI (`file:///…`), so it
+is converted to a local path (and remote schemes fall back); and the whole-row converter
+now names Arrow fields by the schema (not positionally), since Parquet readers match by
+name. Next: #3 (Kafka→Arrow source), then #1 (the throughput benchmark; baseline ready).
+
+## Sink substitution (#2) — original scoping (kept for reference)
 Foundation is in place: the connector/format/Hadoop deps resolve and run together
 (test-scoped), and a host Parquet write is verified as the baseline. What remains is the
 planner wiring, a deep integration to do carefully:
