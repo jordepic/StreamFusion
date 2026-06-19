@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion;
 
+import java.time.LocalDateTime;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -77,6 +78,34 @@ class FlinkFilterSqlHarnessTest {
   void mixedStringAndNumericFilterMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE s <> 'a' AND v >= 20");
+  }
+
+  @Test
+  void filterCarriesTimestampColumnMatchesHost() throws Exception {
+    // The row carries a TIMESTAMP column through the whole-row converter while filtering on another.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::timestampEnvironment, "SELECT * FROM g WHERE v > 15");
+  }
+
+  private static TableEnvironment timestampEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(
+                new String[] {"v", "t"}, Types.INT, Types.LOCAL_DATE_TIME),
+            Row.of(10, LocalDateTime.of(2020, 1, 1, 0, 0, 0)),
+            Row.of(30, LocalDateTime.of(2020, 1, 2, 12, 30, 0)),
+            Row.of(20, LocalDateTime.of(2020, 1, 3, 6, 15, 45)));
+    tEnv.createTemporaryView(
+        "g",
+        source,
+        Schema.newBuilder()
+            .column("v", DataTypes.INT())
+            .column("t", DataTypes.TIMESTAMP(3))
+            .build());
+    return tEnv;
   }
 
   private static TableEnvironment environment() {

@@ -294,6 +294,8 @@ final class FilterCalcMatcher {
         case BOOLEAN:
         case CHAR:
         case VARCHAR:
+        case TIMESTAMP:
+        case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
           break;
         default:
           return false;

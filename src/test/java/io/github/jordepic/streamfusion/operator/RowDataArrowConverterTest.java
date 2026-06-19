@@ -16,15 +16,19 @@ import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
+import org.apache.flink.table.types.logical.DateType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
+import org.apache.flink.table.data.TimestampData;
 import org.junit.jupiter.api.Test;
 
 class RowDataArrowConverterTest {
+
+  private static final int COLUMNS = 9;
 
   private static final RowType SCHEMA =
       RowType.of(
@@ -36,13 +40,14 @@ class RowDataArrowConverterTest {
             new FloatType(),
             new DoubleType(),
             new BooleanType(),
-            new VarCharType(VarCharType.MAX_LENGTH)
+            new VarCharType(VarCharType.MAX_LENGTH),
+            new TimestampType(9)
           },
-          new String[] {"a", "b", "c", "d", "e", "f", "g", "h"});
+          new String[] {"a", "b", "c", "d", "e", "f", "g", "h", "i"});
 
   @Test
   void roundTripsEveryColumnTypeAndNulls() {
-    GenericRowData first = new GenericRowData(8);
+    GenericRowData first = new GenericRowData(COLUMNS);
     first.setField(0, (byte) 1);
     first.setField(1, (short) 2);
     first.setField(2, 3);
@@ -51,10 +56,12 @@ class RowDataArrowConverterTest {
     first.setField(5, 6.5);
     first.setField(6, true);
     first.setField(7, StringData.fromString("hello"));
+    // Sub-millisecond nanos verify the nanosecond round-trip preserves full precision.
+    first.setField(8, TimestampData.fromEpochMillis(1234L, 567000));
 
     // A row that is null in every column exercises the null path on every vector type.
-    GenericRowData nulls = new GenericRowData(8);
-    for (int c = 0; c < 8; c++) {
+    GenericRowData nulls = new GenericRowData(COLUMNS);
+    for (int c = 0; c < COLUMNS; c++) {
       nulls.setField(c, null);
     }
 
@@ -66,7 +73,7 @@ class RowDataArrowConverterTest {
       assertEquals(2, back.size());
       GenericRowData backFirst = (GenericRowData) back.get(0);
       GenericRowData backNulls = (GenericRowData) back.get(1);
-      for (int c = 0; c < 8; c++) {
+      for (int c = 0; c < COLUMNS; c++) {
         assertEquals(first.getField(c), backFirst.getField(c), "column " + c);
         assertEquals(null, backNulls.getField(c), "null column " + c);
       }
@@ -76,8 +83,8 @@ class RowDataArrowConverterTest {
   @Test
   void reportsUnsupportedSchemas() {
     assertTrue(RowDataArrowConverter.supports(SCHEMA));
-    RowType withTimestamp =
-        RowType.of(new LogicalType[] {new IntType(), new TimestampType(3)}, new String[] {"a", "t"});
-    assertFalse(RowDataArrowConverter.supports(withTimestamp));
+    RowType withDate =
+        RowType.of(new LogicalType[] {new IntType(), new DateType()}, new String[] {"a", "d"});
+    assertFalse(RowDataArrowConverter.supports(withDate));
   }
 }

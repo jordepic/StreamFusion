@@ -10,14 +10,18 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.SmallIntVector;
+import org.apache.arrow.vector.TimeStampNanoVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.data.TimestampData;
+import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.logical.TimestampType;
 
 /**
  * Converts whole {@link RowData} rows of a fixed schema to and from an Arrow {@link
@@ -45,12 +49,21 @@ public final class RowDataArrowConverter {
         case BOOLEAN:
         case CHAR:
         case VARCHAR:
+        case TIMESTAMP_WITHOUT_TIME_ZONE:
+        case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
           break;
         default:
           return false;
       }
     }
     return true;
+  }
+
+  /** A timestamp column's declared precision, for {@link RowData#getTimestamp}. */
+  private static int timestampPrecision(LogicalType type) {
+    return type instanceof TimestampType
+        ? ((TimestampType) type).getPrecision()
+        : ((LocalZonedTimestampType) type).getPrecision();
   }
 
   /** Builds an Arrow batch holding {@code rows} under {@code rowType}. The caller closes the root. */
@@ -157,6 +170,21 @@ public final class RowDataArrowConverter {
         v.setValueCount(n);
         return v;
       }
+      case TIMESTAMP_WITHOUT_TIME_ZONE:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
+        int precision = timestampPrecision(type);
+        TimeStampNanoVector v = new TimeStampNanoVector(name, allocator);
+        for (int i = 0; i < n; i++) {
+          if (rows.get(i).isNullAt(column)) {
+            v.setNull(i);
+          } else {
+            TimestampData ts = rows.get(i).getTimestamp(column, precision);
+            v.setSafe(i, ts.getMillisecond() * 1_000_000L + ts.getNanoOfMillisecond());
+          }
+        }
+        v.setValueCount(n);
+        return v;
+      }
       default:
         throw new IllegalArgumentException("unsupported column type: " + type);
     }
@@ -197,6 +225,12 @@ public final class RowDataArrowConverter {
         case VARCHAR:
           value = StringData.fromBytes(((VarCharVector) vector).get(i));
           break;
+        case TIMESTAMP_WITHOUT_TIME_ZONE:
+        case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
+          long nanos = ((TimeStampNanoVector) vector).get(i);
+          value = TimestampData.fromEpochMillis(nanos / 1_000_000L, (int) (nanos % 1_000_000L));
+          break;
+        }
         default:
           throw new IllegalArgumentException("unsupported column type: " + type);
       }
