@@ -76,28 +76,48 @@ with no columnar endpoint to amortize it (hence 0.58×). The favorable cases nee
 columnar endpoint, which means native columnar source/sink support is on the critical
 path, not just operator fusion.
 
-## Phased plan (each green + parity-tested + benchmarked vs Flink)
-1. **Stateless fusion (mechanism).** Fuse a chain of stateless native ops (e.g. `WHERE`
-   feeding a projection) into one operator that applies the sequence to each Arrow batch.
-   The planner grows from per-node substitution to per-connected-component. This proves
-   the fusion machinery; with row endpoints it removes the *inter*-operator transpose but
-   not the entry/exit ones, so expect it to help the ratio without necessarily crossing 1×.
-2. **A columnar endpoint (the real win).** Read a columnar source (Iceberg/Parquet) as
-   Arrow natively — a DataFusion scan instead of Flink deserializing to `RowData` — so the
-   native region *starts* columnar with no source transpose, and/or write a columnar sink
-   from Arrow. This is where Flink is weakest and where the ratio should cross 1×. The
-   transpose lives only at any row-based endpoint (Kafka), per the cost model above.
-3. **Stateless prefix into a stateful window.** Fuse a filter/projection into a window
-   aggregate so the native filter runs on each input batch before aggregating, all in
-   Arrow — compounding with a columnar source.
-4. **Arrow across the shuffle.** Two-phase aggregation has a `keyBy` between local and
-   global; carry Arrow over that network edge (Arrow IPC) so local→global stays columnar.
-   Hardest phase; gated on the others proving out.
+## First pipeline: Kafka source → Parquet sink (row → columnar)
+The first end-to-end target is a row source feeding a columnar sink, so the transpose
+sits once at the Kafka source (record → Arrow) and the region stays columnar through to a
+native Arrow → Parquet write. This is a real ingest pipeline and the cleanest place to
+show the columnar-sink win, since Flink's filesystem+parquet sink encodes `RowData →
+Parquet` at the boundary while we write Arrow batches directly.
+
+Flink baselines exist to compare against: `flink-parquet` (vectorized reader that still
+yields `RowData`, and the writer) via the filesystem connector, and `flink-connector-kafka`.
+Add those deps for the A/B; the native side adds a Kafka→Arrow source and an Arrow→Parquet
+sink.
+
+Build order (each green + benchmarked vs Flink):
+1. **Native Parquet sink.** Arrow `RecordBatch` → Parquet via the `parquet` crate; a Flink
+   sink that batches its input to Arrow and writes natively. Substituting a sink is new
+   (so far only operators are substituted). Benchmark Arrow-native write vs Flink's
+   filesystem+parquet sink.
+2. **Native Kafka → Arrow source.** Batch Kafka records, deserialize, transpose to Arrow
+   once at the source. Deserialization format is the main scoping fork — the cluster uses
+   Avro + schema registry (heavy); a first cut may use a simpler/known schema. This is the
+   single source-side transpose in the row→columnar case.
+3. **Join them.** Kafka → (optional native filter) → Parquet, fully columnar between the
+   two transposes; benchmark vs the equivalent Flink job.
+
+## Later phases
+- **Columnar source (Iceberg/Parquet) as Arrow** — a DataFusion scan instead of Flink
+  deserializing to `RowData`; turns the source transpose into zero and unlocks
+  columnar→columnar. The other half of the connector story.
+- **Stateless prefix fused into a stateful window** — native filter/projection runs on
+  each input batch before aggregating, all in Arrow.
+- **Operator fusion (mechanism)** — replace a maximal shuffle-free native component with
+  one fused operator (per-connected-component substitution); removes inter-operator
+  transposes for chains that aren't already merged by the planner (e.g. a Calc feeding a
+  window aggregate).
+- **Arrow across the shuffle** — two-phase `keyBy` carries Arrow (IPC) so local→global
+  stays columnar. Hardest; gated on the rest.
 
 ## Acceptance criteria
-- A query with two adjacent native operators substitutes as one fused native operator,
-  with RowData↔Arrow conversion only at its outer boundaries (verify via the plan).
+- The native Parquet sink writes byte-equivalent data (same rows read back) to Flink's
+  filesystem+parquet sink, and `ThroughputBenchmark` shows it beating that sink.
+- The Kafka→Arrow source produces identical rows to Flink's Kafka source for the same
+  topic/offsets; the single source transpose is the only one in a Kafka→Parquet job.
 - A columnar source/sink keeps the region columnar end-to-end with the transpose only at
-  row endpoints.
-- Identical results to Flink across the parity suite.
-- `ThroughputBenchmark` shows a columnar-anchored pipeline crossing 1× vs Flink.
+  row endpoints; identical results to Flink across the parity suite.
+- A columnar-anchored pipeline crosses 1× vs Flink on `ThroughputBenchmark`.
