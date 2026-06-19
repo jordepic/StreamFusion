@@ -15,7 +15,7 @@ use datafusion::prelude::{col as logical_col, lit as logical_lit, SessionContext
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use jni::objects::{JByteArray, JClass, JIntArray};
-use jni::sys::{jbyteArray, jint, jlong, jstring};
+use jni::sys::{jbyteArray, jdouble, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -1081,6 +1081,49 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterGreater
         std::ptr::write(out_array_address as *mut FFI_ArrowArray, out_array);
         std::ptr::write(out_schema_address as *mut FFI_ArrowSchema, out_schema);
     }
+}
+
+/// Filters a whole batch from the JVM: keeps rows where column `column_index` compares against
+/// `literal` per `op_code` (0=gt, 1=ge, 2=lt, 3=le, 4=eq, 5=ne). The surviving rows are exported
+/// back. Runs as a DataFusion filter so null cells fail the predicate, as SQL `WHERE` requires.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+    column_index: jint,
+    op_code: jint,
+    literal: jdouble,
+) {
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let schema = batch.schema();
+    let column_name = schema.field(column_index as usize).name().clone();
+    let column = logical_col(&column_name);
+    let value = logical_lit(literal);
+    let predicate = match op_code {
+        0 => column.gt(value),
+        1 => column.gt_eq(value),
+        2 => column.lt(value),
+        3 => column.lt_eq(value),
+        4 => column.eq(value),
+        5 => column.not_eq(value),
+        other => panic!("unsupported filter op code: {other}"),
+    };
+    let result = runtime().block_on(async move {
+        let ctx = SessionContext::new();
+        let frame =
+            ctx.read_batch(batch).expect("failed to read batch").filter(predicate).expect("filter");
+        let mut stream = frame.execute_stream().await.expect("failed to execute plan");
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.expect("failed to pull batch"));
+        }
+        concat_batches(&schema, &batches).expect("failed to assemble result")
+    });
+    export_record_batch(result, out_array_address, out_schema_address);
 }
 
 /// Runs an event-time tumbling-window sum over a batch from the JVM: rows are bucketed by the start
