@@ -20,6 +20,7 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysicalRel {
 
   private final RelDataType outputRowType;
+  private final int[] projection;
   private final int[] columnIndices;
   private final int[] opCodes;
   private final double[] literals;
@@ -30,12 +31,14 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
+      int[] projection,
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
       String[] stringLiterals) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
+    this.projection = projection;
     this.columnIndices = columnIndices;
     this.opCodes = opCodes;
     this.literals = literals;
@@ -59,6 +62,7 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         traitSet,
         inputs.get(0),
         outputRowType,
+        projection,
         columnIndices,
         opCodes,
         literals,
@@ -72,6 +76,8 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
+        FlinkTypeFactory$.MODULE$.toLogicalRowType(getInput().getRowType()),
+        projection,
         columnIndices,
         opCodes,
         literals,

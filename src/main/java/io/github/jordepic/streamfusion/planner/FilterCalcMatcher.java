@@ -46,10 +46,10 @@ final class FilterCalcMatcher {
 
   static boolean matches(Calc calc) {
     RexProgram program = calc.getProgram();
-    // Identity projection only — a pure filter. Note that `col = literal` constant-folds the column
-    // into the projection (making it non-identity), so equality on the filtered column falls back
-    // until projection support lands; column-preserving comparisons (<, <=, >, >=, <>, ranges) stay.
-    if (program.getCondition() == null || !isIdentityProjection(program)) {
+    // A filter (the native value), with a projection that is a list of input columns — a column
+    // subset/reorder. A projection containing a computed expression or a constant (as `col =
+    // literal` constant-folds the column into) falls back until general projection lands.
+    if (program.getCondition() == null || projection(calc) == null) {
       return false;
     }
     RelDataType inputType = calc.getInput().getRowType();
@@ -175,18 +175,22 @@ final class FilterCalcMatcher {
     return null;
   }
 
-  private static boolean isIdentityProjection(RexProgram program) {
+  /**
+   * The output→input column mapping if every projected expression is a plain input column reference
+   * (a subset/reorder), or null if any projection is a computed expression or constant.
+   */
+  static int[] projection(Calc calc) {
+    RexProgram program = calc.getProgram();
     List<RexLocalRef> projects = program.getProjectList();
-    if (projects.size() != program.getInputRowType().getFieldCount()) {
-      return false;
-    }
+    int[] columns = new int[projects.size()];
     for (int i = 0; i < projects.size(); i++) {
       RexNode expr = program.expandLocalRef(projects.get(i));
-      if (!(expr instanceof RexInputRef) || ((RexInputRef) expr).getIndex() != i) {
-        return false;
+      if (!(expr instanceof RexInputRef)) {
+        return null;
       }
+      columns[i] = ((RexInputRef) expr).getIndex();
     }
-    return true;
+    return columns;
   }
 
   private static int opCode(SqlKind kind) {

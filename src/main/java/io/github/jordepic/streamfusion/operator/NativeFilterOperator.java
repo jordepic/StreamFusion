@@ -15,6 +15,7 @@ import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
 
@@ -28,7 +29,8 @@ import org.apache.flink.table.types.logical.RowType;
 public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     implements OneInputStreamOperator<RowData, RowData>, BoundedOneInput {
 
-  private final RowType rowType;
+  private final RowType inputRowType;
+  private final int[] projection;
   private final int[] columnIndices;
   private final int[] opCodes;
   private final double[] literals;
@@ -40,13 +42,15 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
   private transient List<RowData> buffer;
 
   public NativeFilterOperator(
-      RowType rowType,
+      RowType inputRowType,
+      int[] projection,
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
       String[] stringLiterals,
       int batchSize) {
-    this.rowType = rowType;
+    this.inputRowType = inputRowType;
+    this.projection = projection;
     this.columnIndices = columnIndices;
     this.opCodes = opCodes;
     this.literals = literals;
@@ -96,7 +100,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     if (buffer.isEmpty()) {
       return;
     }
-    try (VectorSchemaRoot in = RowDataArrowConverter.write(buffer, rowType, allocator);
+    try (VectorSchemaRoot in = RowDataArrowConverter.write(buffer, inputRowType, allocator);
         ArrowArray inArray = ArrowArray.allocateNew(allocator);
         ArrowSchema inSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray outArray = ArrowArray.allocateNew(allocator);
@@ -113,7 +117,13 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
           stringLiterals);
       try (VectorSchemaRoot out =
           Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
-        for (RowData row : RowDataArrowConverter.read(out, rowType)) {
+        for (RowData survivor : RowDataArrowConverter.read(out, inputRowType)) {
+          // Project the selected input columns (a subset/reorder) into the output row.
+          GenericRowData input = (GenericRowData) survivor;
+          GenericRowData row = new GenericRowData(projection.length);
+          for (int j = 0; j < projection.length; j++) {
+            row.setField(j, input.getField(projection[j]));
+          }
           output.collect(new StreamRecord<>(row));
         }
       }

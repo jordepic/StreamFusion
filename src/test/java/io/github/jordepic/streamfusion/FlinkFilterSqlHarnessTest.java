@@ -39,6 +39,13 @@ class FlinkFilterSqlHarnessTest {
   }
 
   @Test
+  void projectionWithFilterMatchesHost() throws Exception {
+    // A column subset/reorder projection alongside the filter — projected after filtering.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT s, k FROM f WHERE v > 15");
+  }
+
+  @Test
   void rangeFilterMatchesHost() throws Exception {
     // BETWEEN folds to a SEARCH range, which expands to an AND of two comparisons.
     NativeParity.assertParity(

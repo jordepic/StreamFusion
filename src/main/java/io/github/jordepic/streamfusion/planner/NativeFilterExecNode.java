@@ -23,6 +23,8 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
   private static final int BATCH_SIZE = 1024;
   private static final String TRANSFORMATION = "native-filter";
 
+  private final RowType inputType;
+  private final int[] projection;
   private final int[] columnIndices;
   private final int[] opCodes;
   private final double[] literals;
@@ -33,6 +35,8 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
       InputProperty inputProperty,
       RowType outputType,
       String description,
+      RowType inputType,
+      int[] projection,
       int[] columnIndices,
       int[] opCodes,
       double[] literals,
@@ -44,6 +48,8 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
         Collections.singletonList(inputProperty),
         outputType,
         description);
+    this.inputType = inputType;
+    this.projection = projection;
     this.columnIndices = columnIndices;
     this.opCodes = opCodes;
     this.literals = literals;
@@ -60,7 +66,7 @@ public class NativeFilterExecNode extends ExecNodeBase<RowData>
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeFilterOperator(
-            (RowType) getOutputType(), columnIndices, opCodes, literals, stringLiterals, BATCH_SIZE),
+            inputType, projection, columnIndices, opCodes, literals, stringLiterals, BATCH_SIZE),
         InternalTypeInfo.of(getOutputType()),
         input.getParallelism(),
         false);
