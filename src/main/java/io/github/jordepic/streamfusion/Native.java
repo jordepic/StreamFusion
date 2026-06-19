@@ -70,6 +70,29 @@ public final class Native {
       int threshold);
 
   /**
+   * Filters a whole batch the JVM exported, keeping rows where column {@code columnIndex} compares
+   * against {@code literal} by {@code opCode} (0=&gt;, 1=&gt;=, 2=&lt;, 3=&lt;=, 4==, 5=&lt;&gt;),
+   * and writes the surviving rows into the consumer-allocated output C structs. Null cells fail the
+   * predicate, as SQL {@code WHERE} requires.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
+   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   * @param columnIndex the column the predicate tests
+   * @param opCode the comparison operator code
+   * @param literal the value compared against
+   */
+  public static native void filterBatch(
+      long inArrayAddress,
+      long inSchemaAddress,
+      long outArrayAddress,
+      long outSchemaAddress,
+      int columnIndex,
+      int opCode,
+      double literal);
+
+  /**
    * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the
    * consumer-allocated C structs, exercising batch transfer beyond a single column.
    *

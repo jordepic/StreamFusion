@@ -1,0 +1,56 @@
+package io.github.jordepic.streamfusion;
+
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.types.Row;
+import org.junit.jupiter.api.Test;
+
+class FlinkFilterSqlHarnessTest {
+
+  @Test
+  void numericFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v > 20");
+  }
+
+  @Test
+  void reversedOperandFilterMatchesHost() throws Exception {
+    // Literal on the left: `20 >= v` is `v <= 20` — the matcher flips the operator.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE 20 >= v");
+  }
+
+  @Test
+  void bigintEqualityFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE k <> 2");
+  }
+
+  private static TableEnvironment environment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(
+                new String[] {"k", "v", "s"}, Types.LONG, Types.INT, Types.STRING),
+            Row.of(1L, 10, "a"),
+            Row.of(2L, 30, "b"),
+            Row.of(3L, 20, "c"),
+            Row.of(4L, 40, "d"));
+    tEnv.createTemporaryView(
+        "f",
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column("v", DataTypes.INT())
+            .column("s", DataTypes.STRING())
+            .build());
+    return tEnv;
+  }
+}
