@@ -67,9 +67,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           calc.getTraitSet(),
           calc.getInputs().get(0),
           calc.getRowType(),
-          FilterCalcMatcher.columnIndex(calc),
-          FilterCalcMatcher.opCode(calc),
-          FilterCalcMatcher.literal(calc));
+          FilterCalcMatcher.columnIndices(calc),
+          FilterCalcMatcher.opCodes(calc),
+          FilterCalcMatcher.literals(calc));
     }
 
     if (current instanceof StreamPhysicalWindowAggregate) {

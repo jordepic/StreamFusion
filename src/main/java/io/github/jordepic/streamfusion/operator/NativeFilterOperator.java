@@ -29,9 +29,9 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
     implements OneInputStreamOperator<RowData, RowData>, BoundedOneInput {
 
   private final RowType rowType;
-  private final int columnIndex;
-  private final int opCode;
-  private final double literal;
+  private final int[] columnIndices;
+  private final int[] opCodes;
+  private final double[] literals;
   private final int batchSize;
 
   private transient BufferAllocator allocator;
@@ -39,11 +39,11 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
   private transient List<RowData> buffer;
 
   public NativeFilterOperator(
-      RowType rowType, int columnIndex, int opCode, double literal, int batchSize) {
+      RowType rowType, int[] columnIndices, int[] opCodes, double[] literals, int batchSize) {
     this.rowType = rowType;
-    this.columnIndex = columnIndex;
-    this.opCode = opCode;
-    this.literal = literal;
+    this.columnIndices = columnIndices;
+    this.opCodes = opCodes;
+    this.literals = literals;
     this.batchSize = batchSize;
   }
 
@@ -100,9 +100,9 @@ public class NativeFilterOperator extends AbstractStreamOperator<RowData>
           inSchema.memoryAddress(),
           outArray.memoryAddress(),
           outSchema.memoryAddress(),
-          columnIndex,
-          opCode,
-          literal);
+          columnIndices,
+          opCodes,
+          literals);
       try (VectorSchemaRoot out =
           Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
         for (RowData row : RowDataArrowConverter.read(out, rowType)) {

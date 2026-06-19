@@ -20,23 +20,23 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysicalRel {
 
   private final RelDataType outputRowType;
-  private final int columnIndex;
-  private final int opCode;
-  private final double literal;
+  private final int[] columnIndices;
+  private final int[] opCodes;
+  private final double[] literals;
 
   public StreamPhysicalNativeFilter(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
-      int columnIndex,
-      int opCode,
-      double literal) {
+      int[] columnIndices,
+      int[] opCodes,
+      double[] literals) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
-    this.columnIndex = columnIndex;
-    this.opCode = opCode;
-    this.literal = literal;
+    this.columnIndices = columnIndices;
+    this.opCodes = opCodes;
+    this.literals = literals;
   }
 
   @Override
@@ -52,7 +52,7 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeFilter(
-        getCluster(), traitSet, inputs.get(0), outputRowType, columnIndex, opCode, literal);
+        getCluster(), traitSet, inputs.get(0), outputRowType, columnIndices, opCodes, literals);
   }
 
   @Override
@@ -62,8 +62,8 @@ public class StreamPhysicalNativeFilter extends SingleRel implements StreamPhysi
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
-        columnIndex,
-        opCode,
-        literal);
+        columnIndices,
+        opCodes,
+        literals);
   }
 }

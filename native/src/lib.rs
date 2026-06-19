@@ -14,8 +14,8 @@ use datafusion::physical_expr::expressions::{binary, col, lit};
 use datafusion::prelude::{col as logical_col, lit as logical_lit, SessionContext};
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
-use jni::objects::{JByteArray, JClass, JIntArray};
-use jni::sys::{jbyteArray, jdouble, jint, jlong, jstring};
+use jni::objects::{JByteArray, JClass, JDoubleArray, JIntArray};
+use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -1083,35 +1083,48 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterGreater
     }
 }
 
-/// Filters a whole batch from the JVM: keeps rows where column `column_index` compares against
-/// `literal` per `op_code` (0=gt, 1=ge, 2=lt, 3=le, 4=eq, 5=ne). The surviving rows are exported
-/// back. Runs as a DataFusion filter so null cells fail the predicate, as SQL `WHERE` requires.
+/// Filters a whole batch from the JVM: keeps rows satisfying every comparison `column op literal`
+/// (the conjunction of the parallel `column_indices`/`op_codes`/`literals` arrays; op codes 0=gt,
+/// 1=ge, 2=lt, 3=le, 4=eq, 5=ne). The surviving rows are exported back. Runs as a DataFusion filter
+/// so null cells fail the predicate, as SQL `WHERE` requires.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_filterBatch<'local>(
-    _env: JNIEnv<'local>,
+    env: JNIEnv<'local>,
     _class: JClass<'local>,
     in_array_address: jlong,
     in_schema_address: jlong,
     out_array_address: jlong,
     out_schema_address: jlong,
-    column_index: jint,
-    op_code: jint,
-    literal: jdouble,
+    column_indices: JIntArray<'local>,
+    op_codes: JIntArray<'local>,
+    literals: JDoubleArray<'local>,
 ) {
+    let columns = read_kinds(&env, &column_indices);
+    let ops = read_kinds(&env, &op_codes);
+    let values = read_doubles(&env, &literals);
     let batch = import_record_batch(in_array_address, in_schema_address);
     let schema = batch.schema();
-    let column_name = schema.field(column_index as usize).name().clone();
-    let column = logical_col(&column_name);
-    let value = logical_lit(literal);
-    let predicate = match op_code {
-        0 => column.gt(value),
-        1 => column.gt_eq(value),
-        2 => column.lt(value),
-        3 => column.lt_eq(value),
-        4 => column.eq(value),
-        5 => column.not_eq(value),
-        other => panic!("unsupported filter op code: {other}"),
-    };
+
+    let mut predicate: Option<datafusion::prelude::Expr> = None;
+    for ((&column_index, &op_code), &literal) in columns.iter().zip(&ops).zip(&values) {
+        let column = logical_col(schema.field(column_index as usize).name());
+        let value = logical_lit(literal);
+        let term = match op_code {
+            0 => column.gt(value),
+            1 => column.gt_eq(value),
+            2 => column.lt(value),
+            3 => column.lt_eq(value),
+            4 => column.eq(value),
+            5 => column.not_eq(value),
+            other => panic!("unsupported filter op code: {other}"),
+        };
+        predicate = Some(match predicate {
+            Some(existing) => existing.and(term),
+            None => term,
+        });
+    }
+    let predicate = predicate.expect("filter needs at least one comparison");
+
     let result = runtime().block_on(async move {
         let ctx = SessionContext::new();
         let frame =
@@ -1232,6 +1245,14 @@ fn read_kinds(env: &JNIEnv, kinds: &JIntArray) -> Vec<i64> {
     let mut buffer = vec![0i32; length as usize];
     env.get_int_array_region(kinds, 0, &mut buffer).expect("failed to read kinds");
     buffer.into_iter().map(i64::from).collect()
+}
+
+/// Reads a JVM double[] into a Vec.
+fn read_doubles(env: &JNIEnv, values: &JDoubleArray) -> Vec<f64> {
+    let length = env.get_array_length(values).expect("failed to read doubles length");
+    let mut buffer = vec![0f64; length as usize];
+    env.get_double_array_region(values, 0, &mut buffer).expect("failed to read doubles");
+    buffer
 }
 
 /// Folds a batch from the JVM into the aggregator's open windows. Produces no output; results are

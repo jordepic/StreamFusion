@@ -31,6 +31,13 @@ class FlinkFilterSqlHarnessTest {
         FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE k <> 2");
   }
 
+  @Test
+  void conjunctionFilterMatchesHost() throws Exception {
+    // A conjunction of comparisons across two columns; the native filter ANDs the masks.
+    NativeParity.assertParity(
+        FlinkFilterSqlHarnessTest::environment, "SELECT * FROM f WHERE v > 15 AND k <= 3");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);

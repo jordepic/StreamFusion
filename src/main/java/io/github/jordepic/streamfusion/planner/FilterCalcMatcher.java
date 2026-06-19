@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion.planner;
 
+import java.util.ArrayList;
 import java.util.List;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.type.RelDataType;
@@ -14,14 +15,27 @@ import org.apache.calcite.sql.type.SqlTypeName;
 
 /**
  * Recognizes a pure filter the native operator can run: a {@link Calc} with an identity projection
- * (no column rewriting — projection support is separate) whose condition is a single comparison of
- * a numeric column against a literal, over an input whose every column the whole-row converter
- * handles. Anything else — projections, compound or non-comparison predicates, unsupported column
- * types — falls back.
+ * (no column rewriting — projection support is separate) whose condition is a conjunction of
+ * comparisons of a numeric column against a literal, over an input whose every column the whole-row
+ * converter handles. Anything else — projections, disjunctions, non-comparison terms, unsupported
+ * column types — falls back.
  */
 final class FilterCalcMatcher {
 
   private FilterCalcMatcher() {}
+
+  /** One {@code column op literal} comparison: op codes 0=&gt;, 1=&gt;=, 2=&lt;, 3=&lt;=, 4==, 5=&lt;&gt;. */
+  private static final class Comparison {
+    final int column;
+    final int op;
+    final double literal;
+
+    Comparison(int column, int op, double literal) {
+      this.column = column;
+      this.op = op;
+      this.literal = literal;
+    }
+  }
 
   static boolean matches(Calc calc) {
     RexProgram program = calc.getProgram();
@@ -32,29 +46,35 @@ final class FilterCalcMatcher {
     if (!convertibleRow(inputType)) {
       return false;
     }
-    RexNode condition = program.expandLocalRef(program.getCondition());
-    return comparison(condition, inputType) != null;
+    List<Comparison> comparisons = flatten(condition(calc), inputType);
+    return comparisons != null && !comparisons.isEmpty();
   }
 
-  /** The predicate column index. */
-  static int columnIndex(Calc calc) {
-    return comparison(condition(calc), calc.getInput().getRowType())[0];
-  }
-
-  /** The comparison op code: 0=&gt;, 1=&gt;=, 2=&lt;, 3=&lt;=, 4==, 5=&lt;&gt;. */
-  static int opCode(Calc calc) {
-    return comparison(condition(calc), calc.getInput().getRowType())[1];
-  }
-
-  /** The literal compared against, as a double. */
-  static double literal(Calc calc) {
-    RexCall call = (RexCall) condition(calc);
-    for (RexNode operand : call.getOperands()) {
-      if (operand instanceof RexLiteral) {
-        return ((RexLiteral) operand).getValueAs(Double.class);
-      }
+  static int[] columnIndices(Calc calc) {
+    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
+    int[] columns = new int[comparisons.size()];
+    for (int i = 0; i < columns.length; i++) {
+      columns[i] = comparisons.get(i).column;
     }
-    throw new IllegalStateException("no literal in comparison");
+    return columns;
+  }
+
+  static int[] opCodes(Calc calc) {
+    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
+    int[] ops = new int[comparisons.size()];
+    for (int i = 0; i < ops.length; i++) {
+      ops[i] = comparisons.get(i).op;
+    }
+    return ops;
+  }
+
+  static double[] literals(Calc calc) {
+    List<Comparison> comparisons = flatten(condition(calc), calc.getInput().getRowType());
+    double[] values = new double[comparisons.size()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = comparisons.get(i).literal;
+    }
+    return values;
   }
 
   private static RexNode condition(Calc calc) {
@@ -63,15 +83,39 @@ final class FilterCalcMatcher {
   }
 
   /**
-   * For a comparison of a supported numeric column against a literal, returns {@code [columnIndex,
-   * opCode]}; otherwise null. Handles either operand order, flipping the operator when the literal
-   * is on the left.
+   * Flattens a conjunction of comparisons into a list, or null if the condition contains anything
+   * other than `AND`s of supported `column op literal` comparisons.
    */
-  private static int[] comparison(RexNode condition, RelDataType inputType) {
+  private static List<Comparison> flatten(RexNode condition, RelDataType inputType) {
     if (!(condition instanceof RexCall)) {
       return null;
     }
     RexCall call = (RexCall) condition;
+    if (call.getKind() == SqlKind.AND) {
+      List<Comparison> all = new ArrayList<>();
+      for (RexNode operand : call.getOperands()) {
+        List<Comparison> nested = flatten(operand, inputType);
+        if (nested == null) {
+          return null;
+        }
+        all.addAll(nested);
+      }
+      return all;
+    }
+    Comparison comparison = comparison(call, inputType);
+    if (comparison == null) {
+      return null;
+    }
+    List<Comparison> single = new ArrayList<>();
+    single.add(comparison);
+    return single;
+  }
+
+  /**
+   * A single comparison of a supported numeric column against a literal, or null. Handles either
+   * operand order, flipping the operator when the literal is on the left.
+   */
+  private static Comparison comparison(RexCall call, RelDataType inputType) {
     int op = opCode(call.getKind());
     if (op < 0 || call.getOperands().size() != 2) {
       return null;
@@ -79,12 +123,15 @@ final class FilterCalcMatcher {
     RexNode left = call.getOperands().get(0);
     RexNode right = call.getOperands().get(1);
     RexInputRef ref;
+    RexLiteral value;
     boolean literalOnLeft;
     if (left instanceof RexInputRef && right instanceof RexLiteral) {
       ref = (RexInputRef) left;
+      value = (RexLiteral) right;
       literalOnLeft = false;
     } else if (left instanceof RexLiteral && right instanceof RexInputRef) {
       ref = (RexInputRef) right;
+      value = (RexLiteral) left;
       literalOnLeft = true;
     } else {
       return null;
@@ -92,7 +139,11 @@ final class FilterCalcMatcher {
     if (!numeric(inputType.getFieldList().get(ref.getIndex()).getType().getSqlTypeName())) {
       return null;
     }
-    return new int[] {ref.getIndex(), literalOnLeft ? flip(op) : op};
+    Double literal = value.getValueAs(Double.class);
+    if (literal == null) {
+      return null;
+    }
+    return new Comparison(ref.getIndex(), literalOnLeft ? flip(op) : op, literal);
   }
 
   private static boolean isIdentityProjection(RexProgram program) {
@@ -155,8 +206,7 @@ final class FilterCalcMatcher {
 
   /** Whether every input column has a type the whole-row converter can carry. */
   private static boolean convertibleRow(RelDataType inputType) {
-    for (RelDataType field :
-        inputType.getFieldList().stream().map(f -> f.getType()).toList()) {
+    for (RelDataType field : inputType.getFieldList().stream().map(f -> f.getType()).toList()) {
       switch (field.getSqlTypeName()) {
         case TINYINT:
         case SMALLINT:
