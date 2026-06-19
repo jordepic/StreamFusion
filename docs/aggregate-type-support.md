@@ -42,4 +42,6 @@ Notes / divergences this avoids:
   a value-type code).
 - `AVG` over int, and `SUM`/`AVG` over smallint/tinyint/float, await the custom
   accumulators above.
-- Grouping keys beyond a single bigint key are tracked separately in ticket 04.
+- Grouping keys: one or more bigint/int keys are supported (int widens into the
+  int64 composite key, emitted back as int). String/other key types are tracked
+  in ticket 04.
