@@ -16,6 +16,7 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -28,6 +29,7 @@ import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.table.types.logical.RowType;
@@ -51,6 +53,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   protected static final int TYPE_BIGINT = 0;
   protected static final int TYPE_DOUBLE = 1;
   protected static final int TYPE_INT = 2;
+  protected static final int TYPE_STRING = 3;
 
   private final String stateName;
   private final String timeZoneId;
@@ -212,12 +215,12 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
     } else {
       value = new BigIntVector("value", allocator);
     }
-    BigIntVector[] keys = new BigIntVector[keyColumns.length];
+    FieldVector[] keys = new FieldVector[keyColumns.length];
     List<FieldVector> vectors = new ArrayList<>();
     vectors.add(ts);
     vectors.add(value);
     for (int j = 0; j < keyColumns.length; j++) {
-      keys[j] = new BigIntVector("key" + j, allocator);
+      keys[j] = newKeyVector("key" + j, keyTypes[j]);
       vectors.add(keys[j]);
     }
     try (VectorSchemaRoot root = new VectorSchemaRoot(vectors);
@@ -234,7 +237,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
           ((BigIntVector) value).setSafe(i, row.getLong(valueColumn));
         }
         for (int j = 0; j < keyColumns.length; j++) {
-          keys[j].setSafe(i, readKey(row, keyColumns[j], keyTypes[j]));
+          setKey(keys[j], i, row, keyColumns[j], keyTypes[j]);
         }
       }
       root.setRowCount(rows.size());
@@ -251,19 +254,43 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
   public static int[] keyTypes(RowType outputType, int keyCount) {
     int[] types = new int[keyCount];
     for (int j = 0; j < keyCount; j++) {
-      types[j] =
-          outputType.getTypeAt(j).getTypeRoot() == LogicalTypeRoot.INTEGER ? TYPE_INT : TYPE_BIGINT;
+      switch (outputType.getTypeAt(j).getTypeRoot()) {
+        case INTEGER:
+          types[j] = TYPE_INT;
+          break;
+        case VARCHAR:
+        case CHAR:
+          types[j] = TYPE_STRING;
+          break;
+        default:
+          types[j] = TYPE_BIGINT;
+      }
     }
     return types;
   }
 
-  /** Reads a grouping key from the input row, widening an int to long (the native key is int64). */
-  protected static long readKey(RowData row, int column, int keyType) {
-    return keyType == TYPE_INT ? row.getInt(column) : row.getLong(column);
+  /** Creates the Arrow vector carrying a key column: varchar for a string key, else int64. */
+  protected final FieldVector newKeyVector(String name, int keyType) {
+    return keyType == TYPE_STRING
+        ? new VarCharVector(name, allocator)
+        : new BigIntVector(name, allocator);
   }
 
-  /** Boxes a native int64 key back to the emitted column's type (Integer for int, else Long). */
-  protected static Object boxKey(long value, int keyType) {
+  /** Copies row {@code i}'s key from the input row into the key vector (int keys widen to int64). */
+  protected static void setKey(FieldVector vector, int i, RowData row, int column, int keyType) {
+    if (keyType == TYPE_STRING) {
+      ((VarCharVector) vector).setSafe(i, row.getString(column).toBytes());
+    } else {
+      ((BigIntVector) vector).setSafe(i, keyType == TYPE_INT ? row.getInt(column) : row.getLong(column));
+    }
+  }
+
+  /** Boxes a native-produced key cell back to the emitted column's type. */
+  protected static Object boxKey(FieldVector vector, int i, int keyType) {
+    if (keyType == TYPE_STRING) {
+      return StringData.fromBytes(((VarCharVector) vector).get(i));
+    }
+    long value = ((BigIntVector) vector).get(i);
     if (keyType == TYPE_INT) {
       return (int) value;
     }
@@ -295,9 +322,9 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
       flushHandle(watermark, array.memoryAddress(), schema.memoryAddress());
       try (VectorSchemaRoot result =
           Data.importVectorSchemaRoot(allocator, array, schema, dictionaries)) {
-        BigIntVector[] keys = new BigIntVector[keyCount];
+        FieldVector[] keys = new FieldVector[keyCount];
         for (int j = 0; j < keyCount; j++) {
-          keys[j] = (BigIntVector) result.getVector("key" + j);
+          keys[j] = (FieldVector) result.getVector("key" + j);
         }
         BigIntVector windowStart = (BigIntVector) result.getVector("window_start");
         BigIntVector windowEnd = (BigIntVector) result.getVector("window_end");
@@ -311,7 +338,7 @@ public abstract class NativeWindowOperatorBase extends AbstractStreamOperator<Ro
           GenericRowData row = new GenericRowData(keyCount + aggregates + 2);
           int field = 0;
           for (int j = 0; j < keyCount; j++) {
-            row.setField(field++, boxKey(keys[j].get(i), keyTypes[j]));
+            row.setField(field++, boxKey(keys[j], i, keyTypes[j]));
           }
           for (int a = 0; a < aggregates; a++) {
             row.setField(field++, readScalar(results[a], i));

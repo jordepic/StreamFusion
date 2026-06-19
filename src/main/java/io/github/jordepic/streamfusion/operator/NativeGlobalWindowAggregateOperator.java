@@ -52,9 +52,9 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
   protected void pushBatch(List<RowData> rows) {
     int keyCount = keyColumns.length;
     int aggregates = partialColumns.length;
-    BigIntVector[] keys = new BigIntVector[keyCount];
+    FieldVector[] keys = new FieldVector[keyCount];
     for (int j = 0; j < keyCount; j++) {
-      keys[j] = new BigIntVector("key" + j, allocator);
+      keys[j] = newKeyVector("key" + j, keyTypes[j]);
     }
     BigIntVector[] partials = new BigIntVector[aggregates];
     for (int a = 0; a < aggregates; a++) {
@@ -63,7 +63,7 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
     BigIntVector sliceEnd = new BigIntVector("slice_end", allocator);
 
     List<FieldVector> vectors = new ArrayList<>();
-    for (BigIntVector key : keys) {
+    for (FieldVector key : keys) {
       vectors.add(key);
     }
     for (BigIntVector partial : partials) {
@@ -74,9 +74,6 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
     try (VectorSchemaRoot root = new VectorSchemaRoot(vectors);
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-      for (BigIntVector key : keys) {
-        key.allocateNew(rows.size());
-      }
       for (BigIntVector partial : partials) {
         partial.allocateNew(rows.size());
       }
@@ -84,7 +81,7 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
       for (int i = 0; i < rows.size(); i++) {
         RowData row = rows.get(i);
         for (int j = 0; j < keyCount; j++) {
-          keys[j].set(i, readKey(row, keyColumns[j], keyTypes[j]));
+          setKey(keys[j], i, row, keyColumns[j], keyTypes[j]);
         }
         for (int a = 0; a < aggregates; a++) {
           partials[a].set(i, row.getLong(partialColumns[a]));

@@ -225,15 +225,21 @@ final class WindowAggregateMatcher {
     return grouping;
   }
 
-  /** True if every grouping column is an integer-family key (bigint or int) the native side keys on. */
+  /** True if every grouping column is a key type the native side handles (bigint, int, or string). */
   private static boolean supportedKeys(int[] grouping, RelDataType inputType) {
     for (int column : grouping) {
-      SqlTypeName type = inputType.getFieldList().get(column).getType().getSqlTypeName();
-      if (type != SqlTypeName.BIGINT && type != SqlTypeName.INTEGER) {
+      if (!supportedKeyType(inputType.getFieldList().get(column).getType().getSqlTypeName())) {
         return false;
       }
     }
     return true;
+  }
+
+  static boolean supportedKeyType(SqlTypeName type) {
+    return type == SqlTypeName.BIGINT
+        || type == SqlTypeName.INTEGER
+        || type == SqlTypeName.VARCHAR
+        || type == SqlTypeName.CHAR;
   }
 
   static int[] kinds(scala.collection.Seq<AggregateCall> aggCalls) {

@@ -6,6 +6,7 @@ import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.GenericRowData;
@@ -64,9 +65,9 @@ public class NativeLocalWindowAggregateOperator extends NativeWindowOperatorBase
           handle, watermark, array.memoryAddress(), schema.memoryAddress());
       try (VectorSchemaRoot result =
           Data.importVectorSchemaRoot(allocator, array, schema, dictionaries)) {
-        BigIntVector[] keys = new BigIntVector[keyCount];
+        FieldVector[] keys = new FieldVector[keyCount];
         for (int j = 0; j < keyCount; j++) {
-          keys[j] = (BigIntVector) result.getVector("key" + j);
+          keys[j] = (FieldVector) result.getVector("key" + j);
         }
         BigIntVector sliceEnd = (BigIntVector) result.getVector("slice_end");
         BigIntVector[] partials = new BigIntVector[aggregates];
@@ -78,7 +79,7 @@ public class NativeLocalWindowAggregateOperator extends NativeWindowOperatorBase
           GenericRowData row = new GenericRowData(keyCount + aggregates + 1);
           int field = 0;
           for (int j = 0; j < keyCount; j++) {
-            row.setField(field++, boxKey(keys[j].get(i), keyTypes[j]));
+            row.setField(field++, boxKey(keys[j], i, keyTypes[j]));
           }
           for (int a = 0; a < aggregates; a++) {
             row.setField(field++, partials[a].get(i));

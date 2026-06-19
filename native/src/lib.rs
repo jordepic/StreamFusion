@@ -248,7 +248,7 @@ struct TumblingAggregator {
     cumulative: bool,
     aggregates: Vec<WindowAggregate>,
     windows: BTreeMap<i64, AlignedWindow>,
-    key_arity: usize,
+    key_types: Vec<DataType>,
 }
 
 impl TumblingAggregator {
@@ -266,7 +266,7 @@ impl TumblingAggregator {
             cumulative,
             aggregates: kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect(),
             windows: BTreeMap::new(),
-            key_arity: 0,
+            key_types: Vec::new(),
         }
     }
 
@@ -316,7 +316,7 @@ impl TumblingAggregator {
         let ts = column_i64(batch, "ts");
         let value = batch.column_by_name("value").expect("missing value column");
         let key_arrays = key_arrays(batch);
-        self.key_arity = key_arrays.len();
+        self.key_types = key_types(&key_arrays);
 
         // Group the row positions for each (window, key); the value column is sliced by type-
         // agnostic take, so the accumulators see the value column's own type (int, double, ...).
@@ -350,7 +350,7 @@ impl TumblingAggregator {
             let start = window.start;
             let mut group: Vec<(GroupKey, Vec<Box<dyn Accumulator>>)> =
                 window.keys.into_iter().collect();
-            group.sort_by(|(a, _), (b, _)| a.cmp(b));
+            group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             for (key, mut accumulators) in group {
                 keys.push(key);
                 starts.push(start);
@@ -361,8 +361,8 @@ impl TumblingAggregator {
             }
         }
 
-        let mut fields = key_fields(self.key_arity);
-        let mut columns = key_columns(&keys, self.key_arity);
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -386,7 +386,7 @@ impl TumblingAggregator {
             let window = self.windows.remove(&end).expect("window present");
             let mut group: Vec<(GroupKey, Vec<Box<dyn Accumulator>>)> =
                 window.keys.into_iter().collect();
-            group.sort_by(|(a, _), (b, _)| a.cmp(b));
+            group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             for (key, mut accumulators) in group {
                 keys.push(key);
                 slice_ends.push(end);
@@ -397,8 +397,8 @@ impl TumblingAggregator {
             }
         }
 
-        let mut fields = key_fields(self.key_arity);
-        let mut columns = key_columns(&keys, self.key_arity);
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&keys, &self.key_types);
         for (i, scalars) in partials.into_iter().enumerate() {
             let partial_type = self.aggregates[i].state_fields()[0].data_type().clone();
             fields.push(Field::new(format!("partial{i}"), partial_type.clone(), false));
@@ -415,7 +415,7 @@ impl TumblingAggregator {
     fn update_partial(&mut self, batch: &RecordBatch) {
         let n = self.aggregates.len();
         let key_arrays = key_arrays(batch);
-        self.key_arity = key_arrays.len();
+        self.key_types = key_types(&key_arrays);
         let slice_ends = column_i64(batch, "slice_end");
         let partials: Vec<&Int64Array> =
             (0..n).map(|i| column_i64(batch, &format!("partial{i}"))).collect();
@@ -473,8 +473,8 @@ impl TumblingAggregator {
         ];
         let mut columns: Vec<ArrayRef> =
             vec![Arc::new(Int64Array::from(ends)), Arc::new(Int64Array::from(starts))];
-        fields.extend(key_fields(self.key_arity));
-        columns.extend(key_columns(&keys, self.key_arity));
+        fields.extend(key_fields(&self.key_types));
+        columns.extend(key_columns(&keys, &self.key_types));
         fields.extend(state_fields.iter().cloned());
         for (index, scalars) in state_columns.into_iter().enumerate() {
             columns.push(if scalars.is_empty() {
@@ -515,14 +515,12 @@ impl TumblingAggregator {
             let batch = batch.expect("failed to read snapshot");
             // Columns are [window_end, window_start, key0..key{arity-1}, state fields...].
             let arity = batch.num_columns() - 2 - state_field_total;
-            aggregator.key_arity = arity;
             let ends =
                 batch.column(0).as_any().downcast_ref::<Int64Array>().expect("window_end int64");
             let starts =
                 batch.column(1).as_any().downcast_ref::<Int64Array>().expect("window_start int64");
-            let key_arrays: Vec<&Int64Array> = (0..arity)
-                .map(|j| batch.column(2 + j).as_any().downcast_ref::<Int64Array>().expect("key int64"))
-                .collect();
+            let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(2 + j)).collect();
+            aggregator.key_types = key_types(&key_arrays);
             for row in 0..batch.num_rows() {
                 let key = read_key(&key_arrays, row);
                 let mut column = 2 + arity;
@@ -568,7 +566,7 @@ struct SessionAggregator {
     gap_millis: i64,
     aggregates: Vec<WindowAggregate>,
     sessions: HashMap<GroupKey, BTreeMap<i64, Session>>,
-    key_arity: usize,
+    key_types: Vec<DataType>,
 }
 
 impl SessionAggregator {
@@ -578,7 +576,7 @@ impl SessionAggregator {
             gap_millis,
             aggregates: kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect(),
             sessions: HashMap::new(),
-            key_arity: 0,
+            key_types: Vec::new(),
         }
     }
 
@@ -586,7 +584,7 @@ impl SessionAggregator {
         let ts = column_i64(batch, "ts");
         let value = batch.column_by_name("value").expect("missing value column");
         let key_arrays = key_arrays(batch);
-        self.key_arity = key_arrays.len();
+        self.key_types = key_types(&key_arrays);
 
         for row in 0..batch.num_rows() {
             let key = read_key(&key_arrays, row);
@@ -642,13 +640,13 @@ impl SessionAggregator {
             }
         }
         self.sessions.retain(|_, map| !map.is_empty());
-        rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        rows.sort_by(|a, b| (&a.0, a.1).partial_cmp(&(&b.0, b.1)).unwrap_or(std::cmp::Ordering::Equal));
 
         let keys: Vec<GroupKey> = rows.iter().map(|(key, ..)| key.clone()).collect();
         let starts: Vec<i64> = rows.iter().map(|(_, start, ..)| *start).collect();
         let ends: Vec<i64> = rows.iter().map(|(_, _, end, _)| *end).collect();
-        let mut fields = key_fields(self.key_arity);
-        let mut columns = key_columns(&keys, self.key_arity);
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -687,8 +685,8 @@ impl SessionAggregator {
             }
         }
 
-        let mut fields = key_fields(self.key_arity);
-        let mut columns = key_columns(&keys, self.key_arity);
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -724,10 +722,8 @@ impl SessionAggregator {
             let batch = batch.expect("failed to read snapshot");
             // Columns are [key0..key{arity-1}, window_start, window_end, state fields...].
             let arity = batch.num_columns() - 2 - state_field_total;
-            aggregator.key_arity = arity;
-            let key_arrays: Vec<&Int64Array> = (0..arity)
-                .map(|j| batch.column(j).as_any().downcast_ref::<Int64Array>().expect("key int64"))
-                .collect();
+            let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
+            aggregator.key_types = key_types(&key_arrays);
             let starts = batch
                 .column(arity)
                 .as_any()
@@ -760,35 +756,48 @@ impl SessionAggregator {
     }
 }
 
-/// A composite grouping key: the values of the zero or more grouping columns for a row.
-type GroupKey = Vec<i64>;
+/// A composite grouping key: the typed values of the zero or more grouping columns for a row.
+/// Scalars (rather than int64s) so the key can hold any column type — int/bigint/string/….
+type GroupKey = Vec<ScalarValue>;
 
-/// The int64 key columns (`key0`, `key1`, …) present in a batch, in order. Their count is the
-/// grouping arity; an unkeyed (window-only) aggregation has none.
-fn key_arrays<'a>(batch: &'a RecordBatch) -> Vec<&'a Int64Array> {
+/// The key columns (`key0`, `key1`, …) present in a batch, in order, as generic arrays. Their count
+/// is the grouping arity; an unkeyed (window-only) aggregation has none.
+fn key_arrays<'a>(batch: &'a RecordBatch) -> Vec<&'a ArrayRef> {
     let mut arrays = Vec::new();
     while let Some(column) = batch.column_by_name(&format!("key{}", arrays.len())) {
-        arrays.push(column.as_any().downcast_ref::<Int64Array>().expect("key must be int64"));
+        arrays.push(column);
     }
     arrays
 }
 
+/// The Arrow types of the key columns, in order (used to build emitted key columns by position).
+fn key_types(arrays: &[&ArrayRef]) -> Vec<DataType> {
+    arrays.iter().map(|array| array.data_type().clone()).collect()
+}
+
 /// Reads one row's composite key from the gathered key columns.
-fn read_key(arrays: &[&Int64Array], row: usize) -> GroupKey {
-    arrays.iter().map(|array| array.value(row)).collect()
+fn read_key(arrays: &[&ArrayRef], row: usize) -> GroupKey {
+    arrays
+        .iter()
+        .map(|array| ScalarValue::try_from_array(array.as_ref(), row).expect("read key scalar"))
+        .collect()
 }
 
-/// The `key0..key{arity-1}` schema fields for an emitted batch.
-fn key_fields(arity: usize) -> Vec<Field> {
-    (0..arity).map(|j| Field::new(format!("key{j}"), DataType::Int64, false)).collect()
+/// The `key0..key{n-1}` schema fields for an emitted batch, one per stored key type.
+fn key_fields(types: &[DataType]) -> Vec<Field> {
+    types.iter().enumerate().map(|(j, t)| Field::new(format!("key{j}"), t.clone(), false)).collect()
 }
 
-/// Transposes per-row composite keys into one int64 column per key position.
-fn key_columns(keys: &[GroupKey], arity: usize) -> Vec<ArrayRef> {
-    (0..arity)
+/// Transposes per-row composite keys into one typed column per key position.
+fn key_columns(keys: &[GroupKey], types: &[DataType]) -> Vec<ArrayRef> {
+    (0..types.len())
         .map(|j| {
-            let column: Vec<i64> = keys.iter().map(|key| key[j]).collect();
-            Arc::new(Int64Array::from(column)) as ArrayRef
+            let scalars: Vec<ScalarValue> = keys.iter().map(|key| key[j].clone()).collect();
+            if scalars.is_empty() {
+                new_empty_array(&types[j])
+            } else {
+                ScalarValue::iter_to_array(scalars).expect("key column array")
+            }
         })
         .collect()
 }
