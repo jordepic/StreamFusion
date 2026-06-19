@@ -20,7 +20,7 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 |---|---|---|---|---|---|
 | BIGINT  | ✓ | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | DOUBLE  | ✓ | ✓ | ✓ | ✓ | ✓ |
-| INT     | ✓ (custom wrapping) | ✗ truncate | ✓ | ✓ | ✓ |
+| INT     | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | SMALLINT / TINYINT | ✗ | ✗ | ✓ | ✓ | ✓ |
 | FLOAT (REAL) | ✗ FLOAT≠DOUBLE | ✗ | ✓ | ✓ | ✓ |
 | DECIMAL | ✗ precision rules | ✗ | ✓ | ✓ | ✓ |
@@ -30,18 +30,16 @@ Notes / divergences this avoids:
   narrow type, wraps at 2³¹). The same pattern would extend to smallint/tinyint
   (i16/i8) — not yet built.
 - **AVG over integers** is DataFusion `Float64`; Flink truncates to the input
-  type. We match this for `BIGINT` with a custom accumulator; extending to int
-  means casting the truncated result back to int32 — not yet wired.
+  type. We match this for `BIGINT` and `INT` with a custom accumulator that sums
+  in int64 and casts the truncated result back to the input integer type.
 - **DECIMAL** SUM/AVG precision/scale derivation is exotic; excluded.
 
 ## Status
-- Implemented value types: `BIGINT`, `DOUBLE` (all five aggregates), and `INT`
-  for `SUM`/`MIN`/`MAX`/`COUNT` (all but `AVG`). The native value path is
-  type-general; adding the remaining MIN/MAX/COUNT types
+- Implemented value types: `BIGINT`, `DOUBLE`, and `INT` — all five aggregates.
+  The native value path is type-general; adding the remaining MIN/MAX/COUNT types
   (SMALLINT/TINYINT/FLOAT/DECIMAL) is mechanical (an Arrow vector class + getter +
   a value-type code).
-- `AVG` over int, and `SUM`/`AVG` over smallint/tinyint/float, await the custom
-  accumulators above.
+- `SUM`/`AVG` over smallint/tinyint/float await the custom accumulators above.
 - Grouping keys: one or more bigint/int/string keys are supported. The native
   composite key is a list of typed scalars; int widens into int64 carriage and is
   emitted back as int, strings ride as varchar. Other key types (decimal,
