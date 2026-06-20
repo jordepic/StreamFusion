@@ -44,8 +44,9 @@ Three findings shape it:
    exchange. This is the simple first step.
 3. **Comet does the by-key split** (for parallelism > 1) with scatter-append, not sort: vectorized
    hash of the key columns → partition id; one counting pass + prefix sum → per-partition offsets;
-   `interleave_record_batch` to assemble each partition's sub-batch. It matches Spark's hash for
-   parity; we must match **Flink's** key-group assignment instead (below).
+   `interleave_record_batch` to assemble each partition's sub-batch. Comet matches Spark's hash for
+   *interop* with Spark operators; we do **not** need to match Flink's hash — see Phase 2 — because
+   our shuffle feeds only our own native operator. Any consistent hash works.
 
 Reuse Flink's exchange/network (credit-based backpressure, barriers) — do **not** build a native
 transport. The columnar batch rides as the record payload, serialized by our existing
@@ -59,20 +60,34 @@ channel 0. Mark it so the transition pass treats source/window edges as columnar
 split — smallest slice that delivers the columnar window.
 
 ### Phase 2 — parallelism > 1 (by-key split)
-A split operator partitions an `ArrowBatch` into per-keygroup sub-batches (Comet scatter-append +
-`interleave`), each tagged with its destination keygroup; a custom `StreamPartitioner<ArrowBatch>`
-routes each sub-batch by that tag. **Parity-critical:** reproduce Flink's chain exactly —
-`key.hashCode()` (a `BinaryRowData` key → Murmur3 **seed 42**, `BinarySegmentUtils.hashByWords`)
-→ `MathUtils.murmurHash` + `bitMix` → `% maxParallelism` (default **128**) → keygroup →
-`keygroup * parallelism / maxParallelism` → subtask. The split runs natively; the keygroup→channel
-selection runs in the Java partitioner.
+A split operator partitions an `ArrowBatch` into per-channel sub-batches (Comet scatter-append +
+`interleave`), each tagged with its destination channel; a custom `StreamPartitioner<ArrowBatch>`
+routes each sub-batch by that tag.
 
-### Exact Flink references for parity
-`StreamExecExchange` (HASH → `KeyGroupStreamPartitioner` + `RowDataKeySelector`);
-`KeyGroupRangeAssignment.{assignKeyToParallelOperator, computeKeyGroupForKeyHash,
-computeOperatorIndexForKeyGroup}`; `MathUtils.{murmurHash, bitMix}`; `BinaryRowData.hashCode` →
-`BinarySegmentUtils.hashByWords` → `MurmurHashUtils` (seed 42); `PartitionTransformation` +
-`StreamPartitioner<ArrowBatch>` (return `SubtaskStateMapper.FULL`).
+**We do NOT need to reproduce Flink's key-group hash.** The shuffle hash only decides *which
+subtask handles which key* — it does not affect the result. The only correctness requirement is
+**same key → same channel** (any deterministic hash of the key columns; reuse the existing
+`GroupKey`/`ScalarValue` hashing or ahash). This is sound because the keyed consumer downstream is
+*our* native operator, which holds **operator** state (not Flink keyed state) and re-groups
+internally — so it never depends on Flink's key→subtask mapping. The final result set is identical
+under any consistent partitioning, and the parity harness compares sorted result sets.
+
+**The one guardrail:** substitute a columnar exchange **only when its downstream keyed operator is
+also substituted natively**. A fallen-back Flink window *would* assume Flink's distribution, so a
+columnar exchange must never feed a Flink operator. By construction it only ever feeds a native
+columnar window, so this holds — but the substitution must couple the two (don't replace the
+exchange if the window isn't replaced).
+
+(Contrast: Comet reproduces Spark's Murmur3+pmod because it runs *inside* Spark's plan, where
+partitioning is a contract other Spark operators / joins / bucketing / AQE depend on — an interop
+requirement, not a standalone-result one. We have no such cross-engine contract for a fully-native
+keyed segment.)
+
+### Flink references (mechanism only — no hash parity needed)
+`StreamExecExchange` (the HASH exchange we replace); `PartitionTransformation` +
+`StreamPartitioner<ArrowBatch>` (custom partitioner reading the sub-batch's destination channel;
+return `SubtaskStateMapper.FULL`). `numberOfChannels` (downstream parallelism) is supplied to the
+partitioner at runtime; the split uses our own `hash(key) % numberOfChannels`.
 
 ## Constraints
 - Reuse Flink's exchange/network — preserve barrier alignment and backpressure.
@@ -82,11 +97,14 @@ computeOperatorIndexForKeyGroup}`; `MathUtils.{murmurHash, bitMix}`; `BinaryRowD
 ## Build slices
 1. **Phase 1**: columnar single-channel keyed exchange (parallelism 1) + route a columnar window
    onto it; parity-test a `GROUP BY key, window` query at parallelism 1 (columnar source/filter →
-   window). This is also what ticket 21's columnar-windows item is gated on.
+   window). This is also what ticket 21's columnar-windows item is gated on. (Coupled to the
+   window-operator columnar conversion — ticket 21.)
 2. **Phase 2a**: native `partition_batch(batch, key_cols, key_types, num_partitions)` →
-   `Vec<(partition, batch)>` matching Flink's keygroup hash; unit-test parity against the Flink
-   formula in isolation.
-3. **Phase 2b**: the split operator + custom partitioner; parity-test at parallelism > 1.
+   `Vec<(partition, batch)>` using a consistent hash of the key columns (`% num_partitions`); NO
+   Flink-hash reproduction. Unit-test that the same key always maps to the same partition and that
+   every row's key lands in its sub-batch.
+3. **Phase 2b**: the split operator + custom `StreamPartitioner<ArrowBatch>`; parity-test at
+   parallelism > 1 that the result set equals Flink's (distribution differs, result is identical).
 
 ## Interaction
 - Enables ticket 09 (a native chain spans a shuffle and stays columnar) and ticket 21's
