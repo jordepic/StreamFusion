@@ -92,9 +92,21 @@ sequence of columnar operators with no per-combination knowledge. See
    allocator (buffers associate only within one allocator root) — the operator's allocator owns only
    the imported result. Transpose/native exec nodes declare `ArrowBatchTypeInformation` on columnar
    edges so Flink uses the batch serializer, not Kryo.
-4. **Remaining native operators to `Arrow → Arrow`** (windows, sink), so multi-native chains
-   drop the inter-operator conversions.
-5. **Columnar Parquet source**, then **Arrow across the shuffle**.
+4. **Remaining native operators to `Arrow → Arrow`.**
+   - **Sink** ✅ DONE — consumes Arrow batches, writes each to Parquet; marker split into
+     `ColumnarInput`/`ColumnarOutput` so a terminal sink is consume-only. Parity + recovery pass.
+   - **Windows — gated on the columnar shuffle (do after slice 5).** Window operators carry
+     `keyColumns` and sit *downstream of a keyBy*, so their big-data input arrives through a
+     key-partitioned exchange. Making a window `ColumnarInput` means that exchange carries
+     `ArrowBatch` and must repartition a batch *by key* (Arroyo's `sort_to_indices → take →
+     slice`) — i.e. the columnar shuffle. Converting only the output side (RowData in, Arrow
+     out) is possible but saves only the small result-set conversion, not the large input one,
+     so it is not worth the stateful-operator risk ahead of the shuffle. **Sequence windows
+     after the columnar shuffle.** Two-phase local→global is doubly gated (its local→global
+     edge is also a keyed shuffle).
+5. **Columnar Parquet source** (independent, the first >1× candidate: columnar source →
+   [filter] → columnar sink, zero transpose end to end), then **Arrow across the shuffle**
+   (unblocks the windows).
 
 ## What anchors the columnar region — the source and sink formats
 The conversion is a tax whose *placement* is dictated by the endpoint formats, not by the
