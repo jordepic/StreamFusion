@@ -16,8 +16,10 @@
         <arrow.version>18.3.0</arrow.version>
         <flink.version>2.2.1</flink.version>
         <scala.binary.version>2.12</scala.binary.version>
-        <!-- Cargo profile whose output dir holds the loadable native library. -->
+        <!-- Native build: debug by default for a fast correctness loop. The `bench` profile flips
+             both of these to a release build, which benchmarks must use (debug Rust is far slower). -->
         <native.profile>debug</native.profile>
+        <native.cargo.args>build</native.cargo.args>
     </properties>
 
     <dependencies>
@@ -129,9 +131,7 @@
                         <configuration>
                             <executable>cargo</executable>
                             <workingDirectory>${project.basedir}/native</workingDirectory>
-                            <arguments>
-                                <argument>build</argument>
-                            </arguments>
+                            <commandlineArgs>${native.cargo.args}</commandlineArgs>
                         </configuration>
                     </execution>
                 </executions>
@@ -151,5 +151,17 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Build and load the optimized native library. Benchmarks must run under this profile;
+             debug Rust is far slower and gives misleading throughput numbers. -->
+        <profile>
+            <id>bench</id>
+            <properties>
+                <native.profile>release</native.profile>
+                <native.cargo.args>build --release</native.cargo.args>
+            </properties>
+        </profile>
+    </profiles>
 
 </project>
