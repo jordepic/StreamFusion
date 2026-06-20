@@ -104,8 +104,14 @@ sequence of columnar operators with no per-combination knowledge. See
      so it is not worth the stateful-operator risk ahead of the shuffle. **Sequence windows
      after the columnar shuffle.** Two-phase local→global is doubly gated (its local→global
      edge is also a keyed shuffle).
-5. **Columnar Parquet source** (independent, the first >1× candidate: columnar source →
-   [filter] → columnar sink, zero transpose end to end), then **Arrow across the shuffle**
+5. **Columnar Parquet source** ✅ DONE. A native source reads a directory of Parquet files as
+   Arrow batches (synchronous `parquet`-crate reader chained over the sorted, non-hidden files —
+   no async stream across JNI) and emits them via a bounded `SourceFunction`; a leaf rel +
+   zero-input exec node + `addSource(fn, name, ArrowBatchTypeInformation)`. For
+   `INSERT INTO parquet SELECT * FROM parquet` the source and sink are both columnar, so the
+   transition pass inserts **zero transposes** — fully columnar end to end, parity-verified vs
+   host. Reads any filesystem-table directory (skips `.`/`_` files, like Flink's source).
+   **Benchmark this vs Flink — the first >1× candidate.** Then **Arrow across the shuffle**
    (unblocks the windows).
 
 ## What anchors the columnar region — the source and sink formats

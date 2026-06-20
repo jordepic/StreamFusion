@@ -9,6 +9,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalG
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSink;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
@@ -104,6 +105,13 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (!(current instanceof StreamPhysicalRel)
         || !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current)) {
       return current;
+    }
+
+    if (ParquetSourceMatcher.matches(current)) {
+      StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
+      substitutions++;
+      return new StreamPhysicalNativeParquetSource(
+          scan.getCluster(), scan.getTraitSet(), scan.getRowType(), ParquetSourceMatcher.path(scan));
     }
 
     if (current instanceof StreamPhysicalCalc && DoublingCalcMatcher.matches((Calc) current)) {
