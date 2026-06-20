@@ -124,6 +124,27 @@ public final class Native {
   public static native void writeParquet(long inArrayAddress, long inSchemaAddress, String path);
 
   /**
+   * Opens a directory of Parquet files for reading and returns an opaque handle. The handle yields
+   * batches one at a time via {@link #nextBatch} and must be released with {@link #closeParquet}.
+   *
+   * @param directory directory of Parquet files to read
+   */
+  public static native long openParquet(String directory);
+
+  /**
+   * Exports the next Arrow batch from a source handle into the consumer-allocated C structs.
+   *
+   * @param handle a handle from {@link #openParquet}
+   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
+   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   * @return true if a batch was produced, false once the directory is exhausted
+   */
+  public static native boolean nextBatch(long handle, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a Parquet source handle. */
+  public static native void closeParquet(long handle);
+
+  /**
    * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the
    * consumer-allocated C structs, exercising batch transfer beyond a single column.
    *

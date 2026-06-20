@@ -21,7 +21,7 @@ use futures::StreamExt;
 use jni::objects::{
     JByteArray, JClass, JDoubleArray, JIntArray, JLongArray, JObjectArray, JString,
 };
-use jni::sys::{jbyteArray, jint, jlong, jstring};
+use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
@@ -1302,6 +1302,104 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_writeParquet<
     write_parquet(&batch, &path);
 }
 
+/// A reader over a directory of Parquet files, yielding one Arrow batch at a time. Chains each
+/// file's synchronous batch reader in a deterministic (sorted) order — no async stream, so the
+/// handle is sound to hold across JNI calls and pull from one batch per call.
+struct ParquetSource {
+    files: Vec<std::path::PathBuf>,
+    next_file: usize,
+    reader: Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
+}
+
+impl ParquetSource {
+    fn open(dir: &str) -> ParquetSource {
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("failed to read source directory")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                // Read every committed part file, skipping hidden and in-progress ones (a leading
+                // `.` or `_`) — the same convention Flink's filesystem source uses, so this reads a
+                // directory written by either sink regardless of file extension.
+                let name = path.file_name()?.to_str()?;
+                if path.is_file() && !name.starts_with('.') && !name.starts_with('_') {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+        ParquetSource { files, next_file: 0, reader: None }
+    }
+
+    /// The next batch across all files, or None when every file is exhausted.
+    fn next(&mut self) -> Option<RecordBatch> {
+        loop {
+            if let Some(reader) = &mut self.reader {
+                if let Some(batch) = reader.next() {
+                    return Some(batch.expect("failed to read parquet batch"));
+                }
+                self.reader = None;
+            }
+            if self.next_file >= self.files.len() {
+                return None;
+            }
+            let file = std::fs::File::open(&self.files[self.next_file]).expect("failed to open file");
+            self.next_file += 1;
+            self.reader = Some(
+                parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                    .expect("failed to open parquet reader")
+                    .build()
+                    .expect("failed to build parquet reader"),
+            );
+        }
+    }
+}
+
+/// Opens a directory of Parquet files for reading and returns an opaque handle, released with
+/// `closeParquet`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openParquet<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    dir: JString<'local>,
+) -> jlong {
+    let dir: String = env.get_string(&dir).expect("failed to read directory").into();
+    Box::into_raw(Box::new(ParquetSource::open(&dir))) as jlong
+}
+
+/// Exports the next Arrow batch from the source into the consumer-allocated C structs, returning
+/// true if a batch was produced and false once the directory is exhausted.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextBatch<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) -> jboolean {
+    let source = unsafe { &mut *(handle as *mut ParquetSource) };
+    match source.next() {
+        Some(batch) => {
+            export_record_batch(batch, out_array_address, out_schema_address);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Releases a Parquet source handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquet<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut ParquetSource));
+    }
+}
+
 /// Runs an event-time tumbling-window sum over a batch from the JVM: rows are bucketed by the start
 /// of the `window_millis`-wide window their `ts` falls in, and `value` is summed per bucket. This
 /// is the first aggregating operator and the core of the initial target envelope.
@@ -1828,6 +1926,26 @@ mod tests {
         }
         assert_eq!(rows, batch.num_rows());
         assert_eq!(first, values(&batch, 0));
+    }
+
+    // The Parquet source reads back every batch written across a directory's files.
+    #[test]
+    fn reads_a_parquet_directory() {
+        let dir = std::env::temp_dir().join("streamfusion_source_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_parquet(&sample_batch(), dir.join("part-0.parquet").to_str().unwrap());
+        write_parquet(&sample_batch(), dir.join("part-1.parquet").to_str().unwrap());
+
+        let mut source = ParquetSource::open(dir.to_str().unwrap());
+        let mut rows = 0usize;
+        let mut batches = 0usize;
+        while let Some(batch) = source.next() {
+            rows += batch.num_rows();
+            batches += 1;
+        }
+        assert_eq!(rows, 2 * sample_batch().num_rows());
+        assert!(batches >= 2);
     }
 
     // The compiled predicate is cached after the first batch and reused.
