@@ -1442,6 +1442,61 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquet<
     }
 }
 
+/// Holds the per-partition sub-batches of one split, pulled out one at a time by the JVM.
+struct SplitState {
+    partitions: Vec<(usize, RecordBatch)>,
+    cursor: usize,
+}
+
+/// Splits a batch from the JVM by key into per-partition sub-batches and returns a handle to pull
+/// them with `nextSplit`; released with `closeSplit`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_splitByKey<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    key_columns: JIntArray<'local>,
+    num_partitions: jint,
+) -> jlong {
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let keys: Vec<usize> = read_kinds(&env, &key_columns).into_iter().map(|k| k as usize).collect();
+    let partitions = partition_batch(&batch, &keys, num_partitions as usize);
+    Box::into_raw(Box::new(SplitState { partitions, cursor: 0 })) as jlong
+}
+
+/// Exports the next sub-batch into the consumer-allocated C structs and returns its partition, or
+/// -1 once the split is exhausted.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextSplit<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) -> jint {
+    let state = unsafe { &mut *(handle as *mut SplitState) };
+    if state.cursor >= state.partitions.len() {
+        return -1;
+    }
+    let (partition, batch) = state.partitions[state.cursor].clone();
+    state.cursor += 1;
+    export_record_batch(batch, out_array_address, out_schema_address);
+    partition as jint
+}
+
+/// Releases a split handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSplit<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut SplitState));
+    }
+}
+
 /// Runs an event-time tumbling-window sum over a batch from the JVM: rows are bucketed by the start
 /// of the `window_millis`-wide window their `ts` falls in, and `value` is summed per bucket. This
 /// is the first aggregating operator and the core of the initial target envelope.

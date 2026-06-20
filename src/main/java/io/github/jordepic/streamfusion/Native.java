@@ -145,6 +145,29 @@ public final class Native {
   public static native void closeParquet(long handle);
 
   /**
+   * Splits a batch the JVM exported by a consistent hash of the {@code keyColumns} into up to {@code
+   * numPartitions} sub-batches (every row with a given key in one partition), returning a handle to
+   * pull them with {@link #nextSplit}; released with {@link #closeSplit}. The columnar shuffle's
+   * by-key routing.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param keyColumns indices of the key columns to hash
+   * @param numPartitions number of partitions (downstream channels) to split into
+   */
+  public static native long splitByKey(
+      long inArrayAddress, long inSchemaAddress, int[] keyColumns, int numPartitions);
+
+  /**
+   * Exports the next sub-batch of a split into the consumer-allocated C structs and returns its
+   * partition index, or -1 once the split is exhausted.
+   */
+  public static native int nextSplit(long handle, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a split handle. */
+  public static native void closeSplit(long handle);
+
+  /**
    * Imports a whole multi-column batch the JVM exported and exports an equal batch back into the
    * consumer-allocated C structs, exercising batch transfer beyond a single column.
    *
