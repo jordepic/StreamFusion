@@ -62,29 +62,29 @@ The native compute itself is fast (a filter clears ~1.6 G elements/s).
 
 ### End to end vs. Flink
 
-The same query over 5M rows into a discarding sink, native substitution on vs. off,
-single slot — run with `SF_BENCHMARK=true mvn test -Dtest=ThroughputBenchmark`.
+The same query over 5M rows, native substitution on vs. off, single slot — run with
+`SF_BENCHMARK=true mvn test -Pbench -Dtest=ThroughputBenchmark`. The `-Pbench` profile is
+required: it loads the **release** native library (the debug build is ~10–20× slower and
+gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
-| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.07 M rows/s | 1.79 M rows/s | **0.58×** |
-| Tumbling window aggregate | `SUM` by 1s window | 1.54 M rows/s | 1.24 M rows/s | **0.81×** |
-| Parquet sink | `INSERT INTO parquet SELECT *` | 1.18 M rows/s | 0.61 M rows/s | **0.52×** |
+| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.33 M rows/s | 4.23 M rows/s | **3.19×** |
+| Tumbling window aggregate | `SUM` by 1s window | 1.48 M rows/s | 1.79 M rows/s | **1.21×** |
+| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.16 M rows/s | 1.22 M rows/s | **1.05×** |
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 2.82 M rows/s | 2.34 M rows/s | **0.83×** |
 
-**Today, substituting a single operator is slower than Flink, not faster** — and we
-report it rather than hide it. The native compute is quick, but every substituted
-operator (or sink) converts the whole row `RowData → Arrow`, and for one stage fed by a
-row source that round-trip costs more than the native execution saves. The gap narrows
-with work done per converted byte (filter 0.58× → tumbling 0.81×), and the Parquet sink
-(0.52×) makes the lesson concrete: a *columnar sink fed by a row source* still pays the
-transpose at the sink, while Flink writes `RowData → Parquet` directly — so a columnar
-sink alone does not win. The decisive case is a **columnar source**: read Parquet/Iceberg
-as Arrow and the data never becomes `RowData`, so a Parquet→Parquet job stays columnar
-end to end while Flink round-trips through rows. That (and keeping **adjacent native
-operators in Arrow** rather than transposing at each boundary — the
-[Iron Vector](#related-work) model) is where the project crosses 1×. These single-stage,
-row-fed numbers are the precursor; the columnar-source and chained numbers are the ones
-that will justify it.
+Native wins where it does real columnar work and the transpose tax is small relative to
+it. The **fully-columnar Parquet copy is 3.19×** — the data is read as Arrow, flows through
+the native sink, and is written as Arrow, never becoming `RowData`, while Flink round-trips
+every row through its runtime at both ends. A **tumbling aggregate is 1.21×** even though a
+`RowData → Arrow` transpose still sits at its input. The **row-source Parquet sink is ~par
+(1.05×)**: the one transpose at the boundary roughly cancels the native write gain. The
+**stateless filter is 0.83×** — the one case below 1×, and expectedly so: a single cheap
+predicate does not earn back the `RowData → Arrow → RowData` round-trip the lone operator
+pays. It crosses 1× once it stops paying that round-trip — fed by a columnar source, or
+chained with other native operators so no transpose sits between them (the columnar-flow
+mechanism is built; widening the columnar region is what lifts these further).
 
 _Apple M1 Max; numbers are comparable only within a machine._
 

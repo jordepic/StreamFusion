@@ -1349,6 +1349,9 @@ impl ParquetSource {
             self.reader = Some(
                 parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
                     .expect("failed to open parquet reader")
+                    // Larger batches than the 1024 default cut per-batch overhead (each batch is a
+                    // C Data hop and, at the sink, a file); 8192 balances that against batch memory.
+                    .with_batch_size(8192)
                     .build()
                     .expect("failed to build parquet reader"),
             );
@@ -1926,6 +1929,61 @@ mod tests {
         }
         assert_eq!(rows, batch.num_rows());
         assert_eq!(first, values(&batch, 0));
+    }
+
+    // Pure-native read→write ceiling: time copying a directory of Parquet with no JVM in the loop.
+    // Run with: cargo test -- --ignored --nocapture profile_parquet_copy
+    #[test]
+    #[ignore]
+    fn profile_parquet_copy() {
+        let rows: i64 = 5_000_000;
+        let k: ArrayRef = Arc::new(Int64Array::from((0..rows).collect::<Vec<i64>>()));
+        let v: ArrayRef = Arc::new(Int64Array::from((0..rows).map(|i| i % 100).collect::<Vec<i64>>()));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("v", DataType::Int64, true),
+            ])),
+            vec![k, v],
+        )
+        .unwrap();
+        let in_dir = std::env::temp_dir().join("sf_profile_in");
+        let out_dir = std::env::temp_dir().join("sf_profile_out");
+        let _ = std::fs::remove_dir_all(&in_dir);
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&in_dir).unwrap();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        write_parquet(&batch, in_dir.join("part-0.parquet").to_str().unwrap());
+
+        let start = std::time::Instant::now();
+        let mut source = ParquetSource::open(in_dir.to_str().unwrap());
+        let mut i = 0;
+        let mut read = std::time::Duration::ZERO;
+        let mut write = std::time::Duration::ZERO;
+        loop {
+            let t = std::time::Instant::now();
+            let next = source.next();
+            read += t.elapsed();
+            match next {
+                Some(b) => {
+                    let t = std::time::Instant::now();
+                    write_parquet(&b, out_dir.join(format!("part-{i}.parquet")).to_str().unwrap());
+                    write += t.elapsed();
+                    i += 1;
+                }
+                None => break,
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "native copy: {} rows, {} batches in {:?} ({:.2} M rows/s); read {:?}, write {:?}",
+            rows,
+            i,
+            elapsed,
+            rows as f64 / elapsed.as_secs_f64() / 1e6,
+            read,
+            write
+        );
     }
 
     // The Parquet source reads back every batch written across a directory's files.

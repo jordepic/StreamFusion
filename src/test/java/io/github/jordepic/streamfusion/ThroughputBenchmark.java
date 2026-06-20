@@ -30,7 +30,8 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 @EnabledIfEnvironmentVariable(named = "SF_BENCHMARK", matches = "true")
 class ThroughputBenchmark {
 
-  private static final long ROWS = 5_000_000L;
+  private static final long ROWS =
+      System.getenv("SF_ROWS") != null ? Long.parseLong(System.getenv("SF_ROWS")) : 5_000_000L;
   private static final int WARMUP = 1;
   private static final int RUNS = 3;
 
@@ -104,6 +105,72 @@ class ThroughputBenchmark {
       throw new IllegalStateException("native sink did not engage; comparison is moot");
     }
     return seconds;
+  }
+
+  @Test
+  void parquetCopyThroughput() throws Exception {
+    // A Parquet input directory both runs read (written once).
+    Path input = Files.createTempDirectory("bench-copy-in");
+    writeCopyInput(input);
+    double flink = bestOfCopy(input, false);
+    double nativeRun = bestOfCopy(input, true);
+    System.out.printf("%n[benchmark] Parquet copy (INSERT SELECT *) over %,d rows (best of %d)%n", ROWS, RUNS);
+    System.out.printf("[benchmark]   Flink : %6.3f s  (%,.0f rows/s)%n", flink, ROWS / flink);
+    System.out.printf(
+        "[benchmark]   Native: %6.3f s  (%,.0f rows/s)  %.2fx vs Flink%n",
+        nativeRun, ROWS / nativeRun, flink / nativeRun);
+  }
+
+  private static double bestOfCopy(Path input, boolean useNative) throws Exception {
+    double best = Double.MAX_VALUE;
+    for (int run = 0; run < WARMUP + RUNS; run++) {
+      best = Math.min(best, copyRunOnce(input, useNative));
+    }
+    return best;
+  }
+
+  /** One columnar copy: read the Parquet input directory, write a fresh Parquet output directory. */
+  private static double copyRunOnce(Path input, boolean useNative) throws Exception {
+    Path output = Files.createTempDirectory("bench-copy-out");
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    env.enableCheckpointing(1000);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.executeSql(parquetTable("cin", input));
+    tEnv.executeSql(parquetTable("cout", output));
+    PhysicalPlanScan scan = useNative ? NativePlanner.install(tEnv) : null;
+    long start = System.nanoTime();
+    tEnv.executeSql("INSERT INTO cout SELECT * FROM cin").await();
+    double seconds = (System.nanoTime() - start) / 1e9;
+    if (useNative && scan.substitutions() < 2) {
+      throw new IllegalStateException("native source+sink did not engage; comparison is moot");
+    }
+    return seconds;
+  }
+
+  private static void writeCopyInput(Path directory) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    env.enableCheckpointing(1000);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromSequence(0, ROWS - 1)
+            .map(i -> Row.of(i, (int) (i % 100)))
+            .returns(Types.ROW_NAMED(new String[] {"k", "v"}, Types.LONG, Types.INT));
+    tEnv.createTemporaryView(
+        "cs",
+        source,
+        Schema.newBuilder().column("k", DataTypes.BIGINT()).column("v", DataTypes.INT()).build());
+    tEnv.executeSql(parquetTable("cin_write", directory));
+    tEnv.executeSql("INSERT INTO cin_write SELECT * FROM cs").await();
+  }
+
+  private static String parquetTable(String name, Path directory) {
+    return "CREATE TABLE "
+        + name
+        + " (k BIGINT, v INT) WITH ('connector' = 'filesystem', 'path' = '"
+        + directory.toUri()
+        + "', 'format' = 'parquet')";
   }
 
   private static void compare(

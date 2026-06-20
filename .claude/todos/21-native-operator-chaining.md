@@ -111,7 +111,13 @@ sequence of columnar operators with no per-combination knowledge. See
    `INSERT INTO parquet SELECT * FROM parquet` the source and sink are both columnar, so the
    transition pass inserts **zero transposes** — fully columnar end to end, parity-verified vs
    host. Reads any filesystem-table directory (skips `.`/`_` files, like Flink's source).
-   **Benchmark this vs Flink — the first >1× candidate.** Then **Arrow across the shuffle**
+   **Benchmarked vs Flink: 3.19× ✅** (release). Getting there exposed that every prior
+   end-to-end benchmark had run the *debug* native library — the Maven build did `cargo build`
+   with no `--release` and loaded `target/debug`. Profiling proved it: pure-native copy was
+   0.36s (14 M rows/s) while the job was ~7s; the sink's `writeParquet` was ~17× slower than
+   standalone (debug Rust), not GC (one 5.7ms pause). Fixed: a `bench` Maven profile builds and
+   loads release; `mvn test` keeps debug for the fast loop (see CLAUDE.md). Release numbers:
+   copy 3.19×, tumbling 1.21×, sink 1.05×, filter 0.83×. Then **Arrow across the shuffle**
    (unblocks the windows).
 
 ## What anchors the columnar region — the source and sink formats

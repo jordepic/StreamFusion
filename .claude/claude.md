@@ -26,6 +26,10 @@ the feature is worth it, or if it is the precursor to more optimizations. We als
 existing Flink results. The readme.md should include our benchmarks for each operator we implement as well as a
 comparison to the flink operator.
 
+Builds: tests run against a debug native build for a fast iteration loop (`mvn test`), but ALL benchmarking
+must use the release build via the `bench` Maven profile (`mvn test -Pbench ...`) — debug Rust is roughly an
+order of magnitude slower and gives misleading numbers. Never report a benchmark from a debug build.
+
 At a high level:
 We are ripping code out of Arroyo, which itself already uses DataFusion
 We are overriding the planning layer of Flink to use our Arroyo operators
