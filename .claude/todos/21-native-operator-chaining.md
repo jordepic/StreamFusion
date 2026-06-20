@@ -84,10 +84,14 @@ sequence of columnar operators with no per-combination knowledge. See
    not a native transpose. The only transpose lever is Java-side: the converter is cell-at-a-time;
    a column-vectorized converter would speed it up (Flink's `ArrowUtils` does this but bundles a
    conflicting Arrow version — why we hand-rolled). Track that as a perf item, not a native one.
-3. **One native operator to `Arrow → Arrow` + `ColumnarRel` + the transition-inserter pass.**
-   Refactor the filter to consume/produce `ArrowBatch`; mark it columnar; second pass inserts
-   transposes around it. Parity-test a single-filter query — identical results, plan shows
-   `transpose → filter → transpose`.
+3. **One native operator to `Arrow → Arrow` + `ColumnarRel` + the transition-inserter pass.** ✅ DONE.
+   Filter now consumes/produces `ArrowBatch` (projecting columnar via `TransferPair`), is marked
+   `ColumnarRel`, and the second pass in `PhysicalPlanScan` inserts `RowDataToArrow`/`ArrowToRowData`
+   at columnar↔rowwise edges. All 15 filter parity tests pass end-to-end through
+   `transpose → filter → transpose`. **Key fix:** the C Data export must use the input batch's *own*
+   allocator (buffers associate only within one allocator root) — the operator's allocator owns only
+   the imported result. Transpose/native exec nodes declare `ArrowBatchTypeInformation` on columnar
+   edges so Flink uses the batch serializer, not Kryo.
 4. **Remaining native operators to `Arrow → Arrow`** (windows, sink), so multi-native chains
    drop the inter-operator conversions.
 5. **Columnar Parquet source**, then **Arrow across the shuffle**.

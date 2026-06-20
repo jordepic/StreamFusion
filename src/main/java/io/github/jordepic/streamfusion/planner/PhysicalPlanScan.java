@@ -31,7 +31,47 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
   @Override
   public RelNode optimize(RelNode root, StreamOptimizeContext context) {
     record(root);
-    return rewrite(root);
+    // Pass 1 substitutes native (columnar) operators; pass 2 inserts a row↔columnar transpose
+    // wherever a columnar rel meets a rowwise one, so adjacent columnar operators flow batches.
+    return insertTransitions(rewrite(root));
+  }
+
+  /** Inserts transpose rels at every columnar↔rowwise edge of the (already substituted) tree. */
+  private RelNode insertTransitions(RelNode node) {
+    List<RelNode> inputs = new ArrayList<>(node.getInputs().size());
+    boolean changed = false;
+    for (RelNode input : node.getInputs()) {
+      RelNode transitioned = insertTransitions(input);
+      RelNode adapted = adapt(node, transitioned);
+      inputs.add(adapted);
+      changed |= adapted != input;
+    }
+    return changed ? node.copy(node.getTraitSet(), inputs) : node;
+  }
+
+  /** Wraps {@code producer} in a transpose if its output carrier differs from what {@code consumer} expects. */
+  private RelNode adapt(RelNode consumer, RelNode producer) {
+    boolean consumerWantsColumnar = consumesColumnar(consumer);
+    boolean producerEmitsColumnar = emitsColumnar(producer);
+    if (consumerWantsColumnar && !producerEmitsColumnar) {
+      return new StreamPhysicalRowDataToArrow(
+          producer.getCluster(), producer.getTraitSet(), producer);
+    }
+    if (!consumerWantsColumnar && producerEmitsColumnar) {
+      return new StreamPhysicalArrowToRowData(
+          producer.getCluster(), producer.getTraitSet(), producer);
+    }
+    return producer;
+  }
+
+  /** Whether a rel produces Arrow batches (a native columnar operator, or a row→Arrow transpose). */
+  private static boolean emitsColumnar(RelNode node) {
+    return node instanceof ColumnarRel || node instanceof StreamPhysicalRowDataToArrow;
+  }
+
+  /** Whether a rel consumes Arrow batches (a native columnar operator, or an Arrow→row transpose). */
+  private static boolean consumesColumnar(RelNode node) {
+    return node instanceof ColumnarRel || node instanceof StreamPhysicalArrowToRowData;
   }
 
   private RelNode rewrite(RelNode node) {
