@@ -102,12 +102,23 @@ partitioner at runtime; the split uses our own `hash(key) % numberOfChannels`.
   sub-batches tagged with destination via the native split over JNI) + `ColumnarKeyGroupPartitioner`
   (`StreamPartitioner<ArrowBatch>` routing by the tag). Harness-tested: key→single channel, rows
   preserved, partitioner routes by tag.
-- **Planner integration (remaining):** replace a keyed `StreamExecExchange` with the columnar
-  exchange (split operator + `PartitionTransformation` using the partitioner), **coupled to
-  converting the downstream window to `ColumnarInput`** (ticket 21) — a columnar exchange must only
-  ever feed a native columnar window, never a fallen-back Flink one. Parity-test `GROUP BY key,
-  window` at parallelism 1 (single channel) and > 1 (split); the result set equals Flink's even
-  though the distribution differs. This is the end-to-end step that lights up columnar windows.
+- **Columnar window operator** ✅ DONE (ticket 21) — `NativeColumnarWindowAggregateOperator`
+  consumes Arrow batches and produces identical window aggregates; harness-verified.
+- **Planner integration (remaining) — blocked on columnar watermarks.** Wiring was drafted (a
+  `columnar` flag on the window exec node that drops the keyed exchange and does the split/partition
+  itself, a `ColumnarInput` window rel, and a rewrite that goes columnar when the window's input is
+  an exchange over a columnar source) but **reverted unbuilt**, because it cannot trigger end to end
+  yet:
+  - A windowed SQL query needs watermarks on the source. Flink realizes that as **either** a rowwise
+    `StreamPhysicalWatermarkAssigner` between source and window (which transposes the columnar source
+    back to rows — breaks the chain) **or** `SOURCE_WATERMARK()` (which needs the source to *emit*
+    watermarks — our native Parquet source doesn't, and the filesystem connector may not support it).
+  - **Prerequisite: columnar watermark handling** — either a columnar watermark-assigner operator
+    (Arrow→Arrow, computes the watermark from the time column without transposing) or the native
+    source emitting watermarks (e.g. `Watermark.MAX` at end-of-input for a bounded read, which fires
+    every window at the end — correct final results for a bounded job). With that, the window's input
+    edge stays columnar and the drafted wiring triggers; then parity-test `GROUP BY key, window` over
+    a columnar Parquet source at parallelism 1 (single channel) and > 1 (split).
 
 ## Interaction
 - Enables ticket 09 (a native chain spans a shuffle and stays columnar) and ticket 21's
