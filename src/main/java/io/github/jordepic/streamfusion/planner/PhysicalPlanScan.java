@@ -114,15 +114,6 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           scan.getCluster(), scan.getTraitSet(), scan.getRowType(), ParquetSourceMatcher.path(scan));
     }
 
-    if (current instanceof StreamPhysicalCalc && DoublingCalcMatcher.matches((Calc) current)) {
-      substitutions++;
-      return new StreamPhysicalNativeCalc(
-          current.getCluster(),
-          current.getTraitSet(),
-          current.getInputs().get(0),
-          current.getRowType());
-    }
-
     if (current instanceof StreamPhysicalCalc && FilterCalcMatcher.matches((Calc) current)) {
       Calc calc = (Calc) current;
       RexExpression condition = FilterCalcMatcher.encodedCondition(calc);
@@ -139,6 +130,17 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           condition.longs(),
           condition.doubles(),
           condition.strings());
+    }
+
+    if (current instanceof StreamPhysicalCalc && CalcMatcher.matches((Calc) current)) {
+      Calc calc = (Calc) current;
+      substitutions++;
+      return new StreamPhysicalNativeCalc(
+          calc.getCluster(),
+          calc.getTraitSet(),
+          calc.getInputs().get(0),
+          calc.getRowType(),
+          CalcMatcher.encode(calc));
     }
 
     if (current instanceof StreamPhysicalWindowAggregate) {

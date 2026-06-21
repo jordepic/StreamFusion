@@ -51,11 +51,12 @@ class NativePlannerTest {
     TableEnvironment tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
     PhysicalPlanScan scan = NativePlanner.install(tEnv);
 
+    // ABS is not an admitted expression op, so the whole projection falls back to the host.
     List<Integer> result =
-        collectInts(tEnv, "SELECT c0 * 3 AS tripled FROM (VALUES (3), (4), (5)) AS t(c0)");
+        collectInts(tEnv, "SELECT ABS(c0) AS a FROM (VALUES (3), (4), (5)) AS t(c0)");
 
-    assertEquals(0, scan.substitutions(), "non-matching projection should not be substituted");
-    assertEquals(List.of(9, 12, 15), result);
+    assertEquals(0, scan.substitutions(), "an unsupported projection should not be substituted");
+    assertEquals(List.of(3, 4, 5), result);
   }
 
   private static List<Integer> collectInts(TableEnvironment tEnv, String sql) throws Exception {

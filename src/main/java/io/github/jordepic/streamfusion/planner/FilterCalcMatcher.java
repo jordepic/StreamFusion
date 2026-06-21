@@ -62,7 +62,7 @@ final class FilterCalcMatcher {
   }
 
   /** Whether every input column has a type the whole-row converter can carry. */
-  private static boolean convertibleRow(RelDataType inputType) {
+  static boolean convertibleRow(RelDataType inputType) {
     for (RelDataType field : inputType.getFieldList().stream().map(f -> f.getType()).toList()) {
       switch (field.getSqlTypeName()) {
         case TINYINT:

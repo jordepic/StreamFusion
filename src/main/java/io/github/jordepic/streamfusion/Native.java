@@ -113,6 +113,42 @@ public final class Native {
   public static native void closeFilterExpression(long handle);
 
   /**
+   * Compiles an encoded Calc — an optional condition tree plus the projection trees, sharing one set
+   * of pools, with each tree's root in {@code projectionRoots}/{@code conditionRoot} — into a
+   * reusable handle. Released with {@link #closeCalcExpression(long)}.
+   *
+   * @param projectionRoots the pre-order node index of each projection tree's root
+   * @param conditionRoot the condition tree's root index, or -1 if there is no condition
+   * @param outputNames the output column names, in order
+   */
+  public static native long createCalcExpression(
+      int[] kinds,
+      int[] payload,
+      int[] childCounts,
+      long[] longs,
+      double[] doubles,
+      String[] strings,
+      int[] projectionRoots,
+      int conditionRoot,
+      String[] outputNames);
+
+  /**
+   * Runs a batch the JVM exported through a compiled Calc handle — filtering by the condition, then
+   * projecting — writing the output batch into the consumer-allocated output C structs.
+   *
+   * @param handle a handle from {@link #createCalcExpression}
+   */
+  public static native void calcExpression(
+      long handle,
+      long inArrayAddress,
+      long inSchemaAddress,
+      long outArrayAddress,
+      long outSchemaAddress);
+
+  /** Releases a compiled Calc handle and its native state. */
+  public static native void closeCalcExpression(long handle);
+
+  /**
    * Writes an Arrow batch the JVM exported to a Parquet file at {@code path}, encoding it in its
    * columnar form directly rather than through the host's row-to-Parquet path. The core of the
    * native columnar sink.
