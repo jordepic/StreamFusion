@@ -2,10 +2,14 @@ package io.github.jordepic.streamfusion.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
+import org.apache.calcite.rex.RexLocalRef;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexProgram;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.type.SqlTypeName;
 
@@ -38,6 +42,9 @@ final class RexExpression {
   private final List<Long> longs = new ArrayList<>();
   private final List<Double> doubles = new ArrayList<>();
   private final List<String> strings = new ArrayList<>();
+  private final List<Integer> projectionRoots = new ArrayList<>();
+  private int conditionRoot = -1;
+  private String[] outputNames = new String[0];
 
   private RexExpression() {}
 
@@ -45,6 +52,50 @@ final class RexExpression {
   static RexExpression encode(RexNode node) {
     RexExpression encoder = new RexExpression();
     return encoder.emit(node) ? encoder : null;
+  }
+
+  /**
+   * Encodes a whole {@link Calc} — its optional condition followed by every projection expression —
+   * into one shared set of pools, recording each tree's root node. Returns null if any node is an
+   * operation the native engine does not admit, so the Calc falls back to the host.
+   */
+  static RexExpression encodeCalc(Calc calc) {
+    RexProgram program = calc.getProgram();
+    RexExpression encoder = new RexExpression();
+    if (program.getCondition() != null) {
+      RexNode condition =
+          RexUtil.expandSearch(
+              calc.getCluster().getRexBuilder(),
+              null,
+              program.expandLocalRef(program.getCondition()));
+      encoder.conditionRoot = encoder.kinds.size();
+      if (!encoder.emit(condition)) {
+        return null;
+      }
+    }
+    for (RexLocalRef ref : program.getProjectList()) {
+      encoder.projectionRoots.add(encoder.kinds.size());
+      if (!encoder.emit(program.expandLocalRef(ref))) {
+        return null;
+      }
+    }
+    encoder.outputNames = calc.getRowType().getFieldNames().toArray(new String[0]);
+    return encoder;
+  }
+
+  /** The pre-order node index of each projection tree's root. */
+  int[] projectionRoots() {
+    return toIntArray(projectionRoots);
+  }
+
+  /** The condition tree's root node index, or -1 if the Calc has no condition. */
+  int conditionRoot() {
+    return conditionRoot;
+  }
+
+  /** The Calc's output column names, in order. */
+  String[] outputNames() {
+    return outputNames;
   }
 
   int[] kinds() {

@@ -13,18 +13,72 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * Physical plan node that stands in for a projection the native operator can execute. It carries
- * the same output type and traits as the node it replaces, so the rest of the plan is unaffected,
- * and its only job is to translate to the native execution node.
+ * Physical node standing in for a {@link org.apache.calcite.rel.core.Calc} the native operator runs:
+ * an optional filter condition plus the projection expressions, both encoded for the native engine.
+ * The general form of the native filter — it covers computed columns and constants as well as column
+ * subsets. Keeps the replaced node's output type and traits; stateless, so no watermark.
  */
-public class StreamPhysicalNativeCalc extends SingleRel implements StreamPhysicalRel {
+public class StreamPhysicalNativeCalc extends SingleRel
+    implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
 
   private final RelDataType outputRowType;
+  private final int[] kinds;
+  private final int[] payload;
+  private final int[] childCounts;
+  private final long[] longs;
+  private final double[] doubles;
+  private final String[] strings;
+  private final int[] projectionRoots;
+  private final int conditionRoot;
+  private final String[] outputNames;
 
   public StreamPhysicalNativeCalc(
-      RelOptCluster cluster, RelTraitSet traitSet, RelNode input, RelDataType outputRowType) {
+      RelOptCluster cluster,
+      RelTraitSet traitSet,
+      RelNode input,
+      RelDataType outputRowType,
+      RexExpression encoded) {
+    this(
+        cluster,
+        traitSet,
+        input,
+        outputRowType,
+        encoded.kinds(),
+        encoded.payload(),
+        encoded.childCounts(),
+        encoded.longs(),
+        encoded.doubles(),
+        encoded.strings(),
+        encoded.projectionRoots(),
+        encoded.conditionRoot(),
+        encoded.outputNames());
+  }
+
+  private StreamPhysicalNativeCalc(
+      RelOptCluster cluster,
+      RelTraitSet traitSet,
+      RelNode input,
+      RelDataType outputRowType,
+      int[] kinds,
+      int[] payload,
+      int[] childCounts,
+      long[] longs,
+      double[] doubles,
+      String[] strings,
+      int[] projectionRoots,
+      int conditionRoot,
+      String[] outputNames) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
+    this.kinds = kinds;
+    this.payload = payload;
+    this.childCounts = childCounts;
+    this.longs = longs;
+    this.doubles = doubles;
+    this.strings = strings;
+    this.projectionRoots = projectionRoots;
+    this.conditionRoot = conditionRoot;
+    this.outputNames = outputNames;
   }
 
   @Override
@@ -39,7 +93,20 @@ public class StreamPhysicalNativeCalc extends SingleRel implements StreamPhysica
 
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-    return new StreamPhysicalNativeCalc(getCluster(), traitSet, inputs.get(0), outputRowType);
+    return new StreamPhysicalNativeCalc(
+        getCluster(),
+        traitSet,
+        inputs.get(0),
+        outputRowType,
+        kinds,
+        payload,
+        childCounts,
+        longs,
+        doubles,
+        strings,
+        projectionRoots,
+        conditionRoot,
+        outputNames);
   }
 
   @Override
@@ -48,6 +115,15 @@ public class StreamPhysicalNativeCalc extends SingleRel implements StreamPhysica
         ShortcutUtils.unwrapTableConfig(this),
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
-        getRelDetailedDescription());
+        getRelDetailedDescription(),
+        kinds,
+        payload,
+        childCounts,
+        longs,
+        doubles,
+        strings,
+        projectionRoots,
+        conditionRoot,
+        outputNames);
   }
 }

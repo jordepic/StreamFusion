@@ -1317,6 +1317,175 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeFilterEx
     }
 }
 
+/// A compiled expression tree against a schema, coerced like the planner's logical pipeline so the
+/// physical expression sees the operand types the host would.
+fn compile_expr(
+    schema: &SchemaRef,
+    df_schema: &DFSchema,
+    kinds: &[i64],
+    payload: &[i64],
+    child_counts: &[i64],
+    longs: &[i64],
+    doubles: &[f64],
+    strings: &[Option<String>],
+    root: usize,
+) -> Arc<dyn PhysicalExpr> {
+    let mut cursor = root;
+    let logical =
+        build_expr(schema, kinds, payload, child_counts, longs, doubles, strings, &mut cursor);
+    let context = SimplifyContext::default().with_schema(Arc::new(df_schema.clone()));
+    let coerced =
+        ExprSimplifier::new(context).coerce(logical, df_schema).expect("failed to coerce expr");
+    create_physical_expr(&coerced, df_schema, &ExecutionProps::new()).expect("failed to compile expr")
+}
+
+/// The compiled form of a Calc: an optional filter predicate plus the projection expressions.
+struct CompiledCalc {
+    condition: Option<Arc<dyn PhysicalExpr>>,
+    projections: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+/// A compiled Calc held across batches: an optional condition and a list of projection expressions
+/// (each an encoded tree rooted in the shared pools), built once against the first batch's schema.
+/// It filters rows by the condition, then evaluates each projection over the survivors to form the
+/// output batch — the general form of the filter-plus-column-subset path, also covering computed
+/// columns and constants.
+struct CalcExpression {
+    kinds: Vec<i64>,
+    payload: Vec<i64>,
+    child_counts: Vec<i64>,
+    longs: Vec<i64>,
+    doubles: Vec<f64>,
+    strings: Vec<Option<String>>,
+    projection_roots: Vec<usize>,
+    condition_root: i64,
+    output_names: Vec<String>,
+    compiled: Option<CompiledCalc>,
+}
+
+impl CalcExpression {
+    fn compiled(&mut self, schema: &SchemaRef) -> &CompiledCalc {
+        if self.compiled.is_none() {
+            let df_schema = DFSchema::try_from(schema.as_ref().clone()).expect("failed to build schema");
+            let compile = |root: usize| {
+                compile_expr(
+                    schema,
+                    &df_schema,
+                    &self.kinds,
+                    &self.payload,
+                    &self.child_counts,
+                    &self.longs,
+                    &self.doubles,
+                    &self.strings,
+                    root,
+                )
+            };
+            let condition = (self.condition_root >= 0).then(|| compile(self.condition_root as usize));
+            let projections = self.projection_roots.iter().map(|&r| compile(r)).collect();
+            self.compiled = Some(CompiledCalc { condition, projections });
+        }
+        self.compiled.as_ref().unwrap()
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> RecordBatch {
+        let (condition, projections) = {
+            let compiled = self.compiled(&batch.schema());
+            (compiled.condition.clone(), compiled.projections.clone())
+        };
+        let filtered = match condition {
+            Some(predicate) => {
+                let evaluated = predicate
+                    .evaluate(&batch)
+                    .expect("failed to evaluate condition")
+                    .into_array(batch.num_rows())
+                    .expect("failed to materialize condition");
+                let mask = evaluated
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("condition must be boolean");
+                filter_record_batch(&batch, mask).expect("failed to filter batch")
+            }
+            None => batch,
+        };
+        let rows = filtered.num_rows();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(projections.len());
+        for (i, projection) in projections.iter().enumerate() {
+            let array = projection
+                .evaluate(&filtered)
+                .expect("failed to evaluate projection")
+                .into_array(rows)
+                .expect("failed to materialize projection");
+            fields.push(Field::new(&self.output_names[i], array.data_type().clone(), true));
+            columns.push(array);
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("failed to build output")
+    }
+}
+
+/// Compiles an encoded Calc (optional condition + projection trees) into a reusable handle, released
+/// with `closeCalcExpression`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createCalcExpression<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    kinds: JIntArray<'local>,
+    payload: JIntArray<'local>,
+    child_counts: JIntArray<'local>,
+    longs: JLongArray<'local>,
+    doubles: JDoubleArray<'local>,
+    strings: JObjectArray<'local>,
+    projection_roots: JIntArray<'local>,
+    condition_root: jint,
+    output_names: JObjectArray<'local>,
+) -> jlong {
+    let expression = CalcExpression {
+        kinds: read_kinds(&env, &kinds),
+        payload: read_kinds(&env, &payload),
+        child_counts: read_kinds(&env, &child_counts),
+        longs: read_longs(&env, &longs),
+        doubles: read_doubles(&env, &doubles),
+        strings: read_strings(&mut env, &strings),
+        projection_roots: read_kinds(&env, &projection_roots).into_iter().map(|r| r as usize).collect(),
+        condition_root: condition_root as i64,
+        output_names: read_strings(&mut env, &output_names)
+            .into_iter()
+            .map(|s| s.expect("output name"))
+            .collect(),
+        compiled: None,
+    };
+    Box::into_raw(Box::new(expression)) as jlong
+}
+
+/// Runs a batch from the JVM through a compiled Calc handle, exporting the projected output batch.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_calcExpression<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let expression = unsafe { &mut *(handle as *mut CalcExpression) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let result = expression.evaluate(batch);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases a compiled Calc handle and its native state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeCalcExpression<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut CalcExpression));
+    }
+}
+
 /// Encodes a single Arrow batch to a Parquet file. The core of the native columnar sink: the batch
 /// is written in its columnar form directly, skipping the host's row-to-Parquet encoding.
 fn write_parquet(batch: &RecordBatch, path: &str) {
@@ -2078,6 +2247,60 @@ mod tests {
             read,
             write
         );
+    }
+
+    fn ab_batch() -> RecordBatch {
+        let a: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+        let b: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+            ])),
+            vec![a, b],
+        )
+        .unwrap()
+    }
+
+    // A Calc with no condition projects computed columns: [a + b, a].
+    #[test]
+    fn calc_projects_computed_columns() {
+        let mut calc = CalcExpression {
+            kinds: vec![6, 0, 0, 0],
+            payload: vec![0, 0, 1, 0], // CALL(+), col a, col b; col a
+            child_counts: vec![2, 0, 0, 0],
+            longs: vec![],
+            doubles: vec![],
+            strings: vec![],
+            projection_roots: vec![0, 3],
+            condition_root: -1,
+            output_names: vec!["sum".to_string(), "a".to_string()],
+            compiled: None,
+        };
+        let out = calc.evaluate(ab_batch());
+        assert_eq!(out.schema().field(0).name(), "sum");
+        assert_eq!(out.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(), &[11, 22, 33]);
+        assert_eq!(out.column(1).as_any().downcast_ref::<Int64Array>().unwrap().values(), &[1, 2, 3]);
+    }
+
+    // A Calc filters by the condition (a > 2), then projects the survivors.
+    #[test]
+    fn calc_filters_then_projects() {
+        let mut calc = CalcExpression {
+            kinds: vec![6, 0, 1, 0],
+            payload: vec![10, 0, 0, 0], // CALL(>), col a, lit; col a
+            child_counts: vec![2, 0, 0, 0],
+            longs: vec![2],
+            doubles: vec![],
+            strings: vec![],
+            projection_roots: vec![3],
+            condition_root: 0,
+            output_names: vec!["a".to_string()],
+            compiled: None,
+        };
+        let out = calc.evaluate(ab_batch());
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(), &[3]);
     }
 
     // The by-key split sends every row with the same key to the same partition and preserves all

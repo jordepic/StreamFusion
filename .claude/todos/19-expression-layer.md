@@ -63,12 +63,20 @@ project; record any deliberate semantic choice in `divergences/`.
    `filterExpression` handle. The filter routes through it; all existing filter
    tests pass via the general path, with added arithmetic-predicate and
    unsupported-function-fallback tests.
-2. **General projection.** The Calc projection becomes a list of expressions
-   evaluated via `select`; output rows built from the result. Subsumes the
-   column-subset projection and unlocks computed columns and equality (the folded
-   constant projection becomes a literal expression).
-3. **Fuse + expand.** One native Calc operator doing projection+filter in a
-   single pass; widen the admitted op/function set with parity tests.
+2. **General projection.** ✅ DONE — a unified native `Calc` (`CalcExpression`): an optional
+   condition then a list of projection expressions, all encoded into one set of pools with each
+   tree's root recorded (`encodeCalc`). It filters by the condition, then evaluates each projection
+   over the survivors to form the output batch. Columnar in/out (`NativeCalcOperator`,
+   `ColumnarInput`/`ColumnarOutput`), routed by `CalcMatcher`; the old doubling-demo projection is
+   retired and subsumed. Parity-verified: computed columns, constants, mixed, projection+filter, and
+   an un-admitted function falls back. The pure filter-plus-column-subset shape still routes through
+   the filter operator (its column-transfer projection avoids evaluating identity exprs) — **unify
+   the filter into the Calc later** (the Calc subsumes it; kept separate now to avoid churn/regress).
+3. **Fuse + expand.** Projection+filter are now one native pass (done). Remaining: **widen the
+   admitted op/function set** with parity tests — `/` and `%` (integer-division parity!), `CAST`,
+   string/temporal functions, `CASE`/`COALESCE`, `IS NULL`, etc. Each admitted only once a parity
+   test confirms DataFusion matches Flink; un-admitted ops fall back. This is the long tail toward
+   broad coverage.
 
 ## Acceptance criteria
 - Existing filter/projection tests pass via the general expression path.
