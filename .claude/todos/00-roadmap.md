@@ -18,29 +18,30 @@ here when the ticket is deleted.
   Parquet sink (row source) 1.05×, bare filter 0.83×.
 
 ## Next, roughly in order
-1. **Columnar shuffle — Arrow across the keyBy/exchange** (ticket 10). **Mechanism DONE** (native
-   by-key split + `SplitByKeyGroupOperator` + `ColumnarKeyGroupPartitioner`, tested). The hash is a
-   plain consistent hash (no Flink-hash reproduction needed — it only distributes work; the keyed
-   consumer is our own native operator). **Remaining: planner integration** — replace a keyed
-   `StreamExecExchange` with the columnar exchange, coupled to converting the downstream window to
-   `ColumnarInput` (item 2). That end-to-end step lights up columnar windows + columnar two-phase.
-2. **Columnar windows** (ticket 21, gated on #1). Convert the window operators to `Arrow → Arrow`
-   + mark `ColumnarInput`/`ColumnarOutput`, so a filter→window chain and the windowed input edge
-   stay columnar. Blocked on #1 because windows sit downstream of a keyBy.
-3. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
+1. **Columnar windows end to end** (tickets 10, 21). **Built + tested in isolation:** the columnar
+   shuffle mechanism (native by-key split + `SplitByKeyGroupOperator` + `ColumnarKeyGroupPartitioner`)
+   AND the columnar window operator (`NativeColumnarWindowAggregateOperator`). The hash is a plain
+   consistent hash (no Flink-hash reproduction — it only distributes work; the keyed consumer is our
+   own native operator). **Blocked on columnar watermarks:** the planner wiring to connect them
+   (drop the keyed exchange, route the window through the columnar operator) can't trigger because a
+   windowed query's watermark arrives via a *rowwise* watermark-assigner (transposes the columnar
+   source back to rows) or `SOURCE_WATERMARK()` (source must emit watermarks — ours doesn't). So the
+   **next required piece is a columnar watermark-assigner or source watermark emission** (ticket 10);
+   then the drafted window wiring lights up and is parity-tested over a columnar Parquet source.
+2. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
    roll by size/row-count so output file count is independent of read-batch size. Independent of
    the shuffle; improves output quality and throughput.
-4. **Expression layer stages 2–3** (ticket 19): general/computed projection (unblocks the
+3. **Expression layer stages 2–3** (ticket 19): general/computed projection (unblocks the
    constant-folded `=` filter), fuse projection+filter, widen the op set; plus the residual
    narrow-int (`TINYINT`/`SMALLINT`) arithmetic-overflow parity check.
-5. **Wider value/key types** (ticket 04): SMALLINT/TINYINT/FLOAT `SUM`/`AVG`, DECIMAL/TIMESTAMP
+4. **Wider value/key types** (ticket 04): SMALLINT/TINYINT/FLOAT `SUM`/`AVG`, DECIMAL/TIMESTAMP
    grouping keys, multiple value columns, `COUNT(*)`.
-6. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
+5. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only.
-7. **Operator-level perf** (ticket 20 backlog): Java column-vectorized whole-row converter (the
+6. **Operator-level perf** (ticket 20 backlog): Java column-vectorized whole-row converter (the
    transpose is cell-at-a-time), per-row `GroupKey` allocation in aggregators, session `update`
    one-row `take` batching.
-8. **Acceleration policy** (ticket 09): now that lone stateless islands measure < 1× (bare filter
+7. **Acceleration policy** (ticket 09): now that lone stateless islands measure < 1× (bare filter
    0.83×), decide whether to refuse substituting an operator that would be an isolated island with
    row endpoints on both sides, vs always substitute. Benchmark-informed.
 
