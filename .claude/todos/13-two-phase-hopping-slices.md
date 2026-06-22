@@ -1,16 +1,18 @@
-# Two-phase cumulative windows (slice sharing)
+# Two-phase slice-sharing windows (remaining: gcd hopping)
 
-**Status:** open — two-phase **hopping** is DONE (slide divides size; see
-divergences/06). What remains is two-phase **cumulative**, which is also
-slice-based, plus two-phase hopping for the `gcd(size,slide) < slide` ratios that
-currently fall back.
-**Source:** discovered probing HOP; one-phase HOP/CUMULATE and two-phase HOP done
+**Status:** two-phase **hopping** (slide divides size) and two-phase **cumulative** are both DONE.
+What remains is only two-phase hopping for the `gcd(size,slide) < slide` ratios that currently fall
+back (finer `gcd` slice).
+**Source:** discovered probing HOP; one-phase HOP/CUMULATE, two-phase HOP and CUMULATE all done.
+
+## Two-phase cumulative — done
+The global fan-out (`update_partial`) branches on the cumulative flag: a slice ending at `E` merges
+into the nested windows `(base, E), (base, E+step), …, (base, base+max_size)` of its bucket.
+**Key finding:** unlike HOP, the planner's two-phase `CUMULATE` inserts **no** synthetic `count1$1`
+column — the local partials are exactly the user aggregates — so cumulative reuses the plain user
+kinds on both halves with no count to merge and project away.
 
 ## Remaining
-- Two-phase `CUMULATE`: like hopping it is slice-shared by default, but the
-  window→slice fan differs (nested windows sharing a start). The global fan-out
-  added for hopping (`update_partial`) assumes fixed-size windows stepping by the
-  slide; cumulative needs the nested-end mapping instead.
 - Two-phase hopping where the slide does not divide the size (finer `gcd` slice).
 
 ## Why

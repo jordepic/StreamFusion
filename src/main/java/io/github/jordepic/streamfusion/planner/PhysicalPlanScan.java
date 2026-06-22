@@ -15,6 +15,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalS
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWatermarkAssigner;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.plan.optimize.program.StreamOptimizeContext;
@@ -372,6 +373,31 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             IntervalJoinMatcher.rightTime(join),
             IntervalJoinMatcher.lowerMillis(join),
             IntervalJoinMatcher.upperMillis(join));
+      }
+    }
+
+    if (current instanceof StreamPhysicalWindowJoin) {
+      StreamPhysicalWindowJoin join = (StreamPhysicalWindowJoin) current;
+      if (WindowJoinMatcher.matches(join)) {
+        substitutions++;
+        int[] leftKeys = WindowJoinMatcher.leftKeys(join);
+        int[] rightKeys = WindowJoinMatcher.rightKeys(join);
+        // Shuffle each input by its join key (columnar where it sits on a columnar producer), the
+        // same coupling as the interval join. The window join then matches per window in its state.
+        RelNode left = columnarJoinInput(join.getLeft(), leftKeys);
+        RelNode right = columnarJoinInput(join.getRight(), rightKeys);
+        return new StreamPhysicalNativeWindowJoin(
+            join.getCluster(),
+            join.getTraitSet(),
+            left,
+            right,
+            join.getRowType(),
+            leftKeys,
+            rightKeys,
+            WindowJoinMatcher.leftWindowStart(join),
+            WindowJoinMatcher.leftWindowEnd(join),
+            WindowJoinMatcher.rightWindowStart(join),
+            WindowJoinMatcher.rightWindowEnd(join));
       }
     }
 
