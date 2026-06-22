@@ -93,21 +93,21 @@ the debug build and 3.0× on release — same code.)
 | Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.32 M rows/s | 3.45 M rows/s | **2.61×** |
 | Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.80 M rows/s | 3.29 M rows/s | **1.82×** |
 | Interval join (event-time) | `a JOIN b ON a.k=b.k AND a.rt BETWEEN b.rt ± 1s` | 0.37 M rows/s | 0.63 M rows/s | **1.71×** |
-| Tumbling (row source) | `SUM` by 1s window | 1.63 M rows/s | 1.99 M rows/s | **1.22×** |
-| `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.85 M rows/s | 1.04 M rows/s | **1.22×** |
-| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.22 M rows/s | 1.11 M rows/s | **0.91×** |
-| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.11 M rows/s | 2.25 M rows/s | **0.72×** |
+| `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.91 M rows/s | 1.42 M rows/s | **1.56×** |
+| Tumbling (row source) | `SUM` by 1s window | 1.69 M rows/s | 2.10 M rows/s | **1.24×** |
+| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.15 M rows/s | 1.22 M rows/s | **1.06×** |
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.23 M rows/s | 2.41 M rows/s | **0.75×** |
 
 The gain tracks how much of the pipeline stays columnar. Fully-columnar paths lead — the copy
 **2.61×**, the windowed aggregate over a columnar source **1.82×**, the event-time interval join
 **1.71×** (Flink's interval join is slow; ours delegates the match to a DataFusion hash join).
-Row-source stateful ops land near **1.22×** (tumbling, `OVER`): identical native compute, but a
-`RowData → Arrow` transpose still sits at the input. The two below 1× are both **lone row-source
-operators** where the transpose tax exceeds the native gain — the Parquet sink **0.91×** (one
-boundary transpose ≈ the native write gain) and the stateless filter **0.72×** (a single cheap
-predicate cannot earn back the `RowData → Arrow → RowData` round-trip). A lone operator crosses 1×
-once fed by a columnar source or chained with other native operators (no transpose between them) —
-the native-operator-chaining work in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
+Row-source ops still pay a `RowData → Arrow` transpose at the input, but it got ~25% cheaper when the
+converter was made row-major + pre-sized ([ticket 28](../.claude/todos/28-native-row-transpose-and-shuffle.md)):
+`OVER` running `SUM` rises to **1.56×**, tumbling to **1.24×**, and the **Parquet sink crosses 1× to
+1.06×**. The lone stateless **filter stays below 1× at 0.75×** — a single cheap predicate cannot earn
+back the `RowData → Arrow → RowData` round-trip. A lone operator crosses 1× once fed by a columnar
+source or chained with other native operators (no transpose between them) — the native-operator-
+chaining work in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
 
 ### How we got these numbers (a profiling lesson)
 

@@ -18,7 +18,7 @@
 
 **So the original "refuse lone islands via a cost model" premise was wrong** — Comet does not do
 that. A lone filter looks bad only with a *row* source; in Spark the source is a columnar scan, so
-the filter's child is native and the region is columnar-anchored. Our bare-filter 0.72× is the
+the filter's child is native and the region is columnar-anchored. Our bare-filter 0.75× is the
 `row → columnar → row` case Comet also pays with a row source; its only mitigation is config.
 
 **What we already match:** greedy bottom-up substitution + transposes only at columnar↔row edges
