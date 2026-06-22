@@ -8,6 +8,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSink;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
@@ -293,6 +294,22 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             keyColumns,
             valueType,
             kinds);
+      }
+    }
+
+    if (current instanceof StreamPhysicalOverAggregate) {
+      StreamPhysicalOverAggregate over = (StreamPhysicalOverAggregate) current;
+      if (OverAggregateMatcher.matches(over)) {
+        substitutions++;
+        return new StreamPhysicalNativeOverAggregate(
+            over.getCluster(),
+            over.getTraitSet(),
+            over.getInputs().get(0),
+            over.getRowType(),
+            OverAggregateMatcher.timeColumn(over),
+            OverAggregateMatcher.valueColumnIndex(over),
+            OverAggregateMatcher.valueTypeCode(over),
+            OverAggregateMatcher.kinds(over));
       }
     }
 
