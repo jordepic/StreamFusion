@@ -108,6 +108,87 @@ class ThroughputBenchmark {
   }
 
   @Test
+  void windowedColumnarSourceThroughput() throws Exception {
+    // Fully-columnar windowed pipeline: native Parquet source → watermark assigner → columnar
+    // exchange → columnar window (two-phase by default). Compared against the host running the same
+    // query row-fed. Isolates the gain from never transposing to RowData in a stateful pipeline.
+    Path input = Files.createTempDirectory("bench-window-in");
+    writeWindowInput(input);
+    double flink = bestOfWindow(input, false);
+    double nativeRun = bestOfWindow(input, true);
+    System.out.printf(
+        "%n[benchmark] Windowed aggregate over a columnar Parquet source (1s SUM) over %,d rows"
+            + " (best of %d)%n",
+        ROWS, RUNS);
+    System.out.printf("[benchmark]   Flink : %6.3f s  (%,.0f rows/s)%n", flink, ROWS / flink);
+    System.out.printf(
+        "[benchmark]   Native: %6.3f s  (%,.0f rows/s)  %.2fx vs Flink%n",
+        nativeRun, ROWS / nativeRun, flink / nativeRun);
+  }
+
+  private static double bestOfWindow(Path input, boolean useNative) throws Exception {
+    double best = Double.MAX_VALUE;
+    for (int run = 0; run < WARMUP + RUNS; run++) {
+      double seconds = windowRunOnce(input, useNative);
+      if (run >= WARMUP) {
+        best = Math.min(best, seconds);
+      }
+    }
+    return best;
+  }
+
+  /** One windowed aggregate reading the Parquet input into a discarding sink, timed to completion. */
+  private static double windowRunOnce(Path input, boolean useNative) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.executeSql(
+        "CREATE TABLE t (v BIGINT, rt TIMESTAMP_LTZ(3), WATERMARK FOR rt AS rt - INTERVAL '1'"
+            + " SECOND) WITH ('connector' = 'filesystem', 'path' = '"
+            + input.toUri()
+            + "', 'format' = 'parquet')");
+    tEnv.executeSql(
+        "CREATE TABLE sink (window_start TIMESTAMP_LTZ(3), window_end TIMESTAMP_LTZ(3), total BIGINT)"
+            + " WITH ('connector' = 'blackhole')");
+    PhysicalPlanScan scan = useNative ? NativePlanner.install(tEnv) : null;
+    long start = System.nanoTime();
+    tEnv.executeSql(
+            "INSERT INTO sink SELECT window_start, window_end, SUM(v) AS total FROM TABLE(TUMBLE("
+                + "TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) GROUP BY window_start, window_end")
+        .await();
+    double seconds = (System.nanoTime() - start) / 1e9;
+    if (useNative && scan.substitutions() < 3) {
+      throw new IllegalStateException("native source+watermark+window did not engage; moot");
+    }
+    return seconds;
+  }
+
+  private static void writeWindowInput(Path directory) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    env.enableCheckpointing(1000);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    // rt = row index in millis (monotonic), so each 1-second window holds 1000 rows.
+    DataStream<Row> source =
+        env.fromSequence(0, ROWS - 1)
+            .map(i -> Row.of((long) (i % 100), java.time.Instant.ofEpochMilli(i)))
+            .returns(Types.ROW_NAMED(new String[] {"v", "rt"}, Types.LONG, Types.INSTANT));
+    tEnv.createTemporaryView(
+        "ws",
+        source,
+        Schema.newBuilder()
+            .column("v", DataTypes.BIGINT())
+            .column("rt", DataTypes.TIMESTAMP_LTZ(3))
+            .build());
+    tEnv.executeSql(
+        "CREATE TABLE win_write (v BIGINT, rt TIMESTAMP_LTZ(3)) WITH ('connector' = 'filesystem',"
+            + " 'path' = '"
+            + directory.toUri()
+            + "', 'format' = 'parquet')");
+    tEnv.executeSql("INSERT INTO win_write SELECT * FROM ws").await();
+  }
+
+  @Test
   void parquetCopyThroughput() throws Exception {
     // A Parquet input directory both runs read (written once).
     Path input = Files.createTempDirectory("bench-copy-in");

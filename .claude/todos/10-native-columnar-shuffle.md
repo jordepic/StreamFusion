@@ -18,6 +18,10 @@ all parity-green. The shuffle uses its own co-locating hash, not Flink's key-gro
 because the window re-groups in operator state ([divergences/10](../../divergences/10-columnar-exchange-own-hash.md)).
 The `ArrowBatchSerializer` releases the batch after serializing it onto the network edge.
 
+Measured: the fully-columnar windowed pipeline over a Parquet source is **1.91× vs Flink** at
+5M rows (`ThroughputBenchmark.windowedColumnarSourceThroughput`), vs 1.21× for the same window
+fed by a row source (the difference is the transpose the columnar path removes).
+
 **Remaining:** higher-parallelism shuffle coverage (tests are p=1, where the split is one
 channel; multi-channel split is unit-tested in `SplitByKeyGroupOperatorTest`); session windows
 are single-phase only (no two-phase split), so unaffected.

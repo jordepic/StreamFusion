@@ -88,21 +88,25 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
 | Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.33 M rows/s | 4.23 M rows/s | **3.19×** |
-| Tumbling window aggregate | `SUM` by 1s window | 1.48 M rows/s | 1.79 M rows/s | **1.21×** |
+| Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.86 M rows/s | 3.55 M rows/s | **1.91×** |
+| Tumbling window aggregate (row source) | `SUM` by 1s window | 1.48 M rows/s | 1.79 M rows/s | **1.21×** |
 | Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.16 M rows/s | 1.22 M rows/s | **1.05×** |
 | Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 2.82 M rows/s | 2.34 M rows/s | **0.83×** |
 
 Native wins where it does real columnar work and the transpose tax is small relative to
 it. The **fully-columnar Parquet copy is 3.19×** — the data is read as Arrow, flows through
 the native sink, and is written as Arrow, never becoming `RowData`, while Flink round-trips
-every row through its runtime at both ends. A **tumbling aggregate is 1.21×** even though a
-`RowData → Arrow` transpose still sits at its input. The **row-source Parquet sink is ~par
-(1.05×)**: the one transpose at the boundary roughly cancels the native write gain. The
-**stateless filter is 0.83×** — the one case below 1×, and expectedly so: a single cheap
-predicate does not earn back the `RowData → Arrow → RowData` round-trip the lone operator
-pays. It crosses 1× once it stops paying that round-trip — fed by a columnar source, or
-chained with other native operators so no transpose sits between them (the columnar-flow
-mechanism is built; widening the columnar region is what lifts these further).
+every row through its runtime at both ends. The **windowed aggregate over a columnar source is
+1.91×**: the same stateful two-phase window as the row-source case, but fed by a native Parquet
+source so the whole pipeline — source → watermark assigner → keyed shuffle → local/global window
+— flows Arrow with no transpose, including across the shuffle. That is what the **row-source
+tumbling aggregate (1.21×)** leaves on the table: identical native compute, but a `RowData →
+Arrow` transpose still sits at its input because the source is a row stream. The **row-source
+Parquet sink is ~par (1.05×)**: the one transpose at the boundary roughly cancels the native
+write gain. The **stateless filter is 0.83×** — the one case below 1×, and expectedly so: a
+single cheap predicate does not earn back the `RowData → Arrow → RowData` round-trip the lone
+operator pays. The pattern is consistent: the gain tracks how much of the pipeline stays
+columnar, and the windowed-source case shows a stateful pipeline that never leaves Arrow.
 
 _Apple M1 Max; numbers are comparable only within a machine._
 
