@@ -24,7 +24,11 @@ here when the ticket is deleted.
   below 1× are lone row-source operators paying the transpose tax (ticket 21).
 
 ## Next, roughly in order
-1. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
+1. **Native row→Arrow transpose + fused keyed shuffle** (ticket 28). Move the `RowData → Arrow`
+   columnar build off the JVM (slow Arrow-Java per-cell) to native Rust (`arrow-rs` builders), the
+   way `arrow-avro` decodes row bytes → Arrow: JVM does a cheap row serialize, native decodes (and
+   optionally splits by key). Attacks the transpose tax that caps row-source ops. Benchmark-gated.
+2. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
    roll by size/row-count so output file count is independent of read-batch size. Independent of
    the shuffle; improves output quality and throughput.
 3. **Expression layer stages 2–3** (ticket 19): general/computed projection (unblocks the
