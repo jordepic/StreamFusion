@@ -36,15 +36,35 @@ the whole batch is forwarded with a single watermark, no slicing. In-order data 
 every benchmark, the common case — therefore pays nothing, and the windowed
 benchmark is unchanged at 1.91×.
 
-## Residual: Flink's non-deterministic periodic emission
-Besides the eager rule, Flink also emits on a 200 ms **processing-time** timer.
-For out-of-order data near a window boundary, that makes **Flink itself
-non-deterministic** — two runs of the same job can drop different rows depending
-on wall-clock timer firing. We replicate only the deterministic eager path, so we
-match Flink whenever the eager rule decides the drop (the bounded / in-burst case,
-where the processing-time timer doesn't fire mid-data). The genuinely
-timing-dependent case is unmatchable in principle, because there is no single
-"correct" Flink answer to match.
+## Residual: Flink's own non-determinism (two sources, neither ours)
+The drop depends on *when the watermark advances relative to a data row*, and two
+things make that timing non-deterministic **in Flink itself** — not in anything we
+add. We receive whatever watermark Flink's runtime computed; the native side only
+reproduces the deterministic path.
+
+1. **Periodic processing-time emission.** Besides the eager rule, Flink also emits
+   on a 200 ms **processing-time** timer. For out-of-order data near a boundary,
+   two runs of the same job can drop different rows depending on wall-clock timer
+   firing — *even at parallelism 1, single input*. We replicate only the eager
+   path, so we match whenever the eager rule decides the drop (the bounded /
+   in-burst case, where the timer doesn't fire mid-data).
+
+2. **Min-across-channels interleaving at parallelism > 1.** Where an operator
+   combines several input channels into one watermark via `min` — a keyed
+   exchange's downstream, or the two inputs of an interval join — the records and
+   watermark events from those channels interleave in an order set by
+   scheduling/network, which is non-deterministic. So even with perfectly
+   deterministic per-jump emission, the effective watermark sitting beside a given
+   row varies run to run, and a borderline row can be dropped in one run and kept
+   in another. This is a property of Flink's parallel runtime (it affects stock
+   Flink the same way); our slicing reproduces the *deterministic* component (a
+   row arrives after the watermark that closed it on its own channel), but the
+   cross-channel race is not reproducible because there is no single race outcome.
+
+Both cases are unmatchable in principle — there is no single "correct" Flink answer
+to match. In-order / monotonic rowtimes and lagging-watermark jobs have no late
+rows, so neither source bites, at any parallelism (every parity test relies on
+this).
 
 ## Scope
 - The watermark *value* (`max(rowtime) - delay`, floored at 0, MAX at end of
