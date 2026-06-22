@@ -18,10 +18,13 @@ discipline (matcher admits only what we reproduce exactly; verified against the
 host by `NativeParity`).
 
 ## Directly unlocked — single-input, drop straight into the existing shape
-- [ ] **Event-time `OVER` aggregation** — `SUM(v) OVER (PARTITION BY k ORDER BY rt
-      RANGE/ROWS …)`. Append-only, keyed by the partition, watermark-driven state
-      cleanup. Closest cousin to the window; **recommended first**. (Also listed
-      under ticket 11's "window functions / OVER".)
+- [~] **Event-time `OVER` aggregation** — first slice DONE: no `PARTITION BY`,
+      default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, SUM/MIN/MAX/COUNT
+      over one bigint/int/double value column (`NativeOverAggregateOperator` +
+      `OverAggregator`, parity-tested in `FlinkOverAggregateSqlHarnessTest`). The
+      planner's `$SUM0`+`COUNT` decomposition of a user SUM is handled (frame is
+      never empty, so `$SUM0` = SUM). **Follow-ups:** `PARTITION BY` keys (reuse the
+      columnar keyed shuffle), bounded frames / `ROWS`, AVG, proctime.
 - [ ] **Append-only deduplication** — keep-*first*-row
       (`ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt) = 1`). Keyed, insert-only.
       (Keep-*last* is retracting — blocked on ticket 06.)
