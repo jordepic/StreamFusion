@@ -7,6 +7,7 @@ import org.apache.calcite.rel.core.Calc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
@@ -335,6 +336,33 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    if (current instanceof StreamPhysicalIntervalJoin) {
+      StreamPhysicalIntervalJoin join = (StreamPhysicalIntervalJoin) current;
+      if (IntervalJoinMatcher.matches(join)) {
+        substitutions++;
+        int[] leftKeys = IntervalJoinMatcher.leftKeys(join);
+        int[] rightKeys = IntervalJoinMatcher.rightKeys(join);
+        // Keep each input's keyed shuffle columnar where it sits on a columnar producer (a native
+        // exchange splits the batch by that side's join key); otherwise the boundary gets a
+        // row→Arrow transpose. The join re-groups by key in its own state, so the exchange hash need
+        // not match Flink's (divergences/10). The join is always columnar (Arrow pairs out).
+        RelNode left = columnarJoinInput(join.getLeft(), leftKeys);
+        RelNode right = columnarJoinInput(join.getRight(), rightKeys);
+        return new StreamPhysicalNativeIntervalJoin(
+            join.getCluster(),
+            join.getTraitSet(),
+            left,
+            right,
+            join.getRowType(),
+            leftKeys,
+            rightKeys,
+            IntervalJoinMatcher.leftTime(join),
+            IntervalJoinMatcher.rightTime(join),
+            IntervalJoinMatcher.lowerMillis(join),
+            IntervalJoinMatcher.upperMillis(join));
+      }
+    }
+
     if (current instanceof StreamPhysicalGlobalWindowAggregate) {
       StreamPhysicalGlobalWindowAggregate agg = (StreamPhysicalGlobalWindowAggregate) current;
       if (GlobalWindowAggregateMatcher.matches(agg)) {
@@ -384,6 +412,23 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
     return current;
+  }
+
+  /**
+   * Replaces a join input's host keyed exchange with a native columnar one (splitting the batch by
+   * the join key) when it sits on a columnar producer; otherwise returns the input unchanged so the
+   * transition pass inserts a transpose at the columnar boundary.
+   */
+  private RelNode columnarJoinInput(RelNode input, int[] keyColumns) {
+    if (input instanceof StreamPhysicalExchange && input.getInputs().get(0) instanceof ColumnarOutput) {
+      return new StreamPhysicalNativeColumnarExchange(
+          input.getCluster(),
+          input.getTraitSet(),
+          input.getInputs().get(0),
+          input.getRowType(),
+          keyColumns);
+    }
+    return input;
   }
 
   private void record(RelNode node) {

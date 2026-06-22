@@ -34,10 +34,18 @@ matching Flink's hash would be cost with no benefit.
 
 ## Scope / consequences
 - Substitution is gated: the columnar exchange is used **only** when its
-  downstream is a native columnar operator that re-groups by key (today, the
-  columnar window). A host operator behind the exchange would depend on Flink's
-  key groups, so the exchange stays on the host there (the planner only rewrites
-  the exchange as part of substituting the columnar window above it).
+  downstream is a native columnar operator that re-groups by key (the columnar
+  window, `OVER`, or interval join). A host operator behind the exchange would
+  depend on Flink's key groups, so the exchange stays on the host there (the
+  planner only rewrites the exchange as part of substituting the columnar operator
+  above it).
+- **Two-input (interval join):** both inputs get their own columnar exchange, on
+  their respective join-key columns. Co-location across the two sides holds because
+  `partition_for_key` hashes the *key values*, not the column position — and an
+  equi-join means a matching left and right row carry the same key value, so they
+  land on the same channel on both sides. The fixed-seed hash makes this identical
+  across subtasks/processes. The join then re-groups by key in its own state, so
+  (as with the window) the channel need not match Flink's.
 - The shuffle still ships Arrow batches over the network edge via Arrow IPC
   (`ArrowBatchSerializer`); only the channel-selection function differs from Flink.
 - Watermarks propagate through the partition transformation unchanged (Flink

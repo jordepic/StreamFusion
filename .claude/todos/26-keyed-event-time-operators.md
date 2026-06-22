@@ -41,14 +41,12 @@ host by `NativeParity`).
 - [ ] **Event-time sort** (`ORDER BY rt`) — watermark-driven, ~no shuffle;
       unlocked by the watermark assigner alone.
 
-## Partially unlocked — need one more piece: a columnar **two-input** operator
-Every operator we have is one-input. Joins need a two-input columnar operator
-(two `ColumnarInput` edges; connected watermark = min of both inputs). Build that
-first, then:
-- [ ] **Window join** (append-only, windowing-TVF based).
-- [ ] **Interval join** (`a.rt BETWEEN b.rt - X AND b.rt + Y`) — keyed shuffle on
-      the join key + watermark-bounded state cleanup. (Ticket 11: interval/instant
-      join.)
+## Two-input columnar operator — built
+The two-input columnar operator (two `ColumnarInput` edges; connected watermark = min of both
+inputs) now exists (`NativeIntervalJoinOperator`). On top of it:
+- [x] **Interval join** (`a.rt BETWEEN b.rt - X AND b.rt + Y`) — DONE, INNER, **columnar**: keyed
+      shuffle on the join key + watermark-bounded state cleanup. See [ticket 27](27-two-input-columnar-join.md).
+- [ ] **Window join** (append-only, windowing-TVF based) — reuses the two-input operator; open.
 
 ## Still blocked regardless — by the insert-only constraint, not by the shuffle
 These emit retracting/updating changelogs; they need [ticket 06](06-changelog-retract-support.md)
