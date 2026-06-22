@@ -52,10 +52,14 @@ public class StreamPhysicalNativeParquetSource extends AbstractRelNode
 
   @Override
   public ExecNode<?> translateToExecNode() {
+    // The output field names, in order, are exactly the columns to read (honoring the projection
+    // Flink pushed into the scan); the native reader selects them by name from each file batch.
+    String[] projection = getRowType().getFieldNames().toArray(new String[0]);
     return new NativeParquetSourceExecNode(
         ShortcutUtils.unwrapTableConfig(this),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
-        path);
+        path,
+        projection);
   }
 }

@@ -164,8 +164,10 @@ public final class Native {
    * batches one at a time via {@link #nextBatch} and must be released with {@link #closeParquet}.
    *
    * @param directory directory of Parquet files to read
+   * @param projection output column names, in the order the plan expects (honoring projection
+   *     pushdown); an empty array emits every column as read
    */
-  public static native long openParquet(String directory);
+  public static native long openParquet(String directory, String[] projection);
 
   /**
    * Exports the next Arrow batch from a source handle into the consumer-allocated C structs.

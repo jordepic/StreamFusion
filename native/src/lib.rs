@@ -1556,10 +1556,14 @@ struct ParquetSource {
     files: Vec<std::path::PathBuf>,
     next_file: usize,
     reader: Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
+    // The output columns, by name, in the order the plan expects. Honors the projection Flink pushed
+    // into the scan (e.g. a window query that reads only some columns and may reorder them); an empty
+    // projection emits every column as read.
+    projection: Vec<String>,
 }
 
 impl ParquetSource {
-    fn open(dir: &str) -> ParquetSource {
+    fn open(dir: &str, projection: Vec<String>) -> ParquetSource {
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .expect("failed to read source directory")
             .filter_map(|entry| {
@@ -1576,17 +1580,44 @@ impl ParquetSource {
             })
             .collect();
         files.sort();
-        ParquetSource { files, next_file: 0, reader: None }
+        ParquetSource { files, next_file: 0, reader: None, projection }
+    }
+
+    /// Reorders/selects a batch's columns to match the requested projection (by name); identity when
+    /// no projection was requested.
+    fn project(&self, batch: RecordBatch) -> RecordBatch {
+        if self.projection.is_empty() {
+            return batch;
+        }
+        let schema = batch.schema();
+        let mut fields = Vec::with_capacity(self.projection.len());
+        let mut columns = Vec::with_capacity(self.projection.len());
+        for name in &self.projection {
+            let index = schema
+                .index_of(name)
+                .unwrap_or_else(|_| panic!("projected column {name} not in parquet file"));
+            fields.push(schema.field(index).clone());
+            columns.push(batch.column(index).clone());
+        }
+        RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)), columns)
+            .expect("failed to project parquet batch")
     }
 
     /// The next batch across all files, or None when every file is exhausted.
     fn next(&mut self) -> Option<RecordBatch> {
         loop {
-            if let Some(reader) = &mut self.reader {
-                if let Some(batch) = reader.next() {
-                    return Some(batch.expect("failed to read parquet batch"));
-                }
-                self.reader = None;
+            let raw = match &mut self.reader {
+                Some(reader) => match reader.next() {
+                    Some(batch) => Some(batch.expect("failed to read parquet batch")),
+                    None => {
+                        self.reader = None;
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some(batch) = raw {
+                return Some(self.project(batch));
             }
             if self.next_file >= self.files.len() {
                 return None;
@@ -1613,9 +1644,14 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openParquet<'
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     dir: JString<'local>,
+    projection: JObjectArray<'local>,
 ) -> jlong {
     let dir: String = env.get_string(&dir).expect("failed to read directory").into();
-    Box::into_raw(Box::new(ParquetSource::open(&dir))) as jlong
+    let projection = read_strings(&mut env, &projection)
+        .into_iter()
+        .map(|name| name.expect("projection column name was null"))
+        .collect();
+    Box::into_raw(Box::new(ParquetSource::open(&dir, projection))) as jlong
 }
 
 /// Exports the next Arrow batch from the source into the consumer-allocated C structs, returning
@@ -2258,7 +2294,7 @@ mod tests {
         write_parquet(&batch, in_dir.join("part-0.parquet").to_str().unwrap());
 
         let start = std::time::Instant::now();
-        let mut source = ParquetSource::open(in_dir.to_str().unwrap());
+        let mut source = ParquetSource::open(in_dir.to_str().unwrap(), vec![]);
         let mut i = 0;
         let mut read = std::time::Duration::ZERO;
         let mut write = std::time::Duration::ZERO;
@@ -2388,7 +2424,7 @@ mod tests {
         write_parquet(&sample_batch(), dir.join("part-0.parquet").to_str().unwrap());
         write_parquet(&sample_batch(), dir.join("part-1.parquet").to_str().unwrap());
 
-        let mut source = ParquetSource::open(dir.to_str().unwrap());
+        let mut source = ParquetSource::open(dir.to_str().unwrap(), vec![]);
         let mut rows = 0usize;
         let mut batches = 0usize;
         while let Some(batch) = source.next() {
@@ -2418,3 +2454,4 @@ mod tests {
         assert_eq!(values(&first, 0), vec![1, 3]);
     }
 }
+

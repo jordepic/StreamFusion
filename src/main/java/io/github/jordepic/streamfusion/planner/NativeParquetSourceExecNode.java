@@ -25,9 +25,14 @@ public class NativeParquetSourceExecNode extends ExecNodeBase<ArrowBatch>
   private static final String TRANSFORMATION = "native-parquet-source";
 
   private final String path;
+  private final String[] projection;
 
   public NativeParquetSourceExecNode(
-      ReadableConfig tableConfig, RowType outputType, String description, String path) {
+      ReadableConfig tableConfig,
+      RowType outputType,
+      String description,
+      String path,
+      String[] projection) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-parquet-source_1"),
@@ -36,6 +41,7 @@ public class NativeParquetSourceExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.path = path;
+    this.projection = projection;
   }
 
   @Override
@@ -46,7 +52,9 @@ public class NativeParquetSourceExecNode extends ExecNodeBase<ArrowBatch>
     // stream; that, not a boundedness flag, is what ends a bounded read job.
     DataStreamSource<ArrowBatch> source =
         env.addSource(
-            new ParquetArrowSourceFunction(path), TRANSFORMATION, ArrowBatchTypeInformation.INSTANCE);
+            new ParquetArrowSourceFunction(path, projection),
+            TRANSFORMATION,
+            ArrowBatchTypeInformation.INSTANCE);
     return source.getTransformation();
   }
 }

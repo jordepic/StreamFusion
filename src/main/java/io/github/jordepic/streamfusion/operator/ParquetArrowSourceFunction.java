@@ -21,15 +21,18 @@ import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
 public class ParquetArrowSourceFunction implements SourceFunction<ArrowBatch> {
 
   private final String directory;
+  // Output columns by name, in plan order (projection pushdown); empty emits every column.
+  private final String[] projection;
   private volatile boolean running = true;
 
-  public ParquetArrowSourceFunction(String directory) {
+  public ParquetArrowSourceFunction(String directory, String[] projection) {
     this.directory = directory;
+    this.projection = projection;
   }
 
   @Override
   public void run(SourceContext<ArrowBatch> ctx) {
-    long handle = Native.openParquet(directory);
+    long handle = Native.openParquet(directory, projection);
     try (BufferAllocator allocator = new RootAllocator();
         CDataDictionaryProvider dictionaries = new CDataDictionaryProvider()) {
       while (running) {
