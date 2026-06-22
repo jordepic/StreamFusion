@@ -472,16 +472,10 @@ impl TumblingAggregator {
         let partials: Vec<&ArrayRef> =
             (0..n).map(|i| batch.column_by_name(&format!("partial{i}")).expect("partial")).collect();
 
-        // A slice belongs to `window_millis / slide_millis` windows — one for a tumbling global
-        // (slide == size), several for a hopping global where slices are shared across the
-        // overlapping windows. Merge each slice partial into every window that contains it.
-        let num_windows = self.window_millis / self.slide_millis;
         for row in 0..batch.num_rows() {
             let slice_end = slice_ends.value(row);
             let key = read_key(&key_arrays, row);
-            for j in 0..num_windows {
-                let end = slice_end + j * self.slide_millis;
-                let start = end - self.window_millis;
+            for (start, end) in self.partial_windows(slice_end) {
                 for (i, accumulator) in
                     self.accumulators(start, end, key.clone()).iter_mut().enumerate()
                 {
@@ -490,6 +484,33 @@ impl TumblingAggregator {
                         .expect("failed to merge partial");
                 }
             }
+        }
+    }
+
+    /// The `(start, end)` windows a slice ending at `slice_end` belongs to in the global merge.
+    /// Tumbling/hopping: the `window_millis / slide_millis` fixed-size windows sharing this slice
+    /// (one for tumbling, several for an overlapping hopping window). Cumulative: the nested windows
+    /// of its bucket from this slice's end up to the bucket's max-size end, all sharing the bucket
+    /// start — the slice (rows in `(slice_end - step, slice_end]`) contributes to every cumulative
+    /// window that ends at or after it.
+    fn partial_windows(&self, slice_end: i64) -> Vec<(i64, i64)> {
+        if self.cumulative {
+            let base = (slice_end - 1).div_euclid(self.window_millis) * self.window_millis;
+            let mut windows = Vec::new();
+            let mut end = slice_end;
+            while end <= base + self.window_millis {
+                windows.push((base, end));
+                end += self.slide_millis;
+            }
+            windows
+        } else {
+            let num_windows = self.window_millis / self.slide_millis;
+            (0..num_windows)
+                .map(|j| {
+                    let end = slice_end + j * self.slide_millis;
+                    (end - self.window_millis, end)
+                })
+                .collect()
         }
     }
 
@@ -3090,6 +3111,33 @@ mod tests {
         assert_eq!(rest.num_rows(), 1);
         assert_eq!(values(&rest, 1), vec![40]); // v
         assert_eq!(values(&rest, 3), vec![70]); // key 1 running sum 10+20+40
+    }
+
+    // Two-phase cumulative: per-slice SUM partials merge into the nested windows of their bucket.
+    #[test]
+    fn cumulative_two_phase_merges_nested_windows() {
+        // max size 3 s, step 1 s, cumulative, bigint value, SUM.
+        let mut agg = TumblingAggregator::new(3000, 1000, true, 0, vec![0]);
+        let partial = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key0", DataType::Int64, false),
+                Field::new("partial0", DataType::Int64, true),
+                Field::new("slice_end", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 1, 1])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+                Arc::new(Int64Array::from(vec![1000i64, 2000, 3000])),
+            ],
+        )
+        .unwrap();
+        agg.update_partial(&partial);
+        let out = agg.flush(3000);
+        // Nested windows share the bucket start 0; each accumulates the slices up to its end:
+        // (0,1000]=10, (0,2000]=10+20=30, (0,3000]=10+20+30=60.
+        assert_eq!(values(&out, 1), vec![0, 0, 0]); // window_start
+        assert_eq!(values(&out, 2), vec![1000, 2000, 3000]); // window_end
+        assert_eq!(values(&out, 3), vec![10, 30, 60]); // running SUM
     }
 
     // A `[k, v, rt]` batch with int64 rowtime (epoch millis) for the interval-join tests.

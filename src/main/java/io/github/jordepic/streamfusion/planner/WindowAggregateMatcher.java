@@ -89,12 +89,13 @@ final class WindowAggregateMatcher {
     return withCount;
   }
 
-  /** Slice width for the local half: the window size for tumbling, the slide for hopping. */
+  /**
+   * Slice width for the local half: the window size for tumbling, the slide for hopping, the step
+   * for cumulative — i.e. the spacing between successive slice ends, which {@link #windowSlide}
+   * already returns for every shape.
+   */
   static long sliceSize(WindowingStrategy windowing) {
-    WindowSpec spec = windowing.getWindow();
-    return spec instanceof HoppingWindowSpec
-        ? ((HoppingWindowSpec) spec).getSlide().toMillis()
-        : windowSize(windowing);
+    return windowSlide(windowing);
   }
 
   /** A session-window aggregate the native operator handles (single-phase only by construction). */

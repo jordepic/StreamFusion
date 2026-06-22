@@ -19,7 +19,7 @@ otherwise it runs on Flink unchanged.
 | Tumbling window aggregate | Yes | Event-time `TUMBLE` over a local-time-zone (rowtime) attribute; one or more aggregates over the same value column — `SUM` / `MIN` / `MAX` / `COUNT` (and `AVG` only as a lone aggregate); grouped by the window, optionally plus one or more bigint/int/string keys. Value-type support is the parity intersection in [docs/aggregate-type-support.md](docs/aggregate-type-support.md): all five over bigint/double, and `SUM`/`MIN`/`MAX`/`COUNT` over int (`SUM` keeps the host's wrapping int semantics, `AVG` its integer-truncating semantics). `AVG` applies only to integer values (bigint/int), never double. |
 | Hopping window aggregate | Yes | Same as tumbling, with `HOP`. One-phase assigns each row to its overlapping windows; two-phase (the default plan) pre-aggregates per slice and combines the shared slices of each window, requiring the slide to divide the size (other ratios fall back). |
 | Session window aggregate | Yes | Same aggregate/key/value terms as tumbling, with `SESSION` (optionally `PARTITION BY` one or more bigint keys). Each element opens a gap-wide window; overlapping or touching windows merge, including when a late element bridges two open sessions. Always single-phase (the host never splits sessions), so no `ONE_PHASE` is needed. |
-| Cumulative window aggregate | One-phase only | Same terms as tumbling, with `CUMULATE` (zero offset only). Nested windows share a bucket start and grow by the step up to the max size. Like `HOP`, two-phase slice-sharing is not native, so set `table.optimizer.agg-phase-strategy = ONE_PHASE`. |
+| Cumulative window aggregate | Yes | Same terms as tumbling, with `CUMULATE` (zero offset only). Nested windows share a bucket start and grow by the step up to the max size. One- and two-phase: the two-phase global re-buckets each slice partial into every nested window whose end it reaches (and unlike `HOP`, `CUMULATE` carries no synthetic count column, so the partials are just the user aggregates). |
 | `OVER` aggregate (running) | Yes (columnar) | Event-time `OVER ([PARTITION BY k] ORDER BY rt)` with the default `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` frame: one or more `SUM`/`MIN`/`MAX`/`COUNT`/`AVG` over the same bigint/int/double value column, optionally partitioned by one or more bigint/int/string keys, emitting each input row with the running aggregate(s) appended. Columnar — the input columns pass through Arrow and it rides the keyed columnar shuffle with no transpose (native source → watermark assigner → exchange → OVER all flow Arrow). Each row is held until the watermark passes its rowtime, then folded per partition in rowtime order (ties within a key share the value). Bounded/`ROWS` frames and proctime fall back to the host. |
 | Interval join (event-time) | Yes (columnar) | Event-time INNER interval join — `a JOIN b ON a.k = b.k AND a.rt BETWEEN b.rt - X AND b.rt + Y` — with one or more bigint/int/string equi-join keys and an event-time interval on the rowtimes. Columnar: each input is shuffled by its join key through a native columnar exchange and the join emits Arrow batches of the matched pairs (left columns then right columns), so the whole two-input pipeline flows Arrow with no transpose (native sources → watermark assigners → exchanges → join). Both sides buffer per key; a pair is emitted once, when the second of its two rows arrives, and rows are evicted once the combined (min) input watermark passes the point no future row could match. Outer/semi/anti joins, proctime intervals, a residual non-equi predicate, regular (non-interval) joins, and window joins fall back to the host. |
 | Parquet source (`SELECT … FROM`) | Local filesystem | A `filesystem`-connector source with `'format' = 'parquet'` reading from a local (`file:` or scheme-less) `path`. Files are read natively as Arrow batches (columnar), so the data never becomes `RowData` — feeding a fully columnar pipeline (a copy into a Parquet sink runs columnar end to end). Remote filesystems (e.g. `hdfs:`/`s3:`) fall back to the host. |
@@ -28,9 +28,11 @@ otherwise it runs on Flink unchanged.
 Two-phase (local + global) aggregation is accelerated too: the native local
 pre-aggregate emits partial state, the host shuffles by key, and the native
 global merges — for `SUM`/`MIN`/`MAX`/`COUNT` (not `AVG`, whose partial is
-multi-field). This is the default planning, so tumbling and hopping window
-aggregation no longer need `ONE_PHASE`. Hopping uses the host's slice-sharing
-model (a per-slice local, a global that combines each window's slices).
+multi-field). This is the default planning, so tumbling, hopping, and cumulative
+window aggregation no longer need `ONE_PHASE`. Hopping and cumulative use the
+host's slice-sharing model (a per-slice local, a global that re-buckets each
+slice into the windows it belongs to — the overlapping windows for hopping, the
+nested windows up to the max size for cumulative).
 
 When a window (rowtime over a local-time-zone attribute) sits on a columnar
 producer — e.g. a native Parquet source through a watermark assigner — the keyed
@@ -56,7 +58,7 @@ stays row-fed and the shuffle stays on the host.
 
 - Expressions using operations the engine does not admit: arbitrary functions, `/` and `%` (integer-division/modulo, divide-by-zero semantics), narrowing/float→int/string `CAST`, and a bare `IS NULL` (encoded by the host as a null `Sarg` the engine does not yet decode)
 - The native columnar source/sink only on a local (`file:`) path — remote filesystems (`hdfs:`/`s3:`) and non-Parquet formats fall back
-- Two-phase (slice-sharing) cumulative windows, and two-phase hopping where the slide does not divide the size
+- Two-phase hopping where the slide does not divide the size
 - Grouping keys other than bigint/int/string (e.g. decimal, timestamp), aggregates over different value columns, or `COUNT(*)`
 - `AVG` over int, and any aggregate over smallint/tinyint/float/decimal — see [docs/aggregate-type-support.md](docs/aggregate-type-support.md)
 - Two-phase `AVG` (multi-field partial state)
@@ -152,9 +154,9 @@ Two commercial native Flink accelerators exist, both **closed source**:
 
 Where StreamFusion differs: it is **open source**, and every substitution is
 gated and verified for identical results against stock Flink by a parity harness
-rather than asserted. It is already native on **stateful windowing** — tumbling and
-hopping (one- and two-phase), session, and cumulative windows — and event-time
-interval joins, which Iron Vector (stateless only) has not yet shipped. It is
-earlier-stage than Vera X and does not
+rather than asserted. It is already native on **stateful windowing** — tumbling,
+hopping, and cumulative windows (one- and two-phase) plus session windows — and
+event-time interval joins, which Iron Vector (stateless only) has not yet shipped.
+It is earlier-stage than Vera X and does not
 match its operator breadth or have published benchmarks, but its acceleration is
 auditable and parity-first by construction.

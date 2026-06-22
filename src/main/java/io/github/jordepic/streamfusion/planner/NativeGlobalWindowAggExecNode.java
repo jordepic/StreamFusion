@@ -27,6 +27,7 @@ public class NativeGlobalWindowAggExecNode extends ExecNodeBase<RowData>
   private final long windowMillis;
   private final int[] keyColumns;
   private final long slideMillis;
+  private final boolean cumulative;
   private final int[] partialColumns;
   private final int sliceEndColumn;
   private final int valueType;
@@ -39,6 +40,7 @@ public class NativeGlobalWindowAggExecNode extends ExecNodeBase<RowData>
       String description,
       long windowMillis,
       long slideMillis,
+      boolean cumulative,
       int[] keyColumns,
       int[] partialColumns,
       int sliceEndColumn,
@@ -53,6 +55,7 @@ public class NativeGlobalWindowAggExecNode extends ExecNodeBase<RowData>
         description);
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
+    this.cumulative = cumulative;
     this.keyColumns = keyColumns;
     this.partialColumns = partialColumns;
     this.sliceEndColumn = sliceEndColumn;
@@ -73,6 +76,7 @@ public class NativeGlobalWindowAggExecNode extends ExecNodeBase<RowData>
         new NativeGlobalWindowAggregateOperator(
             windowMillis,
             slideMillis,
+            cumulative,
             keyColumns,
             NativeWindowOperatorBase.keyTypes((RowType) getOutputType(), keyColumns.length),
             partialColumns,

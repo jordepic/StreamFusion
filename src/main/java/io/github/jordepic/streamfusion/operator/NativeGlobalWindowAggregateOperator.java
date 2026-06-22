@@ -23,10 +23,12 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
   private final int[] keyTypes;
   private final int[] partialColumns;
   private final int sliceEndColumn;
+  private final boolean cumulative;
 
   public NativeGlobalWindowAggregateOperator(
       long windowMillis,
       long slideMillis,
+      boolean cumulative,
       int[] keyColumns,
       int[] keyTypes,
       int[] partialColumns,
@@ -43,10 +45,28 @@ public class NativeGlobalWindowAggregateOperator extends NativeWindowOperatorBas
         aggregateKinds,
         timeZoneId,
         batchSize);
+    this.cumulative = cumulative;
     this.keyColumns = keyColumns;
     this.keyTypes = keyTypes;
     this.partialColumns = partialColumns;
     this.sliceEndColumn = sliceEndColumn;
+  }
+
+  // Cumulative globals merge each slice into the nested windows of its bucket (the native side keys
+  // on the cumulative flag); tumbling/hopping use the fixed-size fan-out.
+  @Override
+  protected long createHandle() {
+    return cumulative
+        ? Native.createCumulativeAggregator(windowMillis, slideMillis, valueType, aggregateKinds)
+        : super.createHandle();
+  }
+
+  @Override
+  protected long restoreHandle(byte[] snapshot) {
+    return cumulative
+        ? Native.restoreCumulativeAggregator(
+            windowMillis, slideMillis, valueType, aggregateKinds, snapshot)
+        : super.restoreHandle(snapshot);
   }
 
   /**

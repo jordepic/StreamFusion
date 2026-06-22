@@ -3,6 +3,7 @@ package io.github.jordepic.streamfusion.planner;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.flink.table.planner.plan.logical.CumulativeWindowSpec;
 import org.apache.flink.table.planner.plan.logical.HoppingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.SliceAttachedWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
@@ -32,6 +33,13 @@ final class GlobalWindowAggregateMatcher {
       // The global fans each slice into size/slide windows, which requires slide to divide size.
       HoppingWindowSpec hop = (HoppingWindowSpec) spec;
       if (hop.getSize().toMillis() % hop.getSlide().toMillis() != 0) {
+        return false;
+      }
+    } else if (spec instanceof CumulativeWindowSpec) {
+      // The global fans each slice into the nested windows whose end is a step multiple up to the
+      // max size, so the step must divide the max size (Flink guarantees this for CUMULATE).
+      CumulativeWindowSpec cum = (CumulativeWindowSpec) spec;
+      if (cum.getMaxSize().toMillis() % cum.getStep().toMillis() != 0) {
         return false;
       }
     } else if (!(spec instanceof TumblingWindowSpec)) {
@@ -80,20 +88,33 @@ final class GlobalWindowAggregateMatcher {
     return 0;
   }
 
-  /** The full window size in millis (the hopping window's size, not the slice/slide). */
-  static long windowMillis(StreamPhysicalGlobalWindowAggregate aggregate) {
-    WindowSpec spec = aggregate.windowing().getWindow();
-    return spec instanceof HoppingWindowSpec
-        ? ((HoppingWindowSpec) spec).getSize().toMillis()
-        : ((TumblingWindowSpec) spec).getSize().toMillis();
+  /** Whether the global merges a cumulative window (nested windows sharing a bucket start). */
+  static boolean cumulative(StreamPhysicalGlobalWindowAggregate aggregate) {
+    return aggregate.windowing().getWindow() instanceof CumulativeWindowSpec;
   }
 
-  /** The slide in millis: equal to the size for tumbling, the real slide for hopping. */
+  /** The full window size in millis: hopping size, cumulative max size, or the tumbling size. */
+  static long windowMillis(StreamPhysicalGlobalWindowAggregate aggregate) {
+    WindowSpec spec = aggregate.windowing().getWindow();
+    if (spec instanceof HoppingWindowSpec) {
+      return ((HoppingWindowSpec) spec).getSize().toMillis();
+    }
+    if (spec instanceof CumulativeWindowSpec) {
+      return ((CumulativeWindowSpec) spec).getMaxSize().toMillis();
+    }
+    return ((TumblingWindowSpec) spec).getSize().toMillis();
+  }
+
+  /** The slide in millis: the hopping slide, the cumulative step, or the size for tumbling. */
   static long slideMillis(StreamPhysicalGlobalWindowAggregate aggregate) {
     WindowSpec spec = aggregate.windowing().getWindow();
-    return spec instanceof HoppingWindowSpec
-        ? ((HoppingWindowSpec) spec).getSlide().toMillis()
-        : ((TumblingWindowSpec) spec).getSize().toMillis();
+    if (spec instanceof HoppingWindowSpec) {
+      return ((HoppingWindowSpec) spec).getSlide().toMillis();
+    }
+    if (spec instanceof CumulativeWindowSpec) {
+      return ((CumulativeWindowSpec) spec).getStep().toMillis();
+    }
+    return ((TumblingWindowSpec) spec).getSize().toMillis();
   }
 
   static int[] keyColumns(StreamPhysicalGlobalWindowAggregate aggregate) {

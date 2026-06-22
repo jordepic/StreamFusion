@@ -19,6 +19,7 @@ public class StreamPhysicalNativeGlobalWindowAggregate extends SingleRel
   private final RelDataType outputRowType;
   private final long windowMillis;
   private final long slideMillis;
+  private final boolean cumulative;
   private final int[] keyColumns;
   private final int[] partialColumns;
   private final int sliceEndColumn;
@@ -32,6 +33,7 @@ public class StreamPhysicalNativeGlobalWindowAggregate extends SingleRel
       RelDataType outputRowType,
       long windowMillis,
       long slideMillis,
+      boolean cumulative,
       int[] keyColumns,
       int[] partialColumns,
       int sliceEndColumn,
@@ -41,6 +43,7 @@ public class StreamPhysicalNativeGlobalWindowAggregate extends SingleRel
     this.outputRowType = outputRowType;
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
+    this.cumulative = cumulative;
     this.keyColumns = keyColumns;
     this.partialColumns = partialColumns;
     this.sliceEndColumn = sliceEndColumn;
@@ -67,6 +70,7 @@ public class StreamPhysicalNativeGlobalWindowAggregate extends SingleRel
         outputRowType,
         windowMillis,
         slideMillis,
+        cumulative,
         keyColumns,
         partialColumns,
         sliceEndColumn,
@@ -83,6 +87,7 @@ public class StreamPhysicalNativeGlobalWindowAggregate extends SingleRel
         getRelDetailedDescription(),
         windowMillis,
         slideMillis,
+        cumulative,
         keyColumns,
         partialColumns,
         sliceEndColumn,
