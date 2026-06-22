@@ -301,17 +301,37 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       StreamPhysicalOverAggregate over = (StreamPhysicalOverAggregate) current;
       if (OverAggregateMatcher.matches(over)) {
         substitutions++;
+        int timeColumn = OverAggregateMatcher.timeColumn(over);
+        int valueColumn = OverAggregateMatcher.valueColumnIndex(over);
+        int[] keyColumns = OverAggregateMatcher.keyColumns(over);
+        int valueType = OverAggregateMatcher.valueTypeCode(over);
+        int[] kinds = OverAggregateMatcher.kinds(over);
+        // When the OVER sits on an exchange over a columnar producer, keep the keyed shuffle
+        // columnar (a native exchange splits the batch by the partition keys); otherwise the
+        // columnar OVER is fed via a row→Arrow transpose at the boundary. The OVER itself is always
+        // columnar (input columns pass through with the running aggregate appended).
+        RelNode overInput = over.getInputs().get(0);
+        RelNode input = overInput;
+        if (overInput instanceof StreamPhysicalExchange
+            && overInput.getInputs().get(0) instanceof ColumnarOutput) {
+          input =
+              new StreamPhysicalNativeColumnarExchange(
+                  overInput.getCluster(),
+                  overInput.getTraitSet(),
+                  overInput.getInputs().get(0),
+                  overInput.getRowType(),
+                  keyColumns);
+        }
         return new StreamPhysicalNativeOverAggregate(
             over.getCluster(),
             over.getTraitSet(),
-            over.getInputs().get(0),
+            input,
             over.getRowType(),
-            OverAggregateMatcher.timeColumn(over),
-            OverAggregateMatcher.valueColumnIndex(over),
-            OverAggregateMatcher.keyColumns(over),
-            OverAggregateMatcher.keyTypes(over),
-            OverAggregateMatcher.valueTypeCode(over),
-            OverAggregateMatcher.kinds(over));
+            timeColumn,
+            valueColumn,
+            keyColumns,
+            valueType,
+            kinds);
       }
     }
 

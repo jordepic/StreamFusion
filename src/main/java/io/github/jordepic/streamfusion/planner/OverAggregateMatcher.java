@@ -104,27 +104,6 @@ final class OverAggregateMatcher {
     return over.logicWindow().groups.get(0).keys.toArray();
   }
 
-  /** Native key-type code per partition column: 0 = bigint, 2 = int, 3 = string. */
-  static int[] keyTypes(StreamPhysicalOverAggregate over) {
-    int[] columns = keyColumns(over);
-    RelDataType inputType = over.getInput().getRowType();
-    int[] types = new int[columns.length];
-    for (int i = 0; i < columns.length; i++) {
-      switch (inputType.getFieldList().get(columns[i]).getType().getSqlTypeName()) {
-        case INTEGER:
-          types[i] = 2;
-          break;
-        case VARCHAR:
-        case CHAR:
-          types[i] = 3;
-          break;
-        default:
-          types[i] = 0;
-      }
-    }
-    return types;
-  }
-
   static int valueColumnIndex(StreamPhysicalOverAggregate over) {
     return valueColumn(over.logicWindow().groups.get(0), over.getInput().getRowType());
   }

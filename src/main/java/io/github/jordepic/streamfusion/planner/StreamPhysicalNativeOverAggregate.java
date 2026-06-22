@@ -13,19 +13,19 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * Physical node standing in for an event-time {@code OVER} aggregate (RANGE unbounded preceding, no
- * partition key) the native operator runs. Row-fed: it consumes and produces {@link
- * org.apache.flink.table.data.RowData} (each input row with the aggregate appended), so it needs no
- * columnar transpose. Requires a watermark, since each row is emitted once the watermark passes its
- * rowtime.
+ * Physical node standing in for an event-time {@code OVER} aggregate (RANGE unbounded preceding,
+ * optional PARTITION BY) the native operator runs. Columnar: it consumes and produces Arrow batches
+ * ({@link ColumnarInput} and {@link ColumnarOutput}) — the input columns pass through with the
+ * running aggregate(s) appended — so it rides the columnar shuffle with no transpose. Requires a
+ * watermark, since each row is emitted once the watermark passes its rowtime.
  */
-public class StreamPhysicalNativeOverAggregate extends SingleRel implements StreamPhysicalRel {
+public class StreamPhysicalNativeOverAggregate extends SingleRel
+    implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
 
   private final RelDataType outputRowType;
   private final int timeColumn;
   private final int valueColumn;
   private final int[] keyColumns;
-  private final int[] keyTypes;
   private final int valueType;
   private final int[] aggregateKinds;
 
@@ -37,7 +37,6 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
       int timeColumn,
       int valueColumn,
       int[] keyColumns,
-      int[] keyTypes,
       int valueType,
       int[] aggregateKinds) {
     super(cluster, traitSet, input);
@@ -45,7 +44,6 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
     this.timeColumn = timeColumn;
     this.valueColumn = valueColumn;
     this.keyColumns = keyColumns;
-    this.keyTypes = keyTypes;
     this.valueType = valueType;
     this.aggregateKinds = aggregateKinds;
   }
@@ -64,7 +62,7 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeOverAggregate(
         getCluster(), traitSet, inputs.get(0), outputRowType, timeColumn, valueColumn, keyColumns,
-        keyTypes, valueType, aggregateKinds);
+        valueType, aggregateKinds);
   }
 
   @Override
@@ -74,11 +72,9 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
-        FlinkTypeFactory$.MODULE$.toLogicalRowType(getInput().getRowType()),
         timeColumn,
         valueColumn,
         keyColumns,
-        keyTypes,
         valueType,
         aggregateKinds);
   }

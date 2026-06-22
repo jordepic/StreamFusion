@@ -1,6 +1,7 @@
 use arrow::array::{
     make_array, new_empty_array, Array, ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatch,
-    StructArray, UInt32Array,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    UInt32Array,
 };
 use arrow::compute::{concat_batches, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -735,6 +736,166 @@ impl OverAggregator {
             }
         }
         aggregator
+    }
+}
+
+/// Columnar OVER aggregation: buffers whole input batches, and on a watermark emits the rows it has
+/// completed (rowtime <= watermark) with the running aggregate column(s) appended — the input
+/// columns pass straight through, so the data stays Arrow end to end. Wraps {@link OverAggregator}
+/// for the per-key running fold; this layer adds the buffering, the complete/pending split, the
+/// rowtime→millis conversion the inner fold expects, and the passthrough.
+struct OverWindowAggregator {
+    inner: OverAggregator,
+    rt_column: usize,
+    value_column: usize,
+    key_columns: Vec<usize>,
+    buffered: Vec<RecordBatch>,
+    input_schema: Option<SchemaRef>,
+}
+
+impl OverWindowAggregator {
+    fn new(
+        value_type: i64,
+        kinds: Vec<i64>,
+        rt_column: usize,
+        value_column: usize,
+        key_columns: Vec<usize>,
+    ) -> Self {
+        OverWindowAggregator {
+            inner: OverAggregator::new(value_type, kinds),
+            rt_column,
+            value_column,
+            key_columns,
+            buffered: Vec::new(),
+            input_schema: None,
+        }
+    }
+
+    fn push(&mut self, batch: RecordBatch) {
+        self.input_schema = Some(batch.schema());
+        self.buffered.push(batch);
+    }
+
+    /// Emits the rows the watermark has completed (input columns + running aggregates) and keeps the
+    /// rest buffered. Returns an empty batch when nothing is complete.
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        let schema = match &self.input_schema {
+            Some(schema) => schema.clone(),
+            None => return RecordBatch::new_empty(Arc::new(Schema::empty())),
+        };
+        let all = concat_batches(&schema, &self.buffered).expect("failed to concat over buffer");
+        let rt_millis = rt_to_millis(all.column(self.rt_column));
+        let complete_mask: BooleanArray = rt_millis.iter().map(|v| Some(v.unwrap() <= watermark)).collect();
+        let complete = filter_record_batch(&all, &complete_mask).expect("failed to filter complete");
+        let pending_mask = arrow::compute::not(&complete_mask).expect("failed to negate mask");
+        let pending = filter_record_batch(&all, &pending_mask).expect("failed to filter pending");
+        self.buffered = if pending.num_rows() > 0 { vec![pending] } else { Vec::new() };
+        if complete.num_rows() == 0 {
+            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+        }
+
+        let aggregates = self.inner.update(&self.keyed_subbatch(&complete));
+        let mut fields: Vec<Field> =
+            complete.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = complete.columns().to_vec();
+        for (i, field) in aggregates.schema().fields().iter().enumerate() {
+            fields.push(field.as_ref().clone());
+            columns.push(aggregates.column(i).clone());
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build over output batch")
+    }
+
+    /// The `[rt(ms i64), value, key0..]` batch the inner per-key fold reads, projected from the
+    /// completed rows (rowtime converted from its timestamp unit to epoch millis).
+    fn keyed_subbatch(&self, complete: &RecordBatch) -> RecordBatch {
+        let mut fields = vec![
+            Field::new("rt", DataType::Int64, false),
+            Field::new("value", complete.column(self.value_column).data_type().clone(), true),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(rt_to_millis(complete.column(self.rt_column))),
+            complete.column(self.value_column).clone(),
+        ];
+        for (j, &key) in self.key_columns.iter().enumerate() {
+            fields.push(Field::new(format!("key{j}"), complete.column(key).data_type().clone(), false));
+            columns.push(complete.column(key).clone());
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build over sub-batch")
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        let accumulators = self.inner.snapshot();
+        let buffer = match (&self.input_schema, self.buffered.is_empty()) {
+            (Some(schema), false) => {
+                let all = concat_batches(schema, &self.buffered).expect("concat over buffer");
+                let mut bytes = Vec::new();
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &all.schema())
+                    .expect("over buffer writer");
+                writer.write(&all).expect("write over buffer");
+                writer.finish().expect("finish over buffer");
+                drop(writer);
+                bytes
+            }
+            _ => Vec::new(),
+        };
+        let mut out = (accumulators.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&accumulators);
+        out.extend_from_slice(&buffer);
+        out
+    }
+
+    fn restore(
+        value_type: i64,
+        kinds: Vec<i64>,
+        rt_column: usize,
+        value_column: usize,
+        key_columns: Vec<usize>,
+        bytes: &[u8],
+    ) -> Self {
+        let accumulators_len = u32::from_le_bytes(bytes[0..4].try_into().expect("len")) as usize;
+        let inner = OverAggregator::restore(value_type, kinds, &bytes[4..4 + accumulators_len]);
+        let mut aggregator = OverWindowAggregator {
+            inner,
+            rt_column,
+            value_column,
+            key_columns,
+            buffered: Vec::new(),
+            input_schema: None,
+        };
+        let buffer = &bytes[4 + accumulators_len..];
+        if !buffer.is_empty() {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(buffer, None).expect("over buffer reader");
+            for batch in reader {
+                let batch = batch.expect("read over buffer");
+                aggregator.input_schema = Some(batch.schema());
+                aggregator.buffered.push(batch);
+            }
+        }
+        aggregator
+    }
+}
+
+/// Reads a timestamp column as epoch millis, regardless of its stored unit.
+fn rt_to_millis(array: &ArrayRef) -> Int64Array {
+    use arrow::datatypes::TimeUnit;
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let ts = array.as_any().downcast_ref::<TimestampNanosecondArray>().expect("ts ns");
+            ts.iter().map(|v| v.map(|x| x / 1_000_000)).collect()
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let ts = array.as_any().downcast_ref::<TimestampMicrosecondArray>().expect("ts us");
+            ts.iter().map(|v| v.map(|x| x / 1_000)).collect()
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let ts = array.as_any().downcast_ref::<TimestampMillisecondArray>().expect("ts ms");
+            ts.iter().map(|v| v.map(|x| x)).collect()
+        }
+        DataType::Int64 => array.as_any().downcast_ref::<Int64Array>().expect("i64").clone(),
+        other => panic!("unsupported rowtime column type: {other:?}"),
     }
 }
 
@@ -2193,33 +2354,60 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreCumula
     ))) as jlong
 }
 
-/// Creates a stateful OVER aggregator (event-time RANGE unbounded preceding) and returns a handle.
+/// Reads a JVM int[] of column indices into a Vec.
+fn read_columns(env: &JNIEnv, columns: &JIntArray) -> Vec<usize> {
+    read_kinds(env, columns).into_iter().map(|c| c as usize).collect()
+}
+
+/// Creates a columnar OVER aggregator (event-time RANGE unbounded preceding); it buffers input
+/// batches and flushes completed rows with the running aggregates appended. The rt/value/key column
+/// indices locate those columns within the buffered input batch.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createOverAggregator<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     value_type: jint,
     aggregate_kinds: JIntArray<'local>,
+    rt_column: jint,
+    value_column: jint,
+    key_columns: JIntArray<'local>,
 ) -> jlong {
     let kinds = read_kinds(&env, &aggregate_kinds);
-    Box::into_raw(Box::new(OverAggregator::new(value_type as i64, kinds))) as jlong
+    let keys = read_columns(&env, &key_columns);
+    Box::into_raw(Box::new(OverWindowAggregator::new(
+        value_type as i64,
+        kinds,
+        rt_column as usize,
+        value_column as usize,
+        keys,
+    ))) as jlong
 }
 
-/// Folds a batch of complete rows (`rt` + `value`) into the running accumulators and exports the
-/// per-row aggregate columns `[result0..]` (input row order) for the JVM to zip onto its rows.
+/// Buffers an input batch (no output); the rows are emitted later when a watermark completes them.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateOverAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushOverAggregator<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     in_array_address: jlong,
     in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut OverWindowAggregator) };
+    aggregator.push(import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Exports the rows the watermark has completed (input columns + running aggregates).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushOverAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
     out_array_address: jlong,
     out_schema_address: jlong,
 ) {
-    let aggregator = unsafe { &mut *(handle as *mut OverAggregator) };
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    let result = aggregator.update(&batch);
+    let aggregator = unsafe { &mut *(handle as *mut OverWindowAggregator) };
+    let result = aggregator.flush(watermark_millis);
     export_record_batch(result, out_array_address, out_schema_address);
 }
 
@@ -2231,18 +2419,18 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeOverAggr
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut OverAggregator));
+        drop(Box::from_raw(handle as *mut OverWindowAggregator));
     }
 }
 
-/// Serializes the OVER aggregator's running state so the JVM can store it in a checkpoint.
+/// Serializes the OVER aggregator's running state and buffered rows for a checkpoint.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotOverAggregator<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) -> jbyteArray {
-    let aggregator = unsafe { &mut *(handle as *mut OverAggregator) };
+    let aggregator = unsafe { &mut *(handle as *mut OverWindowAggregator) };
     env.byte_array_from_slice(&aggregator.snapshot())
         .expect("failed to allocate over snapshot array")
         .into_raw()
@@ -2255,11 +2443,22 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAg
     _class: JClass<'local>,
     value_type: jint,
     aggregate_kinds: JIntArray<'local>,
+    rt_column: jint,
+    value_column: jint,
+    key_columns: JIntArray<'local>,
     snapshot: JByteArray<'local>,
 ) -> jlong {
     let kinds = read_kinds(&env, &aggregate_kinds);
+    let keys = read_columns(&env, &key_columns);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read over snapshot");
-    Box::into_raw(Box::new(OverAggregator::restore(value_type as i64, kinds, &bytes))) as jlong
+    Box::into_raw(Box::new(OverWindowAggregator::restore(
+        value_type as i64,
+        kinds,
+        rt_column as usize,
+        value_column as usize,
+        keys,
+        &bytes,
+    ))) as jlong
 }
 
 /// Creates a stateful session-window aggregator and returns an opaque handle. As with the tumbling
@@ -2475,6 +2674,41 @@ mod tests {
         let mut over = OverAggregator::new(0, vec![0]);
         // key 1: 10, then (20,30) tie -> 60, 60; key 2: 100, then 140.
         assert_eq!(values(&over.update(&batch), 0), vec![10, 100, 60, 60, 140]);
+    }
+
+    // The columnar (buffering) OVER passes input columns through and appends the running aggregate,
+    // emitting only the rows the watermark has completed.
+    #[test]
+    fn over_window_buffers_and_passes_through() {
+        let k: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 2, 1]));
+        let v: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 100, 40]));
+        // rowtime in nanoseconds (millis 0, 1000, 500, 9000).
+        let rt: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![
+            0i64,
+            1_000_000_000,
+            500_000_000,
+            9_000_000_000,
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("rt", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![k, v, rt]).unwrap();
+        let mut over = OverWindowAggregator::new(0, vec![0], 2, 1, vec![0]);
+        over.push(batch);
+        // Watermark 2000ms completes the first three rows (rt 0/1000/500); the rt=9000 row stays.
+        let out = over.flush(2000);
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(values(&out, 0), vec![1, 1, 2]); // k passed through
+        assert_eq!(values(&out, 1), vec![10, 20, 100]); // v passed through
+        // running SUM per key: key 1 -> 10, 30; key 2 -> 100 (result is the last column).
+        assert_eq!(values(&out, 3), vec![10, 30, 100]);
+        // The pending row flushes once the watermark passes it.
+        let rest = over.flush(10_000);
+        assert_eq!(rest.num_rows(), 1);
+        assert_eq!(values(&rest, 1), vec![40]); // v
+        assert_eq!(values(&rest, 3), vec![70]); // key 1 running sum 10+20+40
     }
 
     // Decoder over the pre-order encoding: CALL gt ( INPUT_REF a , LIT_LONG 5 ).
