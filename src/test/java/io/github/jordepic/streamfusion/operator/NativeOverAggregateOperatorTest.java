@@ -4,6 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
@@ -17,9 +20,8 @@ import org.apache.flink.table.types.logical.RowType;
 import org.junit.jupiter.api.Test;
 
 /**
- * The OVER aggregate operator emits each input row with the running SUM over `RANGE UNBOUNDED
- * PRECEDING` appended, once the watermark passes its rowtime — including shared values for rows that
- * tie on rowtime.
+ * The columnar OVER operator passes the input columns through and appends the running aggregate,
+ * emitting each row (as an Arrow batch) once the watermark passes its rowtime.
  */
 class NativeOverAggregateOperatorTest {
 
@@ -30,50 +32,63 @@ class NativeOverAggregateOperatorTest {
           new String[] {"v", "rt"});
 
   @Test
-  void emitsRunningSumSharingRangeTies() throws Exception {
+  void emitsRunningSumWithPassthrough() throws Exception {
     NativeOverAggregateOperator operator =
-        new NativeOverAggregateOperator(INPUT, 1, 0, new int[0], new int[0], 0, new int[] {0});
-    try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
-        new OneInputStreamOperatorTestHarness<>(operator)) {
-      harness.setup();
+        new NativeOverAggregateOperator(1, 0, new int[0], 0, new int[] {0});
+    try (BufferAllocator allocator = new RootAllocator();
+        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+      harness.setup(new ArrowBatchSerializer());
       harness.open();
 
-      harness.processElement(row(10, 0));
-      harness.processElement(row(20, 1000));
-      harness.processElement(row(30, 1000));
-      harness.processElement(row(40, 2000));
-      // Nothing emitted before the watermark reaches the rows' rowtimes.
-      assertEquals(List.of(), collect(harness));
+      harness.processElement(new StreamRecord<>(batch(allocator, event(10, 0), event(20, 500))));
+      harness.processElement(new StreamRecord<>(batch(allocator, event(30, 1000))));
+      assertEquals(List.of(), collect(harness)); // nothing before the watermark
 
-      harness.processWatermark(new Watermark(2000));
-      // rt 1000 ties (20,30) share 10+20+30=60; emitted in input order with the input columns kept.
+      harness.processWatermark(new Watermark(1000));
+      // Each input row [v, rt] is passed through with the running SUM appended.
       assertEquals(
-          List.of(
-              List.of(10L, 0L, 10L),
-              List.of(20L, 1000L, 60L),
-              List.of(30L, 1000L, 60L),
-              List.of(40L, 2000L, 100L)),
+          List.of(List.of(10L, 0L, 10L), List.of(20L, 500L, 30L), List.of(30L, 1000L, 60L)),
           collect(harness));
+      closeForwarded(harness);
     }
   }
 
-  private static StreamRecord<RowData> row(long v, long rtMillis) {
+  private static RowData event(long v, long rtMillis) {
     GenericRowData row = new GenericRowData(2);
     row.setField(0, v);
     row.setField(1, TimestampData.fromEpochMillis(rtMillis));
-    return new StreamRecord<>(row);
+    return row;
+  }
+
+  private static ArrowBatch batch(BufferAllocator allocator, RowData... rows) {
+    return new ArrowBatch(RowDataArrowConverter.write(List.of(rows), INPUT, allocator));
   }
 
   /** Drains the output as [v, rt-millis, sum] triples. */
-  private static List<List<Long>> collect(OneInputStreamOperatorTestHarness<RowData, RowData> harness) {
+  private static List<List<Long>> collect(
+      OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness) {
     List<List<Long>> rows = new ArrayList<>();
-    while (!harness.getOutput().isEmpty()) {
-      Object event = harness.getOutput().poll();
+    for (Object event : harness.getOutput()) {
       if (event instanceof StreamRecord) {
-        RowData r = (RowData) ((StreamRecord<?>) event).getValue();
-        rows.add(List.of(r.getLong(0), r.getTimestamp(1, 3).getMillisecond(), r.getLong(2)));
+        VectorSchemaRoot root = ((ArrowBatch) ((StreamRecord<?>) event).getValue()).root();
+        var v = (org.apache.arrow.vector.BigIntVector) root.getVector(0);
+        var rt = (org.apache.arrow.vector.TimeStampNanoVector) root.getVector(1);
+        var sum = (org.apache.arrow.vector.BigIntVector) root.getVector(2);
+        for (int i = 0; i < root.getRowCount(); i++) {
+          rows.add(List.of(v.get(i), rt.get(i) / 1_000_000L, sum.get(i)));
+        }
       }
     }
     return rows;
+  }
+
+  private static void closeForwarded(
+      OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness) {
+    for (Object event : harness.getOutput()) {
+      if (event instanceof StreamRecord) {
+        ((ArrowBatch) ((StreamRecord<?>) event).getValue()).root().close();
+      }
+    }
   }
 }

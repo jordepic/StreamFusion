@@ -18,15 +18,17 @@ discipline (matcher admits only what we reproduce exactly; verified against the
 host by `NativeParity`).
 
 ## Directly unlocked — single-input, drop straight into the existing shape
-- [~] **Event-time `OVER` aggregation** — DONE for the default `RANGE BETWEEN
-      UNBOUNDED PRECEDING AND CURRENT ROW` frame, with or without `PARTITION BY`
-      (bigint/int/string keys), SUM/MIN/MAX/COUNT over one bigint/int/double value
-      column (`NativeOverAggregateOperator` + the keyed `OverAggregator`,
-      parity-tested in `FlinkOverAggregateSqlHarnessTest` incl. partitioned). The
-      planner's `$SUM0`+`COUNT` decomposition of a user SUM is handled (frame is
-      never empty, so `$SUM0` = SUM). Row-fed (the host's keyed exchange co-locates
-      partitions). **Follow-ups:** bounded frames / `ROWS`, AVG, proctime, and a
-      columnar OVER fed by the columnar shuffle (it is row-fed today).
+- [~] **Event-time `OVER` aggregation** — DONE, **columnar**, for the default
+      `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` frame, with or without
+      `PARTITION BY` (bigint/int/string keys), SUM/MIN/MAX/COUNT/AVG over one
+      bigint/int/double value column. The native `OverWindowAggregator` buffers input
+      batches and, on a watermark, emits the completed rows with the running
+      aggregate appended — input columns pass through, so it rides the columnar
+      shuffle with no transpose (native source → wm assigner → columnar exchange →
+      columnar OVER, parity-tested incl. partitioned over a Parquet source). AVG
+      works via Flink's `$SUM0`+`COUNT` decomposition (divide on the host). The
+      `$SUM0` = SUM mapping holds because an OVER frame is never empty.
+      **Follow-ups:** bounded frames / `ROWS` (needs frame eviction), proctime.
 - [ ] **Append-only deduplication** — keep-*first*-row
       (`ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt) = 1`). Keyed, insert-only.
       (Keep-*last* is retracting — blocked on ticket 06.)

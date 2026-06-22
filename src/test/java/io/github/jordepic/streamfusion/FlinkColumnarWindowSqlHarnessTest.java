@@ -54,6 +54,17 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   @Test
+  void partitionedOverColumnarSourceMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("cover-in");
+    writeInput(input);
+    // Fully-columnar OVER: native source → watermark assigner → columnar keyed exchange → columnar
+    // OVER, the input columns passing through with the running SUM appended, no transpose anywhere.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "ONE_PHASE"),
+        "SELECT k, v, SUM(v) OVER (PARTITION BY k ORDER BY rt) AS total FROM t");
+  }
+
+  @Test
   void outOfOrderWithinBatchDropsLateRowLikeHost() throws Exception {
     Path input = Files.createTempDirectory("cwin-ooo-in");
     writeOutOfOrderInput(input);
