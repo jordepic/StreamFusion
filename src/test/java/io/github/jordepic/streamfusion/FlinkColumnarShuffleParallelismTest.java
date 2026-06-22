@@ -73,8 +73,8 @@ class FlinkColumnarShuffleParallelismTest {
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
     tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
     // Delay larger than the whole data span (~5.7s) so no window closes before end-of-input MAX —
-    // isolates the shuffle routing from the per-batch watermark divergence (divergences/09), which
-    // at p>1 otherwise shows up as the host late-dropping a borderline first window.
+    // keeps this test about the shuffle routing only, independent of watermark-driven late dropping
+    // (which has its own coverage; see divergences/09 and the out-of-order parity test).
     tEnv.executeSql(
         "CREATE TABLE t (k BIGINT, v BIGINT, rt TIMESTAMP_LTZ(3), "
             + "WATERMARK FOR rt AS rt - INTERVAL '10' SECOND) WITH ('connector' = 'filesystem', "

@@ -53,6 +53,20 @@ class FlinkColumnarWindowSqlHarnessTest {
             + "GROUP BY k, window_start, window_end");
   }
 
+  @Test
+  void outOfOrderWithinBatchDropsLateRowLikeHost() throws Exception {
+    Path input = Files.createTempDirectory("cwin-ooo-in");
+    writeOutOfOrderInput(input);
+    // Delay 0: the rt=5000 row closes window [0,1s) before the trailing rt=500 row, which the host
+    // drops as late (per row). The columnar assigner slices the batch to emit the watermark between
+    // them, so the native pipeline drops it too (divergences/09) — the case that previously diverged.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "ONE_PHASE", "rt"),
+        "SELECT window_start, window_end, SUM(v) AS total "
+            + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
   private static void writeInput(Path directory) throws Exception {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
@@ -75,16 +89,43 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   private static TableEnvironment readEnvironment(Path directory, String phaseStrategy) {
+    return readEnvironment(directory, phaseStrategy, "rt - INTERVAL '2' SECOND");
+  }
+
+  private static TableEnvironment readEnvironment(
+      Path directory, String phaseStrategy, String watermark) {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
     tEnv.getConfig().set("table.optimizer.agg-phase-strategy", phaseStrategy);
     tEnv.executeSql(
         "CREATE TABLE t (k BIGINT, v BIGINT, rt TIMESTAMP_LTZ(3), "
-            + "WATERMARK FOR rt AS rt - INTERVAL '2' SECOND) WITH ('connector' = 'filesystem', "
-            + "'path' = '"
+            + "WATERMARK FOR rt AS "
+            + watermark
+            + ") WITH ('connector' = 'filesystem', 'path' = '"
             + directory.toUri()
             + "', 'format' = 'parquet')");
     return tEnv;
+  }
+
+  /** Writes three rows out of event-time order into a single file (one batch). */
+  private static void writeOutOfOrderInput(Path directory) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    env.enableCheckpointing(100);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.executeSql(
+        "CREATE TABLE in_write (k BIGINT, v BIGINT, rt TIMESTAMP_LTZ(3)) WITH ('connector' = "
+            + "'filesystem', 'path' = '"
+            + directory.toUri()
+            + "', 'format' = 'parquet')");
+    // A high rowtime mid-batch jumps the watermark past the first window, then a low rowtime follows
+    // — the late row whose window already closed.
+    tEnv.executeSql(
+            "INSERT INTO in_write VALUES "
+                + "(1, 10, TO_TIMESTAMP_LTZ(0, 3)), "
+                + "(1, 20, TO_TIMESTAMP_LTZ(5000, 3)), "
+                + "(1, 30, TO_TIMESTAMP_LTZ(500, 3))")
+        .await();
   }
 }

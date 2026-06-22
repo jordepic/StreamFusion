@@ -1,46 +1,56 @@
-# Columnar watermark assignment is per-batch, not per-row
+# Columnar watermark assignment matches Flink's deterministic per-row dropping
 
 **Kind:** behavioral — when the event-time watermark advances relative to the
-rows it governs.
-**Diverges from:** Flink's `WatermarkAssignerOperator`, which evaluates and may
-advance the watermark per row.
-**Follows:** Arroyo, which generates a watermark per `RecordBatch`.
+rows it governs, and which late rows are dropped.
+**Status:** matched for Flink's deterministic behavior; the only residual is
+Flink's own non-deterministic periodic emission (see below).
 
-## Flink's decision
+## Flink's behavior
 Flink's table `WatermarkAssignerOperator` runs the watermark generator **per
-row**: each record updates the running max and, when the watermark jumps past the
-auto-watermark interval, emits eagerly mid-stream. So within a sequence of rows a
-watermark can advance *between* two rows, and a later row whose window the
-watermark has already closed is dropped as late.
+row**: each record updates the running max and emits eagerly when the watermark
+jumps past the auto-watermark interval. So within a run of rows the watermark can
+advance *between* two rows, and a later row whose window that watermark already
+closed is dropped as late (at the downstream window, against the watermark it has
+received — at parallelism > 1 the min across its input channels).
 
 ## What we do
-The columnar assigner consumes an Arrow batch, forwards the whole batch, then
-emits one watermark computed from the batch's maximum rowtime
-(`max(rowtime) - delay`). The watermark therefore advances only at batch
-boundaries, never between rows of the same batch — every row in a batch is seen
-by the downstream window *before* that batch's watermark, so no row is late
-relative to its own batch. Across batches the behavior matches Flink (a later
-batch's rows can still be late w.r.t. an earlier batch's watermark).
+The columnar assigner is per-batch by default, but to match the per-row late-data
+dropping it **slices a batch at each point its running watermark jumps past the
+interval** and emits `(sub-batch, watermark)` in order — replicating Flink's
+eager emission. A row that a sub-batch's watermark closes out therefore arrives at
+the window *after* that watermark (across the shuffle, where Flink takes the min
+across channels), and the native aggregator **drops rows whose window has already
+closed** (`window_end <= current_watermark`, the highest flushed watermark). So
+the deterministic late-drop is reproduced byte-for-byte — verified end to end by
+`FlinkColumnarWindowSqlHarnessTest.outOfOrderWithinBatchDropsLateRowLikeHost`.
 
-## Consequence
-Identical results to Flink whenever no window closes *within* a batch — i.e. for
-in-order / monotonic rowtimes, or any watermark delay large enough that the
-running watermark only closes windows at batch boundaries (the common case, and
-what real 200 ms periodic emission already approximates). They differ only for
-out-of-order rows packed into a single batch where the per-row watermark would
-have closed a window mid-batch and dropped a straggler: Flink drops it, we keep
-it. The aggregate is then the *more complete* one, but it is not byte-identical to
-Flink, so this is a divergence, not a bug.
+The drop is done in the aggregator (post-shuffle), not the assigner, because at
+p > 1 a window's effective watermark is the min across its input channels, which a
+single assigner can't know — only fine-grained watermarks flowing through the
+shuffle reproduce it. That is why the assigner must slice rather than the window
+filter locally.
 
-This is inherent to columnar batch processing of watermarks (the same reason
-Arroyo assigns per batch) and is not worth unwinding — reproducing per-row late
-drops would mean splitting each batch at every watermark-advance point, which
-defeats the columnar model. The parity tests use data/delays that do not close a
-window mid-batch; `FlinkWatermarkAssignerSqlHarnessTest` notes the constraint.
+A **monotonic-rowtime batch can have no within-batch late row** (a later row's
+window can't be closed by an earlier, smaller rowtime), so it takes a fast path:
+the whole batch is forwarded with a single watermark, no slicing. In-order data —
+every benchmark, the common case — therefore pays nothing, and the windowed
+benchmark is unchanged at 1.91×.
+
+## Residual: Flink's non-deterministic periodic emission
+Besides the eager rule, Flink also emits on a 200 ms **processing-time** timer.
+For out-of-order data near a window boundary, that makes **Flink itself
+non-deterministic** — two runs of the same job can drop different rows depending
+on wall-clock timer firing. We replicate only the deterministic eager path, so we
+match Flink whenever the eager rule decides the drop (the bounded / in-burst case,
+where the processing-time timer doesn't fire mid-data). The genuinely
+timing-dependent case is unmatchable in principle, because there is no single
+"correct" Flink answer to match.
 
 ## Scope
-- Only the **event-time watermark advance granularity** differs; the watermark
-  *value* (`max(rowtime) - delay`, floored at 0, MAX at end of input) matches
-  Flink exactly, and is unit-tested in `NativeColumnarWatermarkAssignerOperatorTest`.
-- Bounded jobs still flush every window at end of input (MAX watermark), so
-  completeness is unaffected; only mid-stream late-drop timing can differ.
+- The watermark *value* (`max(rowtime) - delay`, floored at 0, MAX at end of
+  input) matches Flink exactly (`NativeColumnarWatermarkAssignerOperatorTest`).
+- Slicing reproduces the eager per-row emission; the aggregator's
+  `window_end <= current_watermark` drop reproduces the late-data discard. Both
+  the slicing (unit test) and the end-to-end drop (parity test) are covered.
+- The aggregator's `current_watermark` is carried in the snapshot metadata, so
+  late-dropping survives checkpoint/restore.

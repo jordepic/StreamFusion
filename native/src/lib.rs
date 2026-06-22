@@ -281,6 +281,9 @@ struct TumblingAggregator {
     aggregates: Vec<WindowAggregate>,
     windows: BTreeMap<i64, AlignedWindow>,
     key_types: Vec<DataType>,
+    // The highest watermark flushed so far; a row whose window ends at or before it is late (its
+    // window already closed) and is dropped, matching the host's per-row late-data handling.
+    current_watermark: i64,
 }
 
 impl TumblingAggregator {
@@ -299,6 +302,7 @@ impl TumblingAggregator {
             aggregates: kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect(),
             windows: BTreeMap::new(),
             key_types: Vec::new(),
+            current_watermark: i64::MIN,
         }
     }
 
@@ -357,6 +361,10 @@ impl TumblingAggregator {
         for row in 0..batch.num_rows() {
             let mut key = read_key(&key_arrays, row);
             self.windows_for(ts.value(row), &mut windows);
+            // Drop windows already closed by the watermark — the row is late for them. The host's
+            // per-row assigner drops such rows; the columnar assigner slices batches so a closing
+            // watermark precedes any row it makes late, and this is where that row is discarded.
+            windows.retain(|(_, end)| *end > self.current_watermark);
             // Move the row's key into its last window rather than cloning for every one; tumbling has
             // a single window, so this drops the per-row key clone entirely in the common case.
             let last = windows.len().saturating_sub(1);
@@ -379,6 +387,7 @@ impl TumblingAggregator {
     /// cumulative windows sharing a start differ by it; each result column takes the aggregate's
     /// own output type.
     fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
         let mut keys: Vec<GroupKey> = Vec::new();
         let mut starts = Vec::new();
@@ -417,6 +426,7 @@ impl TumblingAggregator {
     /// Local half of two-phase aggregation: emits each closed window's per-aggregate partial state
     /// as `[key, partial0..partialN-1, slice_end]`. Single-field partials (sum/min/max/count).
     fn flush_partial(&mut self, watermark: i64) -> RecordBatch {
+        self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
         let mut keys: Vec<GroupKey> = Vec::new();
         let mut slice_ends = Vec::new();
@@ -525,7 +535,12 @@ impl TumblingAggregator {
             });
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        // Carry the watermark in schema metadata so late-data dropping survives a restore.
+        let metadata = std::collections::HashMap::from([(
+            "current_watermark".to_string(),
+            self.current_watermark.to_string(),
+        )]);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields).with_metadata(metadata)), columns)
             .expect("failed to build snapshot batch");
 
         let mut buffer = Vec::new();
@@ -554,6 +569,9 @@ impl TumblingAggregator {
             .expect("failed to open snapshot reader");
         for batch in reader {
             let batch = batch.expect("failed to read snapshot");
+            if let Some(watermark) = batch.schema().metadata().get("current_watermark") {
+                aggregator.current_watermark = watermark.parse().expect("watermark");
+            }
             // Columns are [window_end, window_start, key0..key{arity-1}, state fields...].
             let arity = batch.num_columns() - 2 - state_field_total;
             let ends =

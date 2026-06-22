@@ -96,6 +96,29 @@ class NativeColumnarWatermarkAssignerOperatorTest {
     }
   }
 
+  @Test
+  void slicesOutOfOrderBatchToEmitWatermarksBetweenRows() throws Exception {
+    // An out-of-order batch: a high rowtime mid-batch jumps the watermark past the interval, then a
+    // low rowtime follows. The host emits the watermark between them (per row); we must too, so the
+    // batch is sliced into [row0,row1] + watermark + [row2] rather than forwarded whole.
+    NativeColumnarWatermarkAssignerOperator operator =
+        new NativeColumnarWatermarkAssignerOperator(1, 0);
+    try (BufferAllocator allocator = new RootAllocator();
+        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+      harness.setup(new ArrowBatchSerializer());
+      harness.open();
+
+      harness.processElement(
+          new StreamRecord<>(batch(allocator, event(1, 0), event(2, 5000), event(3, 500))));
+
+      // Sliced after the row that jumped the watermark (rows 0,1), then the trailing late row (row 2).
+      assertEquals(List.of(2, 1), forwardedRowCounts(harness));
+      assertEquals(List.of(5000L), watermarks(harness));
+      closeForwarded(harness);
+    }
+  }
+
   private static RowData event(long value, long eventTimeMillis) {
     GenericRowData row = new GenericRowData(2);
     row.setField(0, value);
