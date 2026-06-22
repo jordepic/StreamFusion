@@ -19,8 +19,9 @@ here when the ticket is deleted.
   Arroyo; we own buffering + watermark eviction (tickets 26, 27).
 - **Profiling/benchmarks (ticket 20):** Criterion native micro-benches; `ThroughputBenchmark`
   vs Flink; the `bench` Maven profile (release native — mandatory for benchmarks).
-- **Release benchmarks vs Flink:** Parquet copy (columnar→columnar) 3.19×, windowed-over-columnar
-  1.91×, tumbling (row source) 1.21×, Parquet sink (row source) 1.05×, bare filter 0.83×.
+- **Release benchmarks vs Flink (clean):** Parquet copy 2.61×, windowed-over-columnar 1.82×,
+  interval join 1.71×, tumbling 1.22×, OVER 1.22×, Parquet sink 0.91×, bare filter 0.72×. The two
+  below 1× are lone row-source operators paying the transpose tax (ticket 21).
 
 ## Next, roughly in order
 1. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and

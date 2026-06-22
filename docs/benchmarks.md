@@ -29,6 +29,11 @@ Current benches:
   iteration.
 - `tumbling/sum_keyed_update_flush` — the same, grouped by a bigint key (64 distinct
   values), so it exercises the per-row grouping-key path the unkeyed bench does not.
+- `session/sum_keyed_update_flush` — a session `SUM` grouped by key (gap merge).
+- `over/running_sum_keyed`, `over/row_number_keyed` — the columnar `OVER` push+flush, for a
+  running `SUM` (DataFusion accumulator per row) and `ROW_NUMBER` (per-key counter).
+- `interval_join/equi_key_push`, `window_join/equi_key_flush` — the two joins with a unique key
+  (1:1 match, no cross product), so they measure the DataFusion hash-join construction per batch.
 
 ### Results
 
@@ -39,9 +44,13 @@ Numbers are only comparable within a machine; record the host (CPU) alongside.
 | Benchmark | Rows/batch | Time/batch | Elements/s | Notes |
 |---|---|---|---|---|
 | `filter/gt_literal` | 4096 | 2.56 µs | ~1.60 Gelem/s | compiled predicate, ~50% selectivity |
-| `tumbling/sum_update_flush` | 4096 | 110 µs | ~37.4 Melem/s | 16 windows, no key |
-| `tumbling/sum_keyed_update_flush` | 4096 | 262 µs | ~15.7 Melem/s | 16 windows, 64 bigint keys |
-| `session/sum_keyed_update_flush` | 4096 | 2.70 ms | ~1.5 Melem/s | gap merge, 64 bigint keys |
+| `tumbling/sum_update_flush` | 4096 | 106 µs | ~38.6 Melem/s | 16 windows, no key |
+| `tumbling/sum_keyed_update_flush` | 4096 | 252 µs | ~16.3 Melem/s | 16 windows, 64 bigint keys |
+| `interval_join/equi_key_push` | 4096 | 100 µs | ~41 Melem/s | INNER, 1:1, equi-key + interval filter |
+| `window_join/equi_key_flush` | 4096 | 175 µs | ~23 Melem/s | INNER, 1:1, equi-key + window bounds |
+| `over/row_number_keyed` | 4096 | 532 µs | ~7.7 Melem/s | per-key counter, 64 keys |
+| `over/running_sum_keyed` | 4096 | 1.56 ms | ~2.6 Melem/s | per-row running aggregate, 64 keys |
+| `session/sum_keyed_update_flush` | 4096 | ~3 ms | ~1.4 Melem/s | gap merge, 64 keys (high-variance) |
 
 The gap between filter and aggregation is the signal: the filter is a compiled
 expression plus one Arrow kernel, while the tumbling aggregator groups every row by a
@@ -52,17 +61,18 @@ Profiling-driven cuts so far (tumbling, 4096-row batch):
 - moving the row's key into its last window instead of cloning it for every window
   (181 → 171 µs unkeyed, 395 → 323 µs keyed);
 - a fast hash (`ahash`) for the grouping map instead of the stdlib SipHash
-  (171 → 110 µs unkeyed, 323 → 262 µs keyed).
+  (171 → ~106 µs unkeyed, 323 → ~252 µs keyed).
 
-Net so far: the unkeyed path is ~2.2× faster (244 → 110 µs) and the keyed path ~1.5×
-(395 → 262 µs). The remaining per-row `GroupKey` allocation is the next target
+Net so far: the unkeyed path is ~2.3× faster (244 → ~106 µs) and the keyed path ~1.6×
+(395 → ~252 µs). The remaining per-row `GroupKey` allocation is the next target
 (row-format or dictionary-encoded keys) — see the [profiling
 ticket](../.claude/todos/20-profiling-and-benchmarks.md).
 
-The session aggregator is ~10× slower per element than tumbling because its `update`
-slices the value column one row at a time (a `take` per row) rather than once per group;
-batching that slice is its first optimization target. Its grouping hash is a negligible
-fraction here, so the `ahash` swap was deliberately not applied to it.
+The two slow operators both fold **per row**. The running `OVER` aggregate
+(~2.6 Melem/s) drives the DataFusion accumulator one row at a time — a `take` +
+`update_batch` + `evaluate` per row — rather than batching per group; a specialized running
+fold is its optimization target. The session aggregator (~1.4 Melem/s, high-variance) merges
+open windows over a per-key `BTreeMap` and likewise slices the value column one row at a time.
 
 ## End to end vs. Flink
 
@@ -79,17 +89,24 @@ the debug build and 3.0× on release — same code.)
 
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
-| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.33 M rows/s | 4.23 M rows/s | **3.19×** |
-| Tumbling | `SUM` by 1s window | 1.48 M rows/s | 1.79 M rows/s | **1.21×** |
-| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.16 M rows/s | 1.22 M rows/s | **1.05×** |
-| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 2.82 M rows/s | 2.34 M rows/s | **0.83×** |
+| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.32 M rows/s | 3.45 M rows/s | **2.61×** |
+| Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.80 M rows/s | 3.29 M rows/s | **1.82×** |
+| Interval join (event-time) | `a JOIN b ON a.k=b.k AND a.rt BETWEEN b.rt ± 1s` | 0.37 M rows/s | 0.63 M rows/s | **1.71×** |
+| Tumbling (row source) | `SUM` by 1s window | 1.63 M rows/s | 1.99 M rows/s | **1.22×** |
+| `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.85 M rows/s | 1.04 M rows/s | **1.22×** |
+| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.22 M rows/s | 1.11 M rows/s | **0.91×** |
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.11 M rows/s | 2.25 M rows/s | **0.72×** |
 
-Native wins where it does real columnar work: the fully-columnar copy is **3.19×**, a
-tumbling aggregate **1.21×** (despite a transpose still at its input), the row-fed sink is
-par (**1.05×**), and only the trivial stateless filter is below 1× (**0.83×**) — a single
-cheap predicate does not earn back the lone operator's `RowData → Arrow → RowData`
-round-trip; it crosses 1× once fed by a columnar source or chained with other native
-operators (no transpose between them).
+The gain tracks how much of the pipeline stays columnar. Fully-columnar paths lead — the copy
+**2.61×**, the windowed aggregate over a columnar source **1.82×**, the event-time interval join
+**1.71×** (Flink's interval join is slow; ours delegates the match to a DataFusion hash join).
+Row-source stateful ops land near **1.22×** (tumbling, `OVER`): identical native compute, but a
+`RowData → Arrow` transpose still sits at the input. The two below 1× are both **lone row-source
+operators** where the transpose tax exceeds the native gain — the Parquet sink **0.91×** (one
+boundary transpose ≈ the native write gain) and the stateless filter **0.72×** (a single cheap
+predicate cannot earn back the `RowData → Arrow → RowData` round-trip). A lone operator crosses 1×
+once fed by a columnar source or chained with other native operators (no transpose between them) —
+the native-operator-chaining work in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
 
 ### How we got these numbers (a profiling lesson)
 

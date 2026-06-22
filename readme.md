@@ -93,13 +93,19 @@ run with `cd native && cargo bench`. Method and running table:
 | Operator | Benchmark | Batch | Time | Throughput |
 |---|---|---|---|---|
 | Filter (`WHERE`) | compiled predicate `v > 0`, ~50% pass | 4096 rows | 2.56 µs | ~1.60 Gelem/s |
-| Tumbling window aggregate | `SUM` over 16 windows, no key | 4096 rows | 110 µs | ~37.4 Melem/s |
-| Tumbling window aggregate | `SUM` over 16 windows, 64 bigint keys | 4096 rows | 262 µs | ~15.7 Melem/s |
-| Session window aggregate | `SUM`, 64 bigint keys, 500 ms gap | 4096 rows | 2.70 ms | ~1.5 Melem/s |
+| Tumbling window aggregate | `SUM` over 16 windows, no key | 4096 rows | 106 µs | ~38.6 Melem/s |
+| Tumbling window aggregate | `SUM` over 16 windows, 64 bigint keys | 4096 rows | 252 µs | ~16.3 Melem/s |
+| Interval join | INNER, 1:1 on key, equi-key + interval filter | 4096 rows | 100 µs | ~41 Melem/s |
+| Window join | INNER, 1:1 on key + window bounds | 4096 rows | 175 µs | ~23 Melem/s |
+| `OVER` `ROW_NUMBER` | per-key counter, 64 keys | 4096 rows | 532 µs | ~7.7 Melem/s |
+| `OVER` running `SUM` | per-row running aggregate, 64 keys | 4096 rows | 1.56 ms | ~2.6 Melem/s |
+| Session window aggregate | `SUM`, 64 bigint keys, 500 ms gap | 4096 rows | ~3 ms | ~1.4 Melem/s |
 
-The native compute itself is fast (a filter clears ~1.6 G elements/s). The session
-aggregate is the outlier at ~1.5 Melem/s — its merge-on-overlap over a per-key
-`BTreeMap` of open sessions is far heavier than the aligned-window fold.
+The native compute is fast where it batches (a filter clears ~1.6 G elem/s; the joins
+delegate to a DataFusion hash join at 20–40 Melem/s). The two slow operators both fold
+**per row**: the running `OVER` aggregate drives the DataFusion accumulator one row at a
+time (~2.6 Melem/s), and the session aggregate merges open windows over a per-key
+`BTreeMap` (~1.4 Melem/s, and high-variance).
 
 ### End to end vs. Flink
 
@@ -110,26 +116,28 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
-| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.33 M rows/s | 4.23 M rows/s | **3.19×** |
-| Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.86 M rows/s | 3.55 M rows/s | **1.91×** |
-| Tumbling window aggregate (row source) | `SUM` by 1s window | 1.48 M rows/s | 1.79 M rows/s | **1.21×** |
-| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.16 M rows/s | 1.22 M rows/s | **1.05×** |
-| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 2.82 M rows/s | 2.34 M rows/s | **0.83×** |
+| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.32 M rows/s | 3.45 M rows/s | **2.61×** |
+| Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.80 M rows/s | 3.29 M rows/s | **1.82×** |
+| Interval join (event-time) | `a JOIN b ON a.k=b.k AND a.rt BETWEEN b.rt ± 1s` | 0.37 M rows/s | 0.63 M rows/s | **1.71×** |
+| Tumbling window aggregate (row source) | `SUM` by 1s window | 1.63 M rows/s | 1.99 M rows/s | **1.22×** |
+| `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.85 M rows/s | 1.04 M rows/s | **1.22×** |
+| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.22 M rows/s | 1.11 M rows/s | **0.91×** |
+| Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.11 M rows/s | 2.25 M rows/s | **0.72×** |
 
-Native wins where it does real columnar work and the transpose tax is small relative to
-it. The **fully-columnar Parquet copy is 3.19×** — the data is read as Arrow, flows through
-the native sink, and is written as Arrow, never becoming `RowData`, while Flink round-trips
-every row through its runtime at both ends. The **windowed aggregate over a columnar source is
-1.91×**: the same stateful two-phase window as the row-source case, but fed by a native Parquet
-source so the whole pipeline — source → watermark assigner → keyed shuffle → local/global window
-— flows Arrow with no transpose, including across the shuffle. That is what the **row-source
-tumbling aggregate (1.21×)** leaves on the table: identical native compute, but a `RowData →
-Arrow` transpose still sits at its input because the source is a row stream. The **row-source
-Parquet sink is ~par (1.05×)**: the one transpose at the boundary roughly cancels the native
-write gain. The **stateless filter is 0.83×** — the one case below 1×, and expectedly so: a
-single cheap predicate does not earn back the `RowData → Arrow → RowData` round-trip the lone
-operator pays. The pattern is consistent: the gain tracks how much of the pipeline stays
-columnar, and the windowed-source case shows a stateful pipeline that never leaves Arrow.
+The gain tracks how much of the pipeline stays columnar. The **fully-columnar paths lead**:
+the Parquet copy at **2.61×** (read as Arrow, through the native sink, written as Arrow —
+never `RowData`, while Flink round-trips every row at both ends), the windowed aggregate over
+a columnar source at **1.82×** (the whole source → watermark assigner → keyed shuffle →
+local/global window pipeline stays Arrow), and the event-time **interval join at 1.71×** (Flink's
+interval join is slow; ours buffers per key and delegates the match to a DataFusion hash join).
+**Row-source stateful ops land near 1.22×** (tumbling, `OVER`): identical native compute, but a
+`RowData → Arrow` transpose still sits at the input because the source is a row stream. The **two
+below 1× are both lone row-source operators** where the transpose tax exceeds the native gain —
+the Parquet sink at **0.91×** (one boundary transpose roughly cancels the native write) and the
+stateless filter at **0.72×** (a single cheap predicate cannot earn back the
+`RowData → Arrow → RowData` round-trip). Closing that gap is the native-operator-chaining work in
+[ticket 21](.claude/todos/21-native-operator-chaining.md): keep Arrow across adjacent native
+operators so the transpose is paid once at the edges, not per operator.
 
 _Apple M1 Max; numbers are comparable only within a machine._
 
