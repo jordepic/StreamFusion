@@ -600,6 +600,70 @@ impl TumblingAggregator {
     }
 }
 
+/// Event-time `OVER (ORDER BY rt RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)` aggregation,
+/// no partition key: one running accumulator set per aggregate that never evicts. Given a batch of
+/// already-complete rows (their rowtime <= the watermark), it folds them in rowtime order and
+/// returns each row's running aggregate. RANGE means rows sharing a rowtime share the post-fold
+/// value, so ties are folded as a group before any of them is read. The accumulator persists across
+/// calls (UNBOUNDED PRECEDING), so a later batch continues the running total. Emits one value per
+/// input row, in the input row order, so the caller can zip it back onto the passed-through columns.
+struct OverAggregator {
+    aggregates: Vec<WindowAggregate>,
+    accumulators: Vec<Box<dyn Accumulator>>,
+}
+
+impl OverAggregator {
+    fn new(value_type: i64, kinds: Vec<i64>) -> Self {
+        let value_type = value_data_type(value_type);
+        let aggregates: Vec<WindowAggregate> =
+            kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect();
+        let accumulators = aggregates.iter().map(WindowAggregate::create_accumulator).collect();
+        OverAggregator { aggregates, accumulators }
+    }
+
+    /// Folds the batch (`rt` i64 + `value`) into the running accumulators in rowtime order and
+    /// returns `[result0..resultN-1]` per input row, in input order.
+    fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let rt = column_i64(batch, "rt");
+        let value = batch.column_by_name("value").expect("missing value column");
+        let n = batch.num_rows();
+        let num_agg = self.aggregates.len();
+
+        // Process rows in rowtime order, grouping ties (RANGE), but record each row's result at its
+        // original position so the result columns line up with the caller's rows.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&row| rt.value(row));
+        let mut results: Vec<Vec<ScalarValue>> =
+            vec![vec![ScalarValue::Null; n]; num_agg];
+        let mut start = 0;
+        while start < n {
+            let mut end = start;
+            while end < n && rt.value(order[end]) == rt.value(order[start]) {
+                end += 1;
+            }
+            let group: Vec<u32> = order[start..end].iter().map(|&row| row as u32).collect();
+            let values = take(value, &UInt32Array::from(group), None).expect("failed to take values");
+            for (a, accumulator) in self.accumulators.iter_mut().enumerate() {
+                accumulator.update_batch(std::slice::from_ref(&values)).expect("failed to update");
+                let result = accumulator.evaluate().expect("failed to evaluate");
+                for &row in &order[start..end] {
+                    results[a][row] = result.clone();
+                }
+            }
+            start = end;
+        }
+
+        let mut fields = Vec::with_capacity(num_agg);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_agg);
+        for (a, aggregate) in self.aggregates.iter().enumerate() {
+            fields.push(Field::new(format!("result{a}"), aggregate.result_type(), true));
+            columns.push(scalars_to_array(std::mem::take(&mut results[a]), &aggregate.result_type()));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build over result batch")
+    }
+}
+
 /// One open session for a key: its end (the latest element's timestamp plus the gap) and the
 /// incremental accumulators folding in its rows. The start is the map key that holds it.
 struct Session {
@@ -2226,6 +2290,28 @@ mod tests {
 
     fn values(batch: &RecordBatch, column: usize) -> Vec<i64> {
         batch.column(column).as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()
+    }
+
+    // OVER (ORDER BY rt RANGE UNBOUNDED PRECEDING) running SUM: ties in rt share the post-fold value,
+    // and the running total persists across update calls.
+    #[test]
+    fn over_running_sum_shares_range_ties() {
+        let rt: ArrayRef = Arc::new(Int64Array::from(vec![0i64, 1000, 1000, 2000]));
+        let value: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30, 40]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rt", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![rt, value]).unwrap();
+        let mut over = OverAggregator::new(0, vec![0]); // bigint value, SUM
+        // rt 1000 ties (20,30) both see 10+20+30=60; emitted in input order.
+        assert_eq!(values(&over.update(&batch), 0), vec![10, 60, 60, 100]);
+
+        // A later complete batch continues the running total (UNBOUNDED PRECEDING).
+        let rt2: ArrayRef = Arc::new(Int64Array::from(vec![3000i64]));
+        let value2: ArrayRef = Arc::new(Int64Array::from(vec![5i64]));
+        let batch2 = RecordBatch::try_new(schema, vec![rt2, value2]).unwrap();
+        assert_eq!(values(&over.update(&batch2), 0), vec![105]);
     }
 
     // Decoder over the pre-order encoding: CALL gt ( INPUT_REF a , LIT_LONG 5 ).
