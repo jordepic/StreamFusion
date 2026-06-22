@@ -1161,6 +1161,16 @@ fn build_expr(
         7 => logical_lit(longs[arg] as i32),
         8 => logical_lit(longs[arg] as i16),
         9 => logical_lit(longs[arg] as i8),
+        11 => {
+            // A widening numeric cast: build the single child, then wrap it. `arg` is the target code.
+            let child = build_expr(
+                schema, kinds, payload, child_counts, longs, doubles, strings, cursor,
+            );
+            datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(child),
+                cast_data_type(arg),
+            ))
+        }
         6 => {
             let op = payload[node];
             let count = child_counts[node] as usize;
@@ -1180,6 +1190,19 @@ fn build_expr(
             build_call(op, args)
         }
         other => panic!("unsupported expression kind: {other}"),
+    }
+}
+
+/// The Arrow type for a cast target code (mirrors the JVM encoder's widening cast targets).
+fn cast_data_type(code: usize) -> DataType {
+    match code {
+        0 => DataType::Int8,
+        1 => DataType::Int16,
+        2 => DataType::Int32,
+        3 => DataType::Int64,
+        4 => DataType::Float32,
+        5 => DataType::Float64,
+        other => panic!("unsupported cast target: {other}"),
     }
 }
 
