@@ -764,15 +764,221 @@ impl OverAggregator {
     }
 }
 
-/// Columnar OVER aggregation: buffers whole input batches, and on a watermark emits the rows it has
-/// completed (rowtime <= watermark) with the running aggregate column(s) appended — the input
-/// columns pass straight through, so the data stays Arrow end to end. Wraps {@link OverAggregator}
-/// for the per-key running fold; this layer adds the buffering, the complete/pending split, the
-/// rowtime→millis conversion the inner fold expects, and the passthrough.
+/// Window-function code: a SQL `OVER` analytic function that is *not* a mergeable aggregate.
+fn is_window_function_kind(kind: i64) -> bool {
+    kind >= 10
+}
+
+/// Per-key running state for one OVER window function. Unlike the aggregate path these are not
+/// DataFusion accumulators (DataFusion's window evaluators expose no serializable state); we own the
+/// small running state so it checkpoints, computing it incrementally in rowtime order like Flink's
+/// own `OverAggregate` (see divergences/11).
+enum WindowFnState {
+    /// `ROW_NUMBER()` over `ROWS UNBOUNDED PRECEDING` — a per-partition counter (1-based).
+    RowNumber(i64),
+}
+
+impl WindowFnState {
+    fn new(kind: i64) -> Self {
+        match kind {
+            10 => WindowFnState::RowNumber(0),
+            other => panic!("unsupported window function kind: {other}"),
+        }
+    }
+
+    /// Advances the state for the current row and returns its emitted value.
+    fn next(&mut self, _rt: i64) -> ScalarValue {
+        match self {
+            WindowFnState::RowNumber(n) => {
+                *n += 1;
+                ScalarValue::Int64(Some(*n))
+            }
+        }
+    }
+
+    fn result_type(&self) -> DataType {
+        match self {
+            WindowFnState::RowNumber(_) => DataType::Int64,
+        }
+    }
+
+    /// The checkpointable running state, as scalars (one or more per function).
+    fn state(&self) -> Vec<ScalarValue> {
+        match self {
+            WindowFnState::RowNumber(n) => vec![ScalarValue::Int64(Some(*n))],
+        }
+    }
+
+    fn state_types(&self) -> Vec<DataType> {
+        match self {
+            WindowFnState::RowNumber(_) => vec![DataType::Int64],
+        }
+    }
+
+    fn restore_state(&mut self, state: &[ScalarValue]) {
+        match self {
+            WindowFnState::RowNumber(n) => {
+                if let ScalarValue::Int64(Some(value)) = state[0] {
+                    *n = value;
+                }
+            }
+        }
+    }
+}
+
+/// OVER window functions (ROW_NUMBER today; RANK/DENSE_RANK/FIRST_VALUE/LAST_VALUE to follow),
+/// computed incrementally per partition key in rowtime order. The sibling of {@link OverAggregator}
+/// for the non-aggregate `OVER` functions: same `[rt, key0..]` sub-batch in, one result column per
+/// function out, but driven by per-key {@link WindowFnState} rather than DataFusion accumulators.
+struct WindowFunctionOver {
+    kinds: Vec<i64>,
+    keys: HashMap<GroupKey, Vec<WindowFnState>>,
+    key_types: Vec<DataType>,
+}
+
+impl WindowFunctionOver {
+    fn new(kinds: Vec<i64>) -> Self {
+        WindowFunctionOver { kinds, keys: HashMap::new(), key_types: Vec::new() }
+    }
+
+    fn states(&mut self, key: GroupKey) -> &mut Vec<WindowFnState> {
+        let kinds = &self.kinds;
+        self.keys.entry(key).or_insert_with(|| kinds.iter().map(|&k| WindowFnState::new(k)).collect())
+    }
+
+    /// Advances each function per row in rowtime order and returns `[result0..]` in input order.
+    fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let rt = column_i64(batch, "rt");
+        let key_arrays = key_arrays(batch);
+        self.key_types = key_types(&key_arrays);
+        let n = batch.num_rows();
+        let num = self.kinds.len();
+        let row_keys: Vec<GroupKey> = (0..n).map(|row| read_key(&key_arrays, row)).collect();
+        // Stable sort by rowtime: rows of equal rowtime keep input (arrival) order, matching Flink's
+        // ROWS-frame tie order.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&row| rt.value(row));
+        let mut results: Vec<Vec<ScalarValue>> = vec![vec![ScalarValue::Null; n]; num];
+        for &row in &order {
+            for (i, state) in self.states(row_keys[row].clone()).iter_mut().enumerate() {
+                results[i][row] = state.next(rt.value(row));
+            }
+        }
+        let mut fields = Vec::with_capacity(num);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(num);
+        for (i, &kind) in self.kinds.iter().enumerate() {
+            let result_type = WindowFnState::new(kind).result_type();
+            fields.push(Field::new(format!("result{i}"), result_type.clone(), true));
+            columns.push(scalars_to_array(std::mem::take(&mut results[i]), &result_type));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build window-function result batch")
+    }
+
+    /// Serializes the per-key running state (`[key0.., state…]`, one row per key).
+    fn snapshot(&mut self) -> Vec<u8> {
+        let state_types: Vec<DataType> =
+            self.kinds.iter().flat_map(|&k| WindowFnState::new(k).state_types()).collect();
+        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_types.len()];
+        for (key, states) in self.keys.iter() {
+            keys.push(key.clone());
+            let mut column = 0;
+            for state in states {
+                for scalar in state.state() {
+                    state_columns[column].push(scalar);
+                    column += 1;
+                }
+            }
+        }
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&keys, &self.key_types);
+        for (index, state_type) in state_types.iter().enumerate() {
+            fields.push(Field::new(format!("state{index}"), state_type.clone(), true));
+        }
+        for (index, scalars) in state_columns.into_iter().enumerate() {
+            columns.push(scalars_to_array(scalars, &state_types[index]));
+        }
+        write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build window-function snapshot batch"))
+    }
+
+    fn restore(kinds: Vec<i64>, bytes: &[u8]) -> Self {
+        let mut over = WindowFunctionOver::new(kinds);
+        let state_counts: Vec<usize> =
+            over.kinds.iter().map(|&k| WindowFnState::new(k).state_types().len()).collect();
+        let state_total: usize = state_counts.iter().sum();
+        for batch in read_ipc(bytes) {
+            let arity = batch.num_columns() - state_total;
+            let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
+            over.key_types = key_types(&key_arrays);
+            for row in 0..batch.num_rows() {
+                let key = read_key(&key_arrays, row);
+                let mut column = arity;
+                for (i, state) in over.states(key).iter_mut().enumerate() {
+                    let count = state_counts[i];
+                    let scalars: Vec<ScalarValue> = (column..column + count)
+                        .map(|c| ScalarValue::try_from_array(batch.column(c), row).expect("state scalar"))
+                        .collect();
+                    state.restore_state(&scalars);
+                    column += count;
+                }
+            }
+        }
+        over
+    }
+}
+
+/// The inner per-key computation of a columnar OVER: mergeable aggregates (DataFusion accumulators)
+/// or non-aggregate window functions ({@link WindowFunctionOver}). Both take a `[rt, value?, key0..]`
+/// sub-batch and return one result column per output, in input row order.
+enum OverInner {
+    Aggregates(OverAggregator),
+    WindowFunctions(WindowFunctionOver),
+}
+
+impl OverInner {
+    fn new(value_type: i64, kinds: Vec<i64>) -> Self {
+        if kinds.iter().all(|&k| is_window_function_kind(k)) {
+            OverInner::WindowFunctions(WindowFunctionOver::new(kinds))
+        } else {
+            OverInner::Aggregates(OverAggregator::new(value_type, kinds))
+        }
+    }
+
+    fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
+        match self {
+            OverInner::Aggregates(inner) => inner.update(batch),
+            OverInner::WindowFunctions(inner) => inner.update(batch),
+        }
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        match self {
+            OverInner::Aggregates(inner) => inner.snapshot(),
+            OverInner::WindowFunctions(inner) => inner.snapshot(),
+        }
+    }
+
+    fn restore(value_type: i64, kinds: Vec<i64>, bytes: &[u8]) -> Self {
+        if kinds.iter().all(|&k| is_window_function_kind(k)) {
+            OverInner::WindowFunctions(WindowFunctionOver::restore(kinds, bytes))
+        } else {
+            OverInner::Aggregates(OverAggregator::restore(value_type, kinds, bytes))
+        }
+    }
+}
+
+/// Columnar OVER: buffers whole input batches, and on a watermark emits the rows it has completed
+/// (rowtime <= watermark) with the running aggregate / window-function column(s) appended — the input
+/// columns pass straight through, so the data stays Arrow end to end. The {@link OverInner} does the
+/// per-key running fold; this layer adds the buffering, the complete/pending split, the rowtime→millis
+/// conversion the inner expects, and the passthrough.
 struct OverWindowAggregator {
-    inner: OverAggregator,
+    inner: OverInner,
     rt_column: usize,
-    value_column: usize,
+    /// The value column the inner reads, or `None` for functions with no argument (e.g. ROW_NUMBER).
+    value_column: Option<usize>,
     key_columns: Vec<usize>,
     buffered: Vec<RecordBatch>,
     input_schema: Option<SchemaRef>,
@@ -783,11 +989,11 @@ impl OverWindowAggregator {
         value_type: i64,
         kinds: Vec<i64>,
         rt_column: usize,
-        value_column: usize,
+        value_column: Option<usize>,
         key_columns: Vec<usize>,
     ) -> Self {
         OverWindowAggregator {
-            inner: OverAggregator::new(value_type, kinds),
+            inner: OverInner::new(value_type, kinds),
             rt_column,
             value_column,
             key_columns,
@@ -834,14 +1040,12 @@ impl OverWindowAggregator {
     /// The `[rt(ms i64), value, key0..]` batch the inner per-key fold reads, projected from the
     /// completed rows (rowtime converted from its timestamp unit to epoch millis).
     fn keyed_subbatch(&self, complete: &RecordBatch) -> RecordBatch {
-        let mut fields = vec![
-            Field::new("rt", DataType::Int64, false),
-            Field::new("value", complete.column(self.value_column).data_type().clone(), true),
-        ];
-        let mut columns: Vec<ArrayRef> = vec![
-            Arc::new(rt_to_millis(complete.column(self.rt_column))),
-            complete.column(self.value_column).clone(),
-        ];
+        let mut fields = vec![Field::new("rt", DataType::Int64, false)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(rt_to_millis(complete.column(self.rt_column)))];
+        if let Some(value_column) = self.value_column {
+            fields.push(Field::new("value", complete.column(value_column).data_type().clone(), true));
+            columns.push(complete.column(value_column).clone());
+        }
         for (j, &key) in self.key_columns.iter().enumerate() {
             fields.push(Field::new(format!("key{j}"), complete.column(key).data_type().clone(), false));
             columns.push(complete.column(key).clone());
@@ -875,12 +1079,12 @@ impl OverWindowAggregator {
         value_type: i64,
         kinds: Vec<i64>,
         rt_column: usize,
-        value_column: usize,
+        value_column: Option<usize>,
         key_columns: Vec<usize>,
         bytes: &[u8],
     ) -> Self {
         let accumulators_len = u32::from_le_bytes(bytes[0..4].try_into().expect("len")) as usize;
-        let inner = OverAggregator::restore(value_type, kinds, &bytes[4..4 + accumulators_len]);
+        let inner = OverInner::restore(value_type, kinds, &bytes[4..4 + accumulators_len]);
         let mut aggregator = OverWindowAggregator {
             inner,
             rt_column,
@@ -2858,7 +3062,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createOverAgg
         value_type as i64,
         kinds,
         rt_column as usize,
-        value_column as usize,
+        if value_column < 0 { None } else { Some(value_column as usize) },
         keys,
     ))) as jlong
 }
@@ -2935,7 +3139,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAg
         value_type as i64,
         kinds,
         rt_column as usize,
-        value_column as usize,
+        if value_column < 0 { None } else { Some(value_column as usize) },
         keys,
         &bytes,
     ))) as jlong
@@ -3418,7 +3622,7 @@ mod tests {
             Field::new("rt", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), false),
         ]));
         let batch = RecordBatch::try_new(schema, vec![k, v, rt]).unwrap();
-        let mut over = OverWindowAggregator::new(0, vec![0], 2, 1, vec![0]);
+        let mut over = OverWindowAggregator::new(0, vec![0], 2, Some(1), vec![0]);
         over.push(batch);
         // Watermark 2000ms completes the first three rows (rt 0/1000/500); the rt=9000 row stays.
         let out = over.flush(2000);
@@ -3598,6 +3802,27 @@ mod tests {
         let out = restored.push_left(join_batch(vec![1], vec![10], vec![5000]));
         assert_eq!(out.num_rows(), 1);
         assert_eq!(values(&out, 4), vec![100]);
+    }
+
+    // ROW_NUMBER over (PARTITION BY key0 ORDER BY rt): a per-key counter in rowtime order, surviving
+    // across update calls (the unbounded frame).
+    #[test]
+    fn window_function_row_number_counts_per_key() {
+        let batch = |rt: Vec<i64>, key0: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("rt", DataType::Int64, false),
+                    Field::new("key0", DataType::Int64, false),
+                ])),
+                vec![Arc::new(Int64Array::from(rt)), Arc::new(Int64Array::from(key0))],
+            )
+            .unwrap()
+        };
+        let mut over = WindowFunctionOver::new(vec![10]); // ROW_NUMBER
+        // Out of rowtime order within the batch: ROW_NUMBER follows rowtime, emitted in input order.
+        assert_eq!(values(&over.update(&batch(vec![0, 1000, 0], vec![1, 1, 2])), 0), vec![1, 2, 1]);
+        // The counter continues per key across calls.
+        assert_eq!(values(&over.update(&batch(vec![2000, 1000], vec![1, 2])), 0), vec![3, 2]);
     }
 
     // Decoder over the pre-order encoding: CALL gt ( INPUT_REF a , LIT_LONG 5 ).

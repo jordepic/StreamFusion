@@ -37,10 +37,9 @@ final class OverAggregateMatcher {
         return false; // PARTITION BY only on bigint/int/string
       }
     }
-    if (group.isRows
-        || !(group.lowerBound.isUnbounded() && group.lowerBound.isPreceding())
+    if (!(group.lowerBound.isUnbounded() && group.lowerBound.isPreceding())
         || !group.upperBound.isCurrentRow()) {
-      return false; // only RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      return false; // only the UNBOUNDED PRECEDING .. CURRENT ROW frame
     }
     Integer order = orderColumn(group);
     if (order == null
@@ -48,7 +47,27 @@ final class OverAggregateMatcher {
             inputType.getFieldList().get(order).getType())) {
       return false; // exactly one ascending rowtime order column
     }
-    return valueColumn(group, inputType) != null;
+    // Window functions (ROW_NUMBER) are computed per partition with no value column and use a ROWS
+    // frame; aggregates use a RANGE frame over a single shared value column.
+    if (allWindowFunctions(group)) {
+      return true;
+    }
+    return !group.isRows && valueColumn(group, inputType) != null;
+  }
+
+  /** Whether every aggregate in the group is a supported non-aggregate window function. */
+  private static boolean allWindowFunctions(Window.Group group) {
+    for (Window.RexWinAggCall aggCall : group.aggCalls) {
+      if (windowFunctionKind(aggCall.getOperator().getKind()) < 0) {
+        return false;
+      }
+    }
+    return !group.aggCalls.isEmpty();
+  }
+
+  /** Native code for a non-aggregate window function, or -1 if it is not one we implement. */
+  private static int windowFunctionKind(SqlKind kind) {
+    return kind == SqlKind.ROW_NUMBER ? 10 : -1;
   }
 
   /** The single ascending ORDER BY column index, or null if the order is not a lone ascending key. */
@@ -104,19 +123,22 @@ final class OverAggregateMatcher {
     return over.logicWindow().groups.get(0).keys.toArray();
   }
 
+  /** The shared value column index, or -1 for window-function OVER (e.g. ROW_NUMBER) with no argument. */
   static int valueColumnIndex(StreamPhysicalOverAggregate over) {
-    return valueColumn(over.logicWindow().groups.get(0), over.getInput().getRowType());
+    Window.Group group = over.logicWindow().groups.get(0);
+    if (allWindowFunctions(group)) {
+      return -1;
+    }
+    return valueColumn(group, over.getInput().getRowType());
   }
 
-  /** Value-type code matching the native side: 0 = bigint, 1 = double, 2 = int. */
+  /** Value-type code matching the native side: 0 = bigint, 1 = double, 2 = int (0 when no value). */
   static int valueTypeCode(StreamPhysicalOverAggregate over) {
-    switch (over
-        .getInput()
-        .getRowType()
-        .getFieldList()
-        .get(valueColumnIndex(over))
-        .getType()
-        .getSqlTypeName()) {
+    int valueColumn = valueColumnIndex(over);
+    if (valueColumn < 0) {
+      return 0; // window functions ignore the value type
+    }
+    switch (over.getInput().getRowType().getFieldList().get(valueColumn).getType().getSqlTypeName()) {
       case DOUBLE:
         return 1;
       case INTEGER:
@@ -130,9 +152,15 @@ final class OverAggregateMatcher {
     List<Window.RexWinAggCall> aggCalls = over.logicWindow().groups.get(0).aggCalls;
     int[] kinds = new int[aggCalls.size()];
     for (int i = 0; i < aggCalls.size(); i++) {
-      kinds[i] = overKind(aggCalls.get(i).getOperator().getKind());
+      kinds[i] = kindCode(aggCalls.get(i).getOperator().getKind());
     }
     return kinds;
+  }
+
+  /** Native code for an OVER output: a window-function code if it is one, else an aggregate code. */
+  private static int kindCode(SqlKind kind) {
+    int windowFunction = windowFunctionKind(kind);
+    return windowFunction >= 0 ? windowFunction : overKind(kind);
   }
 
   /**

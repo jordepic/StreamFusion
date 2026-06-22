@@ -79,6 +79,17 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   @Test
+  void rowNumberOverColumnarSourceMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("crn-in");
+    writeInput(input);
+    // ROW_NUMBER() rides the same columnar OVER path as the running aggregates: native source →
+    // watermark assigner → columnar exchange → columnar OVER, the per-partition counter appended.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "ONE_PHASE"),
+        "SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt) AS rn FROM t");
+  }
+
+  @Test
   void outOfOrderWithinBatchDropsLateRowLikeHost() throws Exception {
     Path input = Files.createTempDirectory("cwin-ooo-in");
     writeOutOfOrderInput(input);
