@@ -207,6 +207,18 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
+  void twoPhaseCumulativeMatchesHost() throws Exception {
+    // Two-phase (the default plan): a native local pre-aggregates per 1s slice, the host shuffles by
+    // key, and a native global re-buckets each slice into the nested cumulative windows up to the 3s
+    // max size. Both halves substitute (unlike one-phase, which is a single window operator).
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT k, window_start, window_end, SUM(`value`) AS s, COUNT(`value`) AS c "
+            + "FROM TABLE(CUMULATE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '3' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void multiAggregateMatchesHost() throws Exception {
     NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,

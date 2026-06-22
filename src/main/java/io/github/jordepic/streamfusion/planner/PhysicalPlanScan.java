@@ -258,7 +258,19 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
               && WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType())
                   != 2
               && !WindowAggregateMatcher.containsAvg(agg.aggCalls());
-      if (tumbling || hopping) {
+      // Cumulative local: like the tumbling local (pre-aggregates per slice = step), but a cumulative
+      // window. Unlike hopping it carries no synthetic count column, so the partials are the plain
+      // user aggregates and the global re-buckets each slice into its nested windows.
+      boolean cumulativeLocal =
+          !hopping
+              && !tumbling
+              && WindowAggregateMatcher.matches(
+                  agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())
+              && WindowAggregateMatcher.isCumulative(agg.windowing())
+              && WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType())
+                  != 2
+              && !WindowAggregateMatcher.containsAvg(agg.aggCalls());
+      if (tumbling || hopping || cumulativeLocal) {
         substitutions++;
         int[] kinds =
             hopping
@@ -369,6 +381,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         substitutions++;
         long windowMillis = GlobalWindowAggregateMatcher.windowMillis(agg);
         long slideMillis = GlobalWindowAggregateMatcher.slideMillis(agg);
+        boolean cumulative = GlobalWindowAggregateMatcher.cumulative(agg);
         int[] keyColumns = GlobalWindowAggregateMatcher.keyColumns(agg);
         int valueType = GlobalWindowAggregateMatcher.valueType(agg);
         int[] kinds = GlobalWindowAggregateMatcher.kinds(agg);
@@ -393,6 +406,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
               agg.getRowType(),
               windowMillis,
               slideMillis,
+              cumulative,
               keyColumns,
               valueType,
               kinds);
@@ -404,6 +418,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             agg.getRowType(),
             windowMillis,
             slideMillis,
+            cumulative,
             keyColumns,
             GlobalWindowAggregateMatcher.partialColumns(agg),
             GlobalWindowAggregateMatcher.sliceEndColumn(agg),

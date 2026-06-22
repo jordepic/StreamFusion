@@ -29,6 +29,7 @@ public class NativeColumnarGlobalWindowAggExecNode extends ExecNodeBase<RowData>
 
   private final long windowMillis;
   private final long slideMillis;
+  private final boolean cumulative;
   private final int[] keyColumns;
   private final int valueType;
   private final int[] aggregateKinds;
@@ -40,6 +41,7 @@ public class NativeColumnarGlobalWindowAggExecNode extends ExecNodeBase<RowData>
       String description,
       long windowMillis,
       long slideMillis,
+      boolean cumulative,
       int[] keyColumns,
       int valueType,
       int[] aggregateKinds) {
@@ -52,6 +54,7 @@ public class NativeColumnarGlobalWindowAggExecNode extends ExecNodeBase<RowData>
         description);
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
+    this.cumulative = cumulative;
     this.keyColumns = keyColumns;
     this.valueType = valueType;
     this.aggregateKinds = aggregateKinds;
@@ -70,6 +73,7 @@ public class NativeColumnarGlobalWindowAggExecNode extends ExecNodeBase<RowData>
         new NativeColumnarGlobalWindowAggregateOperator(
             windowMillis,
             slideMillis,
+            cumulative,
             NativeWindowOperatorCore.keyTypes((RowType) getOutputType(), keyColumns.length),
             valueType,
             aggregateKinds,

@@ -54,6 +54,20 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   @Test
+  void twoPhaseCumulativeOverColumnarSourceMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("ccum-2phase-in");
+    writeInput(input);
+    // Fully-columnar two-phase cumulative: a columnar local pre-aggregates per slice, a columnar
+    // exchange splits the partials by key, and a columnar global re-buckets each slice into the
+    // nested cumulative windows — the whole local → shuffle → global path flows Arrow.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "TWO_PHASE"),
+        "SELECT k, window_start, window_end, SUM(v) AS total "
+            + "FROM TABLE(CUMULATE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '3' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void partitionedOverColumnarSourceMatchesHost() throws Exception {
     Path input = Files.createTempDirectory("cover-in");
     writeInput(input);

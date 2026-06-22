@@ -21,10 +21,12 @@ public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindow
     implements OneInputStreamOperator<ArrowBatch, RowData> {
 
   private final int[] keyTypes;
+  private final boolean cumulative;
 
   public NativeColumnarGlobalWindowAggregateOperator(
       long windowMillis,
       long slideMillis,
+      boolean cumulative,
       int[] keyTypes,
       int valueType,
       int[] aggregateKinds,
@@ -36,7 +38,25 @@ public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindow
         valueType,
         aggregateKinds,
         timeZoneId);
+    this.cumulative = cumulative;
     this.keyTypes = keyTypes;
+  }
+
+  // Cumulative globals merge each slice into the nested windows of its bucket; see the row-fed
+  // operator. The native side switches fan-out on the cumulative flag set here.
+  @Override
+  protected long createHandle() {
+    return cumulative
+        ? Native.createCumulativeAggregator(windowMillis, slideMillis, valueType, aggregateKinds)
+        : super.createHandle();
+  }
+
+  @Override
+  protected long restoreHandle(byte[] snapshot) {
+    return cumulative
+        ? Native.restoreCumulativeAggregator(
+            windowMillis, slideMillis, valueType, aggregateKinds, snapshot)
+        : super.restoreHandle(snapshot);
   }
 
   @Override
