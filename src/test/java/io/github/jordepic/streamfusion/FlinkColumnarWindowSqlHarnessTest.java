@@ -22,7 +22,7 @@ class FlinkColumnarWindowSqlHarnessTest {
     writeInput(input);
     // No grouping key: the exchange is SINGLETON (one channel).
     NativeParity.assertParity(
-        () -> readEnvironment(input),
+        () -> readEnvironment(input, "ONE_PHASE"),
         "SELECT window_start, window_end, SUM(v) AS total "
             + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
             + "GROUP BY window_start, window_end");
@@ -34,7 +34,20 @@ class FlinkColumnarWindowSqlHarnessTest {
     writeInput(input);
     // GROUP BY k: the exchange is a hash shuffle on k, split by key into channels columnar.
     NativeParity.assertParity(
-        () -> readEnvironment(input),
+        () -> readEnvironment(input, "ONE_PHASE"),
+        "SELECT k, window_start, window_end, SUM(v) AS total "
+            + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseKeyedWindowOverColumnarSourceMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("cwin-2phase-in");
+    writeInput(input);
+    // Two-phase: a columnar local pre-aggregate emits partial Arrow batches, a columnar exchange
+    // splits them by key, and a columnar global merges — the whole two-phase pipeline flows Arrow.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "TWO_PHASE"),
         "SELECT k, window_start, window_end, SUM(v) AS total "
             + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
             + "GROUP BY k, window_start, window_end");
@@ -61,11 +74,11 @@ class FlinkColumnarWindowSqlHarnessTest {
         .await();
   }
 
-  private static TableEnvironment readEnvironment(Path directory) {
+  private static TableEnvironment readEnvironment(Path directory, String phaseStrategy) {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
-    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", phaseStrategy);
     tEnv.executeSql(
         "CREATE TABLE t (k BIGINT, v BIGINT, rt TIMESTAMP_LTZ(3), "
             + "WATERMARK FOR rt AS rt - INTERVAL '2' SECOND) WITH ('connector' = 'filesystem', "

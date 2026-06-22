@@ -12,7 +12,7 @@ import org.apache.flink.table.data.RowData;
  * in {@link NativeWindowOperatorCore}; this layer only supplies the row input path. Each concrete
  * operator decides how a buffered batch is fed to native code and how closed windows are emitted.
  */
-public abstract class NativeWindowOperatorBase extends NativeWindowOperatorCore
+public abstract class NativeWindowOperatorBase extends NativeRowWindowOperatorCore
     implements OneInputStreamOperator<RowData, RowData> {
 
   private final int batchSize;

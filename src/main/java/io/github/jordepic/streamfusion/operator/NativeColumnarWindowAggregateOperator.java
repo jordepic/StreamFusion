@@ -13,7 +13,7 @@ import org.apache.flink.table.data.RowData;
  * the data never transposes to {@link RowData} on the way in. Output is still rows ({@code [key?,
  * agg…, window_start, window_end]}), so a row consumer downstream needs no transpose.
  */
-public class NativeColumnarWindowAggregateOperator extends NativeWindowOperatorCore
+public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperatorCore
     implements OneInputStreamOperator<ArrowBatch, RowData> {
 
   private final boolean cumulative;

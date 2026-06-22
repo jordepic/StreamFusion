@@ -1,19 +1,26 @@
 # Native columnar shuffle: keep Arrow across the exchange
 
-**Status:** DONE for the single-phase window case. A native columnar exchange
+**Status:** DONE for single-phase and two-phase windows. A native columnar exchange
 (`StreamPhysicalNativeColumnarExchange` + `NativeColumnarExchangeExecNode`) splits each
 batch by key (`SplitByKeyGroupOperator`) and routes it via a `PartitionTransformation` +
-`ColumnarKeyGroupPartitioner`, feeding the columnar window with no row transpose.
-`PhysicalPlanScan` substitutes the exchange + columnar window together when the exchange's
-input is columnar (`FlinkColumnarWindowSqlHarnessTest`: no-key SINGLETON and keyed HASH both
-parity-green). The shuffle uses its own co-locating hash, not Flink's key-group hash — safe
-because the window re-groups in operator state ([divergences/10](../../divergences/10-columnar-exchange-own-hash.md)).
-The `ArrowBatchSerializer` now releases the batch after serializing it onto the network edge
-(the write-side leak this surfaced).
+`ColumnarKeyGroupPartitioner`, feeding a columnar window with no row transpose.
+`PhysicalPlanScan` substitutes the exchange + columnar consumer together when the exchange's
+input is columnar:
+- **single-phase** — columnar source → watermark assigner → exchange → columnar window;
+- **two-phase** — columnar local pre-aggregate (emits partial Arrow batches) → exchange (splits
+  the partials by key) → columnar global merge. The operator core was made generic in its output
+  type (`NativeWindowOperatorCore<OUT>` + the `RowData`-emitting `NativeRowWindowOperatorCore`) so
+  the local can emit `ArrowBatch` partials; the global feeds them straight to
+  `updatePartialTumblingAggregator` with no row rebuild.
 
-**Remaining:** two-phase local→global columnar (the exchange between a native local and global
-window aggregate); higher-parallelism shuffle coverage (tests are p=1, where the split is one
-channel; multi-channel split is unit-tested in `SplitByKeyGroupOperatorTest`).
+`FlinkColumnarWindowSqlHarnessTest` covers no-key SINGLETON, keyed HASH, and two-phase keyed,
+all parity-green. The shuffle uses its own co-locating hash, not Flink's key-group hash — safe
+because the window re-groups in operator state ([divergences/10](../../divergences/10-columnar-exchange-own-hash.md)).
+The `ArrowBatchSerializer` releases the batch after serializing it onto the network edge.
+
+**Remaining:** higher-parallelism shuffle coverage (tests are p=1, where the split is one
+channel; multi-channel split is unit-tested in `SplitByKeyGroupOperatorTest`); session windows
+are single-phase only (no two-phase split), so unaffected.
 
 **Source:** user direction — "I don't want to transpose all the time"
 

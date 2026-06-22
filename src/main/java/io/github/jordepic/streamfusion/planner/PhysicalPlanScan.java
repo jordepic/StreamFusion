@@ -262,16 +262,36 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             hopping
                 ? WindowAggregateMatcher.hoppingLocalKinds(agg.aggCalls())
                 : WindowAggregateMatcher.kinds(agg.aggCalls());
+        long sliceSize = WindowAggregateMatcher.sliceSize(agg.windowing());
+        int timeColumn = WindowAggregateMatcher.timeColumn(agg.windowing());
+        int valueColumn = WindowAggregateMatcher.valueColumn(agg.aggCalls());
+        int[] keyColumns = WindowAggregateMatcher.keyColumns(agg.grouping());
+        int valueType =
+            WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType());
+        // A columnar producer feeds a columnar local (Arrow partials out); otherwise row-fed.
+        if (agg.getInputs().get(0) instanceof ColumnarOutput) {
+          return new StreamPhysicalNativeColumnarLocalWindowAggregate(
+              agg.getCluster(),
+              agg.getTraitSet(),
+              agg.getInputs().get(0),
+              agg.getRowType(),
+              sliceSize,
+              timeColumn,
+              valueColumn,
+              keyColumns,
+              valueType,
+              kinds);
+        }
         return new StreamPhysicalNativeLocalWindowAggregate(
             agg.getCluster(),
             agg.getTraitSet(),
             agg.getInputs().get(0),
             agg.getRowType(),
-            WindowAggregateMatcher.sliceSize(agg.windowing()),
-            WindowAggregateMatcher.timeColumn(agg.windowing()),
-            WindowAggregateMatcher.valueColumn(agg.aggCalls()),
-            WindowAggregateMatcher.keyColumns(agg.grouping()),
-            WindowAggregateMatcher.valueTypeCode(agg.aggCalls(), agg.getInput().getRowType()),
+            sliceSize,
+            timeColumn,
+            valueColumn,
+            keyColumns,
+            valueType,
             kinds);
       }
     }
@@ -280,18 +300,48 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       StreamPhysicalGlobalWindowAggregate agg = (StreamPhysicalGlobalWindowAggregate) current;
       if (GlobalWindowAggregateMatcher.matches(agg)) {
         substitutions++;
+        long windowMillis = GlobalWindowAggregateMatcher.windowMillis(agg);
+        long slideMillis = GlobalWindowAggregateMatcher.slideMillis(agg);
+        int[] keyColumns = GlobalWindowAggregateMatcher.keyColumns(agg);
+        int valueType = GlobalWindowAggregateMatcher.valueType(agg);
+        int[] kinds = GlobalWindowAggregateMatcher.kinds(agg);
+        // If the global sits on an exchange over a columnar local, keep the partial shuffle columnar:
+        // a native exchange splits the partial batch by key and feeds a columnar global merge, so the
+        // whole two-phase pipeline flows Arrow. Otherwise stay row-fed (the partial crosses the host
+        // exchange as rows). Same key co-location argument as the single-phase window (divergences/10).
+        RelNode globalInput = agg.getInputs().get(0);
+        if (globalInput instanceof StreamPhysicalExchange
+            && globalInput.getInputs().get(0) instanceof ColumnarOutput) {
+          RelNode columnarExchange =
+              new StreamPhysicalNativeColumnarExchange(
+                  globalInput.getCluster(),
+                  globalInput.getTraitSet(),
+                  globalInput.getInputs().get(0),
+                  globalInput.getRowType(),
+                  keyColumns);
+          return new StreamPhysicalNativeColumnarGlobalWindowAggregate(
+              agg.getCluster(),
+              agg.getTraitSet(),
+              columnarExchange,
+              agg.getRowType(),
+              windowMillis,
+              slideMillis,
+              keyColumns,
+              valueType,
+              kinds);
+        }
         return new StreamPhysicalNativeGlobalWindowAggregate(
             agg.getCluster(),
             agg.getTraitSet(),
             agg.getInputs().get(0),
             agg.getRowType(),
-            GlobalWindowAggregateMatcher.windowMillis(agg),
-            GlobalWindowAggregateMatcher.slideMillis(agg),
-            GlobalWindowAggregateMatcher.keyColumns(agg),
+            windowMillis,
+            slideMillis,
+            keyColumns,
             GlobalWindowAggregateMatcher.partialColumns(agg),
             GlobalWindowAggregateMatcher.sliceEndColumn(agg),
-            GlobalWindowAggregateMatcher.valueType(agg),
-            GlobalWindowAggregateMatcher.kinds(agg));
+            valueType,
+            kinds);
       }
     }
     return current;

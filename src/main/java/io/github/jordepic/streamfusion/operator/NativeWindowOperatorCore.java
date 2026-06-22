@@ -25,11 +25,8 @@ import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
-import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
-import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
-import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.table.types.logical.RowType;
 
 /**
@@ -43,7 +40,7 @@ import org.apache.flink.table.types.logical.RowType;
  * any pending input so it reflects every record seen. The window bounds produced are local
  * wall-clock timestamps in the session zone, matching how the host renders event-time windows.
  */
-public abstract class NativeWindowOperatorCore extends AbstractStreamOperator<RowData> {
+public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperator<OUT> {
 
   protected static final int TIMESTAMP_PRECISION = 3;
 
@@ -351,48 +348,5 @@ public abstract class NativeWindowOperatorCore extends AbstractStreamOperator<Ro
       return ((IntVector) vector).get(row);
     }
     return ((BigIntVector) vector).get(row);
-  }
-
-  /**
-   * Emits the final per-window rows the watermark has closed:
-   * {@code [key?, agg0..aggN-1, window_start, window_end]} — the host's column order. The flush
-   * carries the window end explicitly (windows of the same start can differ by it), so every window
-   * operator — single-phase, global, and session — shares this path.
-   */
-  protected final void emitFinal(long watermark, int[] keyTypes) {
-    int keyCount = keyTypes.length;
-    int aggregates = aggregateCount();
-    try (ArrowArray array = ArrowArray.allocateNew(allocator);
-        ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-      flushHandle(watermark, array.memoryAddress(), schema.memoryAddress());
-      try (VectorSchemaRoot result =
-          Data.importVectorSchemaRoot(allocator, array, schema, dictionaries)) {
-        FieldVector[] keys = new FieldVector[keyCount];
-        for (int j = 0; j < keyCount; j++) {
-          keys[j] = (FieldVector) result.getVector("key" + j);
-        }
-        BigIntVector windowStart = (BigIntVector) result.getVector("window_start");
-        BigIntVector windowEnd = (BigIntVector) result.getVector("window_end");
-        FieldVector[] results = new FieldVector[aggregates];
-        for (int a = 0; a < aggregates; a++) {
-          results[a] = (FieldVector) result.getVector("result" + a);
-        }
-        for (int i = 0; i < result.getRowCount(); i++) {
-          long start = windowStart.get(i);
-          long end = windowEnd.get(i);
-          GenericRowData row = new GenericRowData(keyCount + aggregates + 2);
-          int field = 0;
-          for (int j = 0; j < keyCount; j++) {
-            row.setField(field++, boxKey(keys[j], i, keyTypes[j]));
-          }
-          for (int a = 0; a < aggregates; a++) {
-            row.setField(field++, readScalar(results[a], i));
-          }
-          row.setField(field++, TimestampData.fromLocalDateTime(toLocal(start)));
-          row.setField(field, TimestampData.fromLocalDateTime(toLocal(end)));
-          output.collect(new StreamRecord<>(row, start));
-        }
-      }
-    }
   }
 }
