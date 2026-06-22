@@ -46,7 +46,8 @@ The two-input columnar operator (two `ColumnarInput` edges; connected watermark 
 inputs) now exists (`NativeIntervalJoinOperator`). On top of it:
 - [x] **Interval join** (`a.rt BETWEEN b.rt - X AND b.rt + Y`) — DONE, INNER, **columnar**: keyed
       shuffle on the join key + watermark-bounded state cleanup. See [ticket 27](27-two-input-columnar-join.md).
-- [ ] **Window join** (append-only, windowing-TVF based) — reuses the two-input operator; open.
+- [x] **Window join** (windowing-TVF based) — DONE, INNER, **columnar**: buffer both sides, join per
+      window on watermark close (the window bounds join the equi-keys). See [ticket 27](27-two-input-columnar-join.md).
 
 ## Still blocked regardless — by the insert-only constraint, not by the shuffle
 These emit retracting/updating changelogs; they need [ticket 06](06-changelog-retract-support.md)

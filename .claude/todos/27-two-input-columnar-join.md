@@ -1,6 +1,11 @@
 # Two-input columnar operator → event-time joins
 
-**Status:** interval join **DONE** (INNER, columnar). Window join still open.
+**Status:** DONE. INNER interval join and INNER window join both shipped, columnar, parity-verified.
+Both delegate the match to a DataFusion `HashJoinExec` (interval: equi-keys + a residual interval
+`JoinFilter`; window: equi-keys plus the window bounds so only same-window rows match) — mirroring
+Arroyo's joins, which run a DataFusion join plan over the batches they buffer. We own the buffering
+and watermark-driven eviction; DataFusion owns the match. Remaining: outer/semi/anti joins (emit
+nulls — needs ticket 06 retract or null-emitting state), proctime, residual non-equi predicates.
 
 The two-input columnar operator now exists (`NativeIntervalJoinOperator` —
 `TwoInputStreamOperator<ArrowBatch, ArrowBatch, ArrowBatch>`), so the genuinely new

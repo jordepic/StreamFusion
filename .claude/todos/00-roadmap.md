@@ -6,29 +6,24 @@ here when the ticket is deleted.
 
 ## Where we are (done + parity-verified)
 - **Operators, native + identical to Flink:** filter/`WHERE` (via the native expression engine),
-  tumbling / hopping / session / cumulative window aggregates (one- and two-phase), Parquet sink
-  (exactly-once), Parquet source. Compatibility chart in `readme.md` is the source of truth.
-- **Columnar-flow mechanism (ticket 21):** `ArrowBatch` stream type + IPC serializer, the two
-  transpose operators, the transition-inserter pass, `ColumnarInput`/`ColumnarOutput` markers.
-  **Columnar today:** filter (in+out), Parquet sink (in), Parquet source (out). **Not yet
-  columnar:** the window operators (gated on the shuffle — see below).
+  tumbling / hopping / session / cumulative window aggregates (one- and two-phase), event-time
+  `OVER` aggregation, event-time INNER interval and window joins, Parquet sink (exactly-once),
+  Parquet source. Compatibility chart in `readme.md` is the source of truth.
+- **Columnar flow, end to end (tickets 10, 21):** `ArrowBatch` stream type + IPC serializer, the two
+  transpose operators, the transition-inserter pass, `ColumnarInput`/`ColumnarOutput` markers, a
+  **columnar watermark assigner**, and a **columnar keyed shuffle** (native by-key split +
+  `ColumnarKeyGroupPartitioner`, own consistent hash — divergences/10). Columnar today: source, sink,
+  filter/calc, all window aggregates (one- and two-phase), `OVER`, and both joins — a windowed/keyed
+  pipeline (source → watermark assigner → exchange → operator) flows Arrow with no transpose.
+- **Joins delegate the match to DataFusion** (`HashJoinExec` over the batches we buffer), like
+  Arroyo; we own buffering + watermark eviction (tickets 26, 27).
 - **Profiling/benchmarks (ticket 20):** Criterion native micro-benches; `ThroughputBenchmark`
   vs Flink; the `bench` Maven profile (release native — mandatory for benchmarks).
-- **Release benchmarks vs Flink:** Parquet copy (columnar→columnar) 3.19×, tumbling 1.21×,
-  Parquet sink (row source) 1.05×, bare filter 0.83×.
+- **Release benchmarks vs Flink:** Parquet copy (columnar→columnar) 3.19×, windowed-over-columnar
+  1.91×, tumbling (row source) 1.21×, Parquet sink (row source) 1.05×, bare filter 0.83×.
 
 ## Next, roughly in order
-1. **Columnar windows end to end** (tickets 10, 21). **Built + tested in isolation:** the columnar
-   shuffle mechanism (native by-key split + `SplitByKeyGroupOperator` + `ColumnarKeyGroupPartitioner`)
-   AND the columnar window operator (`NativeColumnarWindowAggregateOperator`). The hash is a plain
-   consistent hash (no Flink-hash reproduction — it only distributes work; the keyed consumer is our
-   own native operator). **Blocked on columnar watermarks:** the planner wiring to connect them
-   (drop the keyed exchange, route the window through the columnar operator) can't trigger because a
-   windowed query's watermark arrives via a *rowwise* `WatermarkAssignerOperator` (transposes the
-   columnar source back to rows). Flink's filesystem source does **not** emit watermarks (verified:
-   no `SupportsWatermarkPushDown`), so the Flink-faithful fix is a **columnar watermark-assigner**
-   (the Arrow→Arrow analog of Flink's operator), not source-emitted watermarks (ticket 10). Deferred.
-2. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
+1. **Parquet sink file coalescing** (ticket 22). The sink writes one file per batch; buffer and
    roll by size/row-count so output file count is independent of read-batch size. Independent of
    the shuffle; improves output quality and throughput.
 3. **Expression layer stages 2–3** (ticket 19): general/computed projection (unblocks the
@@ -55,8 +50,8 @@ here when the ticket is deleted.
 - **Changelog / retract** (ticket 06): only insert-only streams are native today.
 
 ## Breadth / longer horizon
-- **Two-phase cumulative windows** (ticket 13).
-- **Arroyo operator coverage tracker** (ticket 11): joins, OVER/window functions, non-windowed
-  GROUP BY, etc.
+- **Arroyo operator coverage tracker** (ticket 11): append-only dedup, window Top-N, event-time
+  sort remain; non-windowed GROUP BY / regular joins / streaming Top-N need retract (ticket 06).
+  (Two-phase cumulative windows and event-time joins are now done.)
 - **Fully native Kafka source, no JNI** (back burner, noted in ticket 21): subscribe in Rust,
   decode Avro→Arrow, only if the connector semantics can be lifted from Arroyo.

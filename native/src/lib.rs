@@ -6,7 +6,8 @@ use arrow::array::{
 use arrow::compute::{concat_batches, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
-use datafusion::common::DFSchema;
+use datafusion::catalog::memory::MemorySourceConfig;
+use datafusion::common::{DFSchema, JoinSide, JoinType, NullEquality};
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::functions_aggregate::sum::sum_udaf;
@@ -14,8 +15,11 @@ use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::{Accumulator, AggregateUDF, Operator};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
-use datafusion::physical_expr::expressions::{binary, col, lit};
+use datafusion::physical_expr::expressions::{binary, col, lit, Column};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion::physical_plan::collect;
+use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+use datafusion::physical_plan::joins::{HashJoinExec, JoinOn, PartitionMode};
 use datafusion::prelude::{col as logical_col, lit as logical_lit, SessionContext};
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
@@ -939,23 +943,16 @@ fn read_ipc(bytes: &[u8]) -> Vec<RecordBatch> {
         .collect()
 }
 
-/// One buffered row of a join input: its rowtime (epoch millis) and the row's full column values.
-/// Held in a per-join-key bucket until the watermark proves no future row of the other side can
-/// match it.
-struct BufferedRow {
-    rt: i64,
-    values: Vec<ScalarValue>,
-}
-
 /// Event-time INNER interval join, Flink's
 /// `a JOIN b ON a.k = b.k AND a.rt BETWEEN b.rt + lower AND b.rt + upper`.
 ///
-/// Buffers both inputs per join key. When a row arrives it probes the other side's buffer for rows
-/// whose rowtime satisfies the interval and emits the matched pairs at once — each pair emitted
-/// exactly once, when the second of its two rows arrives (the same insert-then-probe-the-other-side
-/// structure as Arroyo's `JoinWithExpiration`). A row is evicted once the combined watermark passes
-/// the point beyond which no future row of the other side could match it. Output columns are the
-/// left input columns followed by the right input columns.
+/// Buffers both inputs as batches. When a batch arrives on one side it is joined against the other
+/// side's buffered rows — an INNER hash join on the equi-keys with the interval as a residual filter
+/// (`lower <= left.rt - right.rt <= upper`) — so each matched pair is emitted exactly once, when the
+/// second of its two rows arrives. This is the insert-then-join-the-other-side structure of Arroyo's
+/// `JoinWithExpiration`, which likewise runs a DataFusion join over the batches it has buffered. A
+/// row is evicted once the watermark passes the point beyond which no future row of the other side
+/// could match it. Output columns are the left input columns followed by the right input columns.
 struct IntervalJoiner {
     left_keys: Vec<usize>,
     right_keys: Vec<usize>,
@@ -965,8 +962,8 @@ struct IntervalJoiner {
     upper: i64,
     left_schema: Option<SchemaRef>,
     right_schema: Option<SchemaRef>,
-    left_buffer: HashMap<GroupKey, Vec<BufferedRow>>,
-    right_buffer: HashMap<GroupKey, Vec<BufferedRow>>,
+    left_buffered: Vec<RecordBatch>,
+    right_buffered: Vec<RecordBatch>,
 }
 
 impl IntervalJoiner {
@@ -987,77 +984,60 @@ impl IntervalJoiner {
             upper,
             left_schema: None,
             right_schema: None,
-            left_buffer: HashMap::new(),
-            right_buffer: HashMap::new(),
+            left_buffered: Vec::new(),
+            right_buffered: Vec::new(),
         }
     }
 
-    /// Reads each row of `batch` into its `(join key, buffered row)`, using `key_indices` for the
-    /// equi-join key and `time_index` for the rowtime (converted to epoch millis).
-    fn rows(
-        batch: &RecordBatch,
-        key_indices: &[usize],
-        time_index: usize,
-    ) -> Vec<(GroupKey, BufferedRow)> {
-        let key_arrays: Vec<&ArrayRef> = key_indices.iter().map(|&i| batch.column(i)).collect();
-        let rt = rt_to_millis(batch.column(time_index));
-        (0..batch.num_rows())
-            .map(|row| {
-                let key = read_key(&key_arrays, row);
-                let values = (0..batch.num_columns())
-                    .map(|c| {
-                        ScalarValue::try_from_array(batch.column(c), row).expect("read join value")
-                    })
-                    .collect();
-                (key, BufferedRow { rt: rt.value(row), values })
-            })
-            .collect()
+    fn key_pairs(&self) -> Vec<(usize, usize)> {
+        self.left_keys.iter().zip(&self.right_keys).map(|(&l, &r)| (l, r)).collect()
     }
 
-    /// Pushes a left batch: probe the right buffer for matches, emit the pairs, then buffer the rows.
+    /// Joins an incoming left batch against the buffered right rows (equi-key + interval filter),
+    /// then buffers it. Empty until the right side has rows.
     fn push_left(&mut self, batch: RecordBatch) -> RecordBatch {
         self.left_schema = Some(batch.schema());
-        let mut pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)> = Vec::new();
-        for (key, left) in Self::rows(&batch, &self.left_keys, self.left_time) {
-            if key_has_null(&key) {
-                continue; // INNER equi-join drops null-key rows (Flink's filterNulls)
+        let result = match &self.right_schema {
+            Some(right_schema) if !self.right_buffered.is_empty() => {
+                let right = concat_batches(right_schema, self.right_buffered.iter())
+                    .expect("concat right interval buffer");
+                let filter = interval_filter(
+                    &batch.schema(),
+                    right_schema,
+                    self.left_time,
+                    self.right_time,
+                    self.lower,
+                    self.upper,
+                );
+                hash_join_inner(batch.clone(), right, &self.key_pairs(), Some(filter))
             }
-            if let Some(rights) = self.right_buffer.get(&key) {
-                for right in rights {
-                    if Self::matches(left.rt, right.rt, self.lower, self.upper) {
-                        pairs.push((left.values.clone(), right.values.clone()));
-                    }
-                }
-            }
-            self.left_buffer.entry(key).or_default().push(left);
-        }
-        self.emit(pairs)
+            _ => RecordBatch::new_empty(Arc::new(Schema::empty())),
+        };
+        self.left_buffered.push(batch);
+        result
     }
 
-    /// Pushes a right batch: probe the left buffer for matches, emit the pairs, then buffer the rows.
+    /// Joins an incoming right batch against the buffered left rows, then buffers it.
     fn push_right(&mut self, batch: RecordBatch) -> RecordBatch {
         self.right_schema = Some(batch.schema());
-        let mut pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)> = Vec::new();
-        for (key, right) in Self::rows(&batch, &self.right_keys, self.right_time) {
-            if key_has_null(&key) {
-                continue; // INNER equi-join drops null-key rows (Flink's filterNulls)
+        let result = match &self.left_schema {
+            Some(left_schema) if !self.left_buffered.is_empty() => {
+                let left = concat_batches(left_schema, self.left_buffered.iter())
+                    .expect("concat left interval buffer");
+                let filter = interval_filter(
+                    left_schema,
+                    &batch.schema(),
+                    self.left_time,
+                    self.right_time,
+                    self.lower,
+                    self.upper,
+                );
+                hash_join_inner(left, batch.clone(), &self.key_pairs(), Some(filter))
             }
-            if let Some(lefts) = self.left_buffer.get(&key) {
-                for left in lefts {
-                    if Self::matches(left.rt, right.rt, self.lower, self.upper) {
-                        pairs.push((left.values.clone(), right.values.clone()));
-                    }
-                }
-            }
-            self.right_buffer.entry(key).or_default().push(right);
-        }
-        self.emit(pairs)
-    }
-
-    /// Whether a left and right rowtime satisfy `lower <= left - right <= upper`.
-    fn matches(left_rt: i64, right_rt: i64, lower: i64, upper: i64) -> bool {
-        let delta = left_rt - right_rt;
-        lower <= delta && delta <= upper
+            _ => RecordBatch::new_empty(Arc::new(Schema::empty())),
+        };
+        self.right_buffered.push(batch);
+        result
     }
 
     /// Drops the rows the watermark has made dead. A left row can no longer match once
@@ -1065,67 +1045,44 @@ impl IntervalJoiner {
     /// `right.rt <= left.rt - lower`); a right row once `right.rt + upper <= watermark`.
     fn advance(&mut self, watermark: i64) {
         let (lower, upper) = (self.lower, self.upper);
-        for rows in self.left_buffer.values_mut() {
-            rows.retain(|row| row.rt - lower > watermark);
-        }
-        self.left_buffer.retain(|_, rows| !rows.is_empty());
-        for rows in self.right_buffer.values_mut() {
-            rows.retain(|row| row.rt + upper > watermark);
-        }
-        self.right_buffer.retain(|_, rows| !rows.is_empty());
+        Self::evict(&mut self.left_buffered, &self.left_schema, self.left_time, |rt| {
+            rt - lower > watermark
+        });
+        Self::evict(&mut self.right_buffered, &self.right_schema, self.right_time, |rt| {
+            rt + upper > watermark
+        });
     }
 
-    /// Builds the output batch (left columns then right columns) for the matched pairs, or an empty
-    /// batch when there were none. Output fields are renamed `c0..` since the downstream conversion
-    /// is positional and the two inputs may share field names.
-    fn emit(&self, pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)>) -> RecordBatch {
-        if pairs.is_empty() {
-            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+    /// Keeps only the buffered rows whose rowtime (column `time`) satisfies `keep`.
+    fn evict(
+        buffered: &mut Vec<RecordBatch>,
+        schema: &Option<SchemaRef>,
+        time: usize,
+        keep: impl Fn(i64) -> bool,
+    ) {
+        let Some(schema) = schema.as_ref() else {
+            return;
+        };
+        if buffered.is_empty() {
+            return;
         }
-        let left_schema = self.left_schema.as_ref().expect("left schema set when emitting");
-        let right_schema = self.right_schema.as_ref().expect("right schema set when emitting");
-        let mut fields: Vec<Field> = Vec::new();
-        let mut columns: Vec<ArrayRef> = Vec::new();
-        for (j, field) in left_schema.fields().iter().enumerate() {
-            fields.push(Field::new(format!("c{}", fields.len()), field.data_type().clone(), true));
-            let scalars = pairs.iter().map(|(left, _)| left[j].clone()).collect();
-            columns.push(scalars_to_array(scalars, field.data_type()));
-        }
-        for (j, field) in right_schema.fields().iter().enumerate() {
-            fields.push(Field::new(format!("c{}", fields.len()), field.data_type().clone(), true));
-            let scalars = pairs.iter().map(|(_, right)| right[j].clone()).collect();
-            columns.push(scalars_to_array(scalars, field.data_type()));
-        }
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("failed to build join output batch")
+        let all = concat_batches(schema, buffered.iter()).expect("concat interval buffer");
+        let rt = rt_to_millis(all.column(time));
+        let mask: BooleanArray = rt.iter().map(|v| Some(keep(v.unwrap()))).collect();
+        let kept = filter_record_batch(&all, &mask).expect("filter interval buffer");
+        *buffered = if kept.num_rows() > 0 { vec![kept] } else { Vec::new() };
     }
 
-    /// Concatenates all buffered rows of one side back into a single batch under its input schema.
-    fn buffer_to_batch(schema: &SchemaRef, buffer: &HashMap<GroupKey, Vec<BufferedRow>>) -> RecordBatch {
-        let rows: Vec<&BufferedRow> = buffer.values().flatten().collect();
-        let columns: Vec<ArrayRef> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(j, field)| {
-                let scalars = rows.iter().map(|row| row.values[j].clone()).collect();
-                scalars_to_array(scalars, field.data_type())
-            })
-            .collect();
-        RecordBatch::try_new(schema.clone(), columns).expect("failed to rebuild join buffer batch")
-    }
-
-    /// Serializes both buffers (`[u32 left_len][left ipc][right ipc]`) for a checkpoint. The rowtimes
-    /// and keys are not stored — they are re-derived from the columns on restore.
+    /// Serializes both buffers (`[u32 left_len][left ipc][right ipc]`) for a checkpoint.
     fn snapshot(&self) -> Vec<u8> {
-        let left = match &self.left_schema {
-            Some(schema) => write_ipc(&Self::buffer_to_batch(schema, &self.left_buffer)),
-            None => Vec::new(),
+        let serialize = |schema: &Option<SchemaRef>, buffered: &[RecordBatch]| match schema {
+            Some(schema) if !buffered.is_empty() => {
+                write_ipc(&concat_batches(schema, buffered.iter()).expect("concat interval buffer"))
+            }
+            _ => Vec::new(),
         };
-        let right = match &self.right_schema {
-            Some(schema) => write_ipc(&Self::buffer_to_batch(schema, &self.right_buffer)),
-            None => Vec::new(),
-        };
+        let left = serialize(&self.left_schema, &self.left_buffered);
+        let right = serialize(&self.right_schema, &self.right_buffered);
         let mut out = (left.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(&left);
         out.extend_from_slice(&right);
@@ -1145,27 +1102,16 @@ impl IntervalJoiner {
         let mut joiner =
             IntervalJoiner::new(left_keys, right_keys, left_time, right_time, lower, upper);
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
-        let left = &bytes[4..4 + left_len];
-        let right = &bytes[4 + left_len..];
-        for batch in read_ipc_if_present(left) {
+        for batch in read_ipc_if_present(&bytes[4..4 + left_len]) {
             joiner.left_schema = Some(batch.schema());
-            for (key, row) in Self::rows(&batch, &joiner.left_keys, joiner.left_time) {
-                joiner.left_buffer.entry(key).or_default().push(row);
-            }
+            joiner.left_buffered.push(batch);
         }
-        for batch in read_ipc_if_present(right) {
+        for batch in read_ipc_if_present(&bytes[4 + left_len..]) {
             joiner.right_schema = Some(batch.schema());
-            for (key, row) in Self::rows(&batch, &joiner.right_keys, joiner.right_time) {
-                joiner.right_buffer.entry(key).or_default().push(row);
-            }
+            joiner.right_buffered.push(batch);
         }
         joiner
     }
-}
-
-/// Whether a composite key contains a null component (such keys never match under INNER equi-join).
-fn key_has_null(key: &GroupKey) -> bool {
-    key.iter().any(ScalarValue::is_null)
 }
 
 /// Reads IPC batches, treating empty bytes (a side that never saw a row) as no batches.
@@ -1174,6 +1120,262 @@ fn read_ipc_if_present(bytes: &[u8]) -> Vec<RecordBatch> {
         Vec::new()
     } else {
         read_ipc(bytes)
+    }
+}
+
+/// Renames a batch's fields to `c0..` (positional) so a joined batch with duplicate input field
+/// names round-trips the C Data Interface cleanly — the downstream conversion is positional.
+fn rename_positional(batch: &RecordBatch) -> RecordBatch {
+    let fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| Field::new(format!("c{i}"), f.data_type().clone(), true))
+        .collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec())
+        .expect("failed to rename join output")
+}
+
+/// Runs an INNER hash join of `left` and `right` on the given equi-key column-index pairs, with an
+/// optional residual filter, and returns the joined rows as one batch (left columns then right
+/// columns, fields renamed `c0..`). Empty when nothing matches. We own the buffering, keying, and
+/// eviction of join state; the match itself is delegated to DataFusion's `HashJoinExec` — the same
+/// split Arroyo's joins use (it runs a DataFusion join plan over the batches it has buffered).
+fn hash_join_inner(
+    left: RecordBatch,
+    right: RecordBatch,
+    key_pairs: &[(usize, usize)],
+    filter: Option<JoinFilter>,
+) -> RecordBatch {
+    let left_schema = left.schema();
+    let right_schema = right.schema();
+    let on: JoinOn = key_pairs
+        .iter()
+        .map(|&(l, r)| {
+            let left_key: Arc<dyn PhysicalExpr> = Arc::new(Column::new(left_schema.field(l).name(), l));
+            let right_key: Arc<dyn PhysicalExpr> =
+                Arc::new(Column::new(right_schema.field(r).name(), r));
+            (left_key, right_key)
+        })
+        .collect();
+    let left_exec = MemorySourceConfig::try_new_exec(&[vec![left]], left_schema, None)
+        .expect("failed to build left join input");
+    let right_exec = MemorySourceConfig::try_new_exec(&[vec![right]], right_schema, None)
+        .expect("failed to build right join input");
+    let join = HashJoinExec::try_new(
+        left_exec,
+        right_exec,
+        on,
+        filter,
+        &JoinType::Inner,
+        None,
+        PartitionMode::CollectLeft,
+        // Null keys never match — Flink's INNER equi-join filters them (filterNulls).
+        NullEquality::NullEqualsNothing,
+        false,
+    )
+    .expect("failed to build hash join");
+    let batches = runtime()
+        .block_on(collect(Arc::new(join), SessionContext::new().task_ctx()))
+        .expect("failed to run hash join");
+    if batches.iter().all(|batch| batch.num_rows() == 0) {
+        return RecordBatch::new_empty(Arc::new(Schema::empty()));
+    }
+    let schema = batches[0].schema();
+    let joined = concat_batches(&schema, &batches).expect("failed to concat join output");
+    rename_positional(&joined)
+}
+
+/// Builds an interval-join residual filter for `lower <= left.rt - right.rt <= upper`, expressed as
+/// `left.rt >= right.rt + lower AND left.rt <= right.rt + upper` over the two rowtime columns so it
+/// works directly on the timestamp type (no subtraction to a duration). `column_indices` maps the
+/// filter's intermediate schema `[left.rt, right.rt]` back to the join inputs.
+fn interval_filter(
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    left_rt: usize,
+    right_rt: usize,
+    lower: i64,
+    upper: i64,
+) -> JoinFilter {
+    use arrow::datatypes::TimeUnit;
+    let left_type = left_schema.field(left_rt).data_type().clone();
+    let right_type = right_schema.field(right_rt).data_type().clone();
+    // The bound is added to the rowtime in its own type and unit (arrow rejects a timestamp plus a
+    // duration of a different unit): a plain millis offset for an int64 rowtime, else a Duration in
+    // the timestamp's own unit (the millis offset scaled to it).
+    let offset = |millis: i64| -> ScalarValue {
+        match &right_type {
+            DataType::Int64 => ScalarValue::Int64(Some(millis)),
+            DataType::Timestamp(TimeUnit::Second, _) => ScalarValue::DurationSecond(Some(millis / 1_000)),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => ScalarValue::DurationMillisecond(Some(millis)),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                ScalarValue::DurationMicrosecond(Some(millis * 1_000))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                ScalarValue::DurationNanosecond(Some(millis * 1_000_000))
+            }
+            other => panic!("unsupported interval-join rowtime type: {other:?}"),
+        }
+    };
+    let intermediate = Arc::new(Schema::new(vec![
+        Field::new("left_rt", left_type, true),
+        Field::new("right_rt", right_type.clone(), true),
+    ]));
+    let left_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("left_rt", 0));
+    let right_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("right_rt", 1));
+    let bound = |millis: i64| -> Arc<dyn PhysicalExpr> {
+        binary(right_col.clone(), Operator::Plus, lit(offset(millis)), &intermediate)
+            .expect("failed to build interval bound")
+    };
+    let ge = binary(left_col.clone(), Operator::GtEq, bound(lower), &intermediate)
+        .expect("failed to build lower bound");
+    let le = binary(left_col.clone(), Operator::LtEq, bound(upper), &intermediate)
+        .expect("failed to build upper bound");
+    let expression = binary(ge, Operator::And, le, &intermediate).expect("failed to build interval and");
+    let column_indices = vec![
+        ColumnIndex { index: left_rt, side: JoinSide::Left },
+        ColumnIndex { index: right_rt, side: JoinSide::Right },
+    ];
+    JoinFilter::new(expression, column_indices, intermediate)
+}
+
+/// Buffered rows of one side of a window join, grouped by window then by equi-join key.
+/// Event-time INNER window join: the join of two windowing-TVF inputs on their equi-join key within
+/// the same window — `a JOIN b ON a.k = b.k` where both sides carry matching `window_start` /
+/// `window_end` columns (assigned upstream by identical `TUMBLE`/`HOP`/`CUMULATE` windows).
+///
+/// Input batches are buffered per side; on a watermark, the rows whose window has closed (its end at
+/// or before the watermark) are joined and evicted. The window equality is folded into the equi-keys
+/// — `window_start` and `window_end` join alongside the user key — so a single hash join over the
+/// closed rows matches only within a window. Late rows for an already-closed window produce no
+/// further output, matching Flink's watermark semantics.
+struct WindowJoiner {
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    left_wstart: usize,
+    left_wend: usize,
+    right_wstart: usize,
+    right_wend: usize,
+    left_schema: Option<SchemaRef>,
+    right_schema: Option<SchemaRef>,
+    left_buffered: Vec<RecordBatch>,
+    right_buffered: Vec<RecordBatch>,
+}
+
+impl WindowJoiner {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_wstart: usize,
+        left_wend: usize,
+        right_wstart: usize,
+        right_wend: usize,
+    ) -> Self {
+        WindowJoiner {
+            left_keys,
+            right_keys,
+            left_wstart,
+            left_wend,
+            right_wstart,
+            right_wend,
+            left_schema: None,
+            right_schema: None,
+            left_buffered: Vec::new(),
+            right_buffered: Vec::new(),
+        }
+    }
+
+    fn push_left(&mut self, batch: RecordBatch) {
+        self.left_schema = Some(batch.schema());
+        self.left_buffered.push(batch);
+    }
+
+    fn push_right(&mut self, batch: RecordBatch) {
+        self.right_schema = Some(batch.schema());
+        self.right_buffered.push(batch);
+    }
+
+    /// Splits a side's buffer into the rows whose window has closed (`window_end <= watermark`,
+    /// returned) and the rest (kept buffered). `None` if the side has not seen any rows.
+    fn split_closed(
+        buffered: &mut Vec<RecordBatch>,
+        schema: &Option<SchemaRef>,
+        wend: usize,
+        watermark: i64,
+    ) -> Option<RecordBatch> {
+        let schema = schema.as_ref()?;
+        if buffered.is_empty() {
+            return None;
+        }
+        let all = concat_batches(schema, buffered.iter()).expect("concat window-join buffer");
+        let ends = rt_to_millis(all.column(wend));
+        let closed_mask: BooleanArray = ends.iter().map(|v| Some(v.unwrap() <= watermark)).collect();
+        let closed = filter_record_batch(&all, &closed_mask).expect("filter closed windows");
+        let pending_mask = arrow::compute::not(&closed_mask).expect("negate window mask");
+        let pending = filter_record_batch(&all, &pending_mask).expect("filter pending windows");
+        *buffered = if pending.num_rows() > 0 { vec![pending] } else { Vec::new() };
+        Some(closed)
+    }
+
+    /// Joins and evicts the windows the watermark has closed (empty batch if nothing matches).
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        let left = Self::split_closed(&mut self.left_buffered, &self.left_schema, self.left_wend, watermark);
+        let right =
+            Self::split_closed(&mut self.right_buffered, &self.right_schema, self.right_wend, watermark);
+        match (left, right) {
+            (Some(left), Some(right)) if left.num_rows() > 0 && right.num_rows() > 0 => {
+                // Join on the user keys plus the window bounds, so only rows of the same window match.
+                let mut on: Vec<(usize, usize)> =
+                    self.left_keys.iter().zip(&self.right_keys).map(|(&l, &r)| (l, r)).collect();
+                on.push((self.left_wstart, self.right_wstart));
+                on.push((self.left_wend, self.right_wend));
+                hash_join_inner(left, right, &on, None)
+            }
+            _ => RecordBatch::new_empty(Arc::new(Schema::empty())),
+        }
+    }
+
+    /// Serializes both buffers (`[u32 left_len][left ipc][right ipc]`) for a checkpoint.
+    fn snapshot(&self) -> Vec<u8> {
+        let serialize = |schema: &Option<SchemaRef>, buffered: &[RecordBatch]| match schema {
+            Some(schema) if !buffered.is_empty() => {
+                write_ipc(&concat_batches(schema, buffered.iter()).expect("concat window-join buffer"))
+            }
+            _ => Vec::new(),
+        };
+        let left = serialize(&self.left_schema, &self.left_buffered);
+        let right = serialize(&self.right_schema, &self.right_buffered);
+        let mut out = (left.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&left);
+        out.extend_from_slice(&right);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_wstart: usize,
+        left_wend: usize,
+        right_wstart: usize,
+        right_wend: usize,
+        bytes: &[u8],
+    ) -> Self {
+        let mut joiner =
+            WindowJoiner::new(left_keys, right_keys, left_wstart, left_wend, right_wstart, right_wend);
+        let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
+        for batch in read_ipc_if_present(&bytes[4..4 + left_len]) {
+            joiner.left_schema = Some(batch.schema());
+            joiner.left_buffered.push(batch);
+        }
+        for batch in read_ipc_if_present(&bytes[4 + left_len..]) {
+            joiner.right_schema = Some(batch.schema());
+            joiner.right_buffered.push(batch);
+        }
+        joiner
     }
 }
 
@@ -2863,6 +3065,125 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreInterv
     ))) as jlong
 }
 
+/// Creates an event-time INNER window joiner and returns an opaque handle. The key/window column
+/// indices locate the equi-join key and the `window_start`/`window_end` columns within each side's
+/// input batch. The JVM owns the handle across calls and must release it with the matching close.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createWindowJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_window_start: jint,
+    left_window_end: jint,
+    right_window_start: jint,
+    right_window_end: jint,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    Box::into_raw(Box::new(WindowJoiner::new(
+        left,
+        right,
+        left_window_start as usize,
+        left_window_end as usize,
+        right_window_start as usize,
+        right_window_end as usize,
+    ))) as jlong
+}
+
+/// Buffers a left batch (no output); its rows are joined later when the watermark closes their window.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushLeftWindowJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut WindowJoiner) };
+    joiner.push_left(import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Buffers a right batch (no output).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushRightWindowJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut WindowJoiner) };
+    joiner.push_right(import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Exports the INNER matches of every window the watermark has closed (then evicts those windows).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushWindowJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut WindowJoiner) };
+    let result = joiner.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases the window joiner and its native state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeWindowJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut WindowJoiner));
+    }
+}
+
+/// Serializes the window joiner's buffered rows for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotWindowJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let joiner = unsafe { &*(handle as *mut WindowJoiner) };
+    env.byte_array_from_slice(&joiner.snapshot())
+        .expect("failed to allocate window-join snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds a window joiner from a snapshot taken by a prior run and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindowJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_window_start: jint,
+    left_window_end: jint,
+    right_window_start: jint,
+    right_window_end: jint,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read window-join snapshot");
+    Box::into_raw(Box::new(WindowJoiner::restore(
+        left,
+        right,
+        left_window_start as usize,
+        left_window_end as usize,
+        right_window_start as usize,
+        right_window_end as usize,
+        &bytes,
+    ))) as jlong
+}
+
 /// Creates a stateful session-window aggregator and returns an opaque handle. As with the tumbling
 /// handle, the JVM owns the native state across calls and must release it with the matching close.
 #[no_mangle]
@@ -3202,6 +3523,68 @@ mod tests {
         joiner.advance(6000);
         // A right row that would otherwise match (delta -500) finds nothing buffered.
         assert_eq!(joiner.push_right(join_batch(vec![1], vec![100], vec![5500])).num_rows(), 0);
+    }
+
+    // A `[k, v, window_start, window_end]` batch (window bounds as int64 millis) for window-join tests.
+    fn window_batch(k: Vec<i64>, v: Vec<i64>, ws: Vec<i64>, we: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, true),
+                Field::new("window_start", DataType::Int64, false),
+                Field::new("window_end", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(k)),
+                Arc::new(Int64Array::from(v)),
+                Arc::new(Int64Array::from(ws)),
+                Arc::new(Int64Array::from(we)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // The matched (left v, right v) pairs of a join output, sorted (the hash join does not promise
+    // an output order; parity is over the result set).
+    fn left_right_values(batch: &RecordBatch) -> Vec<(i64, i64)> {
+        let mut pairs: Vec<(i64, i64)> =
+            values(batch, 1).into_iter().zip(values(batch, 5)).collect();
+        pairs.sort_unstable();
+        pairs
+    }
+
+    // INNER window join: left and right rows of the same key in the same window join (their cross
+    // product) once the watermark closes the window; other windows/keys do not match.
+    #[test]
+    fn window_join_emits_matches_when_window_closes() {
+        // keys col 0; window_start col 2, window_end col 3 on both sides.
+        let mut joiner = WindowJoiner::new(vec![0], vec![0], 2, 3, 2, 3);
+        // Window [0,1000): left k=1 (two rows) and k=2; right k=1 and k=3.
+        joiner.push_left(window_batch(vec![1, 1, 2], vec![10, 11, 20], vec![0, 0, 0], vec![1000, 1000, 1000]));
+        joiner.push_right(window_batch(vec![1, 3], vec![100, 300], vec![0, 0], vec![1000, 1000]));
+        // A later window [1000,2000) for k=1 on both sides (should not mix with [0,1000)).
+        joiner.push_left(window_batch(vec![1], vec![40], vec![1000], vec![2000]));
+        joiner.push_right(window_batch(vec![1], vec![400], vec![1000], vec![2000]));
+
+        // Watermark 1000 closes only [0,1000): k=1 matches (2 left × 1 right = 2 rows), k=2/k=3 don't.
+        let out = joiner.flush(1000);
+        assert_eq!(left_right_values(&out), vec![(10, 100), (11, 100)]);
+
+        // Watermark 2000 closes [1000,2000): k=1 matches once.
+        let rest = joiner.flush(2000);
+        assert_eq!(left_right_values(&rest), vec![(40, 400)]);
+    }
+
+    // Buffered window-join rows survive a snapshot/restore round trip.
+    #[test]
+    fn window_join_restores_buffered_rows() {
+        let mut joiner = WindowJoiner::new(vec![0], vec![0], 2, 3, 2, 3);
+        joiner.push_left(window_batch(vec![1], vec![10], vec![0], vec![1000]));
+        joiner.push_right(window_batch(vec![1], vec![100], vec![0], vec![1000]));
+        let snapshot = joiner.snapshot();
+        let mut restored = WindowJoiner::restore(vec![0], vec![0], 2, 3, 2, 3, &snapshot);
+        let out = restored.flush(1000);
+        assert_eq!(left_right_values(&out), vec![(10, 100)]);
     }
 
     // Buffered rows survive a snapshot/restore round trip and still match afterward.

@@ -381,6 +381,58 @@ public final class Native {
       byte[] snapshot);
 
   /**
+   * Creates an event-time INNER window joiner and returns an opaque handle. It buffers both inputs
+   * (whose rows carry matching {@code window_start}/{@code window_end} columns assigned upstream) and
+   * joins them per window when the watermark closes it. The JVM owns the handle across calls and must
+   * release it with {@link #closeWindowJoiner}.
+   *
+   * @param leftKeys equi-join key column indices in the left input batch
+   * @param rightKeys equi-join key column indices in the right input batch
+   * @param leftWindowStart window-start column index in the left input batch
+   * @param leftWindowEnd window-end column index in the left input batch
+   * @param rightWindowStart window-start column index in the right input batch
+   * @param rightWindowEnd window-end column index in the right input batch
+   */
+  public static native long createWindowJoiner(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftWindowStart,
+      int leftWindowEnd,
+      int rightWindowStart,
+      int rightWindowEnd);
+
+  /** Buffers a left batch; its rows are joined when a watermark closes their window. */
+  public static native void pushLeftWindowJoiner(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /** Buffers a right batch. */
+  public static native void pushRightWindowJoiner(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
+   * Exports the INNER matches (left columns then right columns) of every window the watermark has
+   * closed into the consumer-allocated C structs, then evicts those windows (empty batch if none).
+   */
+  public static native void flushWindowJoiner(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a window joiner handle. */
+  public static native void closeWindowJoiner(long handle);
+
+  /** Serializes a window joiner's buffered rows for a checkpoint. */
+  public static native byte[] snapshotWindowJoiner(long handle);
+
+  /** Rebuilds a window joiner from a snapshot and returns a fresh handle. */
+  public static native long restoreWindowJoiner(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftWindowStart,
+      int leftWindowEnd,
+      int rightWindowStart,
+      int rightWindowEnd,
+      byte[] snapshot);
+
+  /**
    * Creates a stateful cumulative-window aggregator and returns an opaque handle. Cumulative windows
    * are nested windows of {@code stepMillis} growing up to {@code maxSizeMillis}, all sharing a
    * start. It shares the aligned-window engine — {@link #updateTumblingAggregator}, {@link
