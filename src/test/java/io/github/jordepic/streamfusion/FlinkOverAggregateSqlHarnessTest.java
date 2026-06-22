@@ -43,6 +43,15 @@ class FlinkOverAggregateSqlHarnessTest {
   }
 
   @Test
+  void rowNumberMatchesHost() throws Exception {
+    // ROW_NUMBER() over the ROWS UNBOUNDED PRECEDING frame: a per-partition counter in rowtime
+    // order. The source has distinct rowtimes per key, so the numbering is unambiguous.
+    NativeParity.assertParity(
+        FlinkOverAggregateSqlHarnessTest::environment,
+        "SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt) AS rn FROM src");
+  }
+
+  @Test
   void partitionedRunningSumMatchesHost() throws Exception {
     // PARTITION BY k: a running SUM per key, shuffled by the host's keyed exchange.
     NativeParity.assertParity(

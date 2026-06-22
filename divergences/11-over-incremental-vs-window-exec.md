@@ -39,17 +39,39 @@ orchestration (incremental per-key state) is both the parity target and the
 bounded-memory choice. This is the same reasoning as
 [03](03-incremental-window-merge.md), applied to OVER.
 
-## Scope, and where delegation *will* be right
-We admit only **running aggregates** (`SUM`/`MIN`/`MAX`/`COUNT`/`AVG`) over the
-default unbounded frame. `AVG` rides Flink's `$SUM0`+`COUNT` decomposition with the
-divide on the host. Bounded/`ROWS` frames and proctime fall back.
+## General window functions — also incremental (investigated, not assumed)
+`ROW_NUMBER` (shipped), and `RANK`/`DENSE_RANK`/`FIRST_VALUE`/`LAST_VALUE` (to
+follow), are the same `OverAggregate` rel with `UNBOUNDED PRECEDING` frames
+(`ROW_NUMBER` uses `ROWS`). An earlier version of this note predicted they would
+**delegate to a DataFusion window exec like Arroyo**. Investigating both sides
+showed that is wrong here:
 
-General window functions — `ROW_NUMBER`, `RANK`, `LAG`, `LEAD` — are **not**
-mergeable accumulators, so when we add them the incremental model does not apply
-and the right design is to **delegate to a DataFusion window `ExecutionPlan`, as
-Arroyo does** (buffer the frame's rows, run the plan). That will be an alignment,
-not a divergence; recorded here so the future choice is deliberate.
+- **Arroyo's `window_fn` is not a model for this.** It buckets rows **per distinct
+  event-time instant** and runs a DataFusion window exec per instant — so its
+  window functions are scoped to one instant, *not* cumulative across the
+  partition. Flink's `UNBOUNDED PRECEDING` `ROW_NUMBER` counts all prior rows of
+  the partition; Arroyo's per-instant model does not produce that.
+- **A DataFusion window exec would need unbounded retention.** With an unbounded
+  preceding frame, delegating to a batch window plan means keeping every partition
+  row forever (the partition never closes in a stream). Flink keeps a counter, not
+  the rows.
+- **DataFusion's incremental evaluator can't be checkpointed.** `PartitionEvaluator`
+  *can* run incrementally (`ROW_NUMBER` is `n_rows += 1`), but unlike `Accumulator`
+  it exposes **no serializable state**, so delegating the compute would break
+  exactly-once. To checkpoint we must own the state anyway.
+
+So general window functions take the **same incremental, own-the-state path** as the
+running aggregates: a small per-key state (a counter for `ROW_NUMBER`; rank+last-value
+for `RANK`/`DENSE_RANK`; the first / current value for `FIRST_/LAST_VALUE`),
+serialized for checkpointing, matching Flink's `OverAggregate` exactly. For
+`ROW_NUMBER` this is identical to DataFusion's own evaluator (`n+1`), so nothing is
+re-derived; for the others the logic is small and Flink-defined.
+
+## Scope
+Running aggregates (`SUM`/`MIN`/`MAX`/`COUNT`/`AVG`; `AVG` via Flink's
+`$SUM0`+`COUNT` with the divide on the host) and `ROW_NUMBER`. Bounded frames and
+proctime fall back. `RANK`/`DENSE_RANK`/`FIRST_VALUE`/`LAST_VALUE` are next.
 
 ## Verification
-Parity harness: running `SUM`/`MIN`/`MAX`/`COUNT`/`AVG`, partitioned and not, over
+Parity harness: running aggregates and `ROW_NUMBER`, partitioned and not, over
 DataStream and Parquet sources, including rowtime ties within the unbounded frame.
