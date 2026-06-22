@@ -166,8 +166,12 @@ public final class Native {
    * @param directory directory of Parquet files to read
    * @param projection output column names, in the order the plan expects (honoring projection
    *     pushdown); an empty array emits every column as read
+   * @param subtask this reader's subtask index; it reads the sorted files congruent to it modulo
+   *     {@code numSubtasks}, so a parallel read covers every file once
+   * @param numSubtasks the source parallelism
    */
-  public static native long openParquet(String directory, String[] projection);
+  public static native long openParquet(
+      String directory, String[] projection, int subtask, int numSubtasks);
 
   /**
    * Exports the next Arrow batch from a source handle into the consumer-allocated C structs.
