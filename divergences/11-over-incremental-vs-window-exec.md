@@ -69,8 +69,10 @@ re-derived; for the others the logic is small and Flink-defined.
 
 ## Scope
 Running aggregates (`SUM`/`MIN`/`MAX`/`COUNT`/`AVG`; `AVG` via Flink's
-`$SUM0`+`COUNT` with the divide on the host) and `ROW_NUMBER`. Bounded frames and
-proctime fall back. `RANK`/`DENSE_RANK`/`FIRST_VALUE`/`LAST_VALUE` are next.
+`$SUM0`+`COUNT` with the divide on the host) and the window functions
+`ROW_NUMBER`/`RANK`/`DENSE_RANK`. Bounded frames and proctime fall back.
+`FIRST_VALUE`/`LAST_VALUE` are next (they need the value column threaded through and
+RANGE tie handling — the last value in a tie group is shared).
 
 ## Verification
 Parity harness: running aggregates and `ROW_NUMBER`, partitioned and not, over

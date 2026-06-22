@@ -52,6 +52,16 @@ class FlinkOverAggregateSqlHarnessTest {
   }
 
   @Test
+  void rankAndDenseRankMatchHost() throws Exception {
+    // RANK and DENSE_RANK over (PARTITION BY k ORDER BY rt). Tied rowtimes would share a rank;
+    // tie semantics are covered by the native test, here we verify routing + host parity.
+    NativeParity.assertParity(
+        FlinkOverAggregateSqlHarnessTest::environment,
+        "SELECT k, v, RANK() OVER (PARTITION BY k ORDER BY rt) AS rk, "
+            + "DENSE_RANK() OVER (PARTITION BY k ORDER BY rt) AS dr FROM src");
+  }
+
+  @Test
   void partitionedRunningSumMatchesHost() throws Exception {
     // PARTITION BY k: a running SUM per key, shuffled by the host's keyed exchange.
     NativeParity.assertParity(
