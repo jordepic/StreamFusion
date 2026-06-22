@@ -633,37 +633,158 @@ impl TumblingAggregator {
 /// means rows sharing a rowtime within a key share the post-fold value, so all rows of an rt group
 /// are folded before any is read. Accumulators persist across calls (UNBOUNDED PRECEDING). Emits one
 /// value per input row, in input order, so the caller can zip it back onto the passed-through columns.
+/// One non-null value of the OVER value column, in the column's type.
+#[derive(Clone, Copy)]
+enum Num {
+    I64(i64),
+    I32(i32),
+    F64(f64),
+}
+
+/// The OVER value column downcast once, so the per-row fold reads a typed value without a per-row
+/// downcast. `None` for a null row (which the aggregates skip).
+enum ValueColumn<'a> {
+    I64(&'a Int64Array),
+    I32(&'a Int32Array),
+    F64(&'a arrow::array::Float64Array),
+}
+
+impl ValueColumn<'_> {
+    fn at(&self, row: usize) -> Option<Num> {
+        match self {
+            ValueColumn::I64(a) => (!a.is_null(row)).then(|| Num::I64(a.value(row))),
+            ValueColumn::I32(a) => (!a.is_null(row)).then(|| Num::I32(a.value(row))),
+            ValueColumn::F64(a) => (!a.is_null(row)).then(|| Num::F64(a.value(row))),
+        }
+    }
+}
+
+/// Per-key running state for one OVER aggregate. Folded directly per row — no per-row DataFusion
+/// accumulator call — matching DataFusion's accumulators exactly: integer SUM wraps on overflow (as
+/// `sum_udaf` and the int-sum accumulator do), and all four skip null values. The value type is
+/// fixed per aggregator, so each variant pairs a kind with that type. See divergences/11.
+enum RunningAgg {
+    SumI64(Option<i64>),
+    MinI64(Option<i64>),
+    MaxI64(Option<i64>),
+    SumI32(Option<i32>),
+    MinI32(Option<i32>),
+    MaxI32(Option<i32>),
+    SumF64(Option<f64>),
+    MinF64(Option<f64>),
+    MaxF64(Option<f64>),
+    Count(i64),
+}
+
+impl RunningAgg {
+    fn new(kind: i64, value_type: &DataType) -> Self {
+        use RunningAgg::*;
+        if kind == 3 {
+            return Count(0);
+        }
+        match value_type {
+            DataType::Int64 => [SumI64(None), MinI64(None), MaxI64(None)],
+            DataType::Int32 => [SumI32(None), MinI32(None), MaxI32(None)],
+            DataType::Float64 => [SumF64(None), MinF64(None), MaxF64(None)],
+            other => panic!("unsupported OVER value type: {other:?}"),
+        }
+        .into_iter()
+        .nth(kind as usize)
+        .expect("kind 0=SUM, 1=MIN, 2=MAX")
+    }
+
+    /// Folds one non-null value into the running state.
+    fn fold(&mut self, value: Num) {
+        use RunningAgg::*;
+        match (self, value) {
+            (SumI64(s), Num::I64(v)) => *s = Some(s.unwrap_or(0).wrapping_add(v)),
+            (MinI64(m), Num::I64(v)) => *m = Some(m.map_or(v, |x| x.min(v))),
+            (MaxI64(m), Num::I64(v)) => *m = Some(m.map_or(v, |x| x.max(v))),
+            (SumI32(s), Num::I32(v)) => *s = Some(s.unwrap_or(0).wrapping_add(v)),
+            (MinI32(m), Num::I32(v)) => *m = Some(m.map_or(v, |x| x.min(v))),
+            (MaxI32(m), Num::I32(v)) => *m = Some(m.map_or(v, |x| x.max(v))),
+            (SumF64(s), Num::F64(v)) => *s = Some(s.unwrap_or(0.0) + v),
+            (MinF64(m), Num::F64(v)) => *m = Some(m.map_or(v, |x| x.min(v))),
+            (MaxF64(m), Num::F64(v)) => *m = Some(m.map_or(v, |x| x.max(v))),
+            (Count(c), _) => *c += 1,
+            _ => unreachable!("OVER value type does not match aggregate state"),
+        }
+    }
+
+    /// The current running value (also the checkpointed state).
+    fn emit(&self) -> ScalarValue {
+        use RunningAgg::*;
+        match self {
+            SumI64(v) | MinI64(v) | MaxI64(v) => ScalarValue::Int64(*v),
+            SumI32(v) | MinI32(v) | MaxI32(v) => ScalarValue::Int32(*v),
+            SumF64(v) | MinF64(v) | MaxF64(v) => ScalarValue::Float64(*v),
+            Count(c) => ScalarValue::Int64(Some(*c)),
+        }
+    }
+
+    fn result_type(&self) -> DataType {
+        use RunningAgg::*;
+        match self {
+            SumI64(_) | MinI64(_) | MaxI64(_) | Count(_) => DataType::Int64,
+            SumI32(_) | MinI32(_) | MaxI32(_) => DataType::Int32,
+            SumF64(_) | MinF64(_) | MaxF64(_) => DataType::Float64,
+        }
+    }
+
+    fn restore_value(&mut self, scalar: &ScalarValue) {
+        use RunningAgg::*;
+        match (self, scalar) {
+            (Count(c), ScalarValue::Int64(Some(v))) => *c = *v,
+            (SumI64(s) | MinI64(s) | MaxI64(s), ScalarValue::Int64(v)) => *s = *v,
+            (SumI32(s) | MinI32(s) | MaxI32(s), ScalarValue::Int32(v)) => *s = *v,
+            (SumF64(s) | MinF64(s) | MaxF64(s), ScalarValue::Float64(v)) => *s = *v,
+            _ => panic!("OVER state type mismatch on restore"),
+        }
+    }
+}
+
 struct OverAggregator {
-    aggregates: Vec<WindowAggregate>,
-    keys: HashMap<GroupKey, Vec<Box<dyn Accumulator>>>,
+    kinds: Vec<i64>,
+    value_type: DataType,
+    keys: HashMap<GroupKey, Vec<RunningAgg>>,
     key_types: Vec<DataType>,
 }
 
 impl OverAggregator {
     fn new(value_type: i64, kinds: Vec<i64>) -> Self {
-        let value_type = value_data_type(value_type);
-        let aggregates: Vec<WindowAggregate> =
-            kinds.into_iter().map(|kind| WindowAggregate::new(kind, &value_type)).collect();
-        OverAggregator { aggregates, keys: HashMap::new(), key_types: Vec::new() }
+        OverAggregator {
+            kinds,
+            value_type: value_data_type(value_type),
+            keys: HashMap::new(),
+            key_types: Vec::new(),
+        }
     }
 
-    /// The running accumulators for a key, created on first touch.
-    fn accumulators(&mut self, key: GroupKey) -> &mut Vec<Box<dyn Accumulator>> {
-        let aggregates = &self.aggregates;
+    /// The running aggregate state for a key, created on first touch.
+    fn states(&mut self, key: GroupKey) -> &mut Vec<RunningAgg> {
+        let (kinds, value_type) = (&self.kinds, &self.value_type);
         self.keys
             .entry(key)
-            .or_insert_with(|| aggregates.iter().map(WindowAggregate::create_accumulator).collect())
+            .or_insert_with(|| kinds.iter().map(|&kind| RunningAgg::new(kind, value_type)).collect())
     }
 
-    /// Folds the batch (`rt` i64, `value`, optional `key0..`) into the per-key running accumulators in
+    /// Folds the batch (`rt` i64, `value`, optional `key0..`) into the per-key running state in
     /// rowtime order and returns `[result0..resultN-1]` per input row, in input order.
     fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
         let rt = column_i64(batch, "rt");
         let value = batch.column_by_name("value").expect("missing value column");
+        let value_column = match self.value_type {
+            DataType::Int64 => ValueColumn::I64(value.as_any().downcast_ref().expect("int64 value")),
+            DataType::Int32 => ValueColumn::I32(value.as_any().downcast_ref().expect("int32 value")),
+            DataType::Float64 => {
+                ValueColumn::F64(value.as_any().downcast_ref().expect("float64 value"))
+            }
+            ref other => panic!("unsupported OVER value type: {other:?}"),
+        };
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
         let n = batch.num_rows();
-        let num_agg = self.aggregates.len();
+        let num_agg = self.kinds.len();
         let row_keys: Vec<GroupKey> = (0..n).map(|row| read_key(&key_arrays, row)).collect();
 
         let mut order: Vec<usize> = (0..n).collect();
@@ -676,18 +797,21 @@ impl OverAggregator {
                 end += 1;
             }
             // Fold every row of this rt group into its key before reading any (RANGE: tied rows of a
-            // key share the post-fold value); rows of other keys in the group are independent.
+            // key share the post-fold value); a null value is skipped, but the key's state is touched
+            // so the row still emits the running value.
             for &row in &order[start..end] {
-                let one = take(value, &UInt32Array::from(vec![row as u32]), None)
-                    .expect("failed to take value");
-                for accumulator in self.accumulators(row_keys[row].clone()) {
-                    accumulator.update_batch(std::slice::from_ref(&one)).expect("failed to update");
+                let value = value_column.at(row);
+                let states = self.states(row_keys[row].clone());
+                if let Some(num) = value {
+                    for state in states.iter_mut() {
+                        state.fold(num);
+                    }
                 }
             }
             for &row in &order[start..end] {
-                let accumulators = self.keys.get_mut(&row_keys[row]).expect("key present");
-                for (a, accumulator) in accumulators.iter_mut().enumerate() {
-                    results[a][row] = accumulator.evaluate().expect("failed to evaluate");
+                let states = self.keys.get(&row_keys[row]).expect("key present");
+                for (a, state) in states.iter().enumerate() {
+                    results[a][row] = state.emit();
                 }
             }
             start = end;
@@ -695,68 +819,53 @@ impl OverAggregator {
 
         let mut fields = Vec::with_capacity(num_agg);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_agg);
-        for (a, aggregate) in self.aggregates.iter().enumerate() {
-            fields.push(Field::new(format!("result{a}"), aggregate.result_type(), true));
-            columns.push(scalars_to_array(std::mem::take(&mut results[a]), &aggregate.result_type()));
+        for (a, &kind) in self.kinds.iter().enumerate() {
+            let result_type = RunningAgg::new(kind, &self.value_type).result_type();
+            fields.push(Field::new(format!("result{a}"), result_type.clone(), true));
+            columns.push(scalars_to_array(std::mem::take(&mut results[a]), &result_type));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .expect("failed to build over result batch")
     }
 
-    /// Serializes the per-key running accumulators (`[key0.., state…]`, one row per key).
+    /// Serializes the per-key running state (`[key0.., state0..]`, one row per key, one scalar per
+    /// aggregate — the running value is itself the checkpointed state).
     fn snapshot(&mut self) -> Vec<u8> {
-        let state_fields: Vec<Field> =
-            self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
+        let result_types: Vec<DataType> =
+            self.kinds.iter().map(|&k| RunningAgg::new(k, &self.value_type).result_type()).collect();
         let mut keys: Vec<GroupKey> = Vec::new();
-        let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_fields.len()];
-        for (key, accumulators) in self.keys.iter_mut() {
+        let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); self.kinds.len()];
+        for (key, states) in self.keys.iter() {
             keys.push(key.clone());
-            let mut column = 0;
-            for accumulator in accumulators.iter_mut() {
-                for scalar in accumulator.state().expect("state") {
-                    state_columns[column].push(scalar);
-                    column += 1;
-                }
+            for (i, state) in states.iter().enumerate() {
+                state_columns[i].push(state.emit());
             }
         }
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&keys, &self.key_types);
-        fields.extend(state_fields.iter().cloned());
-        for (index, scalars) in state_columns.into_iter().enumerate() {
-            columns.push(scalars_to_array(scalars, state_fields[index].data_type()));
+        for (index, result_type) in result_types.iter().enumerate() {
+            fields.push(Field::new(format!("state{index}"), result_type.clone(), true));
         }
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("failed to build over snapshot batch");
-        let mut buffer = Vec::new();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
-            .expect("failed to open over snapshot writer");
-        writer.write(&batch).expect("failed to write over snapshot");
-        writer.finish().expect("failed to finish over snapshot");
-        drop(writer);
-        buffer
+        for (index, scalars) in state_columns.into_iter().enumerate() {
+            columns.push(scalars_to_array(scalars, &result_types[index]));
+        }
+        write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build over snapshot batch"))
     }
 
     fn restore(value_type: i64, kinds: Vec<i64>, bytes: &[u8]) -> Self {
         let mut aggregator = OverAggregator::new(value_type, kinds);
-        let field_counts: Vec<usize> =
-            aggregator.aggregates.iter().map(|a| a.state_fields().len()).collect();
-        let state_field_total: usize = field_counts.iter().sum();
-        let reader = arrow::ipc::reader::StreamReader::try_new(bytes, None)
-            .expect("failed to open over snapshot reader");
-        for batch in reader {
-            let batch = batch.expect("failed to read over snapshot");
-            let arity = batch.num_columns() - state_field_total;
+        let num_agg = aggregator.kinds.len();
+        for batch in read_ipc(bytes) {
+            let arity = batch.num_columns() - num_agg;
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
             aggregator.key_types = key_types(&key_arrays);
             for row in 0..batch.num_rows() {
                 let key = read_key(&key_arrays, row);
-                let mut column = arity;
-                for (i, accumulator) in aggregator.accumulators(key).iter_mut().enumerate() {
-                    let count = field_counts[i];
-                    let state: Vec<ArrayRef> =
-                        (column..column + count).map(|c| batch.column(c).slice(row, 1)).collect();
-                    accumulator.merge_batch(&state).expect("failed to restore over accumulator");
-                    column += count;
+                for (i, state) in aggregator.states(key).iter_mut().enumerate() {
+                    let scalar = ScalarValue::try_from_array(batch.column(arity + i), row)
+                        .expect("over state scalar");
+                    state.restore_value(&scalar);
                 }
             }
         }
