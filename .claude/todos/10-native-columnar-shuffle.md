@@ -22,9 +22,17 @@ Measured: the fully-columnar windowed pipeline over a Parquet source is **1.91×
 5M rows (`ThroughputBenchmark.windowedColumnarSourceThroughput`), vs 1.21× for the same window
 fed by a row source (the difference is the transpose the columnar path removes).
 
-**Remaining:** higher-parallelism shuffle coverage (tests are p=1, where the split is one
-channel; multi-channel split is unit-tested in `SplitByKeyGroupOperatorTest`); session windows
-are single-phase only (no two-phase split), so unaffected.
+Cross-channel routing is verified end to end at parallelism 2
+(`FlinkColumnarShuffleParallelismTest`): the native Parquet source shards its files across
+subtasks (it is now a `RichParallelSourceFunction` that reads the sorted files congruent to its
+subtask index modulo the parallelism), so a keyed window runs at p=2 and the columnar exchange
+splits each batch by key and routes the sub-batches to both window subtasks, matching the host.
+(The parity test uses a watermark delay wider than the data span so no window closes mid-run —
+isolating the shuffle from the per-batch watermark divergence, which at p>1 otherwise shows as
+the host late-dropping a borderline first window.)
+
+**Remaining:** session windows are single-phase only (no two-phase split), so unaffected. The
+shuffle is otherwise complete: single- and two-phase, one channel and many.
 
 **Source:** user direction — "I don't want to transpose all the time"
 

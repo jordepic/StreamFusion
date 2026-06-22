@@ -8,7 +8,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
+import org.apache.flink.streaming.api.functions.source.legacy.RichParallelSourceFunction;
 
 /**
  * A bounded source that reads a directory of Parquet files natively and emits one {@link ArrowBatch}
@@ -16,9 +16,11 @@ import org.apache.flink.streaming.api.functions.source.legacy.SourceFunction;
  * next columnar operator (or a columnar sink) with no transpose. Returning from {@link #run} once the
  * files are exhausted finishes the job.
  *
- * <p>Ownership of each emitted batch passes to the downstream operator, which closes it after use.
+ * <p>Parallel: each subtask reads a disjoint shard of the directory's files (by file index modulo
+ * the parallelism), so a parallel read covers every file once with no overlap. Ownership of each
+ * emitted batch passes to the downstream operator, which closes it after use.
  */
-public class ParquetArrowSourceFunction implements SourceFunction<ArrowBatch> {
+public class ParquetArrowSourceFunction extends RichParallelSourceFunction<ArrowBatch> {
 
   private final String directory;
   // Output columns by name, in plan order (projection pushdown); empty emits every column.
@@ -35,7 +37,9 @@ public class ParquetArrowSourceFunction implements SourceFunction<ArrowBatch> {
 
   @Override
   public void run(SourceContext<ArrowBatch> ctx) {
-    long handle = Native.openParquet(directory, projection);
+    int subtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
+    int numSubtasks = getRuntimeContext().getTaskInfo().getNumberOfParallelSubtasks();
+    long handle = Native.openParquet(directory, projection, subtask, numSubtasks);
     try (BufferAllocator allocator = new RootAllocator();
         CDataDictionaryProvider dictionaries = new CDataDictionaryProvider()) {
       while (running) {
