@@ -16,6 +16,14 @@ When reviewing code, make sure that it follows the existing principles of codeba
 - DataFusion comet (see ~/data/datafusion-comet for code)
 - Arroyo (see ~/data/arroyo for code)
 
+Reference-first rule (do this BEFORE designing, not after):
+- When adding an operator that already exists in Arroyo, you MUST first consult Arroyo's
+  implementation of it (~/data/arroyo) and mirror its structure, deviating only with a stated reason
+  (recorded in `divergences/`). We are ripping operators out of Arroyo, not reinventing them.
+- When writing code that touches JNI, native memory management, or the Java↔Rust handover (the
+  Arrow C Data Interface bridge, allocator ownership, off-heap accounting), you MUST consult
+  DataFusion Comet (~/data/datafusion-comet) for the established pattern before writing ours.
+
 Because of AI code reviews, we anticipate that there will be an influx of code. I want humans to agree on the
 architecture of a solution, and then allow AI to ensure that the written code is clean and readable by any human.
 Comments should not be necessary unless they explain something non-obvious to the reader. Follow typical clean code
