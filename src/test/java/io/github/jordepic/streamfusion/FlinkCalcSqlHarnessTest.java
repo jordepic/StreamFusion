@@ -64,6 +64,30 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void wideningCastMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT CAST(v AS BIGINT) FROM f");
+  }
+
+  @Test
+  void castToDoubleMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT CAST(v AS DOUBLE) FROM f");
+  }
+
+  @Test
+  void caseWithMixedWidthBranchesMatchesHost() throws Exception {
+    // BIGINT/INT branches: the host casts the INT branch up to BIGINT, now an admitted widening cast.
+    NativeParity.assertParity(
+        FlinkCalcSqlHarnessTest::environment, "SELECT CASE WHEN s <> 'a' THEN k ELSE v END FROM f");
+  }
+
+  @Test
+  void narrowingCastFallsBack() throws Exception {
+    // BIGINT → INT is narrowing (overflow semantics differ), so it is not admitted and falls back.
+    NativeParity.assertFallback(
+        FlinkCalcSqlHarnessTest::environment, "SELECT CAST(k AS INT) FROM f");
+  }
+
+  @Test
   void unsupportedProjectionFunctionFallsBack() throws Exception {
     // A function the expression encoder does not admit makes the whole Calc fall back to the host.
     NativeParity.assertFallback(FlinkCalcSqlHarnessTest::environment, "SELECT ABS(v) FROM f");

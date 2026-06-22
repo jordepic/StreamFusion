@@ -35,6 +35,16 @@ final class RexExpression {
   private static final int KIND_LIT_INT = 7;
   private static final int KIND_LIT_SMALL = 8;
   private static final int KIND_LIT_TINY = 9;
+  // A cast node: payload is the target type code, with one child (the casted expression).
+  private static final int KIND_CAST = 11;
+
+  // Cast target type codes, mirrored on the native side.
+  private static final int CAST_TINYINT = 0;
+  private static final int CAST_SMALLINT = 1;
+  private static final int CAST_INTEGER = 2;
+  private static final int CAST_BIGINT = 3;
+  private static final int CAST_FLOAT = 4;
+  private static final int CAST_DOUBLE = 5;
 
   private final List<Integer> kinds = new ArrayList<>();
   private final List<Integer> payload = new ArrayList<>();
@@ -201,6 +211,9 @@ final class RexExpression {
   }
 
   private boolean emitCall(RexCall call) {
+    if (call.getKind() == SqlKind.CAST) {
+      return emitCast(call);
+    }
     int op = opCode(call.getKind());
     if (op < 0) {
       return false;
@@ -251,6 +264,72 @@ final class RexExpression {
         }
         add(KIND_CALL, op, 2);
         return emit(operands.get(0)) && emit(operands.get(1));
+    }
+  }
+
+  /**
+   * Emits a cast, but only a widening numeric one (integer to a wider integer, integer to
+   * float/double, float to double, or an identity cast). Those are lossless and evaluate identically
+   * on both sides; narrowing, float-to-integer, and string casts differ in overflow/rounding/parsing
+   * semantics, so they are not admitted and the expression falls back.
+   */
+  private boolean emitCast(RexCall call) {
+    if (call.getOperands().size() != 1) {
+      return false;
+    }
+    int target = wideningTargetCode(call.getOperands().get(0).getType().getSqlTypeName(),
+        call.getType().getSqlTypeName());
+    if (target < 0) {
+      return false;
+    }
+    add(KIND_CAST, target, 1);
+    return emit(call.getOperands().get(0));
+  }
+
+  /** The target type code for a widening numeric cast {@code source → target}, or -1 if not safe. */
+  private static int wideningTargetCode(SqlTypeName source, SqlTypeName target) {
+    int from = numericRank(source);
+    int to = numericRank(target);
+    if (from < 0 || to < 0 || to < from) {
+      return -1;
+    }
+    switch (target) {
+      case TINYINT:
+        return CAST_TINYINT;
+      case SMALLINT:
+        return CAST_SMALLINT;
+      case INTEGER:
+        return CAST_INTEGER;
+      case BIGINT:
+        return CAST_BIGINT;
+      case FLOAT:
+      case REAL:
+        return CAST_FLOAT;
+      case DOUBLE:
+        return CAST_DOUBLE;
+      default:
+        return -1;
+    }
+  }
+
+  /** A widening order over the numeric types (lower widens losslessly to higher); -1 if not numeric. */
+  private static int numericRank(SqlTypeName type) {
+    switch (type) {
+      case TINYINT:
+        return 0;
+      case SMALLINT:
+        return 1;
+      case INTEGER:
+        return 2;
+      case BIGINT:
+        return 3;
+      case FLOAT:
+      case REAL:
+        return 4;
+      case DOUBLE:
+        return 5;
+      default:
+        return -1;
     }
   }
 

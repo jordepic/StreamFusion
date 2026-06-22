@@ -75,13 +75,17 @@ project; record any deliberate semantic choice in `divergences/`.
 3. **Fuse + expand.** Projection+filter are now one native pass (done). Widening the admitted
    op/function set with parity tests (each admitted only once a parity test confirms DataFusion
    matches Flink; un-admitted ops fall back):
-   - ✅ `IS NOT NULL` (op 31) — routes, parity-verified.
+   - ✅ `IS NOT NULL` (op 31), ✅ searched `CASE` (op 40, n-ary → when/then pairs + else).
+   - ✅ `CAST` (node kind 11 + target type code) — **widening numeric only** (integer→wider integer,
+     integer→float/double, float→double): lossless/IEEE-identical to the host. Unblocks mixed-width
+     `CASE` branches and explicit widening casts. Narrowing / float→int / string casts are
+     divergence-prone (overflow/rounding/parsing) and **fall back** (parity test asserts it).
    - **`IS NULL`** — Calcite encodes a bare `IS NULL` as a null `Sarg`/`SEARCH` that `expandSearch`
      does not turn into an `IS_NULL` call, so it currently falls back. To route it, detect a
      null-only Sarg in the encoder and emit `IS_NULL`. (`IS NOT NULL` is not Sarg'd, so it routes.)
-   - Remaining: `/` and `%` (integer-division/modulo parity — divergence-prone), `CAST`
-     (overflow/rounding), `CASE`/`COALESCE`, string/temporal functions. The long tail toward broad
-     coverage; each gated by a parity test.
+   - Remaining: `/` and `%` (integer-division/modulo parity — divergence-prone: truncation, negative
+     operands, divide-by-zero), narrowing/float→int/string `CAST`, `COALESCE`/`NULLIF`, string and
+     temporal functions. The long tail toward broad coverage; each gated by a parity test.
 
 ## Acceptance criteria
 - Existing filter/projection tests pass via the general expression path.
