@@ -13,6 +13,7 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -45,10 +46,13 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<RowData>
   private static final int TIMESTAMP_PRECISION = 3;
   private static final int TYPE_DOUBLE = 1;
   private static final int TYPE_INT = 2;
+  private static final int TYPE_STRING = 3;
 
   private final RowType inputType;
   private final int timeColumn;
   private final int valueColumn;
+  private final int[] keyColumns;
+  private final int[] keyTypes;
   private final int valueType;
   private final int[] aggregateKinds;
 
@@ -63,10 +67,18 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<RowData>
   private transient ListState<byte[]> handleState;
 
   public NativeOverAggregateOperator(
-      RowType inputType, int timeColumn, int valueColumn, int valueType, int[] aggregateKinds) {
+      RowType inputType,
+      int timeColumn,
+      int valueColumn,
+      int[] keyColumns,
+      int[] keyTypes,
+      int valueType,
+      int[] aggregateKinds) {
     this.inputType = inputType;
     this.timeColumn = timeColumn;
     this.valueColumn = valueColumn;
+    this.keyColumns = keyColumns;
+    this.keyTypes = keyTypes;
     this.valueType = valueType;
     this.aggregateKinds = aggregateKinds;
   }
@@ -188,7 +200,10 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<RowData>
     }
   }
 
-  /** Builds the {@code [rt, value]} batch the native aggregator folds, in the rows' current order. */
+  /**
+   * Builds the {@code [rt, value, key0..]} batch the native aggregator folds, in the rows' current
+   * order. The key columns drive the per-partition running accumulators.
+   */
   private VectorSchemaRoot buildInput(List<RowData> rows) {
     int n = rows.size();
     BigIntVector rt = new BigIntVector("rt", allocator);
@@ -200,6 +215,13 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<RowData>
     } else {
       value = new BigIntVector("value", allocator);
     }
+    FieldVector[] keys = new FieldVector[keyColumns.length];
+    for (int j = 0; j < keyColumns.length; j++) {
+      keys[j] =
+          keyTypes[j] == TYPE_STRING
+              ? new VarCharVector("key" + j, allocator)
+              : new BigIntVector("key" + j, allocator);
+    }
     for (int i = 0; i < n; i++) {
       RowData row = rows.get(i);
       rt.setSafe(i, row.getTimestamp(timeColumn, TIMESTAMP_PRECISION).getMillisecond());
@@ -210,8 +232,25 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<RowData>
       } else {
         ((BigIntVector) value).setSafe(i, row.getLong(valueColumn));
       }
+      for (int j = 0; j < keyColumns.length; j++) {
+        if (keyTypes[j] == TYPE_STRING) {
+          ((VarCharVector) keys[j]).setSafe(i, row.getString(keyColumns[j]).toBytes());
+        } else {
+          ((BigIntVector) keys[j])
+              .setSafe(
+                  i,
+                  keyTypes[j] == TYPE_INT
+                      ? row.getInt(keyColumns[j])
+                      : row.getLong(keyColumns[j]));
+        }
+      }
     }
-    List<FieldVector> vectors = List.of(rt, value);
+    List<FieldVector> vectors = new java.util.ArrayList<>();
+    vectors.add(rt);
+    vectors.add(value);
+    for (FieldVector key : keys) {
+      vectors.add(key);
+    }
     VectorSchemaRoot root = new VectorSchemaRoot(vectors);
     root.setRowCount(n);
     return root;

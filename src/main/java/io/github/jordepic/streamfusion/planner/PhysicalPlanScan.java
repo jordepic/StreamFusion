@@ -308,6 +308,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             over.getRowType(),
             OverAggregateMatcher.timeColumn(over),
             OverAggregateMatcher.valueColumnIndex(over),
+            OverAggregateMatcher.keyColumns(over),
+            OverAggregateMatcher.keyTypes(over),
             OverAggregateMatcher.valueTypeCode(over),
             OverAggregateMatcher.kinds(over));
       }

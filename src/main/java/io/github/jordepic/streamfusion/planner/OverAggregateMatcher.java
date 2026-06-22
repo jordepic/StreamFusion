@@ -14,11 +14,11 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalO
 
 /**
  * Recognizes the event-time {@code OVER} aggregations the native operator implements: a single
- * window group with no {@code PARTITION BY}, ordered by a rowtime (local-time-zone) attribute, the
- * default {@code RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW} frame, and one or more
- * {@code SUM}/{@code MIN}/{@code MAX}/{@code COUNT} aggregates that all read the same bigint/int/
- * double value column. Anything else (a partition key, ROWS frame, a bounded frame, proctime, AVG,
- * multiple value columns) falls back to the host.
+ * window group ordered by a rowtime (local-time-zone) attribute, the default {@code RANGE BETWEEN
+ * UNBOUNDED PRECEDING AND CURRENT ROW} frame, optional {@code PARTITION BY} on bigint/int/string
+ * keys, and one or more {@code SUM}/{@code MIN}/{@code MAX}/{@code COUNT} aggregates that all read
+ * the same bigint/int/double value column. Anything else (ROWS frame, a bounded frame, proctime,
+ * AVG, multiple value columns, an unsupported key type) falls back to the host.
  */
 final class OverAggregateMatcher {
 
@@ -30,15 +30,18 @@ final class OverAggregateMatcher {
       return false;
     }
     Window.Group group = window.groups.get(0);
-    if (!group.keys.isEmpty()) {
-      return false; // no PARTITION BY in this slice
+    RelDataType inputType = over.getInput().getRowType();
+    for (int key : group.keys.toArray()) {
+      if (!WindowAggregateMatcher.supportedKeyType(
+          inputType.getFieldList().get(key).getType().getSqlTypeName())) {
+        return false; // PARTITION BY only on bigint/int/string
+      }
     }
     if (group.isRows
         || !(group.lowerBound.isUnbounded() && group.lowerBound.isPreceding())
         || !group.upperBound.isCurrentRow()) {
       return false; // only RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     }
-    RelDataType inputType = over.getInput().getRowType();
     Integer order = orderColumn(group);
     if (order == null
         || !FlinkTypeFactory$.MODULE$.isRowtimeIndicatorType(
@@ -94,6 +97,32 @@ final class OverAggregateMatcher {
 
   static int timeColumn(StreamPhysicalOverAggregate over) {
     return orderColumn(over.logicWindow().groups.get(0));
+  }
+
+  /** The PARTITION BY column indices (empty for no partition). */
+  static int[] keyColumns(StreamPhysicalOverAggregate over) {
+    return over.logicWindow().groups.get(0).keys.toArray();
+  }
+
+  /** Native key-type code per partition column: 0 = bigint, 2 = int, 3 = string. */
+  static int[] keyTypes(StreamPhysicalOverAggregate over) {
+    int[] columns = keyColumns(over);
+    RelDataType inputType = over.getInput().getRowType();
+    int[] types = new int[columns.length];
+    for (int i = 0; i < columns.length; i++) {
+      switch (inputType.getFieldList().get(columns[i]).getType().getSqlTypeName()) {
+        case INTEGER:
+          types[i] = 2;
+          break;
+        case VARCHAR:
+        case CHAR:
+          types[i] = 3;
+          break;
+        default:
+          types[i] = 0;
+      }
+    }
+    return types;
   }
 
   static int valueColumnIndex(StreamPhysicalOverAggregate over) {

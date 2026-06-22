@@ -25,6 +25,8 @@ public class NativeOverAggExecNode extends ExecNodeBase<RowData>
   private final RowType inputType;
   private final int timeColumn;
   private final int valueColumn;
+  private final int[] keyColumns;
+  private final int[] keyTypes;
   private final int valueType;
   private final int[] aggregateKinds;
 
@@ -36,6 +38,8 @@ public class NativeOverAggExecNode extends ExecNodeBase<RowData>
       RowType inputType,
       int timeColumn,
       int valueColumn,
+      int[] keyColumns,
+      int[] keyTypes,
       int valueType,
       int[] aggregateKinds) {
     super(
@@ -48,6 +52,8 @@ public class NativeOverAggExecNode extends ExecNodeBase<RowData>
     this.inputType = inputType;
     this.timeColumn = timeColumn;
     this.valueColumn = valueColumn;
+    this.keyColumns = keyColumns;
+    this.keyTypes = keyTypes;
     this.valueType = valueType;
     this.aggregateKinds = aggregateKinds;
   }
@@ -61,7 +67,8 @@ public class NativeOverAggExecNode extends ExecNodeBase<RowData>
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeOverAggregateOperator(inputType, timeColumn, valueColumn, valueType, aggregateKinds),
+        new NativeOverAggregateOperator(
+            inputType, timeColumn, valueColumn, keyColumns, keyTypes, valueType, aggregateKinds),
         InternalTypeInfo.of(getOutputType()),
         input.getParallelism(),
         false);
