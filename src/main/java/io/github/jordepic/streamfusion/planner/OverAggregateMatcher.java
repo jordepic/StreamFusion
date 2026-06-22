@@ -67,7 +67,16 @@ final class OverAggregateMatcher {
 
   /** Native code for a non-aggregate window function, or -1 if it is not one we implement. */
   private static int windowFunctionKind(SqlKind kind) {
-    return kind == SqlKind.ROW_NUMBER ? 10 : -1;
+    switch (kind) {
+      case ROW_NUMBER:
+        return 10;
+      case RANK:
+        return 11;
+      case DENSE_RANK:
+        return 12;
+      default:
+        return -1;
+    }
   }
 
   /** The single ascending ORDER BY column index, or null if the order is not a lone ascending key. */

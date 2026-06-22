@@ -776,51 +776,88 @@ fn is_window_function_kind(kind: i64) -> bool {
 enum WindowFnState {
     /// `ROW_NUMBER()` over `ROWS UNBOUNDED PRECEDING` — a per-partition counter (1-based).
     RowNumber(i64),
+    /// `RANK()` — `count` rows seen, `rank` of the current order-value group, `last` order value.
+    /// Tied order values share a rank; the next value's rank jumps to its row position (gaps).
+    Rank { count: i64, rank: i64, last: Option<i64> },
+    /// `DENSE_RANK()` — increments only when the order value changes, so ranks are gap-free.
+    DenseRank { dense: i64, last: Option<i64> },
 }
 
 impl WindowFnState {
     fn new(kind: i64) -> Self {
         match kind {
             10 => WindowFnState::RowNumber(0),
+            11 => WindowFnState::Rank { count: 0, rank: 0, last: None },
+            12 => WindowFnState::DenseRank { dense: 0, last: None },
             other => panic!("unsupported window function kind: {other}"),
         }
     }
 
-    /// Advances the state for the current row and returns its emitted value.
-    fn next(&mut self, _rt: i64) -> ScalarValue {
+    /// Advances the state for the current row (whose ORDER BY value is `rt`) and returns its value.
+    /// Rows are fed in ascending order, so tied order values arrive consecutively.
+    fn next(&mut self, rt: i64) -> ScalarValue {
         match self {
             WindowFnState::RowNumber(n) => {
                 *n += 1;
                 ScalarValue::Int64(Some(*n))
             }
+            WindowFnState::Rank { count, rank, last } => {
+                *count += 1;
+                if *last != Some(rt) {
+                    *rank = *count;
+                    *last = Some(rt);
+                }
+                ScalarValue::Int64(Some(*rank))
+            }
+            WindowFnState::DenseRank { dense, last } => {
+                if *last != Some(rt) {
+                    *dense += 1;
+                    *last = Some(rt);
+                }
+                ScalarValue::Int64(Some(*dense))
+            }
         }
     }
 
     fn result_type(&self) -> DataType {
-        match self {
-            WindowFnState::RowNumber(_) => DataType::Int64,
-        }
+        DataType::Int64
     }
 
     /// The checkpointable running state, as scalars (one or more per function).
     fn state(&self) -> Vec<ScalarValue> {
+        let i = |v: i64| ScalarValue::Int64(Some(v));
         match self {
-            WindowFnState::RowNumber(n) => vec![ScalarValue::Int64(Some(*n))],
+            WindowFnState::RowNumber(n) => vec![i(*n)],
+            WindowFnState::Rank { count, rank, last } => {
+                vec![i(*count), i(*rank), ScalarValue::Int64(*last)]
+            }
+            WindowFnState::DenseRank { dense, last } => vec![i(*dense), ScalarValue::Int64(*last)],
         }
     }
 
     fn state_types(&self) -> Vec<DataType> {
         match self {
             WindowFnState::RowNumber(_) => vec![DataType::Int64],
+            WindowFnState::Rank { .. } => vec![DataType::Int64; 3],
+            WindowFnState::DenseRank { .. } => vec![DataType::Int64; 2],
         }
     }
 
     fn restore_state(&mut self, state: &[ScalarValue]) {
+        let int = |scalar: &ScalarValue| match scalar {
+            ScalarValue::Int64(value) => *value,
+            _ => None,
+        };
         match self {
-            WindowFnState::RowNumber(n) => {
-                if let ScalarValue::Int64(Some(value)) = state[0] {
-                    *n = value;
-                }
+            WindowFnState::RowNumber(n) => *n = int(&state[0]).unwrap_or(0),
+            WindowFnState::Rank { count, rank, last } => {
+                *count = int(&state[0]).unwrap_or(0);
+                *rank = int(&state[1]).unwrap_or(0);
+                *last = int(&state[2]);
+            }
+            WindowFnState::DenseRank { dense, last } => {
+                *dense = int(&state[0]).unwrap_or(0);
+                *last = int(&state[1]);
             }
         }
     }
@@ -3823,6 +3860,28 @@ mod tests {
         assert_eq!(values(&over.update(&batch(vec![0, 1000, 0], vec![1, 1, 2])), 0), vec![1, 2, 1]);
         // The counter continues per key across calls.
         assert_eq!(values(&over.update(&batch(vec![2000, 1000], vec![1, 2])), 0), vec![3, 2]);
+    }
+
+    // RANK and DENSE_RANK over (ORDER BY rt): tied rowtimes share a rank; RANK leaves gaps after a
+    // tie (next jumps to the row position), DENSE_RANK does not.
+    #[test]
+    fn window_function_rank_and_dense_rank_handle_ties() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("rt", DataType::Int64, false),
+                Field::new("key0", DataType::Int64, false),
+            ])),
+            // One key, rowtimes 10, 10 (tie), 20, 30.
+            vec![
+                Arc::new(Int64Array::from(vec![10i64, 10, 20, 30])),
+                Arc::new(Int64Array::from(vec![1i64, 1, 1, 1])),
+            ],
+        )
+        .unwrap();
+        let mut rank = WindowFunctionOver::new(vec![11]); // RANK
+        assert_eq!(values(&rank.update(&batch), 0), vec![1, 1, 3, 4]);
+        let mut dense = WindowFunctionOver::new(vec![12]); // DENSE_RANK
+        assert_eq!(values(&dense.update(&batch), 0), vec![1, 1, 2, 3]);
     }
 
     // Decoder over the pre-order encoding: CALL gt ( INPUT_REF a , LIT_LONG 5 ).
