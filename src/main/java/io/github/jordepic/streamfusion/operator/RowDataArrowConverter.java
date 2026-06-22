@@ -73,21 +73,41 @@ public final class RowDataArrowConverter {
         : ((LocalZonedTimestampType) type).getPrecision();
   }
 
-  /** Builds an Arrow batch holding {@code rows} under {@code rowType}. The caller closes the root. */
+  /**
+   * Builds an Arrow batch holding {@code rows} under {@code rowType}. The caller closes the root.
+   *
+   * <p>Fills the vectors row-major (one pass over the rows, writing every column per row) into
+   * vectors pre-sized to the row count, the way Comet's {@code ArrowWriter} does — far cheaper than
+   * a column-major pass per field, which re-walks the row list once per column and lets {@code
+   * setSafe} realloc as each vector grows.
+   */
   public static VectorSchemaRoot write(
       List<RowData> rows, RowType rowType, BufferAllocator allocator) {
     int rowCount = rows.size();
-    List<FieldVector> vectors = new ArrayList<>();
-    for (int column = 0; column < rowType.getFieldCount(); column++) {
-      vectors.add(
-          writeColumn(
-              rowType.getTypeAt(column),
-              rowType.getFieldNames().get(column),
-              column,
-              rows,
-              allocator));
+    int fieldCount = rowType.getFieldCount();
+    List<String> names = rowType.getFieldNames();
+    FieldVector[] vectors = new FieldVector[fieldCount];
+    LogicalType[] types = new LogicalType[fieldCount];
+    for (int column = 0; column < fieldCount; column++) {
+      LogicalType type = rowType.getTypeAt(column);
+      types[column] = type;
+      FieldVector vector = createVector(type, names.get(column), allocator);
+      vector.setInitialCapacity(rowCount);
+      vector.allocateNew();
+      vectors[column] = vector;
     }
-    VectorSchemaRoot root = new VectorSchemaRoot(vectors);
+    for (int i = 0; i < rowCount; i++) {
+      RowData row = rows.get(i);
+      for (int column = 0; column < fieldCount; column++) {
+        writeCell(vectors[column], types[column], row, column, i);
+      }
+    }
+    List<FieldVector> columns = new ArrayList<>(fieldCount);
+    for (FieldVector vector : vectors) {
+      vector.setValueCount(rowCount);
+      columns.add(vector);
+    }
+    VectorSchemaRoot root = new VectorSchemaRoot(columns);
     root.setRowCount(rowCount);
     return root;
   }
@@ -105,121 +125,122 @@ public final class RowDataArrowConverter {
     return new ArrayList<>(rows);
   }
 
-  private static FieldVector writeColumn(
-      LogicalType type, String name, int column, List<RowData> rows, BufferAllocator allocator) {
-    int n = rows.size();
+  /** Creates the Arrow vector for a column's logical type (unallocated; the caller pre-sizes it). */
+  private static FieldVector createVector(
+      LogicalType type, String name, BufferAllocator allocator) {
+    switch (type.getTypeRoot()) {
+      case TINYINT:
+        return new TinyIntVector(name, allocator);
+      case SMALLINT:
+        return new SmallIntVector(name, allocator);
+      case INTEGER:
+        return new IntVector(name, allocator);
+      case BIGINT:
+        return new BigIntVector(name, allocator);
+      case FLOAT:
+        return new Float4Vector(name, allocator);
+      case DOUBLE:
+        return new Float8Vector(name, allocator);
+      case BOOLEAN:
+        return new BitVector(name, allocator);
+      case CHAR:
+      case VARCHAR:
+        return new VarCharVector(name, allocator);
+      case TIMESTAMP_WITHOUT_TIME_ZONE:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+        return new TimeStampNanoVector(name, allocator);
+      case DATE:
+        // Flink represents DATE as an int day count, as does Arrow's day-precision date vector.
+        return new DateDayVector(name, allocator);
+      case DECIMAL:
+        return new DecimalVector(
+            name, allocator, ((DecimalType) type).getPrecision(), ((DecimalType) type).getScale());
+      default:
+        throw new IllegalArgumentException("unsupported column type: " + type);
+    }
+  }
+
+  /** Writes row {@code i}'s value (or null) for one column into its pre-created vector. */
+  private static void writeCell(
+      FieldVector vector, LogicalType type, RowData row, int column, int i) {
+    boolean isNull = row.isNullAt(column);
     switch (type.getTypeRoot()) {
       case TINYINT: {
-        TinyIntVector v = new TinyIntVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getByte(column));
-        }
-        v.setValueCount(n);
-        return v;
+        TinyIntVector v = (TinyIntVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getByte(column));
+        break;
       }
       case SMALLINT: {
-        SmallIntVector v = new SmallIntVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getShort(column));
-        }
-        v.setValueCount(n);
-        return v;
+        SmallIntVector v = (SmallIntVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getShort(column));
+        break;
       }
       case INTEGER: {
-        IntVector v = new IntVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getInt(column));
-        }
-        v.setValueCount(n);
-        return v;
+        IntVector v = (IntVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getInt(column));
+        break;
       }
       case BIGINT: {
-        BigIntVector v = new BigIntVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getLong(column));
-        }
-        v.setValueCount(n);
-        return v;
+        BigIntVector v = (BigIntVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getLong(column));
+        break;
       }
       case FLOAT: {
-        Float4Vector v = new Float4Vector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getFloat(column));
-        }
-        v.setValueCount(n);
-        return v;
+        Float4Vector v = (Float4Vector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getFloat(column));
+        break;
       }
       case DOUBLE: {
-        Float8Vector v = new Float8Vector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getDouble(column));
-        }
-        v.setValueCount(n);
-        return v;
+        Float8Vector v = (Float8Vector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getDouble(column));
+        break;
       }
       case BOOLEAN: {
-        BitVector v = new BitVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getBoolean(column) ? 1 : 0);
-        }
-        v.setValueCount(n);
-        return v;
+        BitVector v = (BitVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getBoolean(column) ? 1 : 0);
+        break;
       }
       case CHAR:
       case VARCHAR: {
-        VarCharVector v = new VarCharVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getString(column).toBytes());
-        }
-        v.setValueCount(n);
-        return v;
+        VarCharVector v = (VarCharVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getString(column).toBytes());
+        break;
       }
       case TIMESTAMP_WITHOUT_TIME_ZONE:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE: {
-        int precision = timestampPrecision(type);
-        TimeStampNanoVector v = new TimeStampNanoVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) {
-            v.setNull(i);
-          } else {
-            TimestampData ts = rows.get(i).getTimestamp(column, precision);
-            v.setSafe(i, ts.getMillisecond() * 1_000_000L + ts.getNanoOfMillisecond());
-          }
+        TimeStampNanoVector v = (TimeStampNanoVector) vector;
+        if (isNull) {
+          v.setNull(i);
+        } else {
+          TimestampData ts = row.getTimestamp(column, timestampPrecision(type));
+          v.setSafe(i, ts.getMillisecond() * 1_000_000L + ts.getNanoOfMillisecond());
         }
-        v.setValueCount(n);
-        return v;
+        break;
       }
       case DATE: {
-        // Flink represents DATE as an int day count, as does Arrow's day-precision date vector.
-        DateDayVector v = new DateDayVector(name, allocator);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) v.setNull(i);
-          else v.setSafe(i, rows.get(i).getInt(column));
-        }
-        v.setValueCount(n);
-        return v;
+        DateDayVector v = (DateDayVector) vector;
+        if (isNull) v.setNull(i);
+        else v.setSafe(i, row.getInt(column));
+        break;
       }
       case DECIMAL: {
-        int precision = ((DecimalType) type).getPrecision();
-        int scale = ((DecimalType) type).getScale();
-        DecimalVector v = new DecimalVector(name, allocator, precision, scale);
-        for (int i = 0; i < n; i++) {
-          if (rows.get(i).isNullAt(column)) {
-            v.setNull(i);
-          } else {
-            v.setSafe(i, rows.get(i).getDecimal(column, precision, scale).toBigDecimal());
-          }
+        DecimalVector v = (DecimalVector) vector;
+        if (isNull) {
+          v.setNull(i);
+        } else {
+          int precision = ((DecimalType) type).getPrecision();
+          int scale = ((DecimalType) type).getScale();
+          v.setSafe(i, row.getDecimal(column, precision, scale).toBigDecimal());
         }
-        v.setValueCount(n);
-        return v;
+        break;
       }
       default:
         throw new IllegalArgumentException("unsupported column type: " + type);
