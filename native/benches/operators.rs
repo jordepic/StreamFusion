@@ -7,7 +7,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use streamfusion::bench::{Filter, Session, Tumbling};
+use streamfusion::bench::{Filter, IntervalJoin, Over, Session, Tumbling, WindowJoin};
 
 const ROWS: usize = 4096;
 
@@ -137,11 +137,128 @@ fn bench_session_keyed(c: &mut Criterion) {
     group.finish();
 }
 
+// Columnar OVER over `[k, value, rt]`, 64 keys: the running fold per partition plus the
+// complete/pending split and passthrough, for a running SUM (DataFusion accumulator) and for
+// ROW_NUMBER (per-key counter).
+fn bench_over(c: &mut Criterion) {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).map(|i| i % 64).collect::<Vec<_>>()));
+    let value: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let rt: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("value", DataType::Int64, true),
+            Field::new("rt", DataType::Int64, false),
+        ])),
+        vec![k, value, rt],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("over");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("running_sum_keyed", |b| {
+        b.iter_batched(
+            || Over::new(0, vec![0], 2, Some(1), vec![0]), // bigint SUM; rt col 2, value col 1, key col 0
+            |mut over| {
+                over.push(black_box(batch.clone()));
+                black_box(over.flush(i64::MAX));
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("row_number_keyed", |b| {
+        b.iter_batched(
+            || Over::new(0, vec![10], 2, None, vec![0]), // ROW_NUMBER; no value column
+            |mut over| {
+                over.push(black_box(batch.clone()));
+                black_box(over.flush(i64::MAX));
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// `[k, v, rt]` with a unique key per row, so the equi-join is 1:1 (no cross product) and the bench
+// measures the join machinery rather than output volume.
+fn join_batch() -> RecordBatch {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let v: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let rt: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("rt", DataType::Int64, false),
+        ])),
+        vec![k, v, rt],
+    )
+    .unwrap()
+}
+
+// Interval join: with the left side already buffered, measure one right-batch push (which builds and
+// runs a DataFusion hash join with the interval as a residual filter).
+fn bench_interval_join(c: &mut Criterion) {
+    let batch = join_batch();
+    let mut group = c.benchmark_group("interval_join");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("equi_key_push", |b| {
+        b.iter_batched(
+            || {
+                let mut join = IntervalJoin::new(vec![0], vec![0], 2, 2, 0, 0);
+                join.push_left(batch.clone());
+                join
+            },
+            |mut join| black_box(join.push_right(black_box(batch.clone()))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// Window join: with both sides buffered (one window per 64-row group), measure one flush (which
+// builds and runs a DataFusion hash join keyed on the user key plus the window bounds).
+fn bench_window_join(c: &mut Criterion) {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let v: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let ws: Vec<i64> = (0..ROWS as i64).map(|i| (i / 64) * 1000).collect();
+    let we: Vec<i64> = ws.iter().map(|s| s + 1000).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ])),
+        vec![k, v, Arc::new(Int64Array::from(ws)), Arc::new(Int64Array::from(we))],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("window_join");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("equi_key_flush", |b| {
+        b.iter_batched(
+            || {
+                let mut join = WindowJoin::new(vec![0], vec![0], 2, 3, 2, 3);
+                join.push_left(batch.clone());
+                join.push_right(batch.clone());
+                join
+            },
+            |mut join| black_box(join.flush(i64::MAX)),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_filter,
     bench_tumbling,
     bench_tumbling_keyed,
-    bench_session_keyed
+    bench_session_keyed,
+    bench_over,
+    bench_interval_join,
+    bench_window_join
 );
 criterion_main!(benches);
