@@ -97,15 +97,16 @@ run with `cd native && cargo bench`. Method and running table:
 | Tumbling window aggregate | `SUM` over 16 windows, 64 bigint keys | 4096 rows | 252 µs | ~16.3 Melem/s |
 | Interval join | INNER, 1:1 on key, equi-key + interval filter | 4096 rows | 100 µs | ~41 Melem/s |
 | Window join | INNER, 1:1 on key + window bounds | 4096 rows | 175 µs | ~23 Melem/s |
-| `OVER` `ROW_NUMBER` | per-key counter, 64 keys | 4096 rows | 532 µs | ~7.7 Melem/s |
-| `OVER` running `SUM` | per-row running aggregate, 64 keys | 4096 rows | 1.56 ms | ~2.6 Melem/s |
+| `OVER` running `SUM` | running aggregate (specialized fold), 64 keys | 4096 rows | 0.60 ms | ~6.8 Melem/s |
+| `OVER` `ROW_NUMBER` | per-key counter, 64 keys | 4096 rows | 465 µs | ~8.8 Melem/s |
 | Session window aggregate | `SUM`, 64 bigint keys, 500 ms gap | 4096 rows | ~3 ms | ~1.4 Melem/s |
 
 The native compute is fast where it batches (a filter clears ~1.6 G elem/s; the joins
-delegate to a DataFusion hash join at 20–40 Melem/s). The two slow operators both fold
-**per row**: the running `OVER` aggregate drives the DataFusion accumulator one row at a
-time (~2.6 Melem/s), and the session aggregate merges open windows over a per-key
-`BTreeMap` (~1.4 Melem/s, and high-variance).
+delegate to a DataFusion hash join at 20–40 Melem/s). The running `OVER` aggregate folds a
+small typed state per row (matching DataFusion's accumulators — wrapping integer sum,
+null-skipping — without the per-row accumulator call), at ~6.8 Melem/s. The session
+aggregate, which merges open windows over a per-key `BTreeMap`, is the remaining per-row
+outlier (~1.4 Melem/s, high-variance).
 
 ### End to end vs. Flink
 

@@ -48,8 +48,8 @@ Numbers are only comparable within a machine; record the host (CPU) alongside.
 | `tumbling/sum_keyed_update_flush` | 4096 | 252 µs | ~16.3 Melem/s | 16 windows, 64 bigint keys |
 | `interval_join/equi_key_push` | 4096 | 100 µs | ~41 Melem/s | INNER, 1:1, equi-key + interval filter |
 | `window_join/equi_key_flush` | 4096 | 175 µs | ~23 Melem/s | INNER, 1:1, equi-key + window bounds |
-| `over/row_number_keyed` | 4096 | 532 µs | ~7.7 Melem/s | per-key counter, 64 keys |
-| `over/running_sum_keyed` | 4096 | 1.56 ms | ~2.6 Melem/s | per-row running aggregate, 64 keys |
+| `over/running_sum_keyed` | 4096 | 0.60 ms | ~6.8 Melem/s | running aggregate, specialized fold, 64 keys |
+| `over/row_number_keyed` | 4096 | 465 µs | ~8.8 Melem/s | per-key counter, 64 keys |
 | `session/sum_keyed_update_flush` | 4096 | ~3 ms | ~1.4 Melem/s | gap merge, 64 keys (high-variance) |
 
 The gap between filter and aggregation is the signal: the filter is a compiled
@@ -68,11 +68,12 @@ Net so far: the unkeyed path is ~2.3× faster (244 → ~106 µs) and the keyed p
 (row-format or dictionary-encoded keys) — see the [profiling
 ticket](../.claude/todos/20-profiling-and-benchmarks.md).
 
-The two slow operators both fold **per row**. The running `OVER` aggregate
-(~2.6 Melem/s) drives the DataFusion accumulator one row at a time — a `take` +
-`update_batch` + `evaluate` per row — rather than batching per group; a specialized running
-fold is its optimization target. The session aggregator (~1.4 Melem/s, high-variance) merges
-open windows over a per-key `BTreeMap` and likewise slices the value column one row at a time.
+The running `OVER` aggregate was the per-row outlier (~2.6 Melem/s, a DataFusion accumulator
+`update_batch` + `evaluate` per row); replacing it with a specialized typed running fold —
+matching the accumulators exactly (wrapping integer sum, null-skipping) but without the per-row
+call — took it to ~6.8 Melem/s (2.6×). The session aggregator (~1.4 Melem/s, high-variance) is
+now the remaining per-row outlier: it merges open windows over a per-key `BTreeMap` and slices the
+value column one row at a time.
 
 ## End to end vs. Flink
 
