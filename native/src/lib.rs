@@ -3575,6 +3575,89 @@ pub mod bench {
             self.0.flush(watermark)
         }
     }
+
+    /// A columnar OVER operator driven by push/flush, as the stateful operator drives it.
+    pub struct Over(OverWindowAggregator);
+
+    impl Over {
+        pub fn new(
+            value_type: i64,
+            kinds: Vec<i64>,
+            rt_column: usize,
+            value_column: Option<usize>,
+            key_columns: Vec<usize>,
+        ) -> Self {
+            Over(OverWindowAggregator::new(value_type, kinds, rt_column, value_column, key_columns))
+        }
+
+        pub fn push(&mut self, batch: RecordBatch) {
+            self.0.push(batch);
+        }
+
+        pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+            self.0.flush(watermark)
+        }
+    }
+
+    /// An event-time interval joiner (push emits matches immediately), as the operator drives it.
+    pub struct IntervalJoin(IntervalJoiner);
+
+    impl IntervalJoin {
+        pub fn new(
+            left_keys: Vec<usize>,
+            right_keys: Vec<usize>,
+            left_time: usize,
+            right_time: usize,
+            lower: i64,
+            upper: i64,
+        ) -> Self {
+            IntervalJoin(IntervalJoiner::new(left_keys, right_keys, left_time, right_time, lower, upper))
+        }
+
+        pub fn push_left(&mut self, batch: RecordBatch) -> RecordBatch {
+            self.0.push_left(batch)
+        }
+
+        pub fn push_right(&mut self, batch: RecordBatch) -> RecordBatch {
+            self.0.push_right(batch)
+        }
+    }
+
+    /// An event-time window joiner (buffer on push, join on flush), as the operator drives it.
+    pub struct WindowJoin(WindowJoiner);
+
+    impl WindowJoin {
+        #[allow(clippy::too_many_arguments)]
+        pub fn new(
+            left_keys: Vec<usize>,
+            right_keys: Vec<usize>,
+            left_window_start: usize,
+            left_window_end: usize,
+            right_window_start: usize,
+            right_window_end: usize,
+        ) -> Self {
+            WindowJoin(WindowJoiner::new(
+                left_keys,
+                right_keys,
+                left_window_start,
+                left_window_end,
+                right_window_start,
+                right_window_end,
+            ))
+        }
+
+        pub fn push_left(&mut self, batch: RecordBatch) {
+            self.0.push_left(batch);
+        }
+
+        pub fn push_right(&mut self, batch: RecordBatch) {
+            self.0.push_right(batch);
+        }
+
+        pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+            self.0.flush(watermark)
+        }
+    }
 }
 
 #[cfg(test)]

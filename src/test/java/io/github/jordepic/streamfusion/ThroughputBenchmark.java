@@ -56,6 +56,30 @@ class ThroughputBenchmark {
   }
 
   @Test
+  void overThroughput() throws Exception {
+    // Event-time running SUM OVER (no partition): each row emitted with the running aggregate. Fed
+    // row-wise from the DataStream source (a transpose at its input), so it is the OVER analog of the
+    // row-source tumbling number.
+    compare(
+        "OVER (running SUM)",
+        ThroughputBenchmark::tumblingEnvironment,
+        "CREATE TABLE sink (v BIGINT, total BIGINT) WITH ('connector' = 'blackhole')",
+        "INSERT INTO sink SELECT v, SUM(v) OVER (ORDER BY rt) AS total FROM g");
+  }
+
+  @Test
+  void intervalJoinThroughput() throws Exception {
+    // Event-time INNER interval join, 1:1 on a unique key (bounded output). Exposes the per-batch
+    // DataFusion hash-join construction the joiner does on every arriving batch.
+    compare(
+        "Interval join (INNER, 1:1)",
+        ThroughputBenchmark::joinEnvironment,
+        "CREATE TABLE sink (k BIGINT, av BIGINT, bv BIGINT) WITH ('connector' = 'blackhole')",
+        "INSERT INTO sink SELECT a.k, a.v, b.v FROM A AS a JOIN B AS b ON a.k = b.k "
+            + "AND a.rt BETWEEN b.rt - INTERVAL '1' SECOND AND b.rt + INTERVAL '1' SECOND");
+  }
+
+  @Test
   void parquetSinkThroughput() throws Exception {
     double flink = bestOfSink(false);
     double nativeRun = bestOfSink(true);
@@ -313,6 +337,38 @@ class ThroughputBenchmark {
             .column("s", DataTypes.STRING())
             .build());
     return tEnv;
+  }
+
+  /** Two event-time sources A and B keyed uniquely (k = row index), so the interval join is 1:1. */
+  private static TableEnvironment joinEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    registerJoinSide(env, tEnv, "A");
+    registerJoinSide(env, tEnv, "B");
+    return tEnv;
+  }
+
+  private static void registerJoinSide(
+      StreamExecutionEnvironment env, StreamTableEnvironment tEnv, String name) {
+    // rt = row index in millis (monotonic); k unique so each A row matches exactly its B twin within
+    // the ±1s interval, keeping the join 1:1 and the buffered state ~1s of rows.
+    DataStream<Row> source =
+        env.fromSequence(0, ROWS - 1)
+            .map(i -> Row.of(i, i))
+            .returns(Types.ROW_NAMED(new String[] {"k", "v"}, Types.LONG, Types.LONG))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forMonotonousTimestamps()
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(0)));
+    tEnv.createTemporaryView(
+        name,
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column("v", DataTypes.BIGINT())
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
   }
 
   private static TableEnvironment tumblingEnvironment() {
