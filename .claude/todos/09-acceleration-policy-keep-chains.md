@@ -1,14 +1,36 @@
-# When to accelerate: keep columnar chains, avoid lone islands
+# When to accelerate: keep columnar chains (mimic Comet)
 
-**Status:** open (design / policy) — now benchmark-informed.
-**Source:** user direction; inspiration from DataFusion Comet
+**Status:** open (design / policy) — **reframed after reading Comet's actual rules.**
+**Source:** user direction; mimic DataFusion Comet.
 
-**Update:** the "keep columnar chains" *mechanism* is built (ticket 21: columnar flow with
-transposes only at boundaries). What remains here is the *policy*: release benchmarks show a lone
-stateless island with row endpoints on both sides runs < 1× (bare filter 0.83×), while operators
-doing real columnar work win (tumbling 1.21×, columnar copy 3.19×). Decide whether the planner
-should *refuse* to substitute an operator that would be an isolated island between two row
-endpoints (no adjacent native op, no columnar endpoint), since it cannot beat Flink there.
+**What Comet actually does (read `CometExecRule` + `EliminateRedundantTransitions`):**
+1. **Greedy bottom-up, per-operator, no cost model.** An operator becomes columnar iff *all its
+   children are already native* and it is supported + enabled (`transformUp` + `convertNode`). There
+   is **no** heuristic, threshold, or minimum-chain-length that refuses a "lone island." Comet
+   converts every supported operator in a contiguous chain, anchored by **columnar scans**.
+2. **Transitions at boundaries, then cancel inverse pairs.** Spark inserts `ColumnarToRow`/
+   `RowToColumnar`; Comet's `EliminateRedundantTransitions` removes `ColumnarToRow(RowToColumnar(x))`
+   and friends.
+3. **One targeted island revert only:** `revertRedundantColumnarShuffle` reverts a columnar shuffle
+   stranded between two *row* aggregates (no columnar consumer on either side). Config-gated.
+4. **User control is config, not cost:** per-operator flags (`spark.comet.exec.<op>.enabled`) + a
+   master switch. No automatic cost model.
+
+**So the original "refuse lone islands via a cost model" premise was wrong** — Comet does not do
+that. A lone filter looks bad only with a *row* source; in Spark the source is a columnar scan, so
+the filter's child is native and the region is columnar-anchored. Our bare-filter 0.72× is the
+`row → columnar → row` case Comet also pays with a row source; its only mitigation is config.
+
+**What we already match:** greedy bottom-up substitution + transposes only at columnar↔row edges
+(`PhysicalPlanScan`); no redundant inverse transposes (our per-edge insertion can't create adjacent
+inverse pairs — Comet needs the cleanup pass only because Spark inserts transitions blind); no
+stranded columnar shuffle (we only insert the columnar exchange when coupling a native columnar
+window/join). So our end state equals Comet's by construction.
+
+**The genuine gap vs Comet:** we are all-or-nothing (`NativePlanner.install`). Comet exposes a master
+switch + per-operator enable flags so a user can disable acceleration where it does not pay (e.g. a
+lone filter on a row-source pipeline). **That config surface — not a cost heuristic — is the faithful
+next step.** (Original cost-model notes kept below for history.)
 
 ## Problem
 Today the planner substitutes each supported operator independently. Every
