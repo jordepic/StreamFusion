@@ -32,7 +32,7 @@ class NativeOverAggregateOperatorTest {
   @Test
   void emitsRunningSumSharingRangeTies() throws Exception {
     NativeOverAggregateOperator operator =
-        new NativeOverAggregateOperator(INPUT, 1, 0, 0, new int[] {0});
+        new NativeOverAggregateOperator(INPUT, 1, 0, new int[0], new int[0], 0, new int[] {0});
     try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
         new OneInputStreamOperatorTestHarness<>(operator)) {
       harness.setup();

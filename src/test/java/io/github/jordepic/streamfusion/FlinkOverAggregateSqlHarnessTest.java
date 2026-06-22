@@ -33,6 +33,14 @@ class FlinkOverAggregateSqlHarnessTest {
             + "COUNT(v) OVER w AS c FROM src WINDOW w AS (ORDER BY rt)");
   }
 
+  @Test
+  void partitionedRunningSumMatchesHost() throws Exception {
+    // PARTITION BY k: a running SUM per key, shuffled by the host's keyed exchange.
+    NativeParity.assertParity(
+        FlinkOverAggregateSqlHarnessTest::environment,
+        "SELECT k, v, SUM(v) OVER (PARTITION BY k ORDER BY rt) AS total FROM src");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
@@ -40,19 +48,20 @@ class FlinkOverAggregateSqlHarnessTest {
     // Out-of-order within the bound so the running totals exercise rowtime ordering and ties.
     DataStream<Row> source =
         env.fromData(
-                Types.ROW_NAMED(new String[] {"v", "ts"}, Types.LONG, Types.LONG),
-                Row.of(10L, 0L),
-                Row.of(20L, 1000L),
-                Row.of(30L, 1000L),
-                Row.of(40L, 500L),
-                Row.of(50L, 2000L))
+                Types.ROW_NAMED(new String[] {"k", "v", "ts"}, Types.LONG, Types.LONG, Types.LONG),
+                Row.of(1L, 10L, 0L),
+                Row.of(2L, 20L, 1000L),
+                Row.of(1L, 30L, 1000L),
+                Row.of(2L, 40L, 500L),
+                Row.of(1L, 50L, 2000L))
             .assignTimestampsAndWatermarks(
                 WatermarkStrategy.<Row>forBoundedOutOfOrderness(java.time.Duration.ofSeconds(5))
-                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(2)));
     tEnv.createTemporaryView(
         "src",
         source,
         Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
             .column("v", DataTypes.BIGINT())
             .column("ts", DataTypes.BIGINT())
             .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")

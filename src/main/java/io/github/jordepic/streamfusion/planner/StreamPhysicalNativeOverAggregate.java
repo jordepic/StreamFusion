@@ -24,6 +24,8 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
   private final RelDataType outputRowType;
   private final int timeColumn;
   private final int valueColumn;
+  private final int[] keyColumns;
+  private final int[] keyTypes;
   private final int valueType;
   private final int[] aggregateKinds;
 
@@ -34,12 +36,16 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
       RelDataType outputRowType,
       int timeColumn,
       int valueColumn,
+      int[] keyColumns,
+      int[] keyTypes,
       int valueType,
       int[] aggregateKinds) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.timeColumn = timeColumn;
     this.valueColumn = valueColumn;
+    this.keyColumns = keyColumns;
+    this.keyTypes = keyTypes;
     this.valueType = valueType;
     this.aggregateKinds = aggregateKinds;
   }
@@ -57,8 +63,8 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeOverAggregate(
-        getCluster(), traitSet, inputs.get(0), outputRowType, timeColumn, valueColumn, valueType,
-        aggregateKinds);
+        getCluster(), traitSet, inputs.get(0), outputRowType, timeColumn, valueColumn, keyColumns,
+        keyTypes, valueType, aggregateKinds);
   }
 
   @Override
@@ -71,6 +77,8 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel implements Stre
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getInput().getRowType()),
         timeColumn,
         valueColumn,
+        keyColumns,
+        keyTypes,
         valueType,
         aggregateKinds);
   }
