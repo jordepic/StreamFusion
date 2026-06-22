@@ -899,6 +899,263 @@ fn rt_to_millis(array: &ArrayRef) -> Int64Array {
     }
 }
 
+/// Serializes a batch to a one-shot Arrow IPC stream (used to checkpoint buffered join state).
+fn write_ipc(batch: &RecordBatch) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema())
+        .expect("failed to open ipc writer");
+    writer.write(batch).expect("failed to write ipc batch");
+    writer.finish().expect("failed to finish ipc stream");
+    drop(writer);
+    bytes
+}
+
+/// Reads the batches of a one-shot Arrow IPC stream back.
+fn read_ipc(bytes: &[u8]) -> Vec<RecordBatch> {
+    arrow::ipc::reader::StreamReader::try_new(bytes, None)
+        .expect("failed to open ipc reader")
+        .map(|batch| batch.expect("failed to read ipc batch"))
+        .collect()
+}
+
+/// One buffered row of a join input: its rowtime (epoch millis) and the row's full column values.
+/// Held in a per-join-key bucket until the watermark proves no future row of the other side can
+/// match it.
+struct BufferedRow {
+    rt: i64,
+    values: Vec<ScalarValue>,
+}
+
+/// Event-time INNER interval join, Flink's
+/// `a JOIN b ON a.k = b.k AND a.rt BETWEEN b.rt + lower AND b.rt + upper`.
+///
+/// Buffers both inputs per join key. When a row arrives it probes the other side's buffer for rows
+/// whose rowtime satisfies the interval and emits the matched pairs at once — each pair emitted
+/// exactly once, when the second of its two rows arrives (the same insert-then-probe-the-other-side
+/// structure as Arroyo's `JoinWithExpiration`). A row is evicted once the combined watermark passes
+/// the point beyond which no future row of the other side could match it. Output columns are the
+/// left input columns followed by the right input columns.
+struct IntervalJoiner {
+    left_keys: Vec<usize>,
+    right_keys: Vec<usize>,
+    left_time: usize,
+    right_time: usize,
+    lower: i64,
+    upper: i64,
+    left_schema: Option<SchemaRef>,
+    right_schema: Option<SchemaRef>,
+    left_buffer: HashMap<GroupKey, Vec<BufferedRow>>,
+    right_buffer: HashMap<GroupKey, Vec<BufferedRow>>,
+}
+
+impl IntervalJoiner {
+    fn new(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_time: usize,
+        right_time: usize,
+        lower: i64,
+        upper: i64,
+    ) -> Self {
+        IntervalJoiner {
+            left_keys,
+            right_keys,
+            left_time,
+            right_time,
+            lower,
+            upper,
+            left_schema: None,
+            right_schema: None,
+            left_buffer: HashMap::new(),
+            right_buffer: HashMap::new(),
+        }
+    }
+
+    /// Reads each row of `batch` into its `(join key, buffered row)`, using `key_indices` for the
+    /// equi-join key and `time_index` for the rowtime (converted to epoch millis).
+    fn rows(
+        batch: &RecordBatch,
+        key_indices: &[usize],
+        time_index: usize,
+    ) -> Vec<(GroupKey, BufferedRow)> {
+        let key_arrays: Vec<&ArrayRef> = key_indices.iter().map(|&i| batch.column(i)).collect();
+        let rt = rt_to_millis(batch.column(time_index));
+        (0..batch.num_rows())
+            .map(|row| {
+                let key = read_key(&key_arrays, row);
+                let values = (0..batch.num_columns())
+                    .map(|c| {
+                        ScalarValue::try_from_array(batch.column(c), row).expect("read join value")
+                    })
+                    .collect();
+                (key, BufferedRow { rt: rt.value(row), values })
+            })
+            .collect()
+    }
+
+    /// Pushes a left batch: probe the right buffer for matches, emit the pairs, then buffer the rows.
+    fn push_left(&mut self, batch: RecordBatch) -> RecordBatch {
+        self.left_schema = Some(batch.schema());
+        let mut pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)> = Vec::new();
+        for (key, left) in Self::rows(&batch, &self.left_keys, self.left_time) {
+            if key_has_null(&key) {
+                continue; // INNER equi-join drops null-key rows (Flink's filterNulls)
+            }
+            if let Some(rights) = self.right_buffer.get(&key) {
+                for right in rights {
+                    if Self::matches(left.rt, right.rt, self.lower, self.upper) {
+                        pairs.push((left.values.clone(), right.values.clone()));
+                    }
+                }
+            }
+            self.left_buffer.entry(key).or_default().push(left);
+        }
+        self.emit(pairs)
+    }
+
+    /// Pushes a right batch: probe the left buffer for matches, emit the pairs, then buffer the rows.
+    fn push_right(&mut self, batch: RecordBatch) -> RecordBatch {
+        self.right_schema = Some(batch.schema());
+        let mut pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)> = Vec::new();
+        for (key, right) in Self::rows(&batch, &self.right_keys, self.right_time) {
+            if key_has_null(&key) {
+                continue; // INNER equi-join drops null-key rows (Flink's filterNulls)
+            }
+            if let Some(lefts) = self.left_buffer.get(&key) {
+                for left in lefts {
+                    if Self::matches(left.rt, right.rt, self.lower, self.upper) {
+                        pairs.push((left.values.clone(), right.values.clone()));
+                    }
+                }
+            }
+            self.right_buffer.entry(key).or_default().push(right);
+        }
+        self.emit(pairs)
+    }
+
+    /// Whether a left and right rowtime satisfy `lower <= left - right <= upper`.
+    fn matches(left_rt: i64, right_rt: i64, lower: i64, upper: i64) -> bool {
+        let delta = left_rt - right_rt;
+        lower <= delta && delta <= upper
+    }
+
+    /// Drops the rows the watermark has made dead. A left row can no longer match once
+    /// `left.rt - lower <= watermark` (a future right row has rt > watermark, but matching it needs
+    /// `right.rt <= left.rt - lower`); a right row once `right.rt + upper <= watermark`.
+    fn advance(&mut self, watermark: i64) {
+        let (lower, upper) = (self.lower, self.upper);
+        for rows in self.left_buffer.values_mut() {
+            rows.retain(|row| row.rt - lower > watermark);
+        }
+        self.left_buffer.retain(|_, rows| !rows.is_empty());
+        for rows in self.right_buffer.values_mut() {
+            rows.retain(|row| row.rt + upper > watermark);
+        }
+        self.right_buffer.retain(|_, rows| !rows.is_empty());
+    }
+
+    /// Builds the output batch (left columns then right columns) for the matched pairs, or an empty
+    /// batch when there were none. Output fields are renamed `c0..` since the downstream conversion
+    /// is positional and the two inputs may share field names.
+    fn emit(&self, pairs: Vec<(Vec<ScalarValue>, Vec<ScalarValue>)>) -> RecordBatch {
+        if pairs.is_empty() {
+            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+        }
+        let left_schema = self.left_schema.as_ref().expect("left schema set when emitting");
+        let right_schema = self.right_schema.as_ref().expect("right schema set when emitting");
+        let mut fields: Vec<Field> = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        for (j, field) in left_schema.fields().iter().enumerate() {
+            fields.push(Field::new(format!("c{}", fields.len()), field.data_type().clone(), true));
+            let scalars = pairs.iter().map(|(left, _)| left[j].clone()).collect();
+            columns.push(scalars_to_array(scalars, field.data_type()));
+        }
+        for (j, field) in right_schema.fields().iter().enumerate() {
+            fields.push(Field::new(format!("c{}", fields.len()), field.data_type().clone(), true));
+            let scalars = pairs.iter().map(|(_, right)| right[j].clone()).collect();
+            columns.push(scalars_to_array(scalars, field.data_type()));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build join output batch")
+    }
+
+    /// Concatenates all buffered rows of one side back into a single batch under its input schema.
+    fn buffer_to_batch(schema: &SchemaRef, buffer: &HashMap<GroupKey, Vec<BufferedRow>>) -> RecordBatch {
+        let rows: Vec<&BufferedRow> = buffer.values().flatten().collect();
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(j, field)| {
+                let scalars = rows.iter().map(|row| row.values[j].clone()).collect();
+                scalars_to_array(scalars, field.data_type())
+            })
+            .collect();
+        RecordBatch::try_new(schema.clone(), columns).expect("failed to rebuild join buffer batch")
+    }
+
+    /// Serializes both buffers (`[u32 left_len][left ipc][right ipc]`) for a checkpoint. The rowtimes
+    /// and keys are not stored — they are re-derived from the columns on restore.
+    fn snapshot(&self) -> Vec<u8> {
+        let left = match &self.left_schema {
+            Some(schema) => write_ipc(&Self::buffer_to_batch(schema, &self.left_buffer)),
+            None => Vec::new(),
+        };
+        let right = match &self.right_schema {
+            Some(schema) => write_ipc(&Self::buffer_to_batch(schema, &self.right_buffer)),
+            None => Vec::new(),
+        };
+        let mut out = (left.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(&left);
+        out.extend_from_slice(&right);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_time: usize,
+        right_time: usize,
+        lower: i64,
+        upper: i64,
+        bytes: &[u8],
+    ) -> Self {
+        let mut joiner =
+            IntervalJoiner::new(left_keys, right_keys, left_time, right_time, lower, upper);
+        let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
+        let left = &bytes[4..4 + left_len];
+        let right = &bytes[4 + left_len..];
+        for batch in read_ipc_if_present(left) {
+            joiner.left_schema = Some(batch.schema());
+            for (key, row) in Self::rows(&batch, &joiner.left_keys, joiner.left_time) {
+                joiner.left_buffer.entry(key).or_default().push(row);
+            }
+        }
+        for batch in read_ipc_if_present(right) {
+            joiner.right_schema = Some(batch.schema());
+            for (key, row) in Self::rows(&batch, &joiner.right_keys, joiner.right_time) {
+                joiner.right_buffer.entry(key).or_default().push(row);
+            }
+        }
+        joiner
+    }
+}
+
+/// Whether a composite key contains a null component (such keys never match under INNER equi-join).
+fn key_has_null(key: &GroupKey) -> bool {
+    key.iter().any(ScalarValue::is_null)
+}
+
+/// Reads IPC batches, treating empty bytes (a side that never saw a row) as no batches.
+fn read_ipc_if_present(bytes: &[u8]) -> Vec<RecordBatch> {
+    if bytes.is_empty() {
+        Vec::new()
+    } else {
+        read_ipc(bytes)
+    }
+}
+
 /// One open session for a key: its end (the latest element's timestamp plus the gap) and the
 /// incremental accumulators folding in its rows. The start is the map key that holds it.
 struct Session {
@@ -2461,6 +2718,130 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAg
     ))) as jlong
 }
 
+/// Creates an event-time INNER interval joiner and returns an opaque handle. The key/time column
+/// indices locate the equi-join key and rowtime within each side's input batch; `lower`/`upper` are
+/// the inclusive bounds (millis) on `left.rt - right.rt`. The JVM owns the handle across calls.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createIntervalJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_time: jint,
+    right_time: jint,
+    lower: jlong,
+    upper: jlong,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    Box::into_raw(Box::new(IntervalJoiner::new(
+        left,
+        right,
+        left_time as usize,
+        right_time as usize,
+        lower,
+        upper,
+    ))) as jlong
+}
+
+/// Pushes a left batch, probing the buffered right rows and exporting the matched pairs.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushLeftIntervalJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut IntervalJoiner) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let result = joiner.push_left(batch);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Pushes a right batch, probing the buffered left rows and exporting the matched pairs.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushRightIntervalJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut IntervalJoiner) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let result = joiner.push_right(batch);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Advances the combined watermark, evicting rows no future arrival can match.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_advanceIntervalJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+) {
+    let joiner = unsafe { &mut *(handle as *mut IntervalJoiner) };
+    joiner.advance(watermark_millis);
+}
+
+/// Releases the interval joiner and its native state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeIntervalJoiner<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut IntervalJoiner));
+    }
+}
+
+/// Serializes the joiner's buffered rows for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotIntervalJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let joiner = unsafe { &*(handle as *mut IntervalJoiner) };
+    env.byte_array_from_slice(&joiner.snapshot())
+        .expect("failed to allocate join snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds an interval joiner from a snapshot taken by a prior run and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreIntervalJoiner<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_time: jint,
+    right_time: jint,
+    lower: jlong,
+    upper: jlong,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read join snapshot");
+    Box::into_raw(Box::new(IntervalJoiner::restore(
+        left,
+        right,
+        left_time as usize,
+        right_time as usize,
+        lower,
+        upper,
+        &bytes,
+    ))) as jlong
+}
+
 /// Creates a stateful session-window aggregator and returns an opaque handle. As with the tumbling
 /// handle, the JVM owns the native state across calls and must release it with the matching close.
 #[no_mangle]
@@ -2709,6 +3090,83 @@ mod tests {
         assert_eq!(rest.num_rows(), 1);
         assert_eq!(values(&rest, 1), vec![40]); // v
         assert_eq!(values(&rest, 3), vec![70]); // key 1 running sum 10+20+40
+    }
+
+    // A `[k, v, rt]` batch with int64 rowtime (epoch millis) for the interval-join tests.
+    fn join_batch(k: Vec<i64>, v: Vec<i64>, rt: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, true),
+                Field::new("rt", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(k)),
+                Arc::new(Int64Array::from(v)),
+                Arc::new(Int64Array::from(rt)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // INNER interval join: a left row matches a buffered right row of the same key whose rowtime is
+    // within [rt + lower, rt + upper]; output columns are left ++ right.
+    #[test]
+    fn interval_join_emits_matched_pairs() {
+        // a.rt BETWEEN b.rt - 1000 AND b.rt + 1000, single equi-key on column 0, rt is column 2.
+        let mut joiner = IntervalJoiner::new(vec![0], vec![0], 2, 2, -1000, 1000);
+        // Buffer two right rows for key 1 (rt 5500 in range of left 5000, rt 7000 out of range).
+        assert_eq!(joiner.push_right(join_batch(vec![1, 1], vec![100, 200], vec![5500, 7000])).num_rows(), 0);
+        // A left row (k=1, rt=5000): matches the rt=5500 right row only (delta -500 in [-1000,1000]).
+        let out = joiner.push_left(join_batch(vec![1], vec![10], vec![5000]));
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(values(&out, 0), vec![1]); // left k
+        assert_eq!(values(&out, 1), vec![10]); // left v
+        assert_eq!(values(&out, 2), vec![5000]); // left rt
+        assert_eq!(values(&out, 3), vec![1]); // right k
+        assert_eq!(values(&out, 4), vec![100]); // right v
+        assert_eq!(values(&out, 5), vec![5500]); // right rt
+    }
+
+    // Different keys never match, and a pair is emitted once — when its second side arrives —
+    // regardless of which side arrived first.
+    #[test]
+    fn interval_join_matches_on_key_and_emits_once() {
+        let mut joiner = IntervalJoiner::new(vec![0], vec![0], 2, 2, -1000, 1000);
+        // Left first: buffer a left row, no right yet.
+        assert_eq!(joiner.push_left(join_batch(vec![1], vec![10], vec![5000])).num_rows(), 0);
+        // A right row with a different key does not match.
+        assert_eq!(joiner.push_right(join_batch(vec![2], vec![100], vec![5000])).num_rows(), 0);
+        // A matching right row emits the pair exactly once.
+        let out = joiner.push_right(join_batch(vec![1], vec![100], vec![5500]));
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(values(&out, 1), vec![10]);
+        assert_eq!(values(&out, 4), vec![100]);
+    }
+
+    // The watermark evicts rows past their last useful rowtime, so a later arrival can no longer
+    // match an evicted row.
+    #[test]
+    fn interval_join_evicts_dead_rows_on_watermark() {
+        let mut joiner = IntervalJoiner::new(vec![0], vec![0], 2, 2, -1000, 1000);
+        joiner.push_left(join_batch(vec![1], vec![10], vec![5000]));
+        // Watermark 6000: left.rt - lower = 5000 - (-1000) = 6000, not > 6000, so the row is evicted.
+        joiner.advance(6000);
+        // A right row that would otherwise match (delta -500) finds nothing buffered.
+        assert_eq!(joiner.push_right(join_batch(vec![1], vec![100], vec![5500])).num_rows(), 0);
+    }
+
+    // Buffered rows survive a snapshot/restore round trip and still match afterward.
+    #[test]
+    fn interval_join_restores_buffered_rows() {
+        let mut joiner = IntervalJoiner::new(vec![0], vec![0], 2, 2, -1000, 1000);
+        joiner.push_right(join_batch(vec![1], vec![100], vec![5500]));
+        let snapshot = joiner.snapshot();
+        let mut restored =
+            IntervalJoiner::restore(vec![0], vec![0], 2, 2, -1000, 1000, &snapshot);
+        let out = restored.push_left(join_batch(vec![1], vec![10], vec![5000]));
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(values(&out, 4), vec![100]);
     }
 
     // Decoder over the pre-order encoding: CALL gt ( INPUT_REF a , LIT_LONG 5 ).

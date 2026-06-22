@@ -1,6 +1,38 @@
 # Two-input columnar operator → event-time joins
 
-**Status:** open (next thread). This is the one genuinely new piece of infrastructure
+**Status:** interval join **DONE** (INNER, columnar). Window join still open.
+
+The two-input columnar operator now exists (`NativeIntervalJoinOperator` —
+`TwoInputStreamOperator<ArrowBatch, ArrowBatch, ArrowBatch>`), so the genuinely new
+infrastructure is built; the window-join variant reuses it.
+
+## What landed (INNER interval join)
+- **Native** `IntervalJoiner` (`native/src/lib.rs`): per-join-key buffers for each side, probe the
+  other side on every batch (insert-then-probe, like Arroyo's `JoinWithExpiration`), emit matched
+  pairs once (when the second row arrives), evict on the combined watermark
+  (`left.rt - lower > wm`, `right.rt + upper > wm`). Null keys are dropped (INNER `filterNulls`).
+  Output = left columns ++ right columns (renamed `c0..`, positional downstream). Snapshot/restore
+  serialize both buffers as IPC; key/rt re-derived on restore. 4 rust tests.
+- **JNI / `Native.java`**: `create/pushLeft/pushRight/advance/close/snapshot/restoreIntervalJoiner`.
+- **Operator** `NativeIntervalJoinOperator`: `processElement1/2` push+emit; `processWatermark`
+  (the base combines `processWatermark1/2` into the min) advances eviction then forwards. Operator
+  `ListState` snapshot. 2 harness tests.
+- **Planner**: `IntervalJoinMatcher` (INNER, event-time, ≥1 supported equi-key, all `filterNulls`,
+  no residual non-equi; reads the private `windowBounds` field reflectively for the bounds +
+  left/right time-column indices — those indices are input-relative), `StreamPhysicalNativeIntervalJoin`
+  (`BiRel`, `ColumnarInput`×2 + `ColumnarOutput`), `NativeIntervalJoinExecNode`
+  (`createTwoInputTransformation`). `PhysicalPlanScan` couples a columnar exchange on each input
+  (`columnarJoinInput`). 2 parity tests (DataStream + fully-columnar Parquet).
+
+## Still open: window join
+`StreamPhysicalWindowJoin` — windowing-TVF join (both sides in the same tumbling/hop window).
+Append-only; builds on the windowing infra + the two-input operator above. Defer LEFT/RIGHT/FULL
+outer interval joins too (they emit nulls on watermark expiry — more state/timer logic).
+
+---
+(original planning notes below)
+
+This is the one genuinely new piece of infrastructure
 left for the append-only operator family; everything else (keyed shuffle, watermarks,
 columnar exchange, per-key state) already exists.
 

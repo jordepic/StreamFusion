@@ -339,6 +339,48 @@ public final class Native {
       byte[] snapshot);
 
   /**
+   * Creates an event-time INNER interval joiner and returns an opaque handle. It buffers both inputs
+   * per equi-join key and emits a matched pair when the second of its two rows arrives. The JVM owns
+   * the handle across calls and must release it with {@link #closeIntervalJoiner}.
+   *
+   * @param leftKeys equi-join key column indices in the left input batch
+   * @param rightKeys equi-join key column indices in the right input batch
+   * @param leftTime rowtime column index in the left input batch
+   * @param rightTime rowtime column index in the right input batch
+   * @param lowerMillis inclusive lower bound on {@code left.rt - right.rt}
+   * @param upperMillis inclusive upper bound on {@code left.rt - right.rt}
+   */
+  public static native long createIntervalJoiner(
+      int[] leftKeys, int[] rightKeys, int leftTime, int rightTime, long lowerMillis, long upperMillis);
+
+  /** Pushes a left batch, exporting the matched pairs (left columns then right columns). */
+  public static native void pushLeftIntervalJoiner(
+      long handle, long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
+
+  /** Pushes a right batch, exporting the matched pairs (left columns then right columns). */
+  public static native void pushRightIntervalJoiner(
+      long handle, long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
+
+  /** Advances the combined watermark, evicting rows no future arrival can match. */
+  public static native void advanceIntervalJoiner(long handle, long watermarkMillis);
+
+  /** Releases an interval joiner handle. */
+  public static native void closeIntervalJoiner(long handle);
+
+  /** Serializes an interval joiner's buffered rows for a checkpoint. */
+  public static native byte[] snapshotIntervalJoiner(long handle);
+
+  /** Rebuilds an interval joiner from a snapshot and returns a fresh handle. */
+  public static native long restoreIntervalJoiner(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftTime,
+      int rightTime,
+      long lowerMillis,
+      long upperMillis,
+      byte[] snapshot);
+
+  /**
    * Creates a stateful cumulative-window aggregator and returns an opaque handle. Cumulative windows
    * are nested windows of {@code stepMillis} growing up to {@code maxSizeMillis}, all sharing a
    * start. It shares the aligned-window engine — {@link #updateTumblingAggregator}, {@link
