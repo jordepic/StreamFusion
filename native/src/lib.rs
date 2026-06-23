@@ -1,7 +1,7 @@
 use arrow::array::{
-    make_array, new_empty_array, Array, ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array,
-    Int8Array, RecordBatch, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, UInt32Array,
+    make_array, new_empty_array, Array, ArrayRef, BooleanArray, Float32Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, RecordBatch, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, UInt32Array,
 };
 use arrow::compute::{concat_batches, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -296,14 +296,145 @@ impl Accumulator for WrappingNarrowSumAccumulator {
     }
 }
 
-/// The per-window aggregate. Built-in aggregates come from DataFusion; integer average and the
-/// narrow/int32 wrapping sums are small custom accumulators so their results match the host exactly.
-/// All expose mergeable partial state, so windows accumulate incrementally and checkpoint uniformly.
+/// Sum of a float (4-byte) column matching the host: the host keeps the input type and accumulates
+/// the running sum in float, so it rounds to 4-byte precision on every step (unlike DataFusion's
+/// sum, which widens to double). We accumulate in f32 in the same per-row fold order, so the result
+/// is bit-identical. Null when no non-null value was seen.
+#[derive(Debug, Default)]
+struct FloatSumAccumulator {
+    sum: f32,
+    count: i64,
+}
+
+impl Accumulator for FloatSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array = values[0].as_any().downcast_ref::<Float32Array>().expect("value float32");
+        for value in array.iter().flatten() {
+            self.sum += value;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<Float32Array>().expect("sum state float32");
+        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
+        for value in sums.iter().flatten() {
+            self.sum += value;
+        }
+        self.count += counts.iter().flatten().sum::<i64>();
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        Ok(vec![
+            ScalarValue::Float32((self.count != 0).then_some(self.sum)),
+            ScalarValue::Int64(Some(self.count)),
+        ])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        Ok(ScalarValue::Float32((self.count != 0).then_some(self.sum)))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Average of a float column matching the host: the host accumulates the sum in double, divides by
+/// the count in double, then narrows the result to float. The two-field partial state (sum, count)
+/// rides the general checkpoint path.
+#[derive(Debug, Default)]
+struct FloatAvgAccumulator {
+    sum: f64,
+    count: i64,
+}
+
+impl Accumulator for FloatAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array = values[0].as_any().downcast_ref::<Float32Array>().expect("value float32");
+        for value in array.iter().flatten() {
+            self.sum += f64::from(value);
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<arrow::array::Float64Array>().expect("sum f64");
+        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
+        self.sum += sums.iter().flatten().sum::<f64>();
+        self.count += counts.iter().flatten().sum::<i64>();
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Float64(Some(self.sum)), ScalarValue::Int64(Some(self.count))])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        let average = (self.count != 0).then(|| (self.sum / self.count as f64) as f32);
+        Ok(ScalarValue::Float32(average))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Average of a double column matching the host: the sum accumulates in double, divided by the
+/// count in double (no narrowing). DataFusion's own avg matches this, but the project routes AVG
+/// through custom accumulators (integer AVG truncates), so this keeps the path uniform.
+#[derive(Debug, Default)]
+struct DoubleAvgAccumulator {
+    sum: f64,
+    count: i64,
+}
+
+impl Accumulator for DoubleAvgAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array = values[0].as_any().downcast_ref::<arrow::array::Float64Array>().expect("f64");
+        for value in array.iter().flatten() {
+            self.sum += value;
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<arrow::array::Float64Array>().expect("sum f64");
+        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
+        self.sum += sums.iter().flatten().sum::<f64>();
+        self.count += counts.iter().flatten().sum::<i64>();
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Float64(Some(self.sum)), ScalarValue::Int64(Some(self.count))])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        Ok(ScalarValue::Float64((self.count != 0).then(|| self.sum / self.count as f64)))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// The per-window aggregate. Built-in aggregates come from DataFusion; the averages and the
+/// narrow/int32/float wrapping sums are small custom accumulators so their results match the host
+/// exactly. All expose mergeable partial state, so windows accumulate incrementally and checkpoint
+/// uniformly.
 enum WindowAggregate {
     Builtin(AggregateFunctionExpr),
     IntegerAvg(DataType),
     WrappingIntSum,
     WrappingNarrowSum(DataType),
+    FloatSum,
+    FloatAvg,
+    DoubleAvg,
 }
 
 impl WindowAggregate {
@@ -314,8 +445,13 @@ impl WindowAggregate {
             0 if *value_type == DataType::Int16 || *value_type == DataType::Int8 => {
                 WindowAggregate::WrappingNarrowSum(value_type.clone())
             }
+            // SUM over float keeps the host's 4-byte precision rather than widening to double.
+            0 if *value_type == DataType::Float32 => WindowAggregate::FloatSum,
             0..=3 => WindowAggregate::Builtin(build_builtin(kind, value_type)),
-            // Integer AVG returns the input integer type (truncating); carry it for the result.
+            // Float AVG sums in double and narrows to float; double AVG stays double; integer AVG
+            // truncates to its type.
+            4 if *value_type == DataType::Float32 => WindowAggregate::FloatAvg,
+            4 if *value_type == DataType::Float64 => WindowAggregate::DoubleAvg,
             4 => WindowAggregate::IntegerAvg(value_type.clone()),
             other => panic!("unsupported aggregate kind: {other}"),
         }
@@ -333,6 +469,9 @@ impl WindowAggregate {
             WindowAggregate::WrappingNarrowSum(data_type) => {
                 Box::new(WrappingNarrowSumAccumulator::new(data_type.clone()))
             }
+            WindowAggregate::FloatSum => Box::<FloatSumAccumulator>::default(),
+            WindowAggregate::FloatAvg => Box::<FloatAvgAccumulator>::default(),
+            WindowAggregate::DoubleAvg => Box::<DoubleAvgAccumulator>::default(),
         }
     }
 
@@ -356,6 +495,14 @@ impl WindowAggregate {
                 Field::new("sum", data_type.clone(), true),
                 Field::new("count", DataType::Int64, true),
             ],
+            WindowAggregate::FloatSum => vec![
+                Field::new("sum", DataType::Float32, true),
+                Field::new("count", DataType::Int64, true),
+            ],
+            WindowAggregate::FloatAvg | WindowAggregate::DoubleAvg => vec![
+                Field::new("sum", DataType::Float64, true),
+                Field::new("count", DataType::Int64, true),
+            ],
         }
     }
 
@@ -366,6 +513,8 @@ impl WindowAggregate {
             WindowAggregate::IntegerAvg(result_type) => result_type.clone(),
             WindowAggregate::WrappingIntSum => DataType::Int32,
             WindowAggregate::WrappingNarrowSum(data_type) => data_type.clone(),
+            WindowAggregate::FloatSum | WindowAggregate::FloatAvg => DataType::Float32,
+            WindowAggregate::DoubleAvg => DataType::Float64,
         }
     }
 }

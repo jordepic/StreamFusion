@@ -142,16 +142,17 @@ final class WindowAggregateMatcher {
       return false;
     }
     // SUM and AVG keep the input numeric type, so they are admitted only where a custom native
-    // accumulator reproduces the host exactly. Integer SUM/AVG wrap/truncate deterministically, so
-    // they cover the integer widths. FLOAT SUM/AVG stay on the host: the host accumulates a float
-    // sum at 4-byte precision (and avg's float division), which a native sum would have to match
-    // bit-for-bit — deferred (see docs/aggregate-type-support.md). DOUBLE rides the builtin sum.
+    // accumulator reproduces the host exactly: integer SUM/AVG wrap/truncate deterministically, and
+    // float SUM/AVG match the host's 4-byte sum / double-then-narrow average bit-for-bit (same fold
+    // order). DOUBLE rides the builtin sum and a custom double average. See
+    // docs/aggregate-type-support.md.
     boolean integerType =
         valueType == SqlTypeName.BIGINT
             || valueType == SqlTypeName.INTEGER
             || valueType == SqlTypeName.SMALLINT
             || valueType == SqlTypeName.TINYINT;
-    boolean sumType = integerType || valueType == SqlTypeName.DOUBLE;
+    boolean sumType = integerType || valueType == SqlTypeName.DOUBLE || valueType == SqlTypeName.FLOAT;
+    boolean avgType = sumType;
     boolean multiple = aggCalls.size() > 1;
     for (int i = 0; i < aggCalls.size(); i++) {
       AggregateCall call = aggCalls.apply(i);
@@ -162,10 +163,10 @@ final class WindowAggregateMatcher {
       if (kind == KIND_SUM && !sumType) {
         return false;
       }
-      // AVG has multi-field partial state, so it is only supported as a lone aggregate; and the
-      // native AVG is integer-division (truncating to the input type), so it only applies to an
-      // integer value, never float/double.
-      if (kind == KIND_AVG && (multiple || !integerType)) {
+      // AVG has multi-field partial state, so it is only supported as a lone aggregate; every
+      // numeric type has a matching native accumulator (integer truncating, float double-then-
+      // narrow, double).
+      if (kind == KIND_AVG && (multiple || !avgType)) {
         return false;
       }
     }

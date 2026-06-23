@@ -150,6 +150,16 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
+  void doubleAvgMatchesHost() throws Exception {
+    // AVG over a double: sum and divide in double, matching the host's double average.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, AVG(amount) AS a "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
   void doubleValueAggregateMatchesHost() throws Exception {
     // One-phase double value: SUM/MAX over a double column, plus a bigint COUNT alongside.
     NativeParity.assertParity(
@@ -365,15 +375,30 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
-  void floatSumFallsBack() throws Exception {
-    // SUM over FLOAT keeps the window aggregate on the host: Flink keeps FLOAT, while DataFusion's
-    // sum widens to double. (A trailing projection still routes, so this is a partial fallback.)
-    NativeParity.assertParityWithFallbackReason(
+  void floatSumAvgMatchesHost() throws Exception {
+    // SUM/AVG over FLOAT: the native float sum keeps 4-byte precision and the float avg sums in
+    // double then narrows, matching the host (unlike DataFusion's sum, which widens to double).
+    NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,
         "SELECT window_start, window_end, SUM(fl) AS s "
             + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
-            + "GROUP BY window_start, window_end",
-        "window aggregate");
+            + "GROUP BY window_start, window_end");
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, AVG(fl) AS a "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void floatSumMatchesHostUnderAccumulationError() throws Exception {
+    // Values whose 4-byte running sum accumulates rounding error: native must fold in float (not
+    // double) to match the host bit-for-bit. A double accumulation would drift from the host here.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::floatPrecisionEnvironment,
+        "SELECT window_start, window_end, SUM(fl) AS s, AVG(fl) AS a "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
   }
 
   private static void assertNarrowAggregatesMatchHost(String column) throws Exception {
@@ -430,6 +455,39 @@ class FlinkWindowSqlHarnessTest {
 
   private static TableEnvironment environmentTwoPhase() {
     return buildEnvironment(false);
+  }
+
+  private static TableEnvironment floatPrecisionEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+
+    // Eight 0.1f's in one 1s window: their float running sum is not 0.8f (rounding accumulates),
+    // so the result distinguishes a float accumulation (the host's) from a double one.
+    DataStream<Row> source =
+        env.fromData(
+                Types.ROW_NAMED(new String[] {"fl", "ts"}, Types.FLOAT, Types.LONG),
+                Row.of(0.1f, 0L),
+                Row.of(0.1f, 100L),
+                Row.of(0.1f, 200L),
+                Row.of(0.1f, 300L),
+                Row.of(0.1f, 400L),
+                Row.of(0.1f, 500L),
+                Row.of(0.1f, 600L),
+                Row.of(0.1f, 700L))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forMonotonousTimestamps()
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+    tEnv.createTemporaryView(
+        "src",
+        source,
+        Schema.newBuilder()
+            .column("fl", DataTypes.FLOAT())
+            .column("ts", DataTypes.BIGINT())
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
+    return tEnv;
   }
 
   private static TableEnvironment narrowOverflowEnvironment() {
