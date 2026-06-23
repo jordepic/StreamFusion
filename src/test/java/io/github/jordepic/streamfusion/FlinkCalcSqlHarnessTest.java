@@ -179,6 +179,19 @@ class FlinkCalcSqlHarnessTest {
     NativeParity.assertFallback(FlinkCalcSqlHarnessTest::nullableEnvironment, "SELECT CONCAT(s, '!') FROM g");
   }
 
+  @Test
+  void trimMatchesHost() throws Exception {
+    // Default whitespace both-sides trim maps to DataFusion btrim; spaced values exercise it.
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT TRIM(s) FROM ss");
+  }
+
+  @Test
+  void trimLeadingFallsBack() throws Exception {
+    // Only TRIM(BOTH ' ' …) is admitted; LEADING/TRAILING trims fall back.
+    NativeParity.assertFallback(
+        FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT TRIM(LEADING FROM s) FROM ss");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
@@ -198,6 +211,22 @@ class FlinkCalcSqlHarnessTest {
             .column("v", DataTypes.INT())
             .column("s", DataTypes.STRING())
             .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment spacedStringEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(new String[] {"s"}, Types.STRING),
+            Row.of("  pad  "),
+            Row.of("x"),
+            Row.of(" leading"),
+            Row.of("trailing "));
+    tEnv.createTemporaryView(
+        "ss", source, Schema.newBuilder().column("s", DataTypes.STRING()).build());
     return tEnv;
   }
 

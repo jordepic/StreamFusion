@@ -224,6 +224,9 @@ final class RexExpression {
     if ("COALESCE".equalsIgnoreCase(call.getOperator().getName())) {
       return emitCoalesceAsCase(call.getOperands());
     }
+    if ("TRIM".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitTrim(call);
+    }
     int fnOp = functionOpCode(call.getOperator().getName());
     if (fnOp >= 0) {
       // The admitted scalar functions are all unary over a single string argument.
@@ -393,6 +396,28 @@ final class RexExpression {
   }
 
   /** The native op code for a call kind, or -1 if the operation is not admitted. */
+  /**
+   * Emits {@code TRIM(BOTH ' ' FROM s)} — the default whitespace both-sides trim — as a unary call
+   * (op 54) mapped to DataFusion's {@code btrim}. Calcite gives TRIM three operands: a BOTH/LEADING/
+   * TRAILING flag, the trim characters, and the source string. Only the default (flag {@code BOTH},
+   * a single-space trim set) is admitted; LEADING/TRAILING or custom trim chars fall back.
+   */
+  private boolean emitTrim(RexCall call) {
+    List<RexNode> operands = call.getOperands();
+    if (operands.size() != 3
+        || !(operands.get(0) instanceof RexLiteral)
+        || !(operands.get(1) instanceof RexLiteral)) {
+      return false;
+    }
+    String flag = String.valueOf(((RexLiteral) operands.get(0)).getValue());
+    String trimChars = ((RexLiteral) operands.get(1)).getValueAs(String.class);
+    if (!"BOTH".equals(flag) || !" ".equals(trimChars)) {
+      return false;
+    }
+    add(KIND_CALL, 54, 1);
+    return emit(operands.get(2));
+  }
+
   /**
    * The op code for an admitted scalar function (matched by name, since Flink delivers them as
    * {@code OTHER_FUNCTION} calls), or -1. ASCII-equivalent to the host; the Unicode edges (case

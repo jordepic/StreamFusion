@@ -2393,6 +2393,7 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
         50 => datafusion::functions::string::expr_fn::upper(next()),
         51 => datafusion::functions::string::expr_fn::lower(next()),
         52 => datafusion::functions::unicode::expr_fn::character_length(next()),
+        54 => datafusion::functions::string::expr_fn::btrim(vec![next()]),
         other => panic!("unsupported expression op: {other}"),
     }
 }
