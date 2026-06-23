@@ -1,6 +1,6 @@
 # Surface fallback reasons (Comet-style plan explanation)
 
-**Status:** first cut done (Calc/expression path). Remaining: operator-level matchers + Flink explain.
+**Status:** Calc (precise) + operator-level (coarse) reasons done. Remaining: Flink explain() integration.
 **Source:** user direction — when a query does not accelerate, the user has no way to see *why*.
 
 ## Done (first cut)
@@ -15,10 +15,21 @@
 - `NativeParity.assertFallbackReasonContains(env, sql, reason)`; the ABS/CONCAT/SUBSTRING fallback
   tests assert the reason names the cause.
 
+## Done (operator-level)
+- `PhysicalPlanScan.operatorReason(node)` returns an operator-level reason for each recognized
+  stateful shape its matcher declined — window/global aggregate, OVER, interval/window join — naming
+  the operator and its requirements. Recorded into the same `fallbackReasons()` + log path; the
+  interval-join fallback test asserts it. (Source/sink connector mismatches are intentionally *not*
+  reported — a non-parquet sink is a different connector, not an interesting fallback. Non-insert-only
+  changelog still bails at the early guard without a reason.)
+- Documented in `readme.md` ("Seeing why a query fell back").
+
 ## Remaining
-- **Operator-level matchers.** Window/global aggregate, OVER, interval/window join, source, sink
-  decline with a boolean today; thread a reason (coarse is fine: "unsupported windowing", "non-
-  insert-only changelog", "unsupported value type") so non-Calc fallbacks are visible too.
+- **Per-condition operator reasons.** Operator reasons are coarse (one sentence per operator); the
+  matchers could thread the *specific* failing condition (like the Calc path does) by converting each
+  `matches` to a reason-returning form. Lower priority.
+- **Changelog / connector reasons.** A reason at the insert-only guard (non-insert-only → "changelog
+  not supported") and for filesystem+parquet sinks on a remote path.
 - **Flink explain integration.** `fallbackReasons()` + the log flag are the surfacing today (Comet's
   log path). The richer half — annotating the plan that Flink's `explain()`/`EXPLAIN` prints — is
   still open; investigate whether a `FlinkPhysicalRel` can carry the reason for the explain output.
