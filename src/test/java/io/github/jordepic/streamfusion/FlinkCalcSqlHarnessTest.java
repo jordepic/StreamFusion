@@ -288,6 +288,11 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void asciiMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT ASCII(s) FROM f");
+  }
+
+  @Test
   void explainAnnotatesAFallbackWithItsReason() {
     // explainSql runs the native planner program, so the appended summary names why ABS fell back.
     String explain = NativePlanner.explain(environment(), "SELECT ABS(v) FROM f");

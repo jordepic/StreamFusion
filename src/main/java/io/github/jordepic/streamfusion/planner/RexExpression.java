@@ -547,6 +547,8 @@ final class RexExpression {
         return 60;
       case "RTRIM":
         return 61;
+      case "ASCII":
+        return 67;
       default:
         return -1;
     }
