@@ -93,14 +93,16 @@ project; record any deliberate semantic choice in `divergences/`.
      lone `INT_MIN/-1` overflow edge is documented (divergences/07).
    - ✅ Narrow-int (`TINYINT`/`SMALLINT`) column arithmetic — verified to match on overflow (parity
      tests `a + b` and `c * c` that overflow the narrow range route and agree; docs/aggregate-type-support).
-   - ✅ Scalar string functions `UPPER`/`LOWER`/`CHAR_LENGTH` (ops 50/51/52) — matched by operator
-     name (Flink delivers them as `OTHER_FUNCTION`), mapped to DataFusion `upper`/`lower`/
-     `character_length`; ASCII-identical, Unicode edges documented (divergences/07). `CONCAT` was
-     tried and **rejected**: Flink propagates NULL, DataFusion's `concat` ignores it (fallback test).
+   - ✅ Scalar string functions `UPPER`/`LOWER`/`CHAR_LENGTH` (ops 50/51/52), `TRIM` (op 54, default
+     `BOTH ' '` only), `SUBSTRING` (op 55, literal `pos ≥ 1` / `len ≥ 0` only, result cast Utf8View→
+     Utf8) — matched by operator name, mapped to DataFusion `upper`/`lower`/`character_length`/`btrim`/
+     `substr`/`substring`; ASCII-identical, edges (Unicode, start<1, LEADING/TRAILING) documented in
+     divergences/07 and gated. `CONCAT` was tried and **rejected**: Flink propagates NULL, DataFusion's
+     `concat` ignores it (fallback test).
    - Remaining: narrowing/float→int/string `CAST` (so `COALESCE(s,'x')` with its `CHAR→VARCHAR` cast
-     still falls back); more string functions (`TRIM`/`SUBSTRING`/`POSITION`, each with operand-shape
-     or index nuances) and temporal functions (timezone-prone). The long tail; each gated by a
-     parity test, admitted only where DataFusion matches Flink.
+     still falls back); more string functions (`POSITION`/`REPLACE`/`LPAD`…) and temporal functions
+     (timezone-prone). The long tail; each gated by a parity test, admitted only where DataFusion
+     matches Flink.
 
 ## Acceptance criteria
 - Existing filter/projection tests pass via the general expression path.
