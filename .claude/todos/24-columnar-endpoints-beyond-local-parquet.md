@@ -1,7 +1,7 @@
 # Columnar endpoints beyond local Parquet (Iceberg, remote filesystems)
 
 **Status:** open
-**Source:** the native Parquet source/sink (ticket 21) are local-only; the matchers fall back on
+**Source:** the native Parquet source/sink are local-only; the matchers fall back on
 any non-`file:` scheme.
 
 ## Why

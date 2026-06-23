@@ -159,16 +159,15 @@ a columnar source at **1.82×** (the whole source → watermark assigner → key
 local/global window pipeline stays Arrow), and the event-time **interval join at 1.71×** (Flink's
 interval join is slow; ours buffers per key and delegates the match to a DataFusion hash join).
 The **Parquet sink reaches 2.24×** even from a row source: it writes Arrow → Parquet natively and
-[coalesces batches into size-targeted files](.claude/todos/22-parquet-sink-file-coalescing.md)
-(rolling on a row target / checkpoint) rather than one file per batch, so per-file footer/syscall
-overhead no longer scales with batch count. **Other row-source ops still pay a `RowData → Arrow`
-transpose at the input**, though it is cheaper since the converter was made row-major + pre-sized
-(~25% faster build — [ticket 28](.claude/todos/28-native-row-transpose-and-shuffle.md)): `OVER`
-running `SUM` lands at **1.56×** and tumbling at **1.24×**. The lone **stateless filter remains below
-1× at 0.75×** — a single cheap predicate cannot earn back the `RowData → Arrow → RowData` round-trip.
-Closing that last gap is the native-operator-chaining work in
-[ticket 21](.claude/todos/21-native-operator-chaining.md): keep Arrow across adjacent native
-operators so the transpose is paid once at the edges, not per operator.
+coalesces batches into size-targeted files (rolling on a row target / checkpoint) rather than one
+file per batch, so per-file footer/syscall overhead no longer scales with batch count. **Other
+row-source ops still pay a `RowData → Arrow` transpose at the input**, though it is cheaper since the
+converter was made row-major + pre-sized (~25% faster build): `OVER` running `SUM` lands at **1.56×**
+and tumbling at **1.24×**. The lone **stateless filter remains below 1× at 0.75×** — a single cheap
+predicate cannot earn back the `RowData → Arrow → RowData` round-trip; leave it on the host with
+`-Dstreamfusion.operator.filter.enabled=false`. Closing the gap generally is the columnar-flow work:
+keep Arrow across adjacent native operators so the transpose is paid once at the edges, not per
+operator ([divergences/08](divergences/08-columnar-flow-transitions.md)).
 
 _Apple M1 Max; numbers are comparable only within a machine._
 

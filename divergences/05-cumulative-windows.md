@@ -37,5 +37,4 @@ doesn't have it" is not a reason to skip it. We accept owning the design because
 (1) it produces identical results to the host, verified by the parity harness,
 and (2) it cost almost no new architecture — it is the existing aligned-window
 engine with one more assignment mode, not a new subsystem. Two-phase
-(slice-sharing) cumulative is **not** done; like two-phase hopping it falls back
-(see `.claude/todos/13-two-phase-hopping-slices.md`).
+(slice-sharing) cumulative is also done (see [06](06-two-phase-slice-sharing.md)).

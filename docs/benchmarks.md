@@ -102,7 +102,7 @@ The gain tracks how much of the pipeline stays columnar. Fully-columnar paths le
 **4.68×**, the windowed aggregate over a columnar source **1.82×**, the event-time interval join
 **1.71×** (Flink's interval join is slow; ours delegates the match to a DataFusion hash join). The
 **Parquet sink reaches 2.24×** even from a row source: it writes Arrow → Parquet natively and
-[coalesces batches into size-targeted files](../.claude/todos/22-parquet-sink-file-coalescing.md)
+coalesces batches into size-targeted files
 (rolling on a row target / checkpoint) instead of one file per batch, so per-file overhead no longer
 scales with batch count — this also lifted the columnar copy (2.61 → 4.68×). Other row-source ops
 still pay a `RowData → Arrow` transpose at the input, ~25% cheaper since the converter was made
@@ -110,7 +110,7 @@ row-major + pre-sized ([ticket 28](../.claude/todos/28-native-row-transpose-and-
 running `SUM` **1.56×**, tumbling **1.24×**. The lone stateless **filter stays below 1× at 0.75×** —
 a single cheap predicate cannot earn back the `RowData → Arrow → RowData` round-trip. A lone operator
 crosses 1× once fed by a columnar source or chained with other native operators (no transpose between
-them) — the native-operator-chaining work in [ticket 21](../.claude/todos/21-native-operator-chaining.md).
+them) — the columnar-flow work ([divergences/08](../divergences/08-columnar-flow-transitions.md)).
 
 ### How we got these numbers (a profiling lesson)
 

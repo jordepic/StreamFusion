@@ -1,8 +1,8 @@
 # Keyed / event-time operators unlocked by columnar watermarks + shuffle
 
 **Status:** open (roadmap) — infrastructure landed, operators not yet built.
-**Source:** what the columnar watermark assigner (ticket = done) + columnar keyed
-shuffle (ticket 10) + the generic window core unlocked.
+**Source:** what the columnar watermark assigner + columnar keyed shuffle (both done;
+divergences/10) + the generic window core unlocked.
 
 ## Why these are newly feasible
 The columnar keyed exchange (carry Arrow across a `keyBy`, co-locating keys with
@@ -45,9 +45,9 @@ host by `NativeParity`).
 The two-input columnar operator (two `ColumnarInput` edges; connected watermark = min of both
 inputs) now exists (`NativeIntervalJoinOperator`). On top of it:
 - [x] **Interval join** (`a.rt BETWEEN b.rt - X AND b.rt + Y`) — DONE, INNER, **columnar**: keyed
-      shuffle on the join key + watermark-bounded state cleanup. See [ticket 27](27-two-input-columnar-join.md).
+      shuffle on the join key + watermark-bounded state cleanup. See [divergences/12](../../divergences/12-joins-delegate-match-own-state.md).
 - [x] **Window join** (windowing-TVF based) — DONE, INNER, **columnar**: buffer both sides, join per
-      window on watermark close (the window bounds join the equi-keys). See [ticket 27](27-two-input-columnar-join.md).
+      window on watermark close (the window bounds join the equi-keys). See [divergences/12](../../divergences/12-joins-delegate-match-own-state.md).
 
 ## Still blocked regardless — by the insert-only constraint, not by the shuffle
 These emit retracting/updating changelogs; they need [ticket 06](06-changelog-retract-support.md)
