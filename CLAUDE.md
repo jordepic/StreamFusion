@@ -43,12 +43,12 @@ We are ripping code out of Arroyo, which itself already uses DataFusion
 We are overriding the planning layer of Flink to use our Arroyo operators
 This allows us to handle incoming records is arrow batches as opposed to using the flink row model
 
-The research directory in this folder includes the learnings of previous sessions when looking into other
+The `.claude/research/` directory holds the learnings of previous sessions when looking into other
 repos/techniques. See `.claude/research/flink-arroyo-accelerator-findings.md` for the full architecture
 investigation (planner hook, JNI/Arrow bridge, memory accounting, threading/mailbox model, changelog and
 watermark semantics, type mapping, parity testing, and a risk-first build order).
 
-The todos directory in this folder is effectively a JIRA board of tickets to complete with context on them.
+The `.claude/todos/` directory is effectively a JIRA board of tickets to complete with context on them.
 **Delete a ticket the moment its work ships — in the same commit, not later.** A todo describes work *to do*;
 once done its state belongs in the readme (Compatibility Chart), `00-roadmap.md` ("Where we are"), and a
 `divergences/` note if a decision was made — not in a stale "build X" ticket. When you delete a ticket you must
@@ -58,6 +58,6 @@ Two exceptions stay as records: a partially-done ticket (trim it to what remains
 (keep it, clearly marked, so the dead end isn't re-explored). As we knock things out, update the readme
 Compatibility Chart so it reflects exactly what is accelerated and under what terms.
 
-I'm adding a "divergences" directory - I want this project to be heavily influenced by datafusion-comet and
-arroyo, meaning that to start we should have little divergence from already made architectural decisions.
-If you make such a decision, describe it in this folder and why.
+The `divergences/` directory (at the repo root) records where we deviate from the datafusion-comet / arroyo
+architectural decisions — this project should start with little divergence from them. If you make such a
+decision, describe it in `divergences/` and why.
