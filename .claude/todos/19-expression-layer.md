@@ -72,7 +72,9 @@ project; record any deliberate semantic choice in `divergences/`.
    an un-admitted function falls back. The pure filter-plus-column-subset shape still routes through
    the filter operator (its column-transfer projection avoids evaluating identity exprs) — **unify
    the filter into the Calc later** (the Calc subsumes it; kept separate now to avoid churn/regress).
-3. **Fuse + expand.** Projection+filter are now one native pass (done). Widening the admitted
+3. **Expand the op set.** Projection+filter already arrive as a single Calc node (Calcite merges
+   `Project`+`Filter`), evaluated in one native pass — *not* operator fusion, just handling the
+   planner's node. Widening the admitted
    op/function set with parity tests (each admitted only once a parity test confirms DataFusion
    matches Flink; un-admitted ops fall back):
    - ✅ `IS NOT NULL` (op 31), ✅ searched `CASE` (op 40, n-ary → when/then pairs + else).
