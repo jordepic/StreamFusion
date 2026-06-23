@@ -192,6 +192,33 @@ class FlinkCalcSqlHarnessTest {
         FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT TRIM(LEADING FROM s) FROM ss");
   }
 
+  @Test
+  void substringFromMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT SUBSTRING(s FROM 2) FROM ss");
+  }
+
+  @Test
+  void substringFromForMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT SUBSTRING(s FROM 2 FOR 3) FROM ss");
+  }
+
+  @Test
+  void substringStartBelowOneFallsBack() throws Exception {
+    // Flink clamps a start below 1 to 1; DataFusion counts the out-of-range prefix against the
+    // length. So a literal start < 1 is not admitted and the Calc falls back.
+    NativeParity.assertFallback(
+        FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT SUBSTRING(s FROM 0 FOR 3) FROM ss");
+  }
+
+  @Test
+  void substringRuntimePositionFallsBack() throws Exception {
+    // A non-literal start (column v) can't be range-checked at plan time, so it falls back too.
+    NativeParity.assertFallback(
+        FlinkCalcSqlHarnessTest::environment, "SELECT SUBSTRING(s FROM v) FROM f");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);

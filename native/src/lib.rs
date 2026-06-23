@@ -2371,6 +2371,24 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
             None, when_then, else_expr,
         ));
     }
+    if op == 55 {
+        // SUBSTRING: 2-arg substr(s, pos) or 3-arg substring(s, pos, len). DataFusion's substr
+        // yields a Utf8View; cast back to Utf8 so the result is a plain VarChar vector the JVM
+        // converter reads (same string content, just the non-view representation).
+        let mut a = args.into_iter();
+        let source = a.next().expect("substring source");
+        let position = a.next().expect("substring position");
+        let result = match a.next() {
+            Some(length) => {
+                datafusion::functions::unicode::expr_fn::substring(source, position, length)
+            }
+            None => datafusion::functions::unicode::expr_fn::substr(source, position),
+        };
+        return datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(result),
+            DataType::Utf8,
+        ));
+    }
     let mut it = args.into_iter();
     let mut next = || it.next().expect("missing operand");
     match op {

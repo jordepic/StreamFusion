@@ -67,6 +67,12 @@ hot-path finding.
 - **`COALESCE`/`NULLIF`:** lowered on the encoder side to the searched `CASE` the host defines
   them as, so they inherit `CASE`'s parity exactly rather than relying on a separate native
   function.
+- **`SUBSTRING`:** `SUBSTRING(s FROM pos [FOR len])` maps to DataFusion `substr`/`substring`, with the
+  result cast back to `Utf8` (DataFusion returns a `Utf8View` the JVM converter doesn't read).
+  Admitted only when `pos` is an integer literal ≥ 1 and `len` (if present) ≥ 0: at `pos < 1` Flink
+  clamps the start to 1 while DataFusion counts the out-of-range prefix against the length (e.g.
+  `SUBSTRING('  pad  ' FROM 0 FOR 3)` → `"  p"` on Flink, `"  "` on DataFusion). A runtime (non-literal)
+  position can't be range-checked, so it falls back too — both asserted by tests.
 - **`TRIM`:** only the default `TRIM(BOTH ' ' FROM s)` (whitespace, both sides) is admitted, mapped
   to DataFusion's `btrim`; `LEADING`/`TRAILING` and custom trim characters fall back (asserted by a
   test). The encoder reads Calcite's three-operand TRIM (flag, trim-chars, source) and only proceeds

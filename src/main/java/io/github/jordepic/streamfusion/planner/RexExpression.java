@@ -227,6 +227,9 @@ final class RexExpression {
     if ("TRIM".equalsIgnoreCase(call.getOperator().getName())) {
       return emitTrim(call);
     }
+    if ("SUBSTRING".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitSubstring(call.getOperands());
+    }
     int fnOp = functionOpCode(call.getOperator().getName());
     if (fnOp >= 0) {
       // The admitted scalar functions are all unary over a single string argument.
@@ -396,6 +399,41 @@ final class RexExpression {
   }
 
   /** The native op code for a call kind, or -1 if the operation is not admitted. */
+  /**
+   * Emits {@code SUBSTRING(s FROM pos [FOR len])} (op 55, 2 or 3 operands → native substr/substring).
+   * Admitted only when {@code pos} is an integer literal ≥ 1 and {@code len} (if present) ≥ 0: Flink
+   * and DataFusion diverge when the start is below 1 (Flink clamps it to 1, DataFusion counts the
+   * out-of-range prefix against the length), and a runtime position can't be checked — so a non-
+   * literal or out-of-range bound falls back rather than risk a wrong answer.
+   */
+  private boolean emitSubstring(List<RexNode> args) {
+    if (args.size() != 2 && args.size() != 3) {
+      return false;
+    }
+    if (!isIntLiteralAtLeast(args.get(1), 1)) {
+      return false;
+    }
+    if (args.size() == 3 && !isIntLiteralAtLeast(args.get(2), 0)) {
+      return false;
+    }
+    add(KIND_CALL, 55, args.size());
+    for (RexNode arg : args) {
+      if (!emit(arg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Whether {@code node} is an integer literal whose value is at least {@code min}. */
+  private static boolean isIntLiteralAtLeast(RexNode node, long min) {
+    if (!(node instanceof RexLiteral)) {
+      return false;
+    }
+    Long value = ((RexLiteral) node).getValueAs(Long.class);
+    return value != null && value >= min;
+  }
+
   /**
    * Emits {@code TRIM(BOTH ' ' FROM s)} — the default whitespace both-sides trim — as a unary call
    * (op 54) mapped to DataFusion's {@code btrim}. Calcite gives TRIM three operands: a BOTH/LEADING/
