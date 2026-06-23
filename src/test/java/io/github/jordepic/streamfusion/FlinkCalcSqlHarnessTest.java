@@ -1,5 +1,8 @@
 package io.github.jordepic.streamfusion;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.github.jordepic.streamfusion.planner.NativePlanner;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -221,6 +224,22 @@ class FlinkCalcSqlHarnessTest {
     // reason points at SUBSTRING.
     NativeParity.assertFallbackReasonContains(
         FlinkCalcSqlHarnessTest::environment, "SELECT SUBSTRING(s FROM v) FROM f", "SUBSTRING");
+  }
+
+  @Test
+  void explainAnnotatesAFallbackWithItsReason() {
+    // explainSql runs the native planner program, so the appended summary names why ABS fell back.
+    String explain = NativePlanner.explain(environment(), "SELECT ABS(v) FROM f");
+    assertTrue(explain.contains("Native acceleration (StreamFusion)"), explain);
+    assertTrue(explain.contains("fell back to Flink"), explain);
+    assertTrue(explain.contains("ABS"), explain);
+  }
+
+  @Test
+  void explainReportsNativeOperatorsForASupportedQuery() {
+    String explain = NativePlanner.explain(environment(), "SELECT v + k FROM f WHERE v > 15");
+    assertTrue(explain.contains("operator(s) ran natively"), explain);
+    assertTrue(explain.contains("No operators fell back to Flink"), explain);
   }
 
   private static TableEnvironment environment() {

@@ -559,4 +559,23 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
   public List<String> fallbackReasons() {
     return fallbackReasons;
   }
+
+  /**
+   * A native-acceleration section for appending to Flink's {@code explainSql} output: how many
+   * operators ran natively and, for those that did not, why — Comet's flat "fallback reasons" explain
+   * format. Reflects the plans optimized since this scan was installed.
+   */
+  public String explainSummary() {
+    StringBuilder out = new StringBuilder("== Native acceleration (StreamFusion) ==\n");
+    out.append(substitutions).append(" operator(s) ran natively.\n");
+    if (fallbackReasons.isEmpty()) {
+      out.append("No operators fell back to Flink.\n");
+    } else {
+      out.append(fallbackReasons.size()).append(" operator(s) fell back to Flink:\n");
+      for (String reason : fallbackReasons) {
+        out.append("  - ").append(reason).append('\n');
+      }
+    }
+    return out.toString();
+  }
 }
