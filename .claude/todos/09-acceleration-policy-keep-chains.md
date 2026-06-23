@@ -1,9 +1,20 @@
 # When to accelerate: keep columnar chains (mimic Comet)
 
-**Status:** partially done — the **expression `allowIncompatible` config surface shipped**
-(`NativeConfig`, `-Dstreamfusion.expression.<NAME>.allowIncompatible`, mirroring Comet). Remaining:
-per-operator enable flags + a master native on/off switch.
+**Status:** done — the full Comet-style config surface shipped via `NativeConfig`: per-expression
+`allowIncompatible`, a master native on/off switch, and per-operator enable flags.
 **Source:** user direction; mimic DataFusion Comet.
+
+## Done: master switch + per-operator flags
+- `streamfusion.native.enabled` (default true) — when false, `PhysicalPlanScan.optimize` substitutes
+  nothing and the query runs entirely on the host.
+- `streamfusion.operator.<name>.enabled` (default true) — keeps a matched operator on the host
+  (`parquetSink`/`parquetSource`/`filter`/`calc`/`watermark`/`windowAggregate`/`localWindowAggregate`/
+  `over`/`intervalJoin`/`windowJoin`/`globalWindowAggregate`), Comet's `spark.comet.exec.<op>.enabled`.
+  A disabled-but-matched operator records a `"<op>: disabled by config"` fallback reason (ticket 29),
+  so the explain/log surface shows it was a choice, not a capability gap.
+- The benchmark-informed use is the row-source island that measures < 1× (bare filter): disable
+  `filter` there rather than pay the transpose round-trip. We expose the lever; we do not auto-decide
+  (Comet doesn't either — see below).
 
 ## Done: expression allowIncompatible flags (Comet's `spark.comet.expression.<EXPR>.allowIncompatible`)
 Functions whose native result diverges from the host only at a precision/locale edge — `UPPER`/`LOWER`

@@ -310,6 +310,29 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void masterSwitchDisablesNative() throws Exception {
+    // With native acceleration off, a normally-accelerated filter runs entirely on the host.
+    System.setProperty("streamfusion.native.enabled", "false");
+    try {
+      NativeParity.assertFallback(FlinkCalcSqlHarnessTest::environment, "SELECT k FROM f WHERE v > 15");
+    } finally {
+      System.clearProperty("streamfusion.native.enabled");
+    }
+  }
+
+  @Test
+  void perOperatorFlagKeepsFilterOnHost() throws Exception {
+    // Disabling the filter operator keeps it on the host, with a config fallback reason.
+    System.setProperty("streamfusion.operator.filter.enabled", "false");
+    try {
+      NativeParity.assertFallbackReasonContains(
+          FlinkCalcSqlHarnessTest::environment, "SELECT k FROM f WHERE v > 15", "filter: disabled by config");
+    } finally {
+      System.clearProperty("streamfusion.operator.filter.enabled");
+    }
+  }
+
+  @Test
   void masterFlagEnablesIncompatible() throws Exception {
     // The blanket flag enables any incompatible function (here SIN) without naming it.
     System.setProperty("streamfusion.expression.allowIncompatible", "true");

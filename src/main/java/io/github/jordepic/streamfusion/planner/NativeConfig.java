@@ -26,4 +26,23 @@ public final class NativeConfig {
                 + functionName.toUpperCase(Locale.ROOT)
                 + ".allowIncompatible");
   }
+
+  /**
+   * The master switch for native acceleration ({@code streamfusion.native.enabled}, default true).
+   * When false the planner substitutes nothing and the query runs entirely on the host.
+   */
+  public static boolean nativeEnabled() {
+    return Boolean.parseBoolean(System.getProperty("streamfusion.native.enabled", "true"));
+  }
+
+  /**
+   * Whether a specific operator may be substituted ({@code streamfusion.operator.<name>.enabled},
+   * default true) — the operator analog of {@link #allowsIncompatible}, for keeping an operator on
+   * the host where native does not pay (e.g. a lone row-source filter that measures below 1×),
+   * mirroring Comet's {@code spark.comet.exec.<op>.enabled}.
+   */
+  public static boolean operatorEnabled(String operator) {
+    return Boolean.parseBoolean(
+        System.getProperty("streamfusion.operator." + operator + ".enabled", "true"));
+  }
 }

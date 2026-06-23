@@ -43,6 +43,10 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
   @Override
   public RelNode optimize(RelNode root, StreamOptimizeContext context) {
     record(root);
+    // Master switch: with native acceleration off, substitute nothing — the query runs on the host.
+    if (!NativeConfig.nativeEnabled()) {
+      return root;
+    }
     // Pass 1 substitutes native (columnar) operators; pass 2 inserts a row↔columnar transpose
     // wherever a columnar rel meets a rowwise one, so adjacent columnar operators flow batches.
     return insertTransitions(rewrite(root));
@@ -101,6 +105,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (current instanceof StreamPhysicalSink
         && ParquetSinkMatcher.matches((StreamPhysicalSink) current)
         && ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
+      if (!NativeConfig.operatorEnabled("parquetSink")) {
+        return noteDisabled(current, "parquetSink");
+      }
       StreamPhysicalSink sink = (StreamPhysicalSink) current;
       substitutions++;
       return new StreamPhysicalNativeParquetSink(
@@ -119,6 +126,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
 
     if (ParquetSourceMatcher.matches(current)) {
+      if (!NativeConfig.operatorEnabled("parquetSource")) {
+        return noteDisabled(current, "parquetSource");
+      }
       StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
       substitutions++;
       return new StreamPhysicalNativeParquetSource(
@@ -130,6 +140,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
 
     if (current instanceof StreamPhysicalCalc && FilterCalcMatcher.matches((Calc) current)) {
+      if (!NativeConfig.operatorEnabled("filter")) {
+        return noteDisabled(current, "filter");
+      }
       Calc calc = (Calc) current;
       RexExpression condition = FilterCalcMatcher.encodedCondition(calc);
       substitutions++;
@@ -148,6 +161,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
 
     if (current instanceof StreamPhysicalCalc && CalcMatcher.matches((Calc) current)) {
+      if (!NativeConfig.operatorEnabled("calc")) {
+        return noteDisabled(current, "calc");
+      }
       Calc calc = (Calc) current;
       substitutions++;
       return new StreamPhysicalNativeCalc(
@@ -165,6 +181,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         && current.getInputs().get(0) instanceof ColumnarOutput) {
       StreamPhysicalWatermarkAssigner wm = (StreamPhysicalWatermarkAssigner) current;
       if (WatermarkAssignerMatcher.matches(wm)) {
+        if (!NativeConfig.operatorEnabled("watermark")) {
+          return noteDisabled(current, "watermark");
+        }
         substitutions++;
         return new StreamPhysicalNativeWatermarkAssigner(
             wm.getCluster(),
@@ -180,6 +199,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       StreamPhysicalWindowAggregate agg = (StreamPhysicalWindowAggregate) current;
       if (WindowAggregateMatcher.matches(
           agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())) {
+        if (!NativeConfig.operatorEnabled("windowAggregate")) {
+          return noteDisabled(current, "windowAggregate");
+        }
         substitutions++;
         boolean cumulative = WindowAggregateMatcher.isCumulative(agg.windowing());
         long windowMillis = WindowAggregateMatcher.windowSize(agg.windowing());
@@ -278,6 +300,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
                   != 2
               && !WindowAggregateMatcher.containsAvg(agg.aggCalls());
       if (tumbling || hopping || cumulativeLocal) {
+        if (!NativeConfig.operatorEnabled("localWindowAggregate")) {
+          return noteDisabled(current, "localWindowAggregate");
+        }
         substitutions++;
         int[] kinds =
             hopping
@@ -320,6 +345,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (current instanceof StreamPhysicalOverAggregate) {
       StreamPhysicalOverAggregate over = (StreamPhysicalOverAggregate) current;
       if (OverAggregateMatcher.matches(over)) {
+        if (!NativeConfig.operatorEnabled("over")) {
+          return noteDisabled(current, "over");
+        }
         substitutions++;
         int timeColumn = OverAggregateMatcher.timeColumn(over);
         int valueColumn = OverAggregateMatcher.valueColumnIndex(over);
@@ -358,6 +386,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (current instanceof StreamPhysicalIntervalJoin) {
       StreamPhysicalIntervalJoin join = (StreamPhysicalIntervalJoin) current;
       if (IntervalJoinMatcher.matches(join)) {
+        if (!NativeConfig.operatorEnabled("intervalJoin")) {
+          return noteDisabled(current, "intervalJoin");
+        }
         substitutions++;
         int[] leftKeys = IntervalJoinMatcher.leftKeys(join);
         int[] rightKeys = IntervalJoinMatcher.rightKeys(join);
@@ -385,6 +416,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (current instanceof StreamPhysicalWindowJoin) {
       StreamPhysicalWindowJoin join = (StreamPhysicalWindowJoin) current;
       if (WindowJoinMatcher.matches(join)) {
+        if (!NativeConfig.operatorEnabled("windowJoin")) {
+          return noteDisabled(current, "windowJoin");
+        }
         substitutions++;
         int[] leftKeys = WindowJoinMatcher.leftKeys(join);
         int[] rightKeys = WindowJoinMatcher.rightKeys(join);
@@ -410,6 +444,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (current instanceof StreamPhysicalGlobalWindowAggregate) {
       StreamPhysicalGlobalWindowAggregate agg = (StreamPhysicalGlobalWindowAggregate) current;
       if (GlobalWindowAggregateMatcher.matches(agg)) {
+        if (!NativeConfig.operatorEnabled("globalWindowAggregate")) {
+          return noteDisabled(current, "globalWindowAggregate");
+        }
         substitutions++;
         long windowMillis = GlobalWindowAggregateMatcher.windowMillis(agg);
         long slideMillis = GlobalWindowAggregateMatcher.slideMillis(agg);
@@ -468,9 +505,19 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
   private void noteFallback(RelNode node) {
     String reason =
         node instanceof StreamPhysicalCalc ? calcReason((Calc) node) : operatorReason(node);
-    if (reason == null) {
-      return;
+    if (reason != null) {
+      recordFallback(reason);
     }
+  }
+
+  /** Records that a matched operator was kept on the host by config, and returns it unchanged. */
+  private RelNode noteDisabled(RelNode node, String operator) {
+    recordFallback(
+        operator + ": disabled by config (streamfusion.operator." + operator + ".enabled=false)");
+    return node;
+  }
+
+  private void recordFallback(String reason) {
     fallbackReasons.add(reason);
     if (LOG_FALLBACK_REASONS) {
       System.err.println("[streamfusion] falls back to host — " + reason);

@@ -76,6 +76,21 @@ Two ways to see *why* a node stayed on Flink (mirroring DataFusion Comet's fallb
 - **Plan-time log.** Run with `-Dstreamfusion.logFallbackReasons=true` and each reason is logged as
   it is decided: `[streamfusion] falls back to host — Calc: unsupported function/operator: ABS`.
 
+### Controlling acceleration
+
+Acceleration is configured by JVM system properties (mirroring DataFusion Comet's config surface):
+
+- **Master switch** — `-Dstreamfusion.native.enabled=false` turns off all native substitution; the
+  query runs entirely on Flink.
+- **Per operator** — `-Dstreamfusion.operator.<name>.enabled=false` keeps one operator on the host
+  (`filter`, `calc`, `parquetSource`, `parquetSink`, `watermark`, `over`, `intervalJoin`,
+  `windowJoin`, `windowAggregate`, `localWindowAggregate`, `globalWindowAggregate`). Useful to leave a
+  lone row-source operator that measures below 1× on the host rather than pay the transpose round-trip.
+- **Opt-in incompatible expressions** — `-Dstreamfusion.expression.<NAME>.allowIncompatible=true` (or
+  the blanket `-Dstreamfusion.expression.allowIncompatible=true`) runs natively a function that
+  diverges from the host only at a precision/locale edge (`UPPER`/`LOWER`, `ROUND`, transcendental
+  math), for data that avoids the edge. Default off.
+
 ### Determinism (the one parity caveat)
 
 Results are byte-identical to stock Flink for everything admitted, with a single
