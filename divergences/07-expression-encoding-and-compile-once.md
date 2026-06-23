@@ -67,6 +67,10 @@ hot-path finding.
 - **`COALESCE`/`NULLIF`:** lowered on the encoder side to the searched `CASE` the host defines
   them as, so they inherit `CASE`'s parity exactly rather than relying on a separate native
   function.
+- **`TRIM`:** only the default `TRIM(BOTH ' ' FROM s)` (whitespace, both sides) is admitted, mapped
+  to DataFusion's `btrim`; `LEADING`/`TRAILING` and custom trim characters fall back (asserted by a
+  test). The encoder reads Calcite's three-operand TRIM (flag, trim-chars, source) and only proceeds
+  for the `BOTH` + single-space case.
 - **String functions (`UPPER`/`LOWER`/`CHAR_LENGTH`):** matched by operator name (Flink delivers
   them as `OTHER_FUNCTION`) and mapped to DataFusion's `upper`/`lower`/`character_length`. ASCII is
   bit-identical (verified). Two Unicode edges are *not* reproduced: case folding — Flink's `UPPER`
