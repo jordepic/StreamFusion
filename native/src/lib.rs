@@ -2433,6 +2433,8 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
         62 => datafusion::functions::math::expr_fn::abs(next()),
         63 => datafusion::functions::math::expr_fn::floor(next()),
         64 => datafusion::functions::math::expr_fn::ceil(next()),
+        65 => datafusion::functions::math::expr_fn::signum(next()),
+        66 => datafusion::functions::string::expr_fn::repeat(next(), next()),
         56 => datafusion::prelude::Expr::Like(datafusion::logical_expr::Like::new(
             false,
             Box::new(next()),

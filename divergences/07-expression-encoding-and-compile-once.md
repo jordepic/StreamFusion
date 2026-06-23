@@ -77,12 +77,13 @@ hot-path finding.
   to DataFusion's `btrim`; `LEADING`/`TRAILING` and custom trim characters fall back (asserted by a
   test). The encoder reads Calcite's three-operand TRIM (flag, trim-chars, source) and only proceeds
   for the `BOTH` + single-space case.
-- **`LTRIM`/`RTRIM`/`POSITION`/`ABS`/`FLOOR`/`CEIL`:** `LTRIM`/`RTRIM` default-whitespace only (a
-  2-arg custom-char form falls back); `POSITION(sub IN s)` → `strpos(s, sub)` (returns Int32, matching
-  Flink's INT); `ABS`/`FLOOR`/`CEIL` admitted **only over float/double** — integer `ABS(INT_MIN)`
-  overflows differently and integer `FLOOR`/`CEIL` is an identity Flink keeps in the int type, so the
-  integer forms fall back. `25.5` is a SQL `DECIMAL` literal, so the operand must be a true double
-  (e.g. `v - 25.5E0`) to route.
+- **`LTRIM`/`RTRIM`/`POSITION`/`REPEAT`/`ABS`/`FLOOR`/`CEIL`/`SIGN`:** `LTRIM`/`RTRIM` default-
+  whitespace only (a 2-arg custom-char form falls back); `POSITION(sub IN s)` → `strpos(s, sub)`
+  (returns Int32, matching Flink's INT); `REPEAT(s, n)` → `repeat`; `ABS`/`FLOOR`/`CEIL`/`SIGN`
+  admitted **only over float/double** — integer `ABS(INT_MIN)` overflows differently, integer
+  `FLOOR`/`CEIL` is an identity Flink keeps in the int type, and integer `SIGN` would return int where
+  DataFusion's `signum` returns float, so the integer forms fall back. `25.5` is a SQL `DECIMAL`
+  literal, so the operand must be a true double (e.g. `v - 25.5E0`) to route.
 - **`LIKE`/`REPLACE`/`REVERSE`:** `LIKE` maps to DataFusion's `Expr::Like` (case-sensitive, no
   explicit `ESCAPE` — a 3-operand `LIKE … ESCAPE` falls back); `REPLACE(s, from, to)` to `replace`;
   `REVERSE` to `reverse` (cast `Utf8View`→`Utf8` like `SUBSTRING`). ASCII-identical to the host.

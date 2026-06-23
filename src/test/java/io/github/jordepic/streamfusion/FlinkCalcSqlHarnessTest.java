@@ -278,6 +278,16 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void signFloatMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT SIGN(v - 25.5E0) FROM f");
+  }
+
+  @Test
+  void repeatMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT REPEAT(s, 3) FROM f");
+  }
+
+  @Test
   void explainAnnotatesAFallbackWithItsReason() {
     // explainSql runs the native planner program, so the appended summary names why ABS fell back.
     String explain = NativePlanner.explain(environment(), "SELECT ABS(v) FROM f");
