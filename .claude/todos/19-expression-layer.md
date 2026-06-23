@@ -80,12 +80,18 @@ project; record any deliberate semantic choice in `divergences/`.
      integer→float/double, float→double): lossless/IEEE-identical to the host. Unblocks mixed-width
      `CASE` branches and explicit widening casts. Narrowing / float→int / string casts are
      divergence-prone (overflow/rounding/parsing) and **fall back** (parity test asserts it).
-   - **`IS NULL`** — Calcite encodes a bare `IS NULL` as a null `Sarg`/`SEARCH` that `expandSearch`
-     does not turn into an `IS_NULL` call, so it currently falls back. To route it, detect a
-     null-only Sarg in the encoder and emit `IS_NULL`. (`IS NOT NULL` is not Sarg'd, so it routes.)
+   - ✅ `IS NULL` (op 30) and `IS NOT NULL` (op 31) — both route (Calcite's null-only path reaches
+     `IS_NULL` here; no Sarg special-casing was needed). Regression tests for both.
+   - ✅ `NULL` literal (kind 5) — a bare/typed NULL encodes to an untyped null
+     (`Expr::Literal(ScalarValue::Null)`) the surrounding coercion types.
+   - ✅ `COALESCE` — arrives as an `OTHER_FUNCTION` call (not pre-expanded here), so the encoder
+     lowers it to the searched `CASE` the host defines it as (`WHEN x IS NOT NULL THEN x … ELSE
+     last`), identical first-non-null semantics, no new native op. `NULLIF` rides the same path
+     (Calcite lowers it to `CASE … THEN NULL ELSE a`, now that NULL literals are admitted).
    - Remaining: `/` and `%` (integer-division/modulo parity — divergence-prone: truncation, negative
-     operands, divide-by-zero), narrowing/float→int/string `CAST`, `COALESCE`/`NULLIF`, string and
-     temporal functions. The long tail toward broad coverage; each gated by a parity test.
+     operands, divide-by-zero), narrowing/float→int/string `CAST` (so `COALESCE(s,'x')` with its
+     `CHAR→VARCHAR` cast still falls back), string and temporal functions. The long tail toward broad
+     coverage; each gated by a parity test.
 
 ## Acceptance criteria
 - Existing filter/projection tests pass via the general expression path.
