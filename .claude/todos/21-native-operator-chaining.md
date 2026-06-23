@@ -145,7 +145,7 @@ explains the benchmark ([ticket 20](20-profiling-and-benchmarks.md)): an in-memo
 source into a discarding sink is the row→row case — the *worst* one, paying conversion
 with no columnar endpoint to amortize it (hence 0.58×). The favorable cases need a
 columnar endpoint, which means native columnar source/sink support is on the critical
-path, not just operator fusion.
+path.
 
 ## Build order (columnar flow)
 Each green + benchmarked vs Flink.
@@ -229,14 +229,16 @@ toward a columnar Parquet source; the Kafka row source remains valuable but only
 - **Columnar source (Iceberg/Parquet) as Arrow** — a DataFusion scan instead of Flink
   deserializing to `RowData`; turns the source transpose into zero and unlocks
   columnar→columnar. The other half of the connector story.
-- **Stateless prefix fused into a stateful window** — native filter/projection runs on
-  each input batch before aggregating, all in Arrow.
-- **Operator fusion (mechanism)** — replace a maximal shuffle-free native component with
-  one fused operator (per-connected-component substitution); removes inter-operator
-  transposes for chains that aren't already merged by the planner (e.g. a Calc feeding a
-  window aggregate).
+- **Stateless prefix ahead of a stateful window** — a native filter/projection runs on each
+  input batch before the aggregate, all in Arrow with no transpose between them. This is just the
+  columnar-flow mechanism applied to a Calc→window chain (each operator stays separate; no fused
+  node), so it falls out of the existing transition pass once both ends are columnar.
 - **Arrow across the shuffle** — two-phase `keyBy` carries Arrow (IPC) so local→global
   stays columnar. Hardest; gated on the rest.
+
+(Note: replacing a chain with a single bespoke "fused" operator is **not** a goal — see the
+decision above. Columnar flow already removes inter-operator transposes without per-combination
+nodes, the same way Comet/DataFusion keep batches columnar across separate operators.)
 
 ## Acceptance criteria
 - The native Parquet sink writes byte-equivalent data (same rows read back) to Flink's

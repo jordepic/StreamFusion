@@ -26,9 +26,11 @@ here when the ticket is deleted.
   round-trip; ticket 21).
 
 ## Next, roughly in order
-1. **Expression layer stage 3 tail** (ticket 19): general projection, fuse, and most ops are done
-   (incl. `/` `%`, COALESCE/NULLIF/NULL, narrow-int arithmetic verified). Remaining: narrowing/
-   float→int/string `CAST` and string/temporal functions — each parity-gated.
+1. **Expression layer stage 3 tail** (ticket 19): general projection (the planner's `Calc` node —
+   an optional filter plus projections in one node — handled natively) and a broad function set are
+   done (`/` `%`, COALESCE/NULLIF/NULL, narrow-int arithmetic, and the common string/exact-math
+   functions, with precision/locale-divergent ones opt-in). Remaining: narrowing/float→int/string
+   `CAST`, and any further obscure functions — each parity-gated.
 2. **Wider value/key types** (ticket 04): SMALLINT/TINYINT/FLOAT `SUM`/`AVG`, DECIMAL/TIMESTAMP
    grouping keys, multiple value columns, `COUNT(*)`.
 3. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
