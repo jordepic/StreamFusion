@@ -54,6 +54,13 @@ hot-path finding.
   the aggregator handles ([04](04-synchronous-stateful-execution.md)).
 
 ## Admitted-op semantics notes (parity edges)
+Some functions diverge from the host only at precision/locale edges, not in value. Those fall back
+**by default** but are opt-in via `NativeConfig` — `-Dstreamfusion.expression.<NAME>.allowIncompatible`
+(or the blanket `-Dstreamfusion.expression.allowIncompatible`), mirroring DataFusion Comet's
+`spark.comet.expression.<EXPR>.allowIncompatible`. This covers `UPPER`/`LOWER`, `ROUND`, and the
+transcendental math below. A true value divergence (`CONCAT`'s NULL handling) is never opt-in — it
+would just be wrong.
+
 - **Integer `/` and `%`:** DataFusion and Flink (Java) agree for all finite operands —
   division truncates toward zero and modulo takes the sign of the dividend (verified with
   negative dividends, not just positives). Two edges are *not* silent divergences:
@@ -92,13 +99,13 @@ hot-path finding.
 - **`CHAR_LENGTH`** maps to DataFusion's `character_length` (Comet marks `Length` compatible). It
   counts Unicode code points; a supplementary character (e.g. an emoji) is one code point on both
   sides, so ASCII and BMP text are bit-identical.
-- **`UPPER`/`LOWER` are *not* admitted** (they fall back, asserted by a test). Native (Rust) case
+- **`UPPER`/`LOWER` fall back by default** (opt-in via the flag above; asserted by a test). Native (Rust) case
   folding is locale-independent Unicode, but the JVM's `String.toUpperCase()/toLowerCase()` is
   locale-sensitive (e.g. Turkish dotless-i), so non-ASCII results can silently differ. DataFusion
   Comet reached the same conclusion — it routes case conversion through the JVM by default and only
   uses the native path under an opt-in flag. Until we have that config surface (ticket 09) we fall
   back rather than ship a silent non-ASCII divergence.
-- **Transcendental math is *not* admitted** (`EXP`/`LN`/`LOG10`/`SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/
+- **Transcendental math falls back by default** (opt-in via the flag above): `EXP`/`LN`/`LOG10`/`SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/
   `ATAN`/`POWER`/`SQRT`, which Calcite lowers to `POWER`). These are not IEEE-correctly-rounded, so
   the JVM's `java.lang.Math` (Flink) and DataFusion's Rust libm differ at the last ULP — verified:
   `TAN`/`ATAN`/`ASIN`/`ACOS` mismatch on sampled values (e.g. `tan` `…2386603` vs `…2386602`).
@@ -106,7 +113,7 @@ hot-path finding.
   for a last-ULP-divergent family, so the whole family falls back. (Comet ships them as Compatible —
   it tolerates last-ULP; our byte-exact harness does not. The IEEE-exact ops `+ - * /`, `ABS`,
   `FLOOR`, `CEIL`, `SIGN` are admitted.)
-- **`ROUND` is *not* admitted** (falls back, asserted by a test). Flink rounds float/double via
+- **`ROUND` falls back by default** (opt-in via the flag above; asserted by a test). Flink rounds float/double via
   `BigDecimal` (HALF_UP), which operates on the `Double.toString` decimal representation; DataFusion
   rounds with a binary float multiply (`(x·10^n).round()/10^n`). They agree on sampled values but
   differ on input-dependent precision edges, so a sample passing does not prove parity. Comet

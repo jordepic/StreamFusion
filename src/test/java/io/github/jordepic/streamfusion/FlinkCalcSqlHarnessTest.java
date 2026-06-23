@@ -277,6 +277,50 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void upperRoutesWhenIncompatibleAllowed() throws Exception {
+    // With the opt-in flag, UPPER runs natively; on ASCII data it also matches the host.
+    System.setProperty("streamfusion.expression.UPPER.allowIncompatible", "true");
+    try {
+      NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT UPPER(s) FROM f");
+    } finally {
+      System.clearProperty("streamfusion.expression.UPPER.allowIncompatible");
+    }
+  }
+
+  @Test
+  void roundRoutesWhenIncompatibleAllowed() throws Exception {
+    System.setProperty("streamfusion.expression.ROUND.allowIncompatible", "true");
+    try {
+      // Sampled values happen to agree; the flag is the user accepting the input-dependent risk.
+      NativeParity.assertParity(FlinkCalcSqlHarnessTest::doubleEnvironment, "SELECT ROUND(d, 2) FROM dd");
+    } finally {
+      System.clearProperty("streamfusion.expression.ROUND.allowIncompatible");
+    }
+  }
+
+  @Test
+  void transcendentalRoutesWhenIncompatibleAllowed() throws Exception {
+    // TAN diverges at the last ULP, so only assert it routes (not value parity) under the flag.
+    System.setProperty("streamfusion.expression.TAN.allowIncompatible", "true");
+    try {
+      NativeParity.assertRoutes(FlinkCalcSqlHarnessTest::doubleEnvironment, "SELECT TAN(d) FROM dd");
+    } finally {
+      System.clearProperty("streamfusion.expression.TAN.allowIncompatible");
+    }
+  }
+
+  @Test
+  void masterFlagEnablesIncompatible() throws Exception {
+    // The blanket flag enables any incompatible function (here SIN) without naming it.
+    System.setProperty("streamfusion.expression.allowIncompatible", "true");
+    try {
+      NativeParity.assertRoutes(FlinkCalcSqlHarnessTest::doubleEnvironment, "SELECT SIN(d) FROM dd");
+    } finally {
+      System.clearProperty("streamfusion.expression.allowIncompatible");
+    }
+  }
+
+  @Test
   void transcendentalMathFallsBack() throws Exception {
     // Transcendental math (here TAN) is not admitted: java.lang.Math (Flink) and Rust libm
     // (DataFusion) differ at the last ULP since these are not IEEE-correctly-rounded — verified for

@@ -53,6 +53,23 @@ final class RexExpression {
   private final List<Long> longs = new ArrayList<>();
   private final List<Double> doubles = new ArrayList<>();
   private final List<String> strings = new ArrayList<>();
+  // Unary functions whose native (Rust) result can differ from the host's JVM result — locale case
+  // folding and non-correctly-rounded transcendental math — keyed to their native op code. Admitted
+  // only under the allowIncompatible flag (see NativeConfig); otherwise they fall back.
+  private static final java.util.Map<String, Integer> INCOMPATIBLE_UNARY =
+      java.util.Map.ofEntries(
+          java.util.Map.entry("UPPER", 50),
+          java.util.Map.entry("LOWER", 51),
+          java.util.Map.entry("EXP", 72),
+          java.util.Map.entry("LN", 73),
+          java.util.Map.entry("SIN", 74),
+          java.util.Map.entry("COS", 75),
+          java.util.Map.entry("TAN", 76),
+          java.util.Map.entry("ASIN", 77),
+          java.util.Map.entry("ACOS", 78),
+          java.util.Map.entry("ATAN", 79),
+          java.util.Map.entry("LOG10", 80));
+
   private final List<Integer> projectionRoots = new ArrayList<>();
   private int conditionRoot = -1;
   private String[] outputNames = new String[0];
@@ -313,6 +330,20 @@ final class RexExpression {
     if ("RPAD".equalsIgnoreCase(call.getOperator().getName())) {
       return emitPad(call, 83);
     }
+    // Functions whose native result can differ from the host — locale case folding (UPPER/LOWER) and
+    // last-ULP transcendental math. They fall back unless the allowIncompatible flag opts them in.
+    Integer incompatUnaryOp =
+        INCOMPATIBLE_UNARY.get(call.getOperator().getName().toUpperCase(java.util.Locale.ROOT));
+    if (incompatUnaryOp != null) {
+      return emitIncompatibleUnary(call, incompatUnaryOp);
+    }
+    if ("POWER".equalsIgnoreCase(call.getOperator().getName())
+        || "POW".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitIncompatiblePower(call);
+    }
+    if ("ROUND".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitIncompatibleRound(call);
+    }
     int fnOp = functionOpCode(call.getOperator().getName());
     if (fnOp >= 0) {
       // The admitted scalar functions are all unary over a single string argument.
@@ -550,6 +581,64 @@ final class RexExpression {
     return true;
   }
 
+  /** A unary incompatible function, native only under its allowIncompatible flag. */
+  private boolean emitIncompatibleUnary(RexCall call, int op) {
+    String name = call.getOperator().getName();
+    if (!NativeConfig.allowsIncompatible(name)) {
+      return reject(incompatibleReason(name));
+    }
+    if (call.getOperands().size() != 1) {
+      return reject(name + " requires one argument");
+    }
+    add(KIND_CALL, op, 1);
+    return emit(call.getOperands().get(0));
+  }
+
+  /** {@code POWER(base, exp)} (also the lowering of {@code SQRT}), native only under the flag. */
+  private boolean emitIncompatiblePower(RexCall call) {
+    if (!NativeConfig.allowsIncompatible("POWER")) {
+      return reject(incompatibleReason("POWER"));
+    }
+    List<RexNode> args = call.getOperands();
+    if (args.size() != 2) {
+      return reject("POWER requires 2 arguments");
+    }
+    add(KIND_CALL, 71, 2);
+    return emit(args.get(0)) && emit(args.get(1));
+  }
+
+  /** {@code ROUND(x [, scale])} over float/double, native only under the flag. */
+  private boolean emitIncompatibleRound(RexCall call) {
+    if (!NativeConfig.allowsIncompatible("ROUND")) {
+      return reject(incompatibleReason("ROUND"));
+    }
+    List<RexNode> args = call.getOperands();
+    if (args.isEmpty() || args.size() > 2) {
+      return reject("ROUND requires 1 or 2 arguments");
+    }
+    SqlTypeName type = args.get(0).getType().getSqlTypeName();
+    if (type != SqlTypeName.FLOAT && type != SqlTypeName.REAL && type != SqlTypeName.DOUBLE) {
+      return reject("ROUND: only float/double operands admitted");
+    }
+    if (args.size() == 2 && !(args.get(1) instanceof RexLiteral)) {
+      return reject("ROUND: scale must be a literal");
+    }
+    add(KIND_CALL, 84, args.size());
+    for (RexNode arg : args) {
+      if (!emit(arg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static String incompatibleReason(String name) {
+    return name
+        + ": native result may differ from the host; enable with -Dstreamfusion.expression."
+        + name.toUpperCase(java.util.Locale.ROOT)
+        + ".allowIncompatible=true";
+  }
+
   /** Whether {@code node} is an integer literal whose value is at least {@code min}. */
   private static boolean isIntLiteralAtLeast(RexNode node, long min) {
     if (!(node instanceof RexLiteral)) {
@@ -587,11 +676,10 @@ final class RexExpression {
    * folding, code-point vs UTF-16 length) are recorded in divergences/07.
    */
   private static int functionOpCode(String name) {
+    // Compatible (always-native) unary functions only. Functions whose native result can diverge from
+    // the host (UPPER/LOWER, transcendental math) are handled by the incompatible dispatch in
+    // emitCall, gated behind the allowIncompatible flag — see INCOMPATIBLE_UNARY.
     switch (name.toUpperCase(java.util.Locale.ROOT)) {
-      // UPPER/LOWER are intentionally absent: native (Rust) case folding diverges from the JVM's
-      // locale-sensitive folding on some characters (e.g. Turkish dotless-i). DataFusion Comet
-      // likewise routes case conversion through the JVM by default, so we fall back rather than risk
-      // a silent non-ASCII divergence — see divergences/07.
       case "CHAR_LENGTH":
       case "CHARACTER_LENGTH":
         return 52;
@@ -605,10 +693,6 @@ final class RexExpression {
         return 67;
       case "CHR":
         return 81;
-      // Transcendental math (EXP/LN/LOG10/SIN/COS/TAN/ASIN/ACOS/ATAN/POWER/SQRT) is intentionally
-      // absent: it is not IEEE-correctly-rounded, so the JVM's java.lang.Math and DataFusion's Rust
-      // libm differ at the last ULP (verified for TAN/ATAN/ASIN/ACOS). Comet tolerates this; our
-      // byte-exact parity bar does not — see divergences/07.
       default:
         return -1;
     }
