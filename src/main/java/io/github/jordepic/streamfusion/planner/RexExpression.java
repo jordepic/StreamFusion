@@ -289,6 +289,18 @@ final class RexExpression {
         || "CEILING".equalsIgnoreCase(call.getOperator().getName())) {
       return emitFloatUnary(call, 64);
     }
+    if ("SIGN".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitFloatUnary(call, 65);
+    }
+    if ("REPEAT".equalsIgnoreCase(call.getOperator().getName())) {
+      // REPEAT(s, n): repeat s n times — operands [s, n], same order as DataFusion repeat.
+      List<RexNode> args = call.getOperands();
+      if (args.size() != 2) {
+        return reject("REPEAT requires 2 arguments");
+      }
+      add(KIND_CALL, 66, 2);
+      return emit(args.get(0)) && emit(args.get(1));
+    }
     int fnOp = functionOpCode(call.getOperator().getName());
     if (fnOp >= 0) {
       // The admitted scalar functions are all unary over a single string argument.
