@@ -67,6 +67,18 @@ final class NativeParity {
     }
   }
 
+  /**
+   * Asserts the query routes to native (substitutes at least one operator) without comparing results
+   * — for verifying an opt-in {@code allowIncompatible} flag enables native execution of a function
+   * whose result is intentionally allowed to differ from the host.
+   */
+  static void assertRoutes(Supplier<TableEnvironment> environment, String sql) throws Exception {
+    TableEnvironment nativeEnvironment = environment.get();
+    PhysicalPlanScan scan = NativePlanner.install(nativeEnvironment);
+    collect(nativeEnvironment, sql);
+    assertTrue(scan.substitutions() > 0, "query did not route to native");
+  }
+
   private static List<List<Object>> collect(TableEnvironment environment, String sql)
       throws Exception {
     List<List<Object>> rows = new ArrayList<>();

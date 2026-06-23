@@ -57,7 +57,7 @@ stays row-fed and the shuffle stays on the host.
 
 ### Not yet accelerated (falls back to Flink)
 
-- Expressions using operations the engine does not admit: scalar functions outside the admitted set and narrowing/float→int/string `CAST`. Notable deliberate fallbacks where DataFusion diverges from JVM semantics — `UPPER`/`LOWER` (locale-sensitive case folding), `ROUND` on float/double (`BigDecimal` vs binary rounding), `CONCAT` (NULL handling) — are documented in [divergences/07](divergences/07-expression-encoding-and-compile-once.md)
+- Expressions using operations the engine does not admit: scalar functions outside the admitted set and narrowing/float→int/string `CAST`. Functions where DataFusion diverges from JVM semantics only at a precision/locale edge — `UPPER`/`LOWER` (locale-sensitive case folding), `ROUND` on float/double (`BigDecimal` vs binary rounding), and transcendental math (`SIN`/`EXP`/`POWER`/… last-ULP) — fall back by default but are **opt-in** via `-Dstreamfusion.expression.<NAME>.allowIncompatible=true` (Comet's `allowIncompatible` model). `CONCAT` (NULL handling) is a true value divergence and never opt-in. All documented in [divergences/07](divergences/07-expression-encoding-and-compile-once.md)
 - The native columnar source/sink only on a local (`file:`) path — remote filesystems (`hdfs:`/`s3:`) and non-Parquet formats fall back
 - Two-phase hopping where the slide does not divide the size
 - Grouping keys other than bigint/int/string (e.g. decimal, timestamp), aggregates over different value columns, or `COUNT(*)`

@@ -2380,6 +2380,10 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
             a.next().expect("replace to"),
         );
     }
+    if op == 84 {
+        // ROUND(x) or ROUND(x, scale): opt-in (allowIncompatible) — see the Java encoder.
+        return datafusion::functions::math::expr_fn::round(args);
+    }
     if op == 82 || op == 83 {
         // LPAD/RPAD yield a Utf8View; cast back to Utf8 for the JVM converter.
         let padded = if op == 82 {
@@ -2447,6 +2451,20 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
         66 => datafusion::functions::string::expr_fn::repeat(next(), next()),
         67 => datafusion::functions::string::expr_fn::ascii(next()),
         81 => datafusion::functions::string::expr_fn::chr(next()),
+        // Opt-in (allowIncompatible) functions: native results may differ from the host. The Java
+        // encoder admits these only under the per-function flag — see NativeConfig.
+        50 => datafusion::functions::string::expr_fn::upper(next()),
+        51 => datafusion::functions::string::expr_fn::lower(next()),
+        71 => datafusion::functions::math::expr_fn::power(next(), next()),
+        72 => datafusion::functions::math::expr_fn::exp(next()),
+        73 => datafusion::functions::math::expr_fn::ln(next()),
+        74 => datafusion::functions::math::expr_fn::sin(next()),
+        75 => datafusion::functions::math::expr_fn::cos(next()),
+        76 => datafusion::functions::math::expr_fn::tan(next()),
+        77 => datafusion::functions::math::expr_fn::asin(next()),
+        78 => datafusion::functions::math::expr_fn::acos(next()),
+        79 => datafusion::functions::math::expr_fn::atan(next()),
+        80 => datafusion::functions::math::expr_fn::log10(next()),
         // LEFT/RIGHT yield a Utf8View; cast back to Utf8 for the JVM converter.
         69 => datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
             Box::new(datafusion::functions::unicode::expr_fn::left(next(), next())),

@@ -41,10 +41,10 @@ here when the ticket is deleted.
 5. **Fallback reasons in explain** (ticket 29): done — Calc + per-condition operator reasons,
    `fallbackReasons()`, `-Dstreamfusion.logFallbackReasons`, and `NativePlanner.explain(env, sql)`
    annotating `explainSql`. Optional remainder: changelog/connector reasons.
-6. **Acceleration policy** (ticket 09): now that lone stateless islands measure < 1× (bare filter
-   0.75×), decide whether to refuse substituting an operator that would be an isolated island with
-   row endpoints on both sides, vs always substitute. Benchmark-informed. Pairs with ticket 29 (the
-   config surface + the reason surface are Comet's two halves of "whether/why accelerated").
+6. **Acceleration policy** (ticket 09): the expression `allowIncompatible` config surface shipped
+   (`NativeConfig` + `-Dstreamfusion.expression.<NAME>.allowIncompatible`, opting in UPPER/LOWER/
+   ROUND/transcendentals). Remaining: a master native on/off switch and per-operator enable flags
+   (e.g. refuse a lone sub-1× filter island). Benchmark-informed.
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting** (ticket 05): native `RootAllocator`s per operator are not accounted

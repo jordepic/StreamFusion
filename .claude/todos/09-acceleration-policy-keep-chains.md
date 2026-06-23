@@ -1,7 +1,23 @@
 # When to accelerate: keep columnar chains (mimic Comet)
 
-**Status:** open (design / policy) — **reframed after reading Comet's actual rules.**
+**Status:** partially done — the **expression `allowIncompatible` config surface shipped**
+(`NativeConfig`, `-Dstreamfusion.expression.<NAME>.allowIncompatible`, mirroring Comet). Remaining:
+per-operator enable flags + a master native on/off switch.
 **Source:** user direction; mimic DataFusion Comet.
+
+## Done: expression allowIncompatible flags (Comet's `spark.comet.expression.<EXPR>.allowIncompatible`)
+Functions whose native result diverges from the host only at a precision/locale edge — `UPPER`/`LOWER`
+(case folding), `ROUND` (BigDecimal), transcendental math (`SIN`/`EXP`/`POWER`/`SQRT`/… last-ULP) —
+fall back by default and are opt-in per function (or blanket) via `NativeConfig`, read from JVM system
+properties like the fallback-reason log flag. The encoder gates them in `RexExpression` (an
+`INCOMPATIBLE_UNARY` map plus gated `POWER`/`ROUND`); off → a fallback reason naming the flag, on →
+native. Tests cover both. A true value divergence (`CONCAT` NULL handling) is never opt-in.
+
+## Remaining: operator-level config
+- A master switch to disable native acceleration entirely (today it is all-or-nothing via
+  `NativePlanner.install`).
+- Per-operator enable flags (e.g. disable the native filter on a row-source island that measures
+  < 1×), the operator analog of the per-expression flags above.
 
 **What Comet actually does (read `CometExecRule` + `EliminateRedundantTransitions`):**
 1. **Greedy bottom-up, per-operator, no cost model.** An operator becomes columnar iff *all its
