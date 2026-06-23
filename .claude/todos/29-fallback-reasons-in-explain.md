@@ -1,6 +1,6 @@
 # Surface fallback reasons (Comet-style plan explanation)
 
-**Status:** Calc (precise) + operator-level (coarse) reasons done. Remaining: Flink explain() integration.
+**Status:** done. Calc + per-condition operator reasons, `explainSql` annotation, readme docs.
 **Source:** user direction — when a query does not accelerate, the user has no way to see *why*.
 
 ## Done (first cut)
@@ -24,15 +24,24 @@
   changelog still bails at the early guard without a reason.)
 - Documented in `readme.md` ("Seeing why a query fell back").
 
-## Remaining
-- **Per-condition operator reasons.** Operator reasons are coarse (one sentence per operator); the
-  matchers could thread the *specific* failing condition (like the Calc path does) by converting each
-  `matches` to a reason-returning form. Lower priority.
+## Done (per-condition + explain)
+- **Per-condition operator reasons.** Interval join, window join, OVER, and global window aggregate
+  converted from boolean `matches` to `unsupportedReason` (matches delegates), so the fallback names
+  the specific failing condition (e.g. "interval join: only INNER joins", "global window aggregate:
+  HOP slide must divide size"). The row/local window-aggregate path matches several variants with
+  extra gates, so it intentionally keeps a coarse operator-level reason (precise would be unreliable).
+- **explainSql annotation.** `NativePlanner.explain(env, sql)` returns Flink's `explainSql` plan (which
+  already names substituted native operators) plus `PhysicalPlanScan.explainSummary()` — count of
+  native operators and the fallback reasons. Flink has no SPI to inject text into its EXPLAIN renderer
+  (no `ExtendedExplainGenerator` analog) and fallback nodes are host classes, so this matches Comet's
+  flat fallback-list explain format by appending. Tested (a fallback names its reason; a supported
+  query reports none).
+
+## Remaining (optional)
 - **Changelog / connector reasons.** A reason at the insert-only guard (non-insert-only → "changelog
-  not supported") and for filesystem+parquet sinks on a remote path.
-- **Flink explain integration.** `fallbackReasons()` + the log flag are the surfacing today (Comet's
-  log path). The richer half — annotating the plan that Flink's `explain()`/`EXPLAIN` prints — is
-  still open; investigate whether a `FlinkPhysicalRel` can carry the reason for the explain output.
+  not supported") and for filesystem+parquet sinks on a remote path. Not yet surfaced.
+- Inline (per-node-in-the-tree) explain annotation would need a Flink RelNode explain hook that does
+  not currently exist; the appended-section form is the faithful equivalent.
 
 ## Problem
 Today substitution is silent: a matcher that can't handle a node simply declines, and the operator
