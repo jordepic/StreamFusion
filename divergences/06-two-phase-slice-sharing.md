@@ -37,7 +37,6 @@ partial rather than the whole-window accumulator.
 - Restricted to a slide that divides the size (then slice = slide). Other ratios
   use a finer `gcd` slice with a different window↔slice stepping and fall back.
 - Cumulative windows are also slice-based and two-phase by default; two-phase
-  cumulative is not done yet and falls back (see
-  `.claude/todos/13-two-phase-hopping-slices.md`).
+  cumulative is done the same way (the global fans each slice into its nested windows).
 - Output is identical to the host, verified by the parity harness (window-only
   and keyed, single and multiple aggregates).

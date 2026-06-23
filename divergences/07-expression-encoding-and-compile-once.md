@@ -103,8 +103,8 @@ would just be wrong.
   folding is locale-independent Unicode, but the JVM's `String.toUpperCase()/toLowerCase()` is
   locale-sensitive (e.g. Turkish dotless-i), so non-ASCII results can silently differ. DataFusion
   Comet reached the same conclusion — it routes case conversion through the JVM by default and only
-  uses the native path under an opt-in flag. Until we have that config surface (ticket 09) we fall
-  back rather than ship a silent non-ASCII divergence.
+  uses the native path under an opt-in flag. We do the same: fall back by default, native under the
+  `allowIncompatible` flag, rather than ship a silent non-ASCII divergence.
 - **Transcendental math falls back by default** (opt-in via the flag above): `EXP`/`LN`/`LOG10`/`SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/
   `ATAN`/`POWER`/`SQRT`, which Calcite lowers to `POWER`). These are not IEEE-correctly-rounded, so
   the JVM's `java.lang.Math` (Flink) and DataFusion's Rust libm differ at the last ULP — verified:

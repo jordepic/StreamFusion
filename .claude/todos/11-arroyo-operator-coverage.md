@@ -18,7 +18,7 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       including late elements that bridge two open sessions (ticket 14)
 - [x] Cumulative window (`CUMULATE`) — one-phase; nested windows sharing a start.
       Net-new: Arroyo has no cumulative window (see divergences/05). Two-phase
-      slice-sharing is a follow-up (ticket 13).
+      slice-sharing is done (divergences/06).
 - [ ] Wider value/key types beyond int (ticket 04)
 
 ## Other stateful operators
@@ -41,6 +41,6 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
 - [ ] Native sinks
 
 ## Cross-cutting (do alongside, not after)
-- Acceleration policy / keep chains (ticket 09)
-- Native columnar shuffle (ticket 10)
+- Acceleration config (allowIncompatible / master / per-operator flags) — done (`NativeConfig`)
+- Native columnar shuffle — done (divergences/10)
 - Changelog/retract support (ticket 06) gates the updating aggregations & joins

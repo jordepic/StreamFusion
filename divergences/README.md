@@ -57,6 +57,5 @@ substituted operator *slower* than Flink. Comet keeps *full columnar chains* nat
 only transposes at the native↔host edges; we adopt the same model — operators tagged
 columnar/rowwise, flowing Arrow between columnar ones, transposing only at the boundary —
 supplying the columnar record type and transition insertion ourselves since Flink has no
-columnar framework. See [08](08-columnar-flow-transitions.md) for the mechanism and
-`.claude/todos/21-native-operator-chaining.md` for the plan. It stays a tracked
+columnar framework. See [08](08-columnar-flow-transitions.md) for the mechanism. It is a tracked
 optimization rather than a divergence in *intent*; only the *mechanism* is recorded.
