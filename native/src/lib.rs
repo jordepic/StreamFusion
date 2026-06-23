@@ -2371,6 +2371,15 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
             None, when_then, else_expr,
         ));
     }
+    if op == 58 {
+        // REPLACE(s, from, to): replace every occurrence of `from` with `to`.
+        let mut a = args.into_iter();
+        return datafusion::functions::string::expr_fn::replace(
+            a.next().expect("replace string"),
+            a.next().expect("replace from"),
+            a.next().expect("replace to"),
+        );
+    }
     if op == 55 {
         // SUBSTRING: 2-arg substr(s, pos) or 3-arg substring(s, pos, len). DataFusion's substr
         // yields a Utf8View; cast back to Utf8 so the result is a plain VarChar vector the JVM
@@ -2412,6 +2421,18 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
         51 => datafusion::functions::string::expr_fn::lower(next()),
         52 => datafusion::functions::unicode::expr_fn::character_length(next()),
         54 => datafusion::functions::string::expr_fn::btrim(vec![next()]),
+        56 => datafusion::prelude::Expr::Like(datafusion::logical_expr::Like::new(
+            false,
+            Box::new(next()),
+            Box::new(next()),
+            None,
+            false,
+        )),
+        // REVERSE yields a Utf8View (like substr); cast back to Utf8 for the JVM converter.
+        59 => datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(datafusion::functions::unicode::expr_fn::reverse(next())),
+            DataType::Utf8,
+        )),
         other => panic!("unsupported expression op: {other}"),
     }
 }

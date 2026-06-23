@@ -257,6 +257,19 @@ final class RexExpression {
     if ("SUBSTRING".equalsIgnoreCase(call.getOperator().getName())) {
       return emitSubstring(call.getOperands());
     }
+    if ("REPLACE".equalsIgnoreCase(call.getOperator().getName())) {
+      List<RexNode> args = call.getOperands();
+      if (args.size() != 3) {
+        return reject("REPLACE requires 3 arguments");
+      }
+      add(KIND_CALL, 58, 3);
+      for (RexNode arg : args) {
+        if (!emit(arg)) {
+          return false;
+        }
+      }
+      return true;
+    }
     int fnOp = functionOpCode(call.getOperator().getName());
     if (fnOp >= 0) {
       // The admitted scalar functions are all unary over a single string argument.
@@ -497,6 +510,8 @@ final class RexExpression {
       case "CHAR_LENGTH":
       case "CHARACTER_LENGTH":
         return 52;
+      case "REVERSE":
+        return 59;
       default:
         return -1;
     }
@@ -538,6 +553,8 @@ final class RexExpression {
         return 31;
       case CASE:
         return 40;
+      case LIKE:
+        return 56;
       default:
         return -1;
     }

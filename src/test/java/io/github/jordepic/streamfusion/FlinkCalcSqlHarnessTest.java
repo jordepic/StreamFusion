@@ -227,6 +227,27 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void likeFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT k FROM f WHERE s LIKE '%a%'");
+  }
+
+  @Test
+  void likeProjectionMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT s LIKE 'a%' FROM f");
+  }
+
+  @Test
+  void replaceMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkCalcSqlHarnessTest::spacedStringEnvironment, "SELECT REPLACE(s, ' ', '_') FROM ss");
+  }
+
+  @Test
+  void reverseMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT REVERSE(s) FROM f");
+  }
+
+  @Test
   void explainAnnotatesAFallbackWithItsReason() {
     // explainSql runs the native planner program, so the appended summary names why ABS fell back.
     String explain = NativePlanner.explain(environment(), "SELECT ABS(v) FROM f");
