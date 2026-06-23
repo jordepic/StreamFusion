@@ -572,6 +572,10 @@ final class RexExpression {
         return 61;
       case "ASCII":
         return 67;
+      // Transcendental math (EXP/LN/LOG10/SIN/COS/TAN/ASIN/ACOS/ATAN/POWER/SQRT) is intentionally
+      // absent: it is not IEEE-correctly-rounded, so the JVM's java.lang.Math and DataFusion's Rust
+      // libm differ at the last ULP (verified for TAN/ATAN/ASIN/ACOS). Comet tolerates this; our
+      // byte-exact parity bar does not — see divergences/07.
       default:
         return -1;
     }

@@ -277,6 +277,15 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void transcendentalMathFallsBack() throws Exception {
+    // Transcendental math (here TAN) is not admitted: java.lang.Math (Flink) and Rust libm
+    // (DataFusion) differ at the last ULP since these are not IEEE-correctly-rounded — verified for
+    // TAN/ATAN/ASIN/ACOS. So they fall back rather than risk a silent last-bit divergence.
+    NativeParity.assertFallbackReasonContains(
+        FlinkCalcSqlHarnessTest::doubleEnvironment, "SELECT TAN(d) FROM dd", "TAN");
+  }
+
+  @Test
   void roundFallsBack() throws Exception {
     // ROUND on float/double is NOT admitted. Flink rounds via BigDecimal (HALF_UP), which differs
     // from DataFusion's float-multiply round on input-dependent precision edges; DataFusion Comet

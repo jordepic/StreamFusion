@@ -96,6 +96,14 @@ hot-path finding.
   Comet reached the same conclusion — it routes case conversion through the JVM by default and only
   uses the native path under an opt-in flag. Until we have that config surface (ticket 09) we fall
   back rather than ship a silent non-ASCII divergence.
+- **Transcendental math is *not* admitted** (`EXP`/`LN`/`LOG10`/`SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/
+  `ATAN`/`POWER`/`SQRT`, which Calcite lowers to `POWER`). These are not IEEE-correctly-rounded, so
+  the JVM's `java.lang.Math` (Flink) and DataFusion's Rust libm differ at the last ULP — verified:
+  `TAN`/`ATAN`/`ASIN`/`ACOS` mismatch on sampled values (e.g. `tan` `…2386603` vs `…2386602`).
+  `SIN`/`COS`/`EXP`/`LN`/`POWER` happened to match those samples, but a passing sample is not parity
+  for a last-ULP-divergent family, so the whole family falls back. (Comet ships them as Compatible —
+  it tolerates last-ULP; our byte-exact harness does not. The IEEE-exact ops `+ - * /`, `ABS`,
+  `FLOOR`, `CEIL`, `SIGN` are admitted.)
 - **`ROUND` is *not* admitted** (falls back, asserted by a test). Flink rounds float/double via
   `BigDecimal` (HALF_UP), which operates on the `Double.toString` decimal representation; DataFusion
   rounds with a binary float multiply (`(x·10^n).round()/10^n`). They agree on sampled values but
