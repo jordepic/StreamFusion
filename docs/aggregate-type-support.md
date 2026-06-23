@@ -22,7 +22,7 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 | DOUBLE  | ✓ | ✓ | ✓ | ✓ | ✓ |
 | INT     | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | SMALLINT / TINYINT | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
-| FLOAT (REAL) | ✗ FLOAT≠DOUBLE | ✗ | ✓ | ✓ | ✓ |
+| FLOAT (REAL) | ✓ (custom f32) | ✓ (custom f64→f32) | ✓ | ✓ | ✓ |
 | DECIMAL | ✗ precision rules | ✗ | ✗ | ✗ | ✗ |
 
 Notes / divergences this avoids:
@@ -34,11 +34,12 @@ Notes / divergences this avoids:
   type. We match this for `BIGINT`/`INT`/`SMALLINT`/`TINYINT` with a custom
   accumulator that sums in int64 and casts the truncated result back to the input
   integer type.
-- **SUM/AVG over FLOAT** stays on the host: the host accumulates a float sum at
-  4-byte precision (and avg divides in double then narrows to float), which a
-  native accumulator would have to reproduce bit-for-bit under the same fold
-  order. Deferred until that parity is stress-tested; `MIN`/`MAX`/`COUNT` over
-  float are unaffected (no arithmetic).
+- **SUM/AVG over FLOAT** match with custom accumulators that reproduce the host's
+  precision exactly: `SUM` accumulates in float (4-byte, rounding each step) rather
+  than DataFusion's widening double sum; `AVG` accumulates the sum in double and
+  narrows the quotient to float (as `FloatAvgAggFunction` does). Both fold in the
+  same per-row order as the host, so the result is bit-identical — verified by a
+  parity test over values whose float running sum carries rounding error.
 - **DECIMAL** is excluded entirely (even MIN/MAX): precision/scale derivation and
   the decimal Arrow vector path are not yet built.
 
@@ -59,11 +60,12 @@ result-type coercion lines up with Flink's promotion/wrap behavior on both sides
 Comparisons are width-insensitive and always safe.
 
 ## Status
-- `BIGINT`, `DOUBLE`, and `INT` carry all five aggregates. `SMALLINT` and `TINYINT`
-  carry all five too (`SUM`/`AVG` via custom wrapping/truncating accumulators).
-  `FLOAT` carries `MIN`/`MAX`/`COUNT` (its `SUM`/`AVG` are deferred — see above).
-  The native value path is type-general; each narrow type is an Arrow vector class +
-  getter + a value-type code.
+- Every non-decimal numeric type — `BIGINT`, `DOUBLE`, `INT`, `SMALLINT`, `TINYINT`,
+  `FLOAT` — carries all five aggregates, with custom accumulators where DataFusion
+  would diverge from the host's type/precision (integer `SUM` wraps, integer `AVG`
+  truncates, float `SUM` stays 4-byte, float `AVG` narrows from a double sum, double
+  `AVG` divides in double). The native value path is type-general; each type is an
+  Arrow vector class + getter + a value-type code.
 - `DECIMAL` (all aggregates) stays on the host: precision/scale derivation and the
   decimal Arrow vector path are not yet built.
 - Grouping keys: one or more bigint/int/string/boolean/date keys are supported.

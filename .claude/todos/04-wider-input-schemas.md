@@ -1,7 +1,7 @@
 # Wider input schemas: types, multiple columns, grouping keys
 
-**Status:** partial — wide value types and grouping keys land; multiple value
-columns, `COUNT(*)`, float SUM/AVG, and decimal/timestamp keys remain
+**Status:** partial — all non-decimal numeric value types and wide grouping keys
+land; multiple value columns, `COUNT(*)`, decimal, and decimal/timestamp keys remain
 **Source:** running theme across the operator/matcher work
 
 ## Done
@@ -10,18 +10,15 @@ grouping key in addition to the window (`GROUP BY k, window_start, window_end`),
 matching the host's per-key results and output column order. Multiple aggregates
 per window are supported. The native engine is value-type agnostic; the
 accelerated value types are the parity intersection in
-`docs/aggregate-type-support.md` — all aggregates over bigint/double (both one-
-and two-phase), all aggregates over int/smallint/tinyint (one-phase; `SUM`/`AVG`
-use custom wrapping/truncating accumulators that keep the narrow type, verified at
-the overflow boundary), and `MIN`/`MAX`/`COUNT` over float. Their value column
-rides a narrow Arrow vector decoded by a per-type value-type code. Grouping keys
-may be bigint/int/string/boolean/date (the native key path is type-general, so
-each is a matcher gate + a JVM vector). Remaining below:
+`docs/aggregate-type-support.md` — all aggregates over every non-decimal numeric
+type. Bigint/double are both one- and two-phase; int/smallint/tinyint/float are
+one-phase with custom accumulators that keep the host's type and precision (integer
+wrap/truncate, float 4-byte sum, float/double avg in double), verified at the
+overflow boundary and under float accumulation error. Their value column rides a
+typed Arrow vector decoded by a per-type value-type code. Grouping keys may be
+bigint/int/string/boolean/date (the native key path is type-general, so each is a
+matcher gate + a JVM vector). Remaining below:
 
-- **`SUM`/`AVG` over float:** deferred — the host accumulates a float sum at
-  4-byte precision (and avg divides in double then narrows), which a native
-  accumulator must reproduce bit-for-bit under the same fold order; needs a
-  reordering-sensitive parity stress test before admitting.
 - **DECIMAL value columns (all aggregates):** precision/scale derivation is
   exotic; a matcher gate + a decimal Arrow vector path.
 - **More key types:** decimal/timestamp keys remain (a JVM vector + boxing each;
