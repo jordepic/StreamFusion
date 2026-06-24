@@ -26,13 +26,15 @@ public class RowDataToArrowOperator extends AbstractStreamOperator<ArrowBatch>
 
   private final RowType rowType;
   private final int batchSize;
+  private final boolean carryRowKind;
 
   private transient BufferAllocator allocator;
   private transient List<RowData> buffer;
 
-  public RowDataToArrowOperator(RowType rowType, int batchSize) {
+  public RowDataToArrowOperator(RowType rowType, int batchSize, boolean carryRowKind) {
     this.rowType = rowType;
     this.batchSize = batchSize;
+    this.carryRowKind = carryRowKind;
   }
 
   @Override
@@ -73,7 +75,7 @@ public class RowDataToArrowOperator extends AbstractStreamOperator<ArrowBatch>
     if (buffer.isEmpty()) {
       return;
     }
-    VectorSchemaRoot root = RowDataArrowConverter.write(buffer, rowType, allocator);
+    VectorSchemaRoot root = RowDataArrowConverter.write(buffer, rowType, allocator, carryRowKind);
     output.collect(new StreamRecord<>(new ArrowBatch(root)));
     buffer.clear();
   }
