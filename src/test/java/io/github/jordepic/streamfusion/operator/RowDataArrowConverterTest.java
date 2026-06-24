@@ -28,6 +28,7 @@ import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.flink.table.data.TimestampData;
+import org.apache.flink.types.RowKind;
 import org.junit.jupiter.api.Test;
 
 class RowDataArrowConverterTest {
@@ -85,6 +86,43 @@ class RowDataArrowConverterTest {
         assertEquals(first.getField(c), backFirst.getField(c), "column " + c);
         assertEquals(null, backNulls.getField(c), "null column " + c);
       }
+    }
+  }
+
+  @Test
+  void carriesEveryRowKindWhenRequested() {
+    RowType schema = RowType.of(new LogicalType[] {new IntType()}, new String[] {"a"});
+    RowKind[] kinds = RowKind.values(); // +I, -U, +U, -D — Flink's full four-way changelog
+    List<RowData> rows = new java.util.ArrayList<>();
+    for (int i = 0; i < kinds.length; i++) {
+      GenericRowData row = new GenericRowData(1);
+      row.setRowKind(kinds[i]);
+      row.setField(0, i);
+      rows.add(row);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = RowDataArrowConverter.write(rows, schema, allocator, true)) {
+      List<RowData> back = RowDataArrowConverter.read(root, schema);
+      for (int i = 0; i < kinds.length; i++) {
+        assertEquals(kinds[i], back.get(i).getRowKind(), "kind " + i);
+        assertEquals(i, back.get(i).getInt(0), "value " + i);
+      }
+    }
+  }
+
+  @Test
+  void omitsRowKindColumnByDefault() {
+    RowType schema = RowType.of(new LogicalType[] {new IntType()}, new String[] {"a"});
+    GenericRowData row = new GenericRowData(1);
+    row.setRowKind(RowKind.DELETE);
+    row.setField(0, 7);
+
+    try (BufferAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = RowDataArrowConverter.write(List.of(row), schema, allocator)) {
+      // No hidden column when not requested, and the read defaults to an insert.
+      assertEquals(1, root.getSchema().getFields().size());
+      assertEquals(RowKind.INSERT, RowDataArrowConverter.read(root, schema).get(0).getRowKind());
     }
   }
 
