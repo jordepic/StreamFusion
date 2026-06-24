@@ -176,7 +176,8 @@ transpose (a retract stream is up to ~2× the input rows) outweighs it, and the 
 ([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)) adds to it. It ships for correctness and
 as the changelog foundation that unlocks the retract-consuming operators (the regular updating join
 and streaming Top-N); the path past 1× is a columnar variant
-fed from a columnar source/exchange (no transpose), the same move that put the windowed aggregate and
+([ticket 31](.claude/todos/31-columnar-changelog-operators.md)) fed from a columnar source/exchange
+(no transpose), the same move that put the windowed aggregate and
 `OVER` ahead, and it can be disabled meanwhile with
 `-Dstreamfusion.operator.groupAggregate.enabled=false`. Closing the gap generally is the columnar-flow
 work: keep Arrow across adjacent native operators so the transpose is paid once at the edges, not per
