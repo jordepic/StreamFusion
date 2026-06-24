@@ -52,7 +52,7 @@ public class ParquetArrowSourceFunction extends RichParallelSourceFunction<Arrow
         }
       }
     } finally {
-      Native.closeParquet(handle);
+      Native.closeSource(handle);
     }
   }
 

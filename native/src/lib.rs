@@ -4008,6 +4008,20 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquetW
     sink.close();
 }
 
+/// A native source the JVM pulls one Arrow batch at a time, until the directory is exhausted. The
+/// concrete reader (Parquet, Avro, …) is hidden behind this trait so the file-format readers share
+/// one open/next/close bridge — the bytes are read and decoded directly in the engine, never crossing
+/// into the row world.
+trait BatchSource {
+    fn next_batch(&mut self) -> Option<RecordBatch>;
+}
+
+impl BatchSource for ParquetSource {
+    fn next_batch(&mut self) -> Option<RecordBatch> {
+        self.next()
+    }
+}
+
 /// A reader over a directory of Parquet files, yielding one Arrow batch at a time. Chains each
 /// file's synchronous batch reader in a deterministic (sorted) order — no async stream, so the
 /// handle is sound to hold across JNI calls and pull from one batch per call.
@@ -4182,16 +4196,14 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openParquet<'
         .into_iter()
         .map(|name| name.expect("projection column name was null"))
         .collect();
-    Box::into_raw(Box::new(ParquetSource::open(
-        &dir,
-        projection,
-        subtask as usize,
-        num_subtasks as usize,
-    ))) as jlong
+    let source: Box<dyn BatchSource> =
+        Box::new(ParquetSource::open(&dir, projection, subtask as usize, num_subtasks as usize));
+    Box::into_raw(Box::new(source)) as jlong
 }
 
 /// Exports the next Arrow batch from the source into the consumer-allocated C structs, returning
-/// true if a batch was produced and false once the directory is exhausted.
+/// true if a batch was produced and false once the directory is exhausted. Shared by every native
+/// file source.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextBatch<'local>(
     _env: JNIEnv<'local>,
@@ -4200,8 +4212,8 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextBatch<'lo
     out_array_address: jlong,
     out_schema_address: jlong,
 ) -> jboolean {
-    let source = unsafe { &mut *(handle as *mut ParquetSource) };
-    match source.next() {
+    let source = unsafe { &mut *(handle as *mut Box<dyn BatchSource>) };
+    match source.next_batch() {
         Some(batch) => {
             export_record_batch(batch, out_array_address, out_schema_address);
             1
@@ -4210,15 +4222,15 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextBatch<'lo
     }
 }
 
-/// Releases a Parquet source handle.
+/// Releases a native file source handle.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquet<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSource<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut ParquetSource));
+        drop(Box::from_raw(handle as *mut Box<dyn BatchSource>));
     }
 }
 

@@ -184,7 +184,7 @@ public final class Native {
 
   /**
    * Opens a directory of Parquet files for reading and returns an opaque handle. The handle yields
-   * batches one at a time via {@link #nextBatch} and must be released with {@link #closeParquet}.
+   * batches one at a time via {@link #nextBatch} and must be released with {@link #closeSource}.
    *
    * @param directory directory of Parquet files to read
    * @param projection output column names, in the order the plan expects (honoring projection
@@ -199,15 +199,15 @@ public final class Native {
   /**
    * Exports the next Arrow batch from a source handle into the consumer-allocated C structs.
    *
-   * @param handle a handle from {@link #openParquet}
+   * @param handle a handle from a native file source (e.g. {@link #openParquet})
    * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
    * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
    * @return true if a batch was produced, false once the directory is exhausted
    */
   public static native boolean nextBatch(long handle, long outArrayAddress, long outSchemaAddress);
 
-  /** Releases a Parquet source handle. */
-  public static native void closeParquet(long handle);
+  /** Releases a native file source handle (Parquet, Avro, …). */
+  public static native void closeSource(long handle);
 
   /**
    * Splits a batch the JVM exported by a consistent hash of the {@code keyColumns} into up to {@code
