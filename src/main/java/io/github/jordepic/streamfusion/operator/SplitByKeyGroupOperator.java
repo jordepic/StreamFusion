@@ -6,7 +6,6 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
@@ -36,18 +35,12 @@ public class SplitByKeyGroupOperator extends AbstractStreamOperator<ArrowBatch>
   @Override
   public void open() throws Exception {
     super.open();
-    allocator = new RootAllocator();
-    dictionaries = new CDataDictionaryProvider();
+    allocator = NativeAllocator.SHARED;
+    dictionaries = NativeAllocator.DICTIONARIES;
   }
 
   @Override
   public void close() throws Exception {
-    if (dictionaries != null) {
-      dictionaries.close();
-    }
-    if (allocator != null) {
-      allocator.close();
-    }
     super.close();
   }
 

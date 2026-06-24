@@ -8,7 +8,6 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.util.TransferPair;
@@ -57,8 +56,8 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
   @Override
   public void open() throws Exception {
     super.open();
-    allocator = new RootAllocator();
-    dictionaries = new CDataDictionaryProvider();
+    allocator = NativeAllocator.SHARED;
+    dictionaries = NativeAllocator.DICTIONARIES;
     predicate = Native.createFilterExpression(kinds, payload, childCounts, longs, doubles, strings);
   }
 
@@ -67,12 +66,6 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
     if (predicate != 0) {
       Native.closeFilterExpression(predicate);
       predicate = 0;
-    }
-    if (dictionaries != null) {
-      dictionaries.close();
-    }
-    if (allocator != null) {
-      allocator.close();
     }
     super.close();
   }

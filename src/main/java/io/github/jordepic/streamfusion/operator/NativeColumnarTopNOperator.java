@@ -6,7 +6,6 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.state.ListState;
 import org.apache.flink.api.common.state.ListStateDescriptor;
@@ -75,8 +74,8 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
   @Override
   public void open() throws Exception {
     super.open();
-    allocator = new RootAllocator();
-    dictionaries = new CDataDictionaryProvider();
+    allocator = NativeAllocator.SHARED;
+    dictionaries = NativeAllocator.DICTIONARIES;
   }
 
   @Override
@@ -119,12 +118,6 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
     if (handle != 0) {
       Native.closeTopNRanker(handle);
       handle = 0;
-    }
-    if (dictionaries != null) {
-      dictionaries.close();
-    }
-    if (allocator != null) {
-      allocator.close();
     }
     super.close();
   }

@@ -3,7 +3,6 @@ package io.github.jordepic.streamfusion.operator;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -40,7 +39,7 @@ public class RowDataToArrowOperator extends AbstractStreamOperator<ArrowBatch>
   @Override
   public void open() throws Exception {
     super.open();
-    allocator = new RootAllocator();
+    allocator = NativeAllocator.SHARED;
     buffer = new ArrayList<>(batchSize);
   }
 
@@ -65,9 +64,6 @@ public class RowDataToArrowOperator extends AbstractStreamOperator<ArrowBatch>
 
   @Override
   public void close() throws Exception {
-    if (allocator != null) {
-      allocator.close();
-    }
     super.close();
   }
 

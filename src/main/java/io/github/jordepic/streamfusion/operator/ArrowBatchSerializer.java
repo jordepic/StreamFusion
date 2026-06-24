@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
@@ -26,13 +25,8 @@ import org.apache.flink.core.memory.DataOutputView;
  */
 public final class ArrowBatchSerializer extends TypeSerializer<ArrowBatch> {
 
-  private transient BufferAllocator allocator;
-
   private BufferAllocator allocator() {
-    if (allocator == null) {
-      allocator = new RootAllocator();
-    }
-    return allocator;
+    return NativeAllocator.SHARED;
   }
 
   @Override

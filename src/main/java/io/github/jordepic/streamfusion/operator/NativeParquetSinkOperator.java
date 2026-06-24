@@ -75,7 +75,7 @@ public class NativeParquetSinkOperator extends AbstractStreamOperator<Object>
   @Override
   public void open() throws Exception {
     super.open();
-    dictionaries = new CDataDictionaryProvider();
+    dictionaries = NativeAllocator.DICTIONARIES;
     subtask = getRuntimeContext().getTaskInfo().getIndexOfThisSubtask();
   }
 
@@ -173,9 +173,6 @@ public class NativeParquetSinkOperator extends AbstractStreamOperator<Object>
     // Finalize any open file (a no-op if none) so the handle is freed and the file is well-formed;
     // like the closed files in `uncommitted`, it stays in-progress until a checkpoint commits it.
     closeOpenFile();
-    if (dictionaries != null) {
-      dictionaries.close();
-    }
     super.close();
   }
 
