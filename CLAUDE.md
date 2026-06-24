@@ -43,6 +43,18 @@ We are ripping code out of Arroyo, which itself already uses DataFusion
 We are overriding the planning layer of Flink to use our Arroyo operators
 This allows us to handle incoming records is arrow batches as opposed to using the flink row model
 
+**Native operators are columnar.** Every native operator we add should consume and produce Arrow
+column batches (`ArrowBatch`) — i.e. implement `ColumnarInput`/`ColumnarOutput` — not Flink `RowData`.
+The *only* exceptions are the transpose operators, which exist precisely to bridge the two models at
+the native↔host boundary. The row↔Arrow conversion is paid once at the edges (the transition pass
+inserts a transpose where a columnar operator meets a rowwise host operator), never baked into an
+operator as its input/output type. An operator that takes `RowData` in and emits `RowData` out forces
+a transpose on every batch even inside an all-native chain — pure overhead that keeps it below Flink's
+throughput (see the row-fed benchmark numbers). So: build new operators columnar; if a stateful
+operator is keyed, feed it through the native columnar exchange. The changelog operators (GROUP BY
+aggregate, updating join, Top-N) were built row-fed first for correctness and are the standing
+exception to migrate — see the todos.
+
 The `.claude/research/` directory holds the learnings of previous sessions when looking into other
 repos/techniques. See `.claude/research/flink-arroyo-accelerator-findings.md` for the full architecture
 investigation (planner hook, JNI/Arrow bridge, memory accounting, threading/mailbox model, changelog and

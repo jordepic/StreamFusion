@@ -52,10 +52,14 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (item 1 and the
    ticket 11 operators) before broadening where we read/write.
-3. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators, session
+3. **Columnar changelog operators** (ticket 31): the GROUP BY aggregate, updating join, and Top-N are
+   row-fed (`RowData` in/out, transposing every batch) — violating the *native operators are columnar*
+   principle and the reason they sit below 1×. Give them `ArrowBatch` in/out variants (the native
+   kernels already take Arrow), so a native changelog chain pays no per-operator transpose.
+4. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators, session
    `update` one-row `take` batching. (The `RowData → Arrow` transpose was made row-major + pre-sized,
    ~25% faster; a native decoder was investigated and rejected on benchmark grounds — ticket 28.)
-4. **Nexmark benchmark vs Flink** (ticket 30): run the standard q0–q22 Flink SQL suite native-
+5. **Nexmark benchmark vs Flink** (ticket 30): run the standard q0–q22 Flink SQL suite native-
    substituted vs stock Flink (release), per-query routed-fraction + fallback reasons + throughput
    ratio. Use it as the prioritization engine for both coverage (which queries fall back, and why)
    and perf (which route but trail Flink) — re-run as a regression/impact gate after each change.
