@@ -43,7 +43,7 @@ class TransposeOperatorsTest {
 
     // Declared first so it closes last: its allocator outlives the batches the second harness frees.
     try (OneInputStreamOperatorTestHarness<RowData, ArrowBatch> toArrow =
-            new OneInputStreamOperatorTestHarness<>(new RowDataToArrowOperator(SCHEMA, 2));
+            new OneInputStreamOperatorTestHarness<>(new RowDataToArrowOperator(SCHEMA, 2, false));
         OneInputStreamOperatorTestHarness<ArrowBatch, RowData> toRows =
             new OneInputStreamOperatorTestHarness<>(
                 new ArrowToRowDataOperator(SCHEMA), new ArrowBatchSerializer())) {

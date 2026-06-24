@@ -15,13 +15,19 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 /**
  * Transpose entering a columnar region: a rowwise input becomes Arrow batches. Inserted by the
  * transition pass where a columnar operator consumes from a rowwise one. The logical row type is
- * unchanged — only the physical carrier becomes columnar.
+ * unchanged — only the physical carrier becomes columnar. When the edge carries a changelog,
+ * {@code carryRowKind} keeps each row's {@code RowKind} as a hidden column so the native consumer
+ * sees it (an insert-only edge omits it — every row is an INSERT).
  */
 public class StreamPhysicalRowDataToArrow extends SingleRel
     implements StreamPhysicalRel, ColumnarOutput {
 
-  public StreamPhysicalRowDataToArrow(RelOptCluster cluster, RelTraitSet traitSet, RelNode input) {
+  private final boolean carryRowKind;
+
+  public StreamPhysicalRowDataToArrow(
+      RelOptCluster cluster, RelTraitSet traitSet, RelNode input, boolean carryRowKind) {
     super(cluster, traitSet, input);
+    this.carryRowKind = carryRowKind;
   }
 
   @Override
@@ -36,7 +42,7 @@ public class StreamPhysicalRowDataToArrow extends SingleRel
 
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-    return new StreamPhysicalRowDataToArrow(getCluster(), traitSet, inputs.get(0));
+    return new StreamPhysicalRowDataToArrow(getCluster(), traitSet, inputs.get(0), carryRowKind);
   }
 
   @Override
@@ -45,6 +51,7 @@ public class StreamPhysicalRowDataToArrow extends SingleRel
         ShortcutUtils.unwrapTableConfig(this),
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
-        getRelDetailedDescription());
+        getRelDetailedDescription(),
+        carryRowKind);
   }
 }
