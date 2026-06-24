@@ -120,14 +120,11 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           ParquetSinkMatcher.path(sink));
     }
 
-    // A non-windowed GROUP BY produces a changelog, so it is exempt from the insert-only guard below.
-    // Its input may be insert-only or itself a changelog; the matcher restricts the aggregate set
-    // accordingly (MIN/MAX are only retractable-free over insert-only input).
+    // A non-windowed GROUP BY both emits and consumes a changelog, so it is exempt from the
+    // insert-only guard below — its input may be insert-only or itself a changelog.
     if (current instanceof StreamPhysicalGroupAggregate) {
       StreamPhysicalGroupAggregate agg = (StreamPhysicalGroupAggregate) current;
-      boolean inputInsertOnly =
-          ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0));
-      if (GroupAggregateMatcher.matches(agg, inputInsertOnly)) {
+      if (GroupAggregateMatcher.matches(agg)) {
         if (!NativeConfig.operatorEnabled("groupAggregate")) {
           return noteDisabled(current, "groupAggregate");
         }

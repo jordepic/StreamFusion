@@ -83,12 +83,12 @@ class FlinkGroupAggregateSqlHarnessTest {
   }
 
   @Test
-  void minOverRetractingInputStaysOnHostButMatches() throws Exception {
-    // MIN cannot be retracted incrementally, so the outer aggregate stays on the host while the
-    // inner (insert-only) one still routes — and the result is unchanged.
+  void minMaxOverRetractingInputMatchesHost() throws Exception {
+    // MIN/MAX over a changelog: each retracts via a per-key value multiset, so the outer aggregate
+    // routes natively too (recovering the next extreme when the current one is retracted).
     NativeParity.assertParity(
         FlinkGroupAggregateSqlHarnessTest::environment,
-        "SELECT s, MIN(total) AS mn FROM "
+        "SELECT s, MIN(total) AS mn, MAX(total) AS mx FROM "
             + "(SELECT k, s, SUM(`value`) AS total FROM src GROUP BY k, s) GROUP BY s");
   }
 

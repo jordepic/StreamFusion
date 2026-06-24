@@ -1,9 +1,9 @@
 # Arroyo operator coverage — route everything Arroyo supports
 
 **Status:** open (tracking) — all window aggregates, OVER (subset), event-time INNER
-joins, the non-windowed `GROUP BY` aggregate (changelog emission *and* consumption),
-filter/projection, watermark, shuffle, and Parquet source/sink are done. What remains is
-the other retract-consuming operators (regular joins, Top-N — ticket 06), MIN/MAX retraction,
+joins, the non-windowed `GROUP BY` aggregate (changelog emission *and* consumption, incl.
+MIN/MAX retraction), filter/projection, watermark, shuffle, and Parquet source/sink are done.
+What remains is the other retract-consuming operators (regular joins, Top-N — ticket 06),
 async-gated (lookup join, async UDF — ticket 01), plus OVER/join feature tails.
 **Source:** user direction — "everything Arroyo already supports, routed over"
 
@@ -41,10 +41,9 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       join rather than a direct port. The general per-instant primitive is not ported.
 - [x] Non-windowed group aggregation (`incremental_aggregator.rs`) — emits *and*
       consumes a retract changelog (`+I`/`-U`/`+U`/`-D`, matching the host's per-record
-      `GroupAggFunction`). SUM/COUNT (AVG via the host's SUM/COUNT rewrite) over
-      bigint/int/double retract; MIN/MAX run only over insert-only input. Any
-      converter-supported keys, global aggregation. Remaining: MIN/MAX retraction
-      (per-key value multiset, ticket 06).
+      `GroupAggFunction`). SUM/COUNT/MIN/MAX (AVG via the host's SUM/COUNT rewrite) over
+      bigint/int/double; SUM/COUNT retract a running value, MIN/MAX a per-key value
+      multiset (Arroyo's batch state). Any converter-supported keys, global aggregation.
 - [ ] Regular (non-windowed) join — the updating join with retract; needs ticket 06
       (consuming retractions).
 - [ ] Lookup join (`lookup_join.rs`) — stateless async enrichment against an external
