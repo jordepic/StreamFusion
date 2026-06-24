@@ -2689,6 +2689,168 @@ impl UpdatingJoiner {
     }
 }
 
+/// One ORDER BY column for the Top-N comparator: which column, ascending vs descending, and whether
+/// nulls sort first (independent of direction, as in SQL `NULLS FIRST`/`LAST`).
+struct SortColumn {
+    index: usize,
+    ascending: bool,
+    nulls_first: bool,
+}
+
+/// Orders two rows by the sort columns, returning the first column's decision. Null placement
+/// follows `nulls_first` and is not flipped by `ascending`; the value comparison is.
+fn compare_rows(a: &[ScalarValue], b: &[ScalarValue], sort: &[SortColumn]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::Equal;
+    for s in sort {
+        let (x, y) = (&a[s.index], &b[s.index]);
+        let ord = match (x.is_null(), y.is_null()) {
+            (true, true) => Equal,
+            (true, false) => {
+                if s.nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if s.nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (false, false) => {
+                let c = x.partial_cmp(y).unwrap_or(Equal);
+                if s.ascending {
+                    c
+                } else {
+                    c.reverse()
+                }
+            }
+        };
+        if ord != Equal {
+            return ord;
+        }
+    }
+    Equal
+}
+
+/// Append-only streaming Top-N (`ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) <= N`, rank number
+/// not projected). Per partition it keeps the top `limit` rows sorted by the order keys (ties in
+/// arrival order), exactly the host's append-only bounded buffer. On each input row it inserts into
+/// the buffer; if that overflows the limit it drops the last (rank N+1) — emitting nothing if the
+/// new row is the one dropped, else a DELETE of the displaced row — and otherwise emits the new row
+/// as an INSERT. Output is the input columns (no rank column) plus the `$row_kind$` byte.
+struct TopNRanker {
+    partition_columns: Vec<usize>,
+    sort_columns: Vec<SortColumn>,
+    limit: i64,
+    schema: Option<SchemaRef>,
+    groups: HashMap<GroupKey, Vec<JoinRow>>,
+}
+
+impl TopNRanker {
+    fn new(partition_columns: Vec<usize>, sort_columns: Vec<SortColumn>, limit: i64) -> Self {
+        TopNRanker {
+            partition_columns,
+            sort_columns,
+            limit,
+            schema: None,
+            groups: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let arity = batch.num_columns() - 1;
+        self.schema = Some(UpdatingJoiner::data_schema(batch));
+        let partition_arrays: Vec<&ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+
+        let mut out_rows: Vec<JoinRow> = Vec::new();
+        let mut out_kinds: Vec<i8> = Vec::new();
+
+        for row in 0..batch.num_rows() {
+            let key = read_key(&partition_arrays, row);
+            let full: JoinRow = data_arrays
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, row).expect("top-n row scalar"))
+                .collect();
+            let sort = &self.sort_columns;
+            let buffer = self.groups.entry(key).or_default();
+            // Insert after any rows that order equal-or-before, preserving arrival order for ties.
+            let pos = buffer.partition_point(|r| compare_rows(r, &full, sort) != std::cmp::Ordering::Greater);
+            buffer.insert(pos, full.clone());
+            if buffer.len() as i64 > self.limit {
+                let evicted = buffer.pop().expect("buffer over limit is non-empty");
+                if evicted == full {
+                    continue; // the new row was itself rank N+1 — it never entered the top-N
+                }
+                out_rows.push(evicted);
+                out_kinds.push(3); // -D the displaced row
+            }
+            out_rows.push(full);
+            out_kinds.push(0); // +I the new row
+        }
+        self.emit(out_rows, out_kinds)
+    }
+
+    fn emit(&self, out_rows: Vec<JoinRow>, out_kinds: Vec<i8>) -> RecordBatch {
+        if out_rows.is_empty() {
+            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+        }
+        let schema = self.schema.as_ref().expect("schema set once a row was processed");
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
+        columns.push(Arc::new(Int8Array::from(out_kinds)));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build top-n changelog batch")
+    }
+
+    /// Serializes the buffered rows in per-partition buffer order (partition derivable from the row).
+    fn snapshot(&self) -> Vec<u8> {
+        let Some(schema) = &self.schema else { return Vec::new() };
+        let rows: Vec<&JoinRow> = self.groups.values().flatten().collect();
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("top-n snapshot"))
+    }
+
+    fn restore(
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        bytes: &[u8],
+    ) -> Self {
+        let mut ranker = TopNRanker::new(partition_columns, sort_columns, limit);
+        for batch in read_ipc_if_present(bytes) {
+            ranker.schema = Some(batch.schema());
+            let partition_arrays: Vec<&ArrayRef> =
+                ranker.partition_columns.iter().map(|&i| batch.column(i)).collect();
+            for row in 0..batch.num_rows() {
+                let key = read_key(&partition_arrays, row);
+                let full: JoinRow = (0..batch.num_columns())
+                    .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("top-n scalar"))
+                    .collect();
+                ranker.groups.entry(key).or_default().push(full);
+            }
+        }
+        ranker
+    }
+}
+
 /// One open session for a key: its end (the latest element's timestamp plus the gap) and the
 /// incremental accumulators folding in its rows. The start is the map key that holds it.
 struct Session {
@@ -4736,6 +4898,105 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeUpdating
     }
 }
 
+/// Builds the sort-column comparator config from three parallel arrays (column index, ascending,
+/// nulls-first), as the JVM passes the resolved ORDER BY spec.
+fn read_sort_columns(
+    env: &JNIEnv,
+    indices: &JIntArray,
+    ascending: &JIntArray,
+    nulls_first: &JIntArray,
+) -> Vec<SortColumn> {
+    let indices = read_columns(env, indices);
+    let ascending = read_int_array(env, ascending);
+    let nulls_first = read_int_array(env, nulls_first);
+    indices
+        .into_iter()
+        .enumerate()
+        .map(|(i, index)| SortColumn {
+            index,
+            ascending: ascending[i] != 0,
+            nulls_first: nulls_first[i] != 0,
+        })
+        .collect()
+}
+
+/// Creates an append-only streaming Top-N ranker (`ROW_NUMBER ... <= limit`, no rank-number output)
+/// and returns an opaque handle. The JVM owns it and must release it with the matching close.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    limit: jlong,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    Box::into_raw(Box::new(TopNRanker::new(partitions, sort, limit))) as jlong
+}
+
+/// Folds an input batch into the per-partition top-N and exports the changelog it produces (the
+/// input columns plus `$row_kind$`).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushTopNRanker<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let ranker = unsafe { &mut *(handle as *mut TopNRanker) };
+    let result = ranker.push(&import_record_batch(in_array_address, in_schema_address));
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Serializes the ranker's bounded per-partition buffers for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTopNRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let ranker = unsafe { &mut *(handle as *mut TopNRanker) };
+    env.byte_array_from_slice(&ranker.snapshot())
+        .expect("failed to allocate top-n snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds a Top-N ranker from a snapshot and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    limit: jlong,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read top-n snapshot");
+    Box::into_raw(Box::new(TopNRanker::restore(partitions, sort, limit, &bytes))) as jlong
+}
+
+/// Releases a Top-N ranker handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTopNRanker<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut TopNRanker));
+    }
+}
+
 /// Creates an event-time INNER window joiner and returns an opaque handle. The key/window column
 /// indices locate the equi-join key and the `window_start`/`window_end` columns within each side's
 /// input batch. The JVM owns the handle across calls and must release it with the matching close.
@@ -5372,6 +5633,66 @@ mod tests {
         let out = restored.update(&group_changelog(vec![1], vec![Some(3)], vec![1]));
         assert_eq!(row_kinds(&out), vec![1, 2]); // -U(3), +U(5)
         assert_eq!(values(&out, 1), vec![3, 5]);
+    }
+
+    // A `[p, s, $row_kind$]` insert-only batch (partition p at col 0, sort key s at col 1) for the
+    // Top-N tests.
+    fn topn_batch(p: Vec<i64>, s: Vec<i64>) -> RecordBatch {
+        let kinds = vec![0i8; p.len()];
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("p", DataType::Int64, false),
+                Field::new("s", DataType::Int64, true),
+                Field::new(ROW_KIND_COLUMN, DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(p)),
+                Arc::new(Int64Array::from(s)),
+                Arc::new(Int8Array::from(kinds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn asc(index: usize) -> SortColumn {
+        SortColumn { index, ascending: true, nulls_first: false }
+    }
+
+    // Top-2 by ascending sort key, one partition: a row entering the top-2 inserts and displaces the
+    // current 2nd (a DELETE); a row that would rank 3rd emits nothing.
+    #[test]
+    fn topn_keeps_smallest_n_per_partition() {
+        // partition col 0, ORDER BY col 1 ASC, limit 2.
+        let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2);
+        // s = 5, 3, 8, 1 for partition 1.
+        let out = ranker.push(&topn_batch(vec![1, 1, 1, 1], vec![5, 3, 8, 1]));
+        // 5: +I5. 3: +I3 (top2 = {3,5}). 8: rank 3 -> nothing. 1: +I1, -D5 (top2 = {1,3}).
+        assert_eq!(row_kinds(&out), vec![0, 0, 3, 0]);
+        assert_eq!(values(&out, 1), vec![5, 3, 5, 1]); // the sort-key column of each emitted row
+    }
+
+    // Partitions are independent: each keeps its own top-N.
+    #[test]
+    fn topn_is_per_partition() {
+        let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 1);
+        let out = ranker.push(&topn_batch(vec![1, 2, 1], vec![5, 7, 3]));
+        // p1: +I5; p2: +I7; p1 sees 3 < 5 -> -D5 then +I3 (delete first, as the host emits).
+        assert_eq!(row_kinds(&out), vec![0, 0, 3, 0]);
+        assert_eq!(values(&out, 0), vec![1, 2, 1, 1]); // partition of each emitted row
+        assert_eq!(values(&out, 1), vec![5, 7, 5, 3]);
+    }
+
+    // The bounded buffer survives a checkpoint, so post-restore ranking continues correctly.
+    #[test]
+    fn topn_buffer_survives_snapshot_restore() {
+        let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2);
+        ranker.push(&topn_batch(vec![1, 1], vec![5, 3])); // top2 = {3, 5}
+        let snapshot = ranker.snapshot();
+        let mut restored = TopNRanker::restore(vec![0], vec![asc(1)], 2, &snapshot);
+        // A 1 enters the restored top-2 and displaces the 5.
+        let out = restored.push(&topn_batch(vec![1], vec![1]));
+        assert_eq!(row_kinds(&out), vec![3, 0]); // -D5, +I1
+        assert_eq!(values(&out, 1), vec![5, 1]);
     }
 
     // A `[k, v, $row_kind$]` changelog batch (k join key at col 0) for the updating-join tests.
