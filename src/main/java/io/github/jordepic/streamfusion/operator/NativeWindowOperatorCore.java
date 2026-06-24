@@ -10,7 +10,6 @@ import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import java.math.BigDecimal;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
@@ -207,8 +206,8 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   public void open() throws Exception {
     super.open();
     zone = ZoneId.of(timeZoneId);
-    allocator = new RootAllocator();
-    dictionaries = new CDataDictionaryProvider();
+    allocator = NativeAllocator.SHARED;
+    dictionaries = NativeAllocator.DICTIONARIES;
   }
 
   @Override
@@ -223,12 +222,6 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
     if (handle != 0) {
       closeHandle();
       handle = 0;
-    }
-    if (dictionaries != null) {
-      dictionaries.close();
-    }
-    if (allocator != null) {
-      allocator.close();
     }
     super.close();
   }

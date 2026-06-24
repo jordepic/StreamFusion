@@ -75,12 +75,10 @@ here when the ticket is deleted.
    entirely is the fully-native source (ticket 33).
 
 ## Production-readiness (not yet load-bearing)
-- **Shared FFI allocator** (ticket 34): operators each own a per-operator `RootAllocator` closed at
-  `close()`; follow comet's pattern of one long-lived shared allocator (the file sources already do),
-  since a consumer can outlive a producer's close (the async source proved it). Orthogonal to accounting.
 - **Memory accounting** (ticket 05): native execution memory is not accounted against Flink's
   `MemoryManager`; needs a DataFusion `MemoryPool` with named per-operator consumers bridged to it
-  (comet's model) — distinct from the FFI allocator scope (ticket 34).
+  (comet's model). This is distinct from the FFI Arrow allocator (now one shared, long-lived
+  allocator across all operators, as comet does) — accounting is the pool's job, not the allocator's.
 - **Mailbox threading** (ticket 01): native execution should integrate with the task mailbox
   (non-blocking), not block the task thread.
 

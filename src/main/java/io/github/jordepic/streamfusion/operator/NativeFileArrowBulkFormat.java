@@ -4,10 +4,8 @@ import io.github.jordepic.streamfusion.Native;
 import java.util.List;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
-import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.configuration.Configuration;
@@ -25,22 +23,12 @@ import org.apache.flink.connector.file.src.util.RecordAndPosition;
  * split, and the data is born columnar and never becomes rows. Splittable: a large file is read by
  * several subtasks in parallel, one row-group/stripe range each.
  *
- * <p>Allocator lifetime: a file source's reader runs on a fetcher thread while its emitted batches are
- * consumed later on the task thread, so a batch's off-heap buffers — reference-counted by Arrow — must
- * outlive the reader that produced them. Closing a per-reader (or per-subtask) allocator while a
- * consumer still holds buffers makes Arrow report a false leak. So, exactly as datafusion-comet does,
- * a single long-lived allocator is shared for the whole process; closing a reader frees only its
- * native handle. Batch memory is still reclaimed promptly as each batch's vectors are closed
- * downstream. (Per-operator memory accounting, if added, is a separate DataFusion memory-pool concern,
- * orthogonal to this allocator's scope.)
+ * <p>A file source's reader runs on a fetcher thread while its emitted batches are consumed later on
+ * the task thread, so a batch's off-heap buffers must outlive the reader that produced them; reads go
+ * through the shared {@link NativeAllocator} (never closed during execution), and closing a reader
+ * frees only its native handle.
  */
 abstract class NativeFileArrowBulkFormat implements BulkFormat<ArrowBatch, FileSourceSplit> {
-
-  // One allocator for every native file-source read in this JVM, never closed during execution (see
-  // the class note): emitted batches must outlive the reader, and across subtasks Arrow's allocator is
-  // thread-safe.
-  private static final BufferAllocator ALLOCATOR = new RootAllocator();
-  private static final CDataDictionaryProvider DICTIONARIES = new CDataDictionaryProvider();
 
   // Output columns by name, in plan order (projection pushdown); empty emits every column.
   protected final String[] projection;
@@ -114,13 +102,15 @@ abstract class NativeFileArrowBulkFormat implements BulkFormat<ArrowBatch, FileS
     }
 
     private ArrowBatch readNext() {
-      try (ArrowArray array = ArrowArray.allocateNew(ALLOCATOR);
-          ArrowSchema schema = ArrowSchema.allocateNew(ALLOCATOR)) {
+      BufferAllocator allocator = NativeAllocator.SHARED;
+      try (ArrowArray array = ArrowArray.allocateNew(allocator);
+          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
         if (!Native.nextBatch(handle, array.memoryAddress(), schema.memoryAddress())) {
           return null;
         }
-        VectorSchemaRoot root = Data.importVectorSchemaRoot(ALLOCATOR, array, schema, DICTIONARIES);
-        return new ArrowBatch(adapt(root, ALLOCATOR));
+        VectorSchemaRoot root =
+            Data.importVectorSchemaRoot(allocator, array, schema, NativeAllocator.DICTIONARIES);
+        return new ArrowBatch(adapt(root, allocator));
       }
     }
 
