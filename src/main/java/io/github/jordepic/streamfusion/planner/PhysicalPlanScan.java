@@ -131,16 +131,46 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "groupAggregate");
         }
         substitutions++;
+        int[] kinds = GroupAggregateMatcher.kinds(agg);
+        int[] valueTypes = GroupAggregateMatcher.valueTypeCodes(agg);
+        int[] valueColumns = GroupAggregateMatcher.valueColumns(agg);
+        int[] keyColumns = GroupAggregateMatcher.keyColumns(agg);
+        boolean generateUpdateBefore = GroupAggregateMatcher.generateUpdateBefore(agg);
+        // When the keyed input sits on a columnar producer, keep the shuffle columnar (a native
+        // exchange splits the batch by the grouping keys) and feed a columnar aggregate — the whole
+        // chain flows Arrow with no transpose. Otherwise stay row-fed. Same key co-location argument
+        // as the window aggregate (divergences/10); the aggregate re-groups by key in its own state.
+        RelNode input = agg.getInputs().get(0);
+        if (input instanceof StreamPhysicalExchange
+            && input.getInputs().get(0) instanceof ColumnarOutput) {
+          RelNode columnarExchange =
+              new StreamPhysicalNativeColumnarExchange(
+                  input.getCluster(),
+                  input.getTraitSet(),
+                  input.getInputs().get(0),
+                  input.getRowType(),
+                  keyColumns);
+          return new StreamPhysicalNativeColumnarGroupAggregate(
+              agg.getCluster(),
+              agg.getTraitSet(),
+              columnarExchange,
+              agg.getRowType(),
+              kinds,
+              valueTypes,
+              valueColumns,
+              keyColumns,
+              generateUpdateBefore);
+        }
         return new StreamPhysicalNativeGroupAggregate(
             agg.getCluster(),
             agg.getTraitSet(),
-            agg.getInputs().get(0),
+            input,
             agg.getRowType(),
-            GroupAggregateMatcher.kinds(agg),
-            GroupAggregateMatcher.valueTypeCodes(agg),
-            GroupAggregateMatcher.valueColumns(agg),
-            GroupAggregateMatcher.keyColumns(agg),
-            GroupAggregateMatcher.generateUpdateBefore(agg));
+            kinds,
+            valueTypes,
+            valueColumns,
+            keyColumns,
+            generateUpdateBefore);
       }
     }
 
