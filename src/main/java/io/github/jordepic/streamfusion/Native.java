@@ -474,6 +474,40 @@ public final class Native {
   public static native long restoreUpdatingJoiner(int[] leftKeys, int[] rightKeys, byte[] snapshot);
 
   /**
+   * Creates an append-only streaming Top-N ranker ({@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY
+   * …) <= limit}, rank number not projected). Per partition it keeps the top {@code limit} rows by
+   * the order keys and emits an INSERT for a row entering the top-N and a DELETE for one displaced.
+   * The JVM owns the handle and must release it with {@link #closeTopNRanker}.
+   *
+   * @param partitionColumns PARTITION BY column indices (empty for a single global partition)
+   * @param sortIndices ORDER BY column indices, in order
+   * @param sortAscending per sort column, 1 if ascending else 0
+   * @param sortNullsFirst per sort column, 1 if nulls sort first else 0
+   * @param limit the rank bound N
+   */
+  public static native long createTopNRanker(
+      int[] partitionColumns, int[] sortIndices, int[] sortAscending, int[] sortNullsFirst, long limit);
+
+  /** Pushes an input batch, exporting the top-N changelog (input columns plus the row kind). */
+  public static native void pushTopNRanker(
+      long handle, long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a Top-N ranker handle. */
+  public static native void closeTopNRanker(long handle);
+
+  /** Serializes a Top-N ranker's bounded per-partition buffers for a checkpoint. */
+  public static native byte[] snapshotTopNRanker(long handle);
+
+  /** Rebuilds a Top-N ranker from a snapshot and returns a fresh handle. */
+  public static native long restoreTopNRanker(
+      int[] partitionColumns,
+      int[] sortIndices,
+      int[] sortAscending,
+      int[] sortNullsFirst,
+      long limit,
+      byte[] snapshot);
+
+  /**
    * Creates an event-time INNER window joiner and returns an opaque handle. It buffers both inputs
    * (whose rows carry matching {@code window_start}/{@code window_end} columns assigned upstream) and
    * joins them per window when the watermark closes it. The JVM owns the handle across calls and must
