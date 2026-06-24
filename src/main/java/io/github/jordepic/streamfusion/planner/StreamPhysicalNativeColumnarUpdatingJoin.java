@@ -13,18 +13,20 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * Physical node standing in for a regular (non-windowed) INNER equi-join the native updating join
- * runs. It preserves the replaced node's output type and traits — including its (possibly
- * retracting) changelog mode. Row-fed (not columnar) and needs no watermark: the join fires per
- * record and keeps unbounded keyed state until rows are retracted.
+ * Physical node for the regular (non-windowed) INNER updating join, run by the native joiner. Arrow
+ * batches in on both inputs and out ({@link ColumnarInput} and {@link ColumnarOutput}); each input is
+ * shuffled by its equi-join key (a columnar exchange where the side sits on a columnar producer,
+ * otherwise a transpose at the boundary). It preserves the replaced node's output type and traits —
+ * including its retracting changelog mode — and needs no watermark (unbounded keyed state).
  */
-public class StreamPhysicalNativeUpdatingJoin extends BiRel implements StreamPhysicalRel {
+public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
+    implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
 
   private final RelDataType outputRowType;
   private final int[] leftKeys;
   private final int[] rightKeys;
 
-  public StreamPhysicalNativeUpdatingJoin(
+  public StreamPhysicalNativeColumnarUpdatingJoin(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelNode left,
@@ -50,18 +52,16 @@ public class StreamPhysicalNativeUpdatingJoin extends BiRel implements StreamPhy
 
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-    return new StreamPhysicalNativeUpdatingJoin(
+    return new StreamPhysicalNativeColumnarUpdatingJoin(
         getCluster(), traitSet, inputs.get(0), inputs.get(1), outputRowType, leftKeys, rightKeys);
   }
 
   @Override
   public ExecNode<?> translateToExecNode() {
-    return new NativeUpdatingJoinExecNode(
+    return new NativeColumnarUpdatingJoinExecNode(
         ShortcutUtils.unwrapTableConfig(this),
         InputProperty.DEFAULT,
         InputProperty.DEFAULT,
-        FlinkTypeFactory$.MODULE$.toLogicalRowType(getLeft().getRowType()),
-        FlinkTypeFactory$.MODULE$.toLogicalRowType(getRight().getRowType()),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
         leftKeys,

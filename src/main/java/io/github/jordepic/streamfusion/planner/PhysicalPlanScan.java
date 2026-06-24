@@ -136,46 +136,21 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "groupAggregate");
         }
         substitutions++;
-        int[] kinds = GroupAggregateMatcher.kinds(agg);
-        int[] valueTypes = GroupAggregateMatcher.valueTypeCodes(agg);
-        int[] valueColumns = GroupAggregateMatcher.valueColumns(agg);
         int[] keyColumns = GroupAggregateMatcher.keyColumns(agg);
-        boolean generateUpdateBefore = GroupAggregateMatcher.generateUpdateBefore(agg);
-        // When the keyed input sits on a columnar producer, keep the shuffle columnar (a native
-        // exchange splits the batch by the grouping keys) and feed a columnar aggregate — the whole
-        // chain flows Arrow with no transpose. Otherwise stay row-fed. Same key co-location argument
-        // as the window aggregate (divergences/10); the aggregate re-groups by key in its own state.
-        RelNode input = agg.getInputs().get(0);
-        if (input instanceof StreamPhysicalExchange
-            && input.getInputs().get(0) instanceof ColumnarOutput) {
-          RelNode columnarExchange =
-              new StreamPhysicalNativeColumnarExchange(
-                  input.getCluster(),
-                  input.getTraitSet(),
-                  input.getInputs().get(0),
-                  input.getRowType(),
-                  keyColumns);
-          return new StreamPhysicalNativeColumnarGroupAggregate(
-              agg.getCluster(),
-              agg.getTraitSet(),
-              columnarExchange,
-              agg.getRowType(),
-              kinds,
-              valueTypes,
-              valueColumns,
-              keyColumns,
-              generateUpdateBefore);
-        }
-        return new StreamPhysicalNativeGroupAggregate(
+        // The aggregate is columnar (Arrow in/out). Keep the keyed shuffle columnar where the input
+        // sits on a columnar producer (a native exchange splits the batch by the grouping keys);
+        // otherwise the transition pass inserts a transpose at the host exchange boundary. Same key
+        // co-location argument as the window aggregate (divergences/10).
+        return new StreamPhysicalNativeColumnarGroupAggregate(
             agg.getCluster(),
             agg.getTraitSet(),
-            input,
+            columnarInput(agg.getInputs().get(0), keyColumns),
             agg.getRowType(),
-            kinds,
-            valueTypes,
-            valueColumns,
+            GroupAggregateMatcher.kinds(agg),
+            GroupAggregateMatcher.valueTypeCodes(agg),
+            GroupAggregateMatcher.valueColumns(agg),
             keyColumns,
-            generateUpdateBefore);
+            GroupAggregateMatcher.generateUpdateBefore(agg));
       }
     }
 
@@ -188,14 +163,18 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "updatingJoin");
         }
         substitutions++;
-        return new StreamPhysicalNativeUpdatingJoin(
+        int[] leftKeys = RegularJoinMatcher.leftKeys(join);
+        int[] rightKeys = RegularJoinMatcher.rightKeys(join);
+        // Columnar (Arrow in/out); keep each side's keyed shuffle columnar where it sits on a
+        // columnar producer, else the transition pass transposes at the boundary.
+        return new StreamPhysicalNativeColumnarUpdatingJoin(
             join.getCluster(),
             join.getTraitSet(),
-            join.getInputs().get(0),
-            join.getInputs().get(1),
+            columnarInput(join.getLeft(), leftKeys),
+            columnarInput(join.getRight(), rightKeys),
             join.getRowType(),
-            RegularJoinMatcher.leftKeys(join),
-            RegularJoinMatcher.rightKeys(join));
+            leftKeys,
+            rightKeys);
       }
     }
 
@@ -210,12 +189,15 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "topN");
         }
         substitutions++;
-        return new StreamPhysicalNativeTopN(
+        int[] partitionColumns = TopNMatcher.partitionColumns(rank);
+        // Columnar (Arrow in/out); keep the partitioned shuffle columnar where the input sits on a
+        // columnar producer, else the transition pass transposes at the boundary.
+        return new StreamPhysicalNativeColumnarTopN(
             rank.getCluster(),
             rank.getTraitSet(),
-            rank.getInput(),
+            columnarInput(rank.getInput(), partitionColumns),
             rank.getRowType(),
-            TopNMatcher.partitionColumns(rank),
+            partitionColumns,
             TopNMatcher.sortIndices(rank),
             TopNMatcher.sortAscending(rank),
             TopNMatcher.sortNullsFirst(rank),
@@ -517,8 +499,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         // exchange splits the batch by that side's join key); otherwise the boundary gets a
         // row→Arrow transpose. The join re-groups by key in its own state, so the exchange hash need
         // not match Flink's (divergences/10). The join is always columnar (Arrow pairs out).
-        RelNode left = columnarJoinInput(join.getLeft(), leftKeys);
-        RelNode right = columnarJoinInput(join.getRight(), rightKeys);
+        RelNode left = columnarInput(join.getLeft(), leftKeys);
+        RelNode right = columnarInput(join.getRight(), rightKeys);
         return new StreamPhysicalNativeIntervalJoin(
             join.getCluster(),
             join.getTraitSet(),
@@ -545,8 +527,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] rightKeys = WindowJoinMatcher.rightKeys(join);
         // Shuffle each input by its join key (columnar where it sits on a columnar producer), the
         // same coupling as the interval join. The window join then matches per window in its state.
-        RelNode left = columnarJoinInput(join.getLeft(), leftKeys);
-        RelNode right = columnarJoinInput(join.getRight(), rightKeys);
+        RelNode left = columnarInput(join.getLeft(), leftKeys);
+        RelNode right = columnarInput(join.getRight(), rightKeys);
         return new StreamPhysicalNativeWindowJoin(
             join.getCluster(),
             join.getTraitSet(),
@@ -691,7 +673,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
    * the join key) when it sits on a columnar producer; otherwise returns the input unchanged so the
    * transition pass inserts a transpose at the columnar boundary.
    */
-  private RelNode columnarJoinInput(RelNode input, int[] keyColumns) {
+  private RelNode columnarInput(RelNode input, int[] keyColumns) {
     if (input instanceof StreamPhysicalExchange && input.getInputs().get(0) instanceof ColumnarOutput) {
       return new StreamPhysicalNativeColumnarExchange(
           input.getCluster(),
