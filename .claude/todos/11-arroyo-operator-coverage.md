@@ -44,8 +44,10 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       `GroupAggFunction`). SUM/COUNT/MIN/MAX (AVG via the host's SUM/COUNT rewrite) over
       bigint/int/double; SUM/COUNT retract a running value, MIN/MAX a per-key value
       multiset (Arroyo's batch state). Any converter-supported keys, global aggregation.
-- [ ] Regular (non-windowed) join — the updating join with retract; needs ticket 06
-      (consuming retractions).
+- [x] Regular (non-windowed) join — INNER updating equi-join, emits *and* consumes a
+      changelog. Per-side keyed multiset probed incrementally (native, not DataFusion
+      delegation — divergences/14); INNER only, equi-key, null keys dropped. Remaining:
+      outer/semi/anti, residual non-equi predicate.
 - [ ] Lookup join (`lookup_join.rs`) — stateless async enrichment against an external
       table; uses ticket 01's async pattern, not the synchronous stateful path.
 - [ ] Async UDF (`async_udf.rs`) — async scalar UDF; same async dependency (ticket 01).

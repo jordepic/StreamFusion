@@ -2553,6 +2553,11 @@ impl UpdatingJoiner {
             let kind = row_kinds.value(row);
             let retract = kind == 1 || kind == 3;
             let key = read_key(&key_arrays, row);
+            // INNER equi-join: a null in the join key can never satisfy `a.k = b.k`, so the row
+            // neither joins nor is stored (the host's null-filtering INNER semantics).
+            if key.iter().any(ScalarValue::is_null) {
+                continue;
+            }
             let full: JoinRow = data_arrays
                 .iter()
                 .map(|a| ScalarValue::try_from_array(a, row).expect("join row scalar"))
@@ -5421,6 +5426,42 @@ mod tests {
         let mut right_vs = values(&out, 3);
         right_vs.sort();
         assert_eq!(right_vs, vec![100, 200]);
+    }
+
+    // A null join key never matches (INNER `a.k = b.k` null semantics): the row is neither joined
+    // nor stored.
+    #[test]
+    fn updating_join_drops_null_keys() {
+        let mut joiner = UpdatingJoiner::new(vec![0], vec![0]);
+        // A right row with a null key, then a left row with a null key — no match either way.
+        let right = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, true),
+                Field::new("v", DataType::Int64, true),
+                Field::new(ROW_KIND_COLUMN, DataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(1)])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+        joiner.push(&right, false);
+        // Left null key matches nothing; left key=1 matches the stored right (1, 200).
+        let left = RecordBatch::try_new(
+            right.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(1)])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int8Array::from(vec![0, 0])),
+            ],
+        )
+        .unwrap();
+        let out = joiner.push(&left, true);
+        assert_eq!(out.num_rows(), 1); // only key=1 pair, not the null-key rows
+        assert_eq!(values(&out, 1), vec![20]); // left v
+        assert_eq!(values(&out, 3), vec![200]); // right v
     }
 
     // The per-side multiset survives a checkpoint, so a post-restore arrival still finds its match.

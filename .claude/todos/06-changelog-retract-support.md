@@ -49,10 +49,17 @@
   Append-only input is the same path with no retractions. The insert-only gate on
   the input edge is dropped; all of SUM/MIN/MAX/COUNT work over either input.
 
+- **Changelog consumption — the regular (updating) INNER join.** A per-side keyed
+  multiset probed incrementally per input row (native, not DataFusion delegation —
+  divergences/14); emits one output per match carrying the input row's kind, so it
+  both emits and consumes a changelog. INNER + equi-key; null keys dropped; per-side
+  state checkpointed. Outer/semi/anti and residual non-equi predicates fall back.
+
 ## Remaining
-- **Other retract-*consuming* operators** — regular (non-windowed) joins and
-  streaming Top-N (ticket 11). These are new operators; the `RowKind` plumbing and
-  the retract accumulation pattern they need now exist.
+- **Streaming Top-N** (`ROW_NUMBER`/rank ≤ N, ticket 11) — the last retract-consuming
+  operator. Per-partition sorted state emitting `+I`/`-U`/`+U`/`-D` as the top set
+  changes (RisingWave's `TopNCache`, divergences/14; we hold the full set in memory
+  rather than its three-tier cache).
 
 ## Problem
 Everything so far assumes append-only, insert-only streams. Flink's planner

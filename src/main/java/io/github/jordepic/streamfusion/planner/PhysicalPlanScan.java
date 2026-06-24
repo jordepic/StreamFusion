@@ -10,6 +10,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalE
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
@@ -139,6 +140,26 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             GroupAggregateMatcher.valueColumns(agg),
             GroupAggregateMatcher.keyColumns(agg),
             GroupAggregateMatcher.generateUpdateBefore(agg));
+      }
+    }
+
+    // A regular (non-windowed) join emits a changelog and consumes one on either side, so it is
+    // exempt from the insert-only guard below (like the GROUP BY above).
+    if (current instanceof StreamPhysicalJoin) {
+      StreamPhysicalJoin join = (StreamPhysicalJoin) current;
+      if (RegularJoinMatcher.matches(join)) {
+        if (!NativeConfig.operatorEnabled("updatingJoin")) {
+          return noteDisabled(current, "updatingJoin");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeUpdatingJoin(
+            join.getCluster(),
+            join.getTraitSet(),
+            join.getInputs().get(0),
+            join.getInputs().get(1),
+            join.getRowType(),
+            RegularJoinMatcher.leftKeys(join),
+            RegularJoinMatcher.rightKeys(join));
       }
     }
 
