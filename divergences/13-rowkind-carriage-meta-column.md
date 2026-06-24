@@ -24,6 +24,6 @@ byte-for-byte parity with Flink — which is four-way — the boundary encoding 
 preserve all four kinds. A byte column is the cheapest faithful representation and
 keeps the data schema unchanged (the kind rides alongside, not among, the fields).
 
-This is the representational foundation for native changelog operators (non-windowed
-`GROUP BY` aggregation and regular joins); honoring/emitting the kinds in an operator
-is separate work (ticket 06).
+This is the representational foundation for the native changelog operators that build on it: the
+non-windowed `GROUP BY` aggregate, the regular (updating) INNER join, and append-only streaming
+Top-N all honor and emit these kinds.

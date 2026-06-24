@@ -36,10 +36,14 @@ not in *what computes the join*.
 ## Scope (current limitation, not a divergence of intent)
 INNER only; one or more equi-join keys of supported types (bigint/int/string);
 no residual non-equi predicate beyond the interval/window. Outer/semi/anti joins
-emit nulls on watermark expiry, which needs either null-emitting state or the
-retract path ([06-changelog](../.claude/todos/06-changelog-retract-support.md));
-they fall back to the host until then. Null keys never match — `HashJoinExec` is
-built with `NullEquality::NullEqualsNothing`, matching Flink's `filterNulls`.
+emit nulls on watermark expiry, which needs null-emitting state; they fall back to
+the host until then. Null keys never match — `HashJoinExec` is built with
+`NullEquality::NullEqualsNothing`, matching Flink's `filterNulls`.
+
+The regular (non-windowed) **updating** join takes the opposite implementation
+choice — a keyed multiset probed incrementally rather than a batch hash join — for
+the reason recorded in [divergences/14](14-standalone-streaming-engines.md): a
+changelog join needs per-row retract bookkeeping a batch join can't give.
 
 ## Shared divergences that still apply
 - The per-input keyed shuffle uses our own hash, not Flink's key-group hash

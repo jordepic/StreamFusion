@@ -9,6 +9,12 @@ here when the ticket is deleted.
   tumbling / hopping / session / cumulative window aggregates (one- and two-phase), event-time
   `OVER` aggregation, event-time INNER interval and window joins, Parquet sink (exactly-once),
   Parquet source. Compatibility chart in `readme.md` is the source of truth.
+- **Changelog / retract — done.** `RowKind` crosses the boundary as a four-way byte column
+  (divergences/13), and three operators both emit and consume a retract changelog: the non-windowed
+  `GROUP BY` aggregate (SUM/COUNT/MIN/MAX retract), the regular (updating) INNER equi-join, and
+  append-only streaming Top-N (`ROW_NUMBER`). The streaming engines RisingWave/Proton informed these
+  (divergences/14). Feature tails — outer/semi/anti joins, rank-number / `RANK` / retracting-input
+  Top-N — are tracked in the coverage tracker (ticket 11).
 - **Window aggregate input schemas:** all five aggregates over every non-decimal
   numeric value type (custom accumulators keep the host's type/precision) plus decimal MIN/MAX/COUNT;
   multiple value columns (`SUM(a), SUM(b)`); bigint/int/string/boolean/date/timestamp/decimal grouping
@@ -59,14 +65,12 @@ here when the ticket is deleted.
   against Flink's `MemoryManager`.
 - **Mailbox threading** (ticket 01): native execution should integrate with the task mailbox
   (non-blocking), not block the task thread.
-- **Changelog / retract** (ticket 06): the non-windowed `GROUP BY` aggregate both emits and consumes
-  a retract changelog (SUM/COUNT/MIN/MAX all retract). The other retract-consuming operators — regular
-  joins, Top-N — remain.
 
 ## Breadth / longer horizon
 - **Arroyo operator coverage tracker** (ticket 11): append-only dedup, window Top-N, event-time
-  sort remain; regular joins / streaming Top-N still need their own retract-consuming operators
-  (ticket 06). (Two-phase cumulative windows, event-time joins, and the non-windowed GROUP BY
-  aggregate — emitting *and* consuming a changelog — are now done.)
+  sort remain, plus operator feature tails (outer/semi/anti joins, rank-number / `RANK` /
+  retracting-input Top-N). (Two-phase cumulative windows, event-time joins, the non-windowed GROUP BY
+  aggregate, the regular updating join, and append-only Top-N — emitting *and* consuming a changelog
+  — are now done.)
 - **Fully native Kafka source, no JNI** (back burner): subscribe in Rust, decode Avro→Arrow, only if
   the connector semantics can be lifted from Arroyo.

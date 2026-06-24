@@ -39,17 +39,17 @@ For us it does three things our current benches cannot:
 3. **Feed the backlog.** Distil the report into two lists, each item pointing at the
    query that motivates it:
    - **Coverage gaps** — operators/expressions/types a query needs that we do not yet
-     accelerate (expected: non-windowed GROUP BY and Top-N need retract/changelog
-     [ticket 06]; regular joins need it too; some need `CAST`/functions from
-     [ticket 19]). These prioritize the operator backlog by Nexmark impact.
+     accelerate (non-windowed GROUP BY, regular joins, and append-only Top-N now route via the
+     changelog operators; remaining tails — outer joins, rank-number Top-N — and `CAST`/functions
+     from [ticket 19]). These prioritize the operator backlog by Nexmark impact.
    - **Perf hotspots** — queries that route natively but trail Flink, pointing at the
      hot path to profile next (feeds [ticket 20](20-profiling-and-benchmarks.md): e.g.
      per-row `GroupKey` allocation, the row↔Arrow transpose).
 
 ## Scope / notes
-- Insert-only today, so retract-dependent queries (non-windowed aggregation, Top-N,
-  regular joins) will fall back until [ticket 06] lands — that fallback *is* the signal;
-  do not force them.
+- Changelog operators now exist (non-windowed aggregation, regular INNER joins, append-only
+  Top-N route natively); remaining retract tails (outer joins, rank-number / retracting-input
+  Top-N) still fall back — that fallback *is* the signal; do not force them.
 - The point is the loop, not a one-off number: re-run after each operator/perf change
   and watch the routed-fraction and ratios move. A query that newly routes, or a ratio
   that crosses 1×, is the proof the change mattered (CLAUDE.md: if the benchmark doesn't

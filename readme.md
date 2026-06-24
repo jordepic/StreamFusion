@@ -174,8 +174,8 @@ predicate cannot earn back the `RowData → Arrow → RowData` round-trip; leave
 story at 0.77×**: a per-key `SUM` is cheap, so the input transpose plus the changelog output
 transpose (a retract stream is up to ~2× the input rows) outweighs it, and the per-row key read
 ([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)) adds to it. It ships for correctness and
-as the changelog foundation that unlocks the retract-*consuming* operators
-([ticket 06](.claude/todos/06-changelog-retract-support.md)); the path past 1× is a columnar variant
+as the changelog foundation that unlocks the retract-consuming operators (the regular updating join
+and streaming Top-N); the path past 1× is a columnar variant
 fed from a columnar source/exchange (no transpose), the same move that put the windowed aggregate and
 `OVER` ahead, and it can be disabled meanwhile with
 `-Dstreamfusion.operator.groupAggregate.enabled=false`. Closing the gap generally is the columnar-flow

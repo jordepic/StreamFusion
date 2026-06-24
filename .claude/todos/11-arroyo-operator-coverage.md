@@ -70,4 +70,5 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
 ## Cross-cutting (do alongside, not after)
 - Acceleration config (allowIncompatible / master / per-operator flags) — done (`NativeConfig`)
 - Native columnar shuffle — done (divergences/10)
-- Changelog/retract support (ticket 06) gates the updating aggregations & joins
+- Changelog/retract support — done (`RowKind` carriage + the GROUP BY, updating join, and Top-N
+  emit/consume changelogs; divergences/13, /14)
