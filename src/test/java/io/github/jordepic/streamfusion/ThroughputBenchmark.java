@@ -161,6 +161,79 @@ class ThroughputBenchmark {
         nativeRun, ROWS / nativeRun, flink / nativeRun);
   }
 
+  @Test
+  void groupByColumnarSourceThroughput() throws Exception {
+    // Non-windowed GROUP BY reading a native Parquet source through a native columnar keyed shuffle
+    // into a columnar aggregate — no input transpose, unlike the row-fed groupByThroughput. The
+    // changelog still transposes once at the host sink edge.
+    Path input = Files.createTempDirectory("bench-cgrp-in");
+    writeGroupInput(input);
+    double flink = bestOfGroup(input, false);
+    double nativeRun = bestOfGroup(input, true);
+    System.out.printf(
+        "%n[benchmark] Non-windowed GROUP BY over a columnar Parquet source (SUM per key) over %,d"
+            + " rows (best of %d)%n",
+        ROWS, RUNS);
+    System.out.printf("[benchmark]   Flink : %6.3f s  (%,.0f rows/s)%n", flink, ROWS / flink);
+    System.out.printf(
+        "[benchmark]   Native: %6.3f s  (%,.0f rows/s)  %.2fx vs Flink%n",
+        nativeRun, ROWS / nativeRun, flink / nativeRun);
+  }
+
+  private static double bestOfGroup(Path input, boolean useNative) throws Exception {
+    double best = Double.MAX_VALUE;
+    for (int run = 0; run < WARMUP + RUNS; run++) {
+      double seconds = groupRunOnce(input, useNative);
+      if (run >= WARMUP) {
+        best = Math.min(best, seconds);
+      }
+    }
+    return best;
+  }
+
+  private static double groupRunOnce(Path input, boolean useNative) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "ONE_PHASE");
+    tEnv.executeSql(
+        "CREATE TABLE t (k BIGINT, v BIGINT) WITH ('connector' = 'filesystem', 'path' = '"
+            + input.toUri()
+            + "', 'format' = 'parquet')");
+    tEnv.executeSql(
+        "CREATE TABLE sink (k BIGINT, total BIGINT) WITH ('connector' = 'blackhole')");
+    PhysicalPlanScan scan = useNative ? NativePlanner.install(tEnv) : null;
+    long start = System.nanoTime();
+    tEnv.executeSql("INSERT INTO sink SELECT k, SUM(v) AS total FROM t GROUP BY k").await();
+    double seconds = (System.nanoTime() - start) / 1e9;
+    if (useNative && scan.substitutions() < 2) {
+      throw new IllegalStateException("native source + columnar group aggregate did not engage; moot");
+    }
+    return seconds;
+  }
+
+  private static void writeGroupInput(Path directory) throws Exception {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    env.enableCheckpointing(1000);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    // 1024 keys: after the first pass every row revises an existing key (a -U/+U pair), the
+    // steady-state changelog cost.
+    DataStream<Row> source =
+        env.fromSequence(0, ROWS - 1)
+            .map(i -> Row.of(i % 1024, i))
+            .returns(Types.ROW_NAMED(new String[] {"k", "v"}, Types.LONG, Types.LONG));
+    tEnv.createTemporaryView(
+        "gs",
+        source,
+        Schema.newBuilder().column("k", DataTypes.BIGINT()).column("v", DataTypes.BIGINT()).build());
+    tEnv.executeSql(
+        "CREATE TABLE grp_write (k BIGINT, v BIGINT) WITH ('connector' = 'filesystem', 'path' = '"
+            + directory.toUri()
+            + "', 'format' = 'parquet')");
+    tEnv.executeSql("INSERT INTO grp_write SELECT * FROM gs").await();
+  }
+
   private static double bestOfWindow(Path input, boolean useNative) throws Exception {
     double best = Double.MAX_VALUE;
     for (int run = 0; run < WARMUP + RUNS; run++) {

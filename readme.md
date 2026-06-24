@@ -156,6 +156,7 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 | Tumbling window aggregate (row source) | `SUM` by 1s window | 1.69 M rows/s | 2.10 M rows/s | **1.24×** |
 | Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.23 M rows/s | 2.41 M rows/s | **0.75×** |
 | Non-windowed `GROUP BY` (row source) | `SUM(v) … GROUP BY k`, 1024 keys | 1.73 M rows/s | 1.33 M rows/s | **0.77×** |
+| Non-windowed `GROUP BY` (columnar source) | `SUM(v) … GROUP BY k` from Parquet | 2.03 M rows/s | 1.82 M rows/s | **0.89×** |
 
 The gain tracks how much of the pipeline stays columnar. The **fully-columnar paths lead**:
 the Parquet copy at **4.68×** (read as Arrow, through the native sink, written as Arrow —
@@ -173,12 +174,13 @@ predicate cannot earn back the `RowData → Arrow → RowData` round-trip; leave
 `-Dstreamfusion.operator.filter.enabled=false`. The **row-fed non-windowed `GROUP BY` is the same
 story at 0.77×**: a per-key `SUM` is cheap, so the input transpose plus the changelog output
 transpose (a retract stream is up to ~2× the input rows) outweighs it, and the per-row key read
-([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)) adds to it. It ships for correctness and
-as the changelog foundation that unlocks the retract-consuming operators (the regular updating join
-and streaming Top-N); the path past 1× is a columnar variant
-([ticket 31](.claude/todos/31-columnar-changelog-operators.md)) fed from a columnar source/exchange
-(no transpose), the same move that put the windowed aggregate and
-`OVER` ahead, and it can be disabled meanwhile with
+([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)) adds to it. Its **columnar variant**
+([ticket 31](.claude/todos/31-columnar-changelog-operators.md)), fed Arrow from a Parquet source
+through a native keyed shuffle, removes the input transpose and lifts it to **0.89×** — the same move
+that put the windowed aggregate and `OVER` ahead. It is still short of 1× only because the changelog
+output (up to ~2× rows) still transposes at the host sink edge and the per-row key read
+([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)) remains; a fully-native downstream removes
+that last transpose. The row-fed variant can be disabled meanwhile with
 `-Dstreamfusion.operator.groupAggregate.enabled=false`. Closing the gap generally is the columnar-flow
 work: keep Arrow across adjacent native operators so the transpose is paid once at the edges, not per
 operator ([divergences/08](divergences/08-columnar-flow-transitions.md)).
