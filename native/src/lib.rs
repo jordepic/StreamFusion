@@ -1430,7 +1430,13 @@ impl GroupAggregator {
             }
             let prev = if exists { Some(self.output_values(&key)) } else { None };
             {
-                let state = self.state(key.clone());
+                // Clone the key into the map only when inserting a new group; an existing group
+                // (the steady state) is reached by reference, avoiding a per-row key allocation.
+                let state = if exists {
+                    self.keys.get_mut(&key).expect("key present")
+                } else {
+                    self.state(key.clone())
+                };
                 for i in 0..num_agg {
                     match &value_columns[i] {
                         // COUNT(*): the value is ignored, so any number drives the count.
@@ -5301,6 +5307,24 @@ pub mod bench {
 
         pub fn flush(&mut self, watermark: i64) -> RecordBatch {
             self.0.flush(watermark)
+        }
+    }
+
+    /// A non-windowed GROUP BY aggregator (update emits the changelog), as the operator drives it.
+    pub struct GroupBy(GroupAggregator);
+
+    impl GroupBy {
+        pub fn new(
+            kinds: Vec<i64>,
+            value_types: Vec<i64>,
+            value_columns: Vec<i64>,
+            key_columns: Vec<usize>,
+        ) -> Self {
+            GroupBy(GroupAggregator::new(kinds, value_types, value_columns, key_columns, true))
+        }
+
+        pub fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
+            self.0.update(batch)
         }
     }
 

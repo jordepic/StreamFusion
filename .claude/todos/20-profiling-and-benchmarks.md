@@ -43,10 +43,16 @@ vs. Flink fallback, tracked over time so a regression is visible.
 - **Per-row key allocation.** The aggregator `update` builds a `GroupKey`
   (`Vec<ScalarValue>`, and a `String` per row for string keys) for every row. The
   per-window *clone* is gone (moved into the last window) and the grouping map now uses a
-  fast hash (`ahash`) instead of SipHash, but the per-row `Vec` allocation remains. The
-  keyed bench still costs ~2.4× the unkeyed one; row-format or dictionary-encoded keys are
-  the next target. The same `ahash` swap likely helps the session/partial grouping maps —
-  apply once those have benches.
+  fast hash (`ahash`) instead of SipHash, but the per-row `Vec` allocation remains.
+  - **[done]** The non-windowed `GROUP BY` no longer clones the key per row to reach its
+    group: an existing group (the steady state) is reached by `get_mut`, cloning only when a
+    new group is inserted. ~8% on the string-key micro-bench (`group_by/sum_string_key`,
+    2.00 → 1.85 ms). The same get-vs-insert pattern could be applied to the other keyed
+    operators' update loops.
+  - Remaining: the per-row `read_key` `Vec`/`String` allocation itself. Row-format
+    (`arrow::row::RowConverter`) or dictionary-encoded keys are the next target — biggest win
+    for string/composite keys (a single bigint key barely allocates). The `ahash` swap likely
+    helps the session/partial grouping maps too — apply once those have benches.
 - **[fixed]** `windows_for` allocated a `Vec` per row in the update loop. Reusing one
   buffer across rows cut the tumbling bench ~26% (244 → 181 µs / 17 → 22.6 Melem/s).
 - **Session `update` slices one row at a time.** The session bench

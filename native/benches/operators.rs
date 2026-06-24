@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use streamfusion::bench::{Filter, IntervalJoin, Over, Session, Tumbling, WindowJoin};
@@ -97,6 +97,37 @@ fn bench_tumbling_keyed(c: &mut Criterion) {
                 aggregator.update(black_box(&batch));
                 black_box(aggregator.flush(i64::MAX));
             },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// Non-windowed GROUP BY SUM keyed by a string column: this is the changelog hot loop, and a string
+// key is where the per-row grouping-key allocation hurts most (each key is a heap String).
+fn bench_group_by_string_key(c: &mut Criterion) {
+    use streamfusion::bench::GroupBy;
+    let value: Vec<i64> = (0..ROWS as i64).collect();
+    // 256 distinct keys, so after the first pass every row revises an existing group.
+    let key: Vec<String> = (0..ROWS).map(|i| format!("key-{}", i % 256)).collect();
+    let key_col: ArrayRef = Arc::new(StringArray::from(key));
+    let value_col: ArrayRef = Arc::new(Int64Array::from(value));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key0", DataType::Utf8, false),
+            Field::new("value0", DataType::Int64, true),
+        ])),
+        vec![key_col, value_col],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("group_by");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("sum_string_key", |b| {
+        b.iter_batched(
+            // SUM (kind 0) over value column 1, grouped by string key column 0.
+            || GroupBy::new(vec![0], vec![0], vec![1], vec![0]),
+            |mut aggregator| black_box(aggregator.update(black_box(&batch))),
             BatchSize::SmallInput,
         )
     });
@@ -256,6 +287,7 @@ criterion_group!(
     bench_filter,
     bench_tumbling,
     bench_tumbling_keyed,
+    bench_group_by_string_key,
     bench_session_keyed,
     bench_over,
     bench_interval_join,
