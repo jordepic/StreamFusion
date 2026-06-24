@@ -155,8 +155,8 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 | `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.91 M rows/s | 1.42 M rows/s | **1.56×** |
 | Tumbling window aggregate (row source) | `SUM` by 1s window | 1.69 M rows/s | 2.10 M rows/s | **1.24×** |
 | Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.23 M rows/s | 2.41 M rows/s | **0.75×** |
-| Non-windowed `GROUP BY` (row source) | `SUM(v) … GROUP BY k`, 1024 keys | 1.73 M rows/s | 1.33 M rows/s | **0.77×** |
-| Non-windowed `GROUP BY` (columnar source) | `SUM(v) … GROUP BY k` from Parquet | 2.03 M rows/s | 1.82 M rows/s | **0.89×** |
+| Non-windowed `GROUP BY` (row source) | `SUM(v) … GROUP BY k`, 1024 keys | 2.21 M rows/s | 1.48 M rows/s | **0.67×** |
+| Non-windowed `GROUP BY` (columnar source) | `SUM(v) … GROUP BY k` from Parquet | 2.16 M rows/s | 1.84 M rows/s | **0.85×** |
 
 The gain tracks how much of the pipeline stays columnar. The **fully-columnar paths lead**:
 the Parquet copy at **4.68×** (read as Arrow, through the native sink, written as Arrow —
@@ -172,11 +172,11 @@ converter was made row-major + pre-sized (~25% faster build): `OVER` running `SU
 and tumbling at **1.24×**. The lone **stateless filter remains below 1× at 0.75×** — a single cheap
 predicate cannot earn back the `RowData → Arrow → RowData` round-trip; leave it on the host with
 `-Dstreamfusion.operator.filter.enabled=false`. The **non-windowed `GROUP BY` from a row source is the
-same story at 0.77×**: the operator is columnar, but a row source feeds it through a transpose, and a
-per-key `SUM` is too cheap to earn back that input transpose plus the changelog output transpose (a
-retract stream is up to ~2× the input rows) and the per-row key read
+same story at 0.67×**: the operator is columnar, but a row source feeds it through a transpose (and
+out through another to the host sink), and a per-key `SUM` is too cheap to earn back those transposes
+(a retract stream is up to ~2× the input rows) plus the per-row key read
 ([ticket 20](.claude/todos/20-profiling-and-benchmarks.md)). **From a columnar (Parquet) source through
-a native keyed shuffle the input transpose is gone and it reaches 0.89×** — the same move that put the
+a native keyed shuffle the input transpose is gone and it reaches 0.85×** — the same move that put the
 windowed aggregate and `OVER` ahead. It is still short of 1× only because the changelog output still
 transposes at the host sink edge and the per-row key read remains; a fully-native downstream removes
 that last transpose. It can be disabled meanwhile with
