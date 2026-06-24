@@ -48,6 +48,7 @@ host — verified by the parity harness.
 - [10 — Columnar exchange uses its own hash](10-columnar-exchange-own-hash.md) — the keyed columnar shuffle co-locates each key on a channel with an internal hash, not Flink's key-group hash; safe because the downstream native window re-groups by key in operator state and never uses Flink keyed state.
 - [11 — OVER: incremental accumulators, not a window exec](11-over-incremental-vs-window-exec.md) — running `OVER` and window functions (`ROW_NUMBER`) fold a small per-key state in rowtime order (matching Flink) rather than running a DataFusion/Arroyo window plan over buffered rows; investigation showed Arroyo's per-instant `window_fn` is not cumulative, a batch window exec would need unbounded retention, and DataFusion's incremental window evaluator can't be checkpointed — so own-the-state is the only Flink-parity, bounded path.
 - [12 — Joins delegate the match, own the state](12-joins-delegate-match-own-state.md) — interval/window joins run the match as a DataFusion `HashJoinExec` (aligned with Arroyo) but own buffering + watermark eviction via Flink state (Arroyo uses its own expiring key-time tables); INNER + equi-key scope.
+- [13 — RowKind carriage as a four-way byte column](13-rowkind-carriage-meta-column.md) — a changelog row's `RowKind` rides the Arrow batch as a hidden byte column carrying all four Flink kinds, not Arroyo's two-way `is_retract` flag, so the `-U`/`-D` distinction upsert sinks need survives the boundary (research §6 width gap).
 
 ## Known transitional gap (not yet a deliberate divergence)
 

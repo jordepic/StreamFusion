@@ -27,6 +27,7 @@ import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.types.RowKind;
 
 /**
  * Converts whole {@link RowData} rows of a fixed schema to and from an Arrow {@link
@@ -36,8 +37,18 @@ import org.apache.flink.table.types.logical.TimestampType;
  *
  * <p>Only the column types below are supported; {@link #supports} reports whether a schema is
  * convertible so the planner can fall back otherwise. Nulls are preserved per cell.
+ *
+ * <p>A changelog stream's {@link RowKind} lives as per-row metadata on {@code RowData}, for which
+ * Arrow has no equivalent; to carry it across the boundary it is written as a hidden byte column
+ * ({@link #ROW_KIND_COLUMN}) when requested, and read back onto each row. See divergences/13.
  */
 public final class RowDataArrowConverter {
+
+  /**
+   * Name of the hidden column carrying Flink's four-way {@link RowKind} as a byte. The {@code $}
+   * prefix follows Flink's convention for system columns so it cannot collide with a SQL field.
+   */
+  public static final String ROW_KIND_COLUMN = "$row_kind$";
 
   private RowDataArrowConverter() {}
 
@@ -83,6 +94,15 @@ public final class RowDataArrowConverter {
    */
   public static VectorSchemaRoot write(
       List<RowData> rows, RowType rowType, BufferAllocator allocator) {
+    return write(rows, rowType, allocator, false);
+  }
+
+  /**
+   * As {@link #write(List, RowType, BufferAllocator)}, but when {@code withRowKind} also appends the
+   * {@link #ROW_KIND_COLUMN} so a changelog stream's {@link RowKind} survives the boundary.
+   */
+  public static VectorSchemaRoot write(
+      List<RowData> rows, RowType rowType, BufferAllocator allocator, boolean withRowKind) {
     int rowCount = rows.size();
     int fieldCount = rowType.getFieldCount();
     List<String> names = rowType.getFieldNames();
@@ -102,10 +122,19 @@ public final class RowDataArrowConverter {
         writeCell(vectors[column], types[column], row, column, i);
       }
     }
-    List<FieldVector> columns = new ArrayList<>(fieldCount);
+    List<FieldVector> columns = new ArrayList<>(fieldCount + (withRowKind ? 1 : 0));
     for (FieldVector vector : vectors) {
       vector.setValueCount(rowCount);
       columns.add(vector);
+    }
+    if (withRowKind) {
+      TinyIntVector kinds = new TinyIntVector(ROW_KIND_COLUMN, allocator);
+      kinds.allocateNew(rowCount);
+      for (int i = 0; i < rowCount; i++) {
+        kinds.set(i, rows.get(i).getRowKind().toByteValue());
+      }
+      kinds.setValueCount(rowCount);
+      columns.add(kinds);
     }
     VectorSchemaRoot root = new VectorSchemaRoot(columns);
     root.setRowCount(rowCount);
@@ -121,6 +150,12 @@ public final class RowDataArrowConverter {
     }
     for (int column = 0; column < rowType.getFieldCount(); column++) {
       readColumn(root.getVector(column), rowType.getTypeAt(column), rows, column);
+    }
+    TinyIntVector kinds = (TinyIntVector) root.getVector(ROW_KIND_COLUMN);
+    if (kinds != null) {
+      for (int i = 0; i < rowCount; i++) {
+        rows.get(i).setRowKind(RowKind.fromByteValue(kinds.get(i)));
+      }
     }
     return new ArrayList<>(rows);
   }
