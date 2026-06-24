@@ -61,6 +61,13 @@ here when the ticket is deleted.
    substituted vs stock Flink (release), per-query routed-fraction + fallback reasons + throughput
    ratio. Use it as the prioritization engine for both coverage (which queries fall back, and why)
    and perf (which route but trail Flink) — re-run as a regression/impact gate after each change.
+5. **Native decode-to-Arrow at ingest** (ticket 32): skip the per-record `RowData` materialization on
+   source formats, two source kinds handled differently. **File sources** (JSON/CSV/Avro/ORC files):
+   hand Rust the path, read+decode directly, no JVM round-trip (ParquetSource pattern) — easiest, do
+   first. **Streaming/Kafka:** keep Flink's connector, pay one off-heap copy into a native decode
+   operator (arrow-json/csv/avro share one push API; CDC envelopes → our `$row_kind$` changelog;
+   protobuf via prost-reflect). JSON decode kernel landed (~5.3 Melem/s). Removing the Kafka copy
+   entirely is the fully-native source (ticket 33).
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting** (ticket 05): native `RootAllocator`s per operator are not accounted
@@ -74,5 +81,6 @@ here when the ticket is deleted.
   retracting-input Top-N). (Two-phase cumulative windows, event-time joins, the non-windowed GROUP BY
   aggregate, the regular updating join, and append-only Top-N — emitting *and* consuming a changelog
   — are now done.)
-- **Fully native Kafka source, no JNI** (back burner): subscribe in Rust, decode Avro→Arrow, only if
-  the connector semantics can be lifted from Arroyo.
+- **Fully native Kafka source, no JNI** (ticket 33, back burner): subscribe in Rust, decode →Arrow,
+  lifting the connector semantics (partition/offset/checkpoint/watermark) from Arroyo. Removes the one
+  off-heap copy ticket 32 pays; only worth it once that decode path proves the copy is the bottleneck.
