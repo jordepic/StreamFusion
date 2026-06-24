@@ -1,9 +1,10 @@
 # Arroyo operator coverage — route everything Arroyo supports
 
 **Status:** open (tracking) — all window aggregates, OVER (subset), event-time INNER
-joins, filter/projection, watermark, shuffle, and Parquet source/sink are done. What
-remains is retract-gated (updating aggregation, regular joins — ticket 06) or
-async-gated (lookup join, async UDF — ticket 01), plus OVER/join feature tails.
+joins, the non-windowed `GROUP BY` aggregate (changelog *emission*, append-only input),
+filter/projection, watermark, shuffle, and Parquet source/sink are done. What remains is
+retract-*consuming* (a `GROUP BY` over a changelog source, regular joins, Top-N — ticket 06's
+input half) or async-gated (lookup join, async UDF — ticket 01), plus OVER/join feature tails.
 **Source:** user direction — "everything Arroyo already supports, routed over"
 
 Goal: reach Flink parity (identical results, verified by the parity harness) for
@@ -38,9 +39,14 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
 - [~] Instant join (`instant_join.rs`) — its main use, a windowed equi-join, is covered
       by our window join (INNER, on shared window bounds, divergences/12) via a hash
       join rather than a direct port. The general per-instant primitive is not ported.
-- [ ] Updating (non-windowed) group aggregation (`incremental_aggregator.rs` +
-      `updating_cache.rs`) — emits retractions; needs ticket 06 (changelog/retract).
-- [ ] Regular (non-windowed) join — the updating join with retract; needs ticket 06.
+- [x] Non-windowed group aggregation over an **append-only** input
+      (`incremental_aggregator.rs`) — emits the retract changelog (`+I` then `-U`/`+U`,
+      matching the host's per-record `GroupAggFunction`). SUM/MIN/MAX/COUNT (AVG via
+      the host's SUM/COUNT rewrite) over bigint/int/double, any converter-supported
+      keys, global aggregation. *Consuming* retractions (a `GROUP BY` over a changelog
+      source, the `updating_cache` retract path) still needs ticket 06's input half.
+- [ ] Regular (non-windowed) join — the updating join with retract; needs ticket 06
+      (consuming retractions).
 - [ ] Lookup join (`lookup_join.rs`) — stateless async enrichment against an external
       table; uses ticket 01's async pattern, not the synchronous stateful path.
 - [ ] Async UDF (`async_udf.rs`) — async scalar UDF; same async dependency (ticket 01).

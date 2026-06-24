@@ -8,6 +8,7 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
@@ -117,6 +118,30 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           sink.getInputs().get(0),
           sink.getRowType(),
           ParquetSinkMatcher.path(sink));
+    }
+
+    // A non-windowed GROUP BY produces a changelog, so it is exempt from the insert-only guard below;
+    // it is eligible when its own input is insert-only (append-only), since this first changelog
+    // operator only emits retractions, it does not yet consume them.
+    if (current instanceof StreamPhysicalGroupAggregate) {
+      StreamPhysicalGroupAggregate agg = (StreamPhysicalGroupAggregate) current;
+      if (GroupAggregateMatcher.matches(agg)
+          && ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
+        if (!NativeConfig.operatorEnabled("groupAggregate")) {
+          return noteDisabled(current, "groupAggregate");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeGroupAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            GroupAggregateMatcher.kinds(agg),
+            GroupAggregateMatcher.valueTypeCodes(agg),
+            GroupAggregateMatcher.valueColumns(agg),
+            GroupAggregateMatcher.keyColumns(agg),
+            GroupAggregateMatcher.generateUpdateBefore(agg));
+      }
     }
 
     // Native operators emit insert-only rows; substituting into a retracting or updating stream

@@ -22,22 +22,24 @@
   paths are unchanged). This is the representational foundation every changelog
   operator needs — chosen four-way over Arroyo's two-way `is_retract` to preserve
   the `-U`/`-D` distinction upsert sinks require (divergences/13).
+- **Changelog *emission* — the non-windowed `GROUP BY` aggregate.** The first
+  changelog-emitting operator ships: per-key running state, append-only input,
+  emitting `+I` then `-U`/`+U` per the host's `GroupAggFunction` (per input row, in
+  order; `-U` gated on `generateUpdateBefore`; unchanged result suppressed).
+  SUM/MIN/MAX/COUNT (AVG via the host's SUM/COUNT rewrite) over bigint/int/double,
+  any converter-supported grouping keys, global aggregation, checkpointed. See the
+  readme compatibility row and the `RowKind` carriage above.
 
-## Remaining: emit a changelog from an operator
-The biggest single unlock is **non-windowed `GROUP BY` aggregation** — gated only
-because it *emits* a changelog; its input can be append-only. Build it next as the
-first changelog-emitting operator:
-- Native per-key accumulators (no window/watermark), state snapshot via Arrow IPC
-  into Flink state, synchronous on the mailbox — mirror the window aggregate stack.
-- Replicate Flink's `GroupAggFunction` emission **per input row, in order**: first
-  row for a key → `+I`; later rows → `-U`(prev)+`+U`(new) gated on the planner's
-  `generateUpdateBefore` flag, **suppressed when new == prev** (retention disabled).
-  Not Arroyo's net-per-flush coalescing — parity needs the exact event sequence.
-- Matcher/exec-node/planner wiring for `StreamPhysicalGroupAggregate`; relax the
-  gate for this node's (retracting) output edge while inputs stay insert-only.
-- Parity-gated, benchmarked vs Flink's `GroupAggregate`.
-Then later: honor retracting *input* (read RowKind, native `retract_batch`, the
-`-D` count→0 branch) to unlock regular joins / streaming Top-N.
+## Remaining: *consume* a changelog (honor retracting input)
+Everything above emits retractions from insert-only input. The next half is
+honoring them on **input**:
+- Read the input `RowKind` (now carried) and accumulate with retract — a native
+  `retract_batch` path on the accumulators, and the `-D` (count reaches zero)
+  branch the append-only operator can skip today.
+- Drop the insert-only gate on the input edge once an operator can consume a
+  changelog correctly.
+This unlocks the retract-*consuming* operators: a non-windowed `GROUP BY` over a
+retracting source, regular (non-windowed) joins, and streaming Top-N (ticket 11).
 
 ## Problem
 Everything so far assumes append-only, insert-only streams. Flink's planner
