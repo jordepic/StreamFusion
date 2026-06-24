@@ -1,8 +1,9 @@
 # Non-blocking integration with the task mailbox
 
-**Status:** DECIDED — do what Flink does (stateful operators run synchronously on
-the mailbox). No async bridge for stateful native operators. Kept as a record
-plus the list of operators that will later need non-blocking work.
+**Status:** DECIDED + locked in — stateful operators run synchronously on the mailbox
+(no async bridge), now guarded by a checkpoint-interleaving test. The async pattern's
+only worthwhile unlock is a native columnar source; lookup join / async UDF are
+I/O-bound and don't fit a compute accelerator (see "What the async pattern unlocks").
 
 ## Decision
 Run stateful native operators synchronously on the task (mailbox) thread, with
@@ -79,6 +80,28 @@ design). Revisit only if a native operator needs to block on something other
 than CPU.
 
 ## Follow-ups (if/when we add the above)
-- Lock in the current guarantee with a checkpoint-interleaving test.
+- ✅ **Lock in the current guarantee with a checkpoint-interleaving test.** Done —
+  `NativeWindowAggregateOperatorTest.bufferedInputSurvivesCheckpointMidStream` snapshots
+  with rows still buffered (a barrier landing mid-stream, before the window's watermark),
+  restores into a fresh operator, and confirms the buffered rows survived and combine
+  with post-restore rows. Proves snapshot-flushes-pending + synchronous-mailbox loses
+  nothing across a checkpoint.
 - Source-operator availability-future bridge (separate ticket when we add a
   native source).
+
+## What the async pattern actually unlocks — and whether it's worth building
+Ticket 1's `AsyncWaitOperator` pattern would enable three Arroyo operators. They are
+**not** equally worth building for a *compute* accelerator:
+
+- **Native columnar source** (availability futures) — **worth it.** A columnar source
+  feeds a fully-native pipeline (no input transpose) and is throughput-relevant. This is
+  the valuable async-gated work; it overlaps [ticket 24](24-columnar-endpoints-beyond-local-parquet.md).
+- **Lookup join** (`lookup_join.rs`) and **async UDF** (`async_udf.rs`) — **low value,
+  likely not worth building.** Both are *I/O-bound*: the lookup hits a JVM
+  `LookupTableSource` (JDBC/HBase/…) and the async UDF calls an external function — the
+  bottleneck is the external call, not row compute, and that I/O **cannot** move to Rust
+  (it's a JVM connector). A "native" version would transpose RowData↔Arrow around a join
+  concat / function call with no columnar compute to accelerate — pure overhead for zero
+  throughput gain. By the project's own bar ("if benchmarks don't improve, reconsider the
+  feature"), these should stay on the host. Build only if a concrete reason appears
+  (e.g. the probe side carries heavy native compute that dominates the I/O).

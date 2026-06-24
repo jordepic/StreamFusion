@@ -1,9 +1,11 @@
 package io.github.jordepic.streamfusion.operator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
@@ -13,6 +15,42 @@ import org.apache.flink.table.data.TimestampData;
 import org.junit.jupiter.api.Test;
 
 class NativeWindowAggregateOperatorTest {
+
+  private static NativeWindowAggregateOperator operator() {
+    // No grouping key; UTC so emitted window bounds stay on the epoch millis asserted here.
+    return new NativeWindowAggregateOperator(
+        false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0},
+        new int[] {0}, "UTC", 8);
+  }
+
+  // The mailbox decision (ticket 01): native compute runs synchronously on the task thread and a
+  // checkpoint flushes buffered input into the snapshot, so a barrier landing mid-stream — between
+  // elements, before the window's watermark — loses nothing. Rows buffered when the snapshot is
+  // taken must survive restore and combine with post-restore rows in the same window.
+  @Test
+  void bufferedInputSurvivesCheckpointMidStream() throws Exception {
+    OperatorSubtaskState snapshot;
+    try (OneInputStreamOperatorTestHarness<RowData, RowData> harness =
+        new OneInputStreamOperatorTestHarness<>(operator())) {
+      harness.open();
+      // Two rows in window [0, 1000); fewer than the batch size, so they stay buffered (unflushed).
+      harness.processElement(new StreamRecord<>(event(1, 0)));
+      harness.processElement(new StreamRecord<>(event(2, 500)));
+      // Checkpoint mid-stream, before any watermark closes the window.
+      snapshot = harness.snapshot(1L, 1L);
+      assertTrue(collect(harness).isEmpty(), "no window closed yet, so nothing should be emitted");
+    }
+
+    // A fresh operator restores from the snapshot and continues; the buffered rows must be present.
+    try (OneInputStreamOperatorTestHarness<RowData, RowData> restored =
+        new OneInputStreamOperatorTestHarness<>(operator())) {
+      restored.initializeState(snapshot);
+      restored.open();
+      restored.processElement(new StreamRecord<>(event(3, 600))); // same window, after restore
+      restored.processWatermark(new Watermark(1000));
+      assertEquals(List.of(row(6, 0, 1000)), collect(restored)); // 1 + 2 (pre-checkpoint) + 3
+    }
+  }
 
   // Input schema [value, rt]; output schema [total, window_start, window_end].
   @Test
