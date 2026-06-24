@@ -150,7 +150,7 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
-| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.35 M rows/s | 6.34 M rows/s | **4.68×** |
+| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.32 M rows/s | 6.54 M rows/s | **4.97×** |
 | Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.23 M rows/s | 2.76 M rows/s | **2.24×** |
 | Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.80 M rows/s | 3.29 M rows/s | **1.82×** |
 | Interval join (event-time) | `a JOIN b ON a.k=b.k AND a.rt BETWEEN b.rt ± 1s` | 0.37 M rows/s | 0.63 M rows/s | **1.71×** |
@@ -161,7 +161,7 @@ gives misleading numbers — see [docs/benchmarks.md](docs/benchmarks.md)).
 | Non-windowed `GROUP BY` (columnar source) | `SUM(v) … GROUP BY k` from Parquet | 2.16 M rows/s | 1.84 M rows/s | **0.85×** |
 
 The gain tracks how much of the pipeline stays columnar. The **fully-columnar paths lead**:
-the Parquet copy at **4.68×** (read as Arrow, through the native sink, written as Arrow —
+the Parquet copy at **4.97×** (read as Arrow, through the native sink, written as Arrow —
 never `RowData`, while Flink round-trips every row at both ends), the windowed aggregate over
 a columnar source at **1.82×** (the whole source → watermark assigner → keyed shuffle →
 local/global window pipeline stays Arrow), and the event-time **interval join at 1.71×** (Flink's
