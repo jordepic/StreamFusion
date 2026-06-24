@@ -43,14 +43,13 @@
   accumulate (`+I`/`+U`) or retract (`-U`/`-D`); `SUM`/`COUNT` retract (subtract /
   decrement), a per-key record count drives the `-D` delete when it reaches zero,
   and a per-aggregate non-null count makes a fully-retracted `SUM` report `NULL`
-  (the host's sum-with-retract). Append-only input is the same path with no
-  retractions. The insert-only gate on its input edge is dropped; `MIN`/`MAX` are
-  admitted only over insert-only input (they can't be retracted incrementally).
+  (the host's sum-with-retract). `MIN`/`MAX` retract via a per-key value→count
+  multiset (Arroyo's "Batch" state; Flink's `*WithRetractAccumulator` `MapView`)
+  that recovers the next extreme — checkpointed as a side table per aggregate.
+  Append-only input is the same path with no retractions. The insert-only gate on
+  the input edge is dropped; all of SUM/MIN/MAX/COUNT work over either input.
 
 ## Remaining
-- **`MIN`/`MAX` over a retracting input** — needs a per-key value→count multiset
-  (Arroyo's "Batch" state; Flink's `Max/MinWithRetractAccumulator` uses a `MapView`)
-  to recompute the extreme after a retraction. Today they fall back over a changelog.
 - **Other retract-*consuming* operators** — regular (non-windowed) joins and
   streaming Top-N (ticket 11). These are new operators; the `RowKind` plumbing and
   the retract accumulation pattern they need now exist.

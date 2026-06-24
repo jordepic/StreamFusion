@@ -545,6 +545,11 @@ fn scalars_to_array(scalars: Vec<ScalarValue>, data_type: &DataType) -> ArrayRef
     }
 }
 
+/// A typed NULL scalar of the given type (the value an aggregate reports when it has no live input).
+fn null_scalar(data_type: &DataType) -> ScalarValue {
+    ScalarValue::try_from(data_type).expect("null scalar of type")
+}
+
 /// One open aligned window: its start, plus the per-key accumulators folding in matching rows. The
 /// owning map keys windows by their *end*, which is unique even for cumulative windows that share a
 /// start, so the start is carried here.
@@ -1175,27 +1180,142 @@ impl OverAggregator {
 /// (must match the JVM converter's column name). See divergences/13.
 const ROW_KIND_COLUMN: &str = "$row_kind$";
 
-/// Per-key state for a `GROUP BY` group: the running aggregates, their per-aggregate non-null input
-/// counts (so a SUM whose last non-null value is retracted reports NULL, as the host does), and the
-/// live record count (reaching zero deletes the group).
+/// Total ordering over f64 so a MIN/MAX value multiset can be a `BTreeMap` (floats compared by
+/// `total_cmp`); a given aggregate's column has no NaN in practice, so the tie-break is moot.
+#[derive(Clone, Copy, PartialEq)]
+struct OrdF64(f64);
+impl Eq for OrdF64 {}
+impl PartialOrd for OrdF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrdF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// A MIN/MAX value used as an ordered multiset key. Each aggregate only ever stores one variant (its
+/// fixed value type), so the derived cross-variant ordering is never exercised.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum MinMaxKey {
+    I64(i64),
+    I32(i32),
+    F64(OrdF64),
+}
+
+impl MinMaxKey {
+    fn of(num: Num) -> Self {
+        match num {
+            Num::I64(v) => MinMaxKey::I64(v),
+            Num::I32(v) => MinMaxKey::I32(v),
+            Num::F64(v) => MinMaxKey::F64(OrdF64(v)),
+        }
+    }
+
+    fn from_scalar(scalar: &ScalarValue) -> Self {
+        match scalar {
+            ScalarValue::Int64(Some(v)) => MinMaxKey::I64(*v),
+            ScalarValue::Int32(Some(v)) => MinMaxKey::I32(*v),
+            ScalarValue::Float64(Some(v)) => MinMaxKey::F64(OrdF64(*v)),
+            other => panic!("unexpected MIN/MAX value scalar: {other:?}"),
+        }
+    }
+
+    fn scalar(&self) -> ScalarValue {
+        match self {
+            MinMaxKey::I64(v) => ScalarValue::Int64(Some(*v)),
+            MinMaxKey::I32(v) => ScalarValue::Int32(Some(*v)),
+            MinMaxKey::F64(v) => ScalarValue::Float64(Some(v.0)),
+        }
+    }
+}
+
+/// Per-(key, aggregate) state. SUM and COUNT fold/retract a single running value (SUM also keeps a
+/// non-null count so it reports NULL once fully retracted). MIN/MAX cannot be retracted from a single
+/// value, so they keep a value→count multiset and read the extreme off its ends — what makes them
+/// retractable (Flink's `*WithRetractAccumulator` uses a `MapView`; Arroyo calls this the batch state).
+enum GroupAggState {
+    Running { agg: RunningAgg, non_null: i64 },
+    Extremes { is_min: bool, counts: BTreeMap<MinMaxKey, i64> },
+}
+
+impl GroupAggState {
+    fn new(kind: i64, value_type: &DataType) -> Self {
+        match kind {
+            1 => GroupAggState::Extremes { is_min: true, counts: BTreeMap::new() }, // MIN
+            2 => GroupAggState::Extremes { is_min: false, counts: BTreeMap::new() }, // MAX
+            _ => GroupAggState::Running { agg: RunningAgg::new(kind, value_type), non_null: 0 },
+        }
+    }
+
+    fn accumulate(&mut self, value: Num) {
+        match self {
+            GroupAggState::Running { agg, non_null } => {
+                agg.fold(value);
+                *non_null += 1;
+            }
+            GroupAggState::Extremes { counts, .. } => {
+                *counts.entry(MinMaxKey::of(value)).or_insert(0) += 1;
+            }
+        }
+    }
+
+    fn retract(&mut self, value: Num) {
+        match self {
+            GroupAggState::Running { agg, non_null } => {
+                agg.retract(value);
+                *non_null -= 1;
+            }
+            GroupAggState::Extremes { counts, .. } => {
+                let key = MinMaxKey::of(value);
+                if let Some(count) = counts.get_mut(&key) {
+                    *count -= 1;
+                    if *count <= 0 {
+                        counts.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The current output value; SUM and MIN/MAX report NULL when they hold no live non-null input.
+    fn emit(&self, result_type: &DataType) -> ScalarValue {
+        match self {
+            GroupAggState::Running { agg, non_null } => match agg {
+                RunningAgg::Count(_) => agg.emit(),
+                _ if *non_null == 0 => null_scalar(result_type),
+                _ => agg.emit(),
+            },
+            GroupAggState::Extremes { is_min, counts } => {
+                let extreme = if *is_min { counts.keys().next() } else { counts.keys().next_back() };
+                extreme.map_or_else(|| null_scalar(result_type), MinMaxKey::scalar)
+            }
+        }
+    }
+}
+
+/// Per-key state for a `GROUP BY` group: the per-aggregate state and the live record count (reaching
+/// zero deletes the group).
 struct GroupKeyState {
-    aggs: Vec<RunningAgg>,
-    non_null: Vec<i64>,
+    aggs: Vec<GroupAggState>,
     records: i64,
 }
 
-/// Non-windowed `GROUP BY` aggregation over a changelog. Holds per-key running state — no windows,
-/// no watermark — and processes a batch in input order like the host's per-record aggregate, so the
+/// Non-windowed `GROUP BY` aggregation over a changelog. Holds per-key state — no windows, no
+/// watermark — and processes a batch in input order like the host's per-record aggregate, so the
 /// emitted change sequence matches byte for byte. Each row's `RowKind` (carried on `$row_kind$`)
 /// selects accumulate (`+I`/`+U`) or retract (`-U`/`-D`); a key's first row inserts, a result change
 /// retracts the previous value then appends the new (the `-U` gated on `generate_update_before`, an
-/// unchanged result suppressed), and a key whose record count reaches zero is deleted (`-D`). Input
-/// may be append-only (then every row accumulates and no group is ever deleted) — the same path.
-/// SUM/COUNT are retractable; MIN/MAX accumulate only and are admitted only over insert-only input.
-/// The emitted batch is `[key0.., result0..]` plus the `$row_kind$` byte column.
+/// unchanged result suppressed), and a key whose record count reaches zero is deleted (`-D`). An
+/// append-only input is the same path with no retractions. SUM/COUNT retract a running value; MIN/MAX
+/// retract by keeping a per-key value multiset. The emitted batch is `[key0.., result0..]` plus the
+/// `$row_kind$` byte column.
 struct GroupAggregator {
     kinds: Vec<i64>,
     value_types: Vec<DataType>,
+    result_types: Vec<DataType>,
     value_columns: Vec<i64>,
     key_columns: Vec<usize>,
     generate_update_before: bool,
@@ -1211,9 +1331,16 @@ impl GroupAggregator {
         key_columns: Vec<usize>,
         generate_update_before: bool,
     ) -> Self {
+        let value_types: Vec<DataType> = value_types.iter().map(|&code| value_data_type(code)).collect();
+        let result_types = kinds
+            .iter()
+            .zip(&value_types)
+            .map(|(&kind, vt)| RunningAgg::new(kind, vt).result_type())
+            .collect();
         GroupAggregator {
-            value_types: value_types.iter().map(|&code| value_data_type(code)).collect(),
             kinds,
+            value_types,
+            result_types,
             value_columns,
             key_columns,
             generate_update_before,
@@ -1225,37 +1352,16 @@ impl GroupAggregator {
     /// The per-key state, created (empty) on first touch.
     fn state(&mut self, key: GroupKey) -> &mut GroupKeyState {
         let (kinds, value_types) = (&self.kinds, &self.value_types);
-        let num_agg = kinds.len();
         self.keys.entry(key).or_insert_with(|| GroupKeyState {
-            aggs: kinds.iter().zip(value_types).map(|(&kind, vt)| RunningAgg::new(kind, vt)).collect(),
-            non_null: vec![0; num_agg],
+            aggs: kinds.iter().zip(value_types).map(|(&kind, vt)| GroupAggState::new(kind, vt)).collect(),
             records: 0,
         })
     }
 
-    fn result_types(&self) -> Vec<DataType> {
-        self.kinds
-            .iter()
-            .zip(&self.value_types)
-            .map(|(&kind, vt)| RunningAgg::new(kind, vt).result_type())
-            .collect()
-    }
-
-    /// A key's current output tuple. SUM reports NULL while it has no non-null contributions (the
-    /// host's sum-with-retract); every other aggregate reports its running value directly.
+    /// A key's current output tuple (each aggregate reports NULL while it has no live input).
     fn output_values(&self, key: &GroupKey) -> Vec<ScalarValue> {
         let state = self.keys.get(key).expect("key present");
-        self.kinds
-            .iter()
-            .enumerate()
-            .map(|(i, &kind)| {
-                if kind == 0 && state.non_null[i] == 0 {
-                    ScalarValue::try_from(&state.aggs[i].result_type()).expect("null scalar")
-                } else {
-                    state.aggs[i].emit()
-                }
-            })
-            .collect()
+        state.aggs.iter().zip(&self.result_types).map(|(agg, rt)| agg.emit(rt)).collect()
     }
 
     /// Folds the batch's rows into per-key state in input order, honoring each row's `RowKind`, and
@@ -1318,21 +1424,20 @@ impl GroupAggregator {
                 let state = self.state(key.clone());
                 for i in 0..num_agg {
                     match &value_columns[i] {
+                        // COUNT(*): the value is ignored, so any number drives the count.
                         None => {
                             if retract {
                                 state.aggs[i].retract(Num::I64(0));
                             } else {
-                                state.aggs[i].fold(Num::I64(0));
+                                state.aggs[i].accumulate(Num::I64(0));
                             }
                         }
                         Some(column) => {
                             if let Some(num) = column.at(row) {
                                 if retract {
                                     state.aggs[i].retract(num);
-                                    state.non_null[i] -= 1;
                                 } else {
-                                    state.aggs[i].fold(num);
-                                    state.non_null[i] += 1;
+                                    state.aggs[i].accumulate(num);
                                 }
                             }
                         }
@@ -1361,10 +1466,9 @@ impl GroupAggregator {
         }
         drop(push);
 
-        let result_types = self.result_types();
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&out_keys, &self.key_types);
-        for (i, rt) in result_types.iter().enumerate() {
+        for (i, rt) in self.result_types.iter().enumerate() {
             fields.push(Field::new(format!("result{i}"), rt.clone(), true));
             columns.push(scalars_to_array(std::mem::take(&mut out_results[i]), rt));
         }
@@ -1374,38 +1478,64 @@ impl GroupAggregator {
             .expect("failed to build group-by changelog batch")
     }
 
-    /// Serializes per-key state: `[key0.., records, state0, nonnull0, …]`, one row per key. The raw
-    /// running value (not the NULL-gated output) plus the non-null count and record count are exactly
-    /// what restore needs to resume.
+    /// Serializes per-key state. A main batch carries `[key0.., records, state{i}, nonnull{i}…]` (the
+    /// raw running value and non-null count for SUM/COUNT; a NULL placeholder for MIN/MAX), and a side
+    /// batch per MIN/MAX aggregate carries its `[key0.., value, count]` multiset rows.
     fn snapshot(&mut self) -> Vec<u8> {
-        let result_types = self.result_types();
         let num_agg = self.kinds.len();
         let mut keys: Vec<GroupKey> = Vec::new();
         let mut records: Vec<i64> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut non_null_columns: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
+        let mut multiset_keys: Vec<Vec<GroupKey>> = vec![Vec::new(); num_agg];
+        let mut multiset_values: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
+        let mut multiset_counts: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
         for (key, state) in self.keys.iter() {
             keys.push(key.clone());
             records.push(state.records);
             for i in 0..num_agg {
-                state_columns[i].push(state.aggs[i].emit());
-                non_null_columns[i].push(state.non_null[i]);
+                match &state.aggs[i] {
+                    GroupAggState::Running { agg, non_null } => {
+                        state_columns[i].push(agg.emit());
+                        non_null_columns[i].push(*non_null);
+                    }
+                    GroupAggState::Extremes { counts, .. } => {
+                        state_columns[i].push(null_scalar(&self.result_types[i]));
+                        non_null_columns[i].push(0);
+                        for (value, count) in counts.iter() {
+                            multiset_keys[i].push(key.clone());
+                            multiset_values[i].push(value.scalar());
+                            multiset_counts[i].push(*count);
+                        }
+                    }
+                }
             }
         }
+
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&keys, &self.key_types);
         fields.push(Field::new("records", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(records)));
         for i in 0..num_agg {
-            fields.push(Field::new(format!("state{i}"), result_types[i].clone(), true));
-            columns.push(scalars_to_array(std::mem::take(&mut state_columns[i]), &result_types[i]));
+            fields.push(Field::new(format!("state{i}"), self.result_types[i].clone(), true));
+            columns.push(scalars_to_array(std::mem::take(&mut state_columns[i]), &self.result_types[i]));
             fields.push(Field::new(format!("nonnull{i}"), DataType::Int64, false));
             columns.push(Arc::new(Int64Array::from(std::mem::take(&mut non_null_columns[i]))));
         }
-        write_ipc(
-            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                .expect("failed to build group-by snapshot batch"),
-        )
+        let mut batches =
+            vec![RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("main snapshot")];
+        for i in 0..num_agg {
+            if matches!(self.kinds[i], 1 | 2) {
+                let mut f = key_fields(&self.key_types);
+                let mut c = key_columns(&multiset_keys[i], &self.key_types);
+                f.push(Field::new("value", self.result_types[i].clone(), true));
+                c.push(scalars_to_array(std::mem::take(&mut multiset_values[i]), &self.result_types[i]));
+                f.push(Field::new("count", DataType::Int64, false));
+                c.push(Arc::new(Int64Array::from(std::mem::take(&mut multiset_counts[i]))));
+                batches.push(RecordBatch::try_new(Arc::new(Schema::new(f)), c).expect("multiset snapshot"));
+            }
+        }
+        write_framed(&batches)
     }
 
     fn restore(
@@ -1419,26 +1549,53 @@ impl GroupAggregator {
         let mut aggregator =
             GroupAggregator::new(kinds, value_types, value_columns, key_columns, generate_update_before);
         let num_agg = aggregator.kinds.len();
-        for batch in read_ipc(bytes) {
-            // Columns: key0.., records, then (state, nonnull) per aggregate.
-            let arity = batch.num_columns() - 1 - 2 * num_agg;
-            let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
-            aggregator.key_types = key_types(&key_arrays);
-            let records = column_i64(&batch, "records");
-            for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
-                let state = aggregator.state(key);
-                state.records = records.value(row);
-                for i in 0..num_agg {
-                    let scalar = ScalarValue::try_from_array(batch.column(arity + 1 + 2 * i), row)
+        let batches = read_framed(bytes);
+        if batches.is_empty() {
+            return aggregator;
+        }
+        // Main batch: key0.., records, then (state, nonnull) per aggregate.
+        let main = &batches[0];
+        let arity = main.num_columns() - 1 - 2 * num_agg;
+        let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| main.column(j)).collect();
+        aggregator.key_types = key_types(&key_arrays);
+        let records = column_i64(main, "records");
+        for row in 0..main.num_rows() {
+            let key = read_key(&key_arrays, row);
+            let state = aggregator.state(key);
+            state.records = records.value(row);
+            for i in 0..num_agg {
+                if let GroupAggState::Running { agg, non_null } = &mut state.aggs[i] {
+                    let scalar = ScalarValue::try_from_array(main.column(arity + 1 + 2 * i), row)
                         .expect("group state scalar");
-                    state.aggs[i].restore_value(&scalar);
-                    state.non_null[i] = batch
+                    agg.restore_value(&scalar);
+                    *non_null = main
                         .column(arity + 2 + 2 * i)
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .expect("nonnull int64")
                         .value(row);
+                }
+            }
+        }
+        // One side batch per MIN/MAX aggregate, in aggregate order: key0.., value, count.
+        let mut frame = 1;
+        for i in 0..num_agg {
+            if !matches!(aggregator.kinds[i], 1 | 2) {
+                continue;
+            }
+            let side = &batches[frame];
+            frame += 1;
+            let side_arity = side.num_columns() - 2;
+            let side_keys: Vec<&ArrayRef> = (0..side_arity).map(|j| side.column(j)).collect();
+            let values = side.column(side_arity);
+            let counts = column_i64(side, "count");
+            for row in 0..side.num_rows() {
+                let key = read_key(&side_keys, row);
+                let value = ScalarValue::try_from_array(values, row).expect("multiset value");
+                if let Some(GroupAggState::Extremes { counts: map, .. }) =
+                    aggregator.keys.get_mut(&key).map(|s| &mut s.aggs[i])
+                {
+                    map.insert(MinMaxKey::from_scalar(&value), counts.value(row));
                 }
             }
         }
@@ -1864,6 +2021,31 @@ fn read_ipc(bytes: &[u8]) -> Vec<RecordBatch> {
         .expect("failed to open ipc reader")
         .map(|batch| batch.expect("failed to read ipc batch"))
         .collect()
+}
+
+/// Serializes several batches of differing schemas into one buffer, each length-prefixed, so a
+/// snapshot can carry side tables (e.g. a per-key multiset) alongside the main per-key state.
+fn write_framed(batches: &[RecordBatch]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let bytes = write_ipc(batch);
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+/// Reads back the length-prefixed batches written by {@link write_framed}, in order.
+fn read_framed(bytes: &[u8]) -> Vec<RecordBatch> {
+    let mut batches = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        batches.extend(read_ipc(&bytes[pos..pos + len]));
+        pos += len;
+    }
+    batches
 }
 
 /// Event-time INNER interval join, Flink's
@@ -4865,6 +5047,38 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert!(!result.is_null(0) && result.as_any().downcast_ref::<Int64Array>().unwrap().value(0) == 5);
         assert!(result.is_null(2)); // the +U carries a NULL sum
+    }
+
+    // MIN over a changelog: retracting the current minimum reveals the next-smallest from the
+    // per-key value multiset (what a single running value could not do).
+    #[test]
+    fn group_by_min_recovers_next_after_retract() {
+        // kind MIN (1) over value column 1, group on column 0, emit -U.
+        let mut agg = GroupAggregator::new(vec![1], vec![0], vec![1], vec![0], true);
+        // +I 5, +I 3, +I 8 (min 3), then -U 3 (min back to 5).
+        let out = agg.update(&group_changelog(
+            vec![1, 1, 1, 1],
+            vec![Some(5), Some(3), Some(8), Some(3)],
+            vec![0, 0, 0, 1],
+        ));
+        assert_eq!(row_kinds(&out), vec![0, 1, 2, 1, 2]);
+        // min: 5; 5->3; (8 leaves min 3, suppressed); 3->5 after retracting the 3.
+        assert_eq!(values(&out, 1), vec![5, 5, 3, 3, 5]);
+    }
+
+    // The MIN/MAX value multiset survives a checkpoint, so a post-restore retract still recovers the
+    // next extreme.
+    #[test]
+    fn group_by_min_multiset_survives_snapshot_restore() {
+        let mut agg = GroupAggregator::new(vec![1], vec![0], vec![1], vec![0], true);
+        agg.update(&group_changelog(vec![1, 1], vec![Some(5), Some(3)], vec![0, 0])); // min 3
+        let snapshot = agg.snapshot();
+        let mut restored =
+            GroupAggregator::restore(vec![1], vec![0], vec![1], vec![0], true, &snapshot);
+        // Retract the 3 — the restored multiset still holds the 5, so the min becomes 5.
+        let out = restored.update(&group_changelog(vec![1], vec![Some(3)], vec![1]));
+        assert_eq!(row_kinds(&out), vec![1, 2]); // -U(3), +U(5)
+        assert_eq!(values(&out, 1), vec![3, 5]);
     }
 
     // A `[k, v, rt]` batch with int64 rowtime (epoch millis) for the interval-join tests.

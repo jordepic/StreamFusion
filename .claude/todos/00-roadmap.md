@@ -59,9 +59,9 @@ here when the ticket is deleted.
   against Flink's `MemoryManager`.
 - **Mailbox threading** (ticket 01): native execution should integrate with the task mailbox
   (non-blocking), not block the task thread.
-- **Changelog / retract** (ticket 06): the non-windowed `GROUP BY` aggregate now both emits and
-  consumes a retract changelog (SUM/COUNT retract; MIN/MAX over a changelog and the other
-  retract-consuming operators — regular joins, Top-N — remain).
+- **Changelog / retract** (ticket 06): the non-windowed `GROUP BY` aggregate both emits and consumes
+  a retract changelog (SUM/COUNT/MIN/MAX all retract). The other retract-consuming operators — regular
+  joins, Top-N — remain.
 
 ## Breadth / longer horizon
 - **Arroyo operator coverage tracker** (ticket 11): append-only dedup, window Top-N, event-time
