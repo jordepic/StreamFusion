@@ -35,7 +35,7 @@ host by `NativeParity`).
       unbounded `OverWindowAggregator`. Also: proctime. Deferred in favor of joins.
 - [ ] **Append-only deduplication** — keep-*first*-row
       (`ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt) = 1`). Keyed, insert-only.
-      (Keep-*last* is retracting — blocked on ticket 06.)
+      (Keep-*last* is retracting — changelog support now exists; tracked in ticket 11.)
 - [ ] **Window Top-N** and **window deduplication** — built on the windowing-TVF +
       keyed-shuffle infra we now have; append-only.
 - [ ] **Event-time sort** (`ORDER BY rt`) — watermark-driven, ~no shuffle;
@@ -49,12 +49,11 @@ inputs) now exists (`NativeIntervalJoinOperator`). On top of it:
 - [x] **Window join** (windowing-TVF based) — DONE, INNER, **columnar**: buffer both sides, join per
       window on watermark close (the window bounds join the equi-keys). See [divergences/12](../../divergences/12-joins-delegate-match-own-state.md).
 
-## Still blocked regardless — by the insert-only constraint, not by the shuffle
-These emit retracting/updating changelogs; they need [ticket 06](06-changelog-retract-support.md)
-(changelog/`RowKind` support — the long-term move away from append-only), not the
-shuffle work:
-- Non-windowed `GROUP BY` aggregation, regular (non-windowed) joins, streaming
-  Top-N, keep-last deduplication, temporal joins.
+## Changelog operators — unblocked and largely shipped
+These emit retracting/updating changelogs, which once needed changelog/`RowKind` support that now
+exists (divergences/13, /14). The non-windowed `GROUP BY` aggregate, the regular (non-windowed)
+INNER join, and append-only streaming Top-N are done; keep-last deduplication and temporal joins
+remain, tracked in the coverage tracker (ticket 11).
 
 ## Pointers
 - Pipeline shape + own-hash co-location: [divergences/10](../../divergences/10-columnar-exchange-own-hash.md).
