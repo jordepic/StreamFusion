@@ -13,8 +13,10 @@ here when the ticket is deleted.
   (divergences/13), and three operators both emit and consume a retract changelog: the non-windowed
   `GROUP BY` aggregate (SUM/COUNT/MIN/MAX retract), the regular (updating) INNER equi-join, and
   append-only streaming Top-N (`ROW_NUMBER`). The streaming engines RisingWave/Proton informed these
-  (divergences/14). Feature tails — outer/semi/anti joins, rank-number / `RANK` / retracting-input
-  Top-N — are tracked in the coverage tracker (ticket 11).
+  (divergences/14). All three are **columnar** (Arrow in/out) per the CLAUDE.md principle — the
+  row↔Arrow conversion is paid only at host edges, so a native changelog chain has no per-operator
+  transpose. Feature tails — outer/semi/anti joins, rank-number / `RANK` / retracting-input Top-N —
+  are tracked in the coverage tracker (ticket 11).
 - **Window aggregate input schemas:** all five aggregates over every non-decimal
   numeric value type (custom accumulators keep the host's type/precision) plus decimal MIN/MAX/COUNT;
   multiple value columns (`SUM(a), SUM(b)`); bigint/int/string/boolean/date/timestamp/decimal grouping
@@ -52,14 +54,10 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (item 1 and the
    ticket 11 operators) before broadening where we read/write.
-3. **Columnar changelog operators** (ticket 31): the GROUP BY aggregate, updating join, and Top-N are
-   row-fed (`RowData` in/out, transposing every batch) — violating the *native operators are columnar*
-   principle and the reason they sit below 1×. Give them `ArrowBatch` in/out variants (the native
-   kernels already take Arrow), so a native changelog chain pays no per-operator transpose.
-4. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators, session
+3. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators, session
    `update` one-row `take` batching. (The `RowData → Arrow` transpose was made row-major + pre-sized,
    ~25% faster; a native decoder was investigated and rejected on benchmark grounds — ticket 28.)
-5. **Nexmark benchmark vs Flink** (ticket 30): run the standard q0–q22 Flink SQL suite native-
+4. **Nexmark benchmark vs Flink** (ticket 30): run the standard q0–q22 Flink SQL suite native-
    substituted vs stock Flink (release), per-query routed-fraction + fallback reasons + throughput
    ratio. Use it as the prioritization engine for both coverage (which queries fall back, and why)
    and perf (which route but trail Flink) — re-run as a regression/impact gate after each change.
