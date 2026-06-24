@@ -41,7 +41,7 @@ here when the ticket is deleted.
   (`NativeConfig`); fallback-reason reporting (`PhysicalPlanScan.fallbackReasons()`,
   `-Dstreamfusion.logFallbackReasons`, `NativePlanner.explain`). Mirrors Comet; see readme
   "Controlling acceleration" / "Seeing why a query fell back".
-- **Release benchmarks vs Flink (clean):** Parquet copy 4.68×, Parquet sink 2.24×, windowed-over-
+- **Release benchmarks vs Flink (clean):** Parquet copy 4.97×, Parquet sink 2.24×, windowed-over-
   columnar 1.82×, interval join 1.71×, OVER 1.56×, tumbling 1.24×, bare filter 0.75×. Sink coalescing
   lifted both Parquet paths; the row-major + pre-sized transpose build lifted the row-source ops (a
   native row decoder was investigated and rejected — ticket 28). Only the lone stateless filter stays
@@ -75,8 +75,12 @@ here when the ticket is deleted.
    entirely is the fully-native source (ticket 33).
 
 ## Production-readiness (not yet load-bearing)
-- **Memory accounting** (ticket 05): native `RootAllocator`s per operator are not accounted
-  against Flink's `MemoryManager`.
+- **Shared FFI allocator** (ticket 34): operators each own a per-operator `RootAllocator` closed at
+  `close()`; follow comet's pattern of one long-lived shared allocator (the file sources already do),
+  since a consumer can outlive a producer's close (the async source proved it). Orthogonal to accounting.
+- **Memory accounting** (ticket 05): native execution memory is not accounted against Flink's
+  `MemoryManager`; needs a DataFusion `MemoryPool` with named per-operator consumers bridged to it
+  (comet's model) — distinct from the FFI allocator scope (ticket 34).
 - **Mailbox threading** (ticket 01): native execution should integrate with the task mailbox
   (non-blocking), not block the task thread.
 
