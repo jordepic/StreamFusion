@@ -19,7 +19,7 @@ datafusion-orc = { git = "https://github.com/datafusion-contrib/datafusion-orc.g
 orc-rust = "0.8"
 parquet = { version = "58", features = ["arrow"] }
 datafusion = "53.1.0"
-# Native Kafka consumer, behind the `kafka-bench` feature so the normal build needs no librdkafka.
+# Native Kafka consumer, behind the `kafka` feature so the normal build needs no librdkafka.
 # Dynamic-linked against the system librdkafka (brew install librdkafka) — no cmake/bundled build; the
 # sync BaseConsumer is enough, so tokio/libz default features are off.
 rdkafka = { version = "0.36", default-features = false, features = ["dynamic-linking"], optional = true }
@@ -29,8 +29,10 @@ futures = "0.3"
 ahash = "0.8"
 
 [features]
-# Opt-in: the native Kafka consumer used only by the ingest benchmark (needs a system librdkafka).
-kafka-bench = ["dep:rdkafka"]
+# Opt-in: the native rdkafka consumer (needs a system librdkafka). `kafka` builds the production
+# split reader; `kafka-bench` additionally builds the throwaway whole-topic benchmark consumer.
+kafka = ["dep:rdkafka"]
+kafka-bench = ["kafka"]
 
 [dev-dependencies]
 criterion = "0.5"
