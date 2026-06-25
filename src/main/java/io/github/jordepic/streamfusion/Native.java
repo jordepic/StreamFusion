@@ -439,6 +439,12 @@ public final class Native {
       long outArrayAddress,
       long outSchemaAddress);
 
+  /**
+   * Benchmark-only: decode a body batch and return the decoded row count without exporting the result,
+   * so the shallow path terminates with Arrow in Rust (symmetric with the native consumer).
+   */
+  public static native long decodeJsonCount(long handle, long inArrayAddress, long inSchemaAddress);
+
   /** Releases a JSON decode operator handle. */
   public static native void closeJsonDecoder(long handle);
 
@@ -459,6 +465,19 @@ public final class Native {
       String brokers, String topic, long schemaArrayAddress, long schemaAddress, long maxMessages);
 
   /**
+   * Benchmark-only: drive the production split reader over a topic and count decoded rows entirely in
+   * Rust (no per-batch export to the JVM), as the source would feed a downstream native operator.
+   * Returns the row count.
+   */
+  public static native long benchmarkNativeConsume(
+      String[] configKeys,
+      String[] configValues,
+      String topic,
+      long schemaArrayAddress,
+      long schemaAddress,
+      long maxMessages);
+
+  /**
    * Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
    * {@link #closeKafkaConsumer}. One rdkafka consumer multiplexes the subtask's partitions; splits are
    * added later with {@link #assignKafkaSplits} as the enumerator assigns them. The reader manually
@@ -466,11 +485,20 @@ public final class Native {
    *
    * @param configKeys translated librdkafka config keys (from {@code KafkaConfigTranslator})
    * @param configValues values index-aligned with {@code configKeys}, applied verbatim
+   * @param format decoder: 0 = JSON (against the schema C structs), 1 = Confluent Avro
    * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the decoder's schema
    * @param schemaAddress address of the matching exported {@code ArrowSchema}
+   * @param avroSchema writer-schema JSON for Avro (ignored for JSON; pass "")
+   * @param schemaId Confluent schema id the Avro writer schema is registered under (ignored for JSON)
    */
   public static native long openKafkaConsumer(
-      String[] configKeys, String[] configValues, long schemaArrayAddress, long schemaAddress);
+      String[] configKeys,
+      String[] configValues,
+      int format,
+      long schemaArrayAddress,
+      long schemaAddress,
+      String avroSchema,
+      int schemaId);
 
   /**
    * Adds splits to the reader and re-assigns the consumer: each new partition seeks to its start
@@ -483,6 +511,12 @@ public final class Native {
    */
   public static native void assignKafkaSplits(
       long handle, String[] topics, long[] partitions, long[] startOffsets);
+
+  /**
+   * Removes finished splits (reached their bounded stopping offset) from the consumer's assignment so
+   * it no longer fetches or blocks on them. Index-aligned {@code topics}/{@code partitions}.
+   */
+  public static native void unassignKafkaSplits(long handle, String[] topics, long[] partitions);
 
   /**
    * Polls one cycle, decoding one Arrow batch per partition that had messages. Returns the number of

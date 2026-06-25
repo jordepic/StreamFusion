@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.connector.kafka.source.enumerator.initializer.NoStoppingOffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscriber;
 import org.apache.flink.table.types.logical.RowType;
@@ -53,8 +54,8 @@ final class KafkaTables {
     if (options.get("topic") == null) {
       return false; // topic-pattern not supported natively yet
     }
-    if (mapStartupMode(options) == null) {
-      return false; // e.g. specific-offsets
+    if (mapStartupMode(options) == null || !boundedModeSupported(options)) {
+      return false; // e.g. specific-offsets startup, or an unsupported bounded mode
     }
     if (options.get(PROPERTIES_PREFIX + "bootstrap.servers") == null) {
       return false;
@@ -72,17 +73,27 @@ final class KafkaTables {
       values[i] = librdkafka.get(keys[i]);
     }
     List<String> topics = Arrays.asList(options.get("topic").split(";"));
+    boolean bounded = "latest-offset".equals(options.get("scan.bounded.mode"));
     return new NativeKafkaSource(
         KafkaSubscriber.getTopicListSubscriber(topics),
         mapStartupMode(options),
-        OffsetsInitializer.latest(), // no stopping offset: unbounded
-        Boundedness.CONTINUOUS_UNBOUNDED,
+        bounded ? OffsetsInitializer.latest() : new NoStoppingOffsetsInitializer(),
+        bounded ? Boundedness.BOUNDED : Boundedness.CONTINUOUS_UNBOUNDED,
         props,
         keys,
         values,
+        0, // JSON (the only SQL format wired natively today)
         outputType,
+        "",
+        0,
         MAX_RECORDS,
         POLL_TIMEOUT_MILLIS);
+  }
+
+  /** Whether {@code scan.bounded.mode} is one the native source handles (unbounded or latest-offset). */
+  private static boolean boundedModeSupported(Map<String, String> options) {
+    String mode = options.get("scan.bounded.mode");
+    return mode == null || "unbounded".equals(mode) || "latest-offset".equals(mode);
   }
 
   /** The consumer {@code Properties}: the {@code properties.*} options plus Flink's forced overrides. */
