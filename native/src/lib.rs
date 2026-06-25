@@ -4765,25 +4765,67 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeGroupAgg
     }
 }
 
-/// Creates a JSON decode operator and returns an opaque handle, released with `closeJsonDecoder`. The
-/// target schema is taken from an empty batch the JVM exports (built from the plan's row type); the
-/// operator turns a batch of one binary column of raw JSON message bodies into a typed batch of that
-/// schema. This is the format-decode core both the shallow and native Kafka paths feed bytes into.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createJsonDecoder<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    schema_array_address: jlong,
-    schema_address: jlong,
-) -> jlong {
-    let template = import_record_batch(schema_array_address, schema_address);
-    Box::into_raw(Box::new(JsonDecoder::new(template.schema()))) as jlong
+/// The single, format-dispatched decode core shared by every ingest path: it turns a batch of one
+/// binary column — raw message bodies, one per row — into a typed Arrow batch. JSON goes through
+/// `arrow-json`; Confluent-Avro through `arrow-avro` against a local schema-id store. Both the shallow
+/// path (Flink polls bytes, hands them here) and the native source (rdkafka polls bytes, hands them
+/// here) feed the *same* `MessageDecoder`; only who produces the body batch differs.
+enum MessageDecoder {
+    Json(JsonDecoder),
+    Avro(arrow_avro::schema::SchemaStore),
 }
 
-/// Decodes one input batch (a single binary column of JSON bodies) into a typed batch, exporting it
-/// into the consumer-allocated C structs.
+impl MessageDecoder {
+    /// `format` 0 = JSON (decoded against `output_schema`), 1 = Confluent-Avro (decoded against
+    /// `avro_schema` registered at `schema_id`).
+    fn new(format: i32, output_schema: SchemaRef, avro_schema: &str, schema_id: i32) -> MessageDecoder {
+        if format == 1 {
+            use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
+            let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+            store
+                .set(Fingerprint::Id(schema_id as u32), AvroSchema::new(avro_schema.to_string()))
+                .expect("failed to register avro schema");
+            MessageDecoder::Avro(store)
+        } else {
+            MessageDecoder::Json(JsonDecoder::new(output_schema))
+        }
+    }
+
+    fn decode(&self, body: &RecordBatch) -> RecordBatch {
+        match self {
+            MessageDecoder::Json(decoder) => decoder.decode(body),
+            MessageDecoder::Avro(store) => decode_avro_body(store, body),
+        }
+    }
+}
+
+/// Creates a format-dispatched message decoder and returns an opaque handle, released with
+/// `closeDecoder`. The JSON target schema is taken from an empty batch the JVM exports; the Avro writer
+/// schema is `avroSchema` registered under `schemaId`.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeJson<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    format: jint,
+    schema_array_address: jlong,
+    schema_address: jlong,
+    avro_schema: JString<'local>,
+    schema_id: jint,
+) -> jlong {
+    // The output schema is only used by JSON decode; Avro derives its own from the writer schema, so
+    // its caller can pass 0/0 for the schema C structs.
+    let schema = if format == 1 {
+        Arc::new(Schema::empty())
+    } else {
+        import_record_batch(schema_array_address, schema_address).schema()
+    };
+    let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
+    Box::into_raw(Box::new(MessageDecoder::new(format, schema, &avro_schema, schema_id))) as jlong
+}
+
+/// Decodes one body batch into a typed batch, exporting it into the consumer-allocated C structs.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeInto<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -4792,7 +4834,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeJson<'l
     out_array_address: jlong,
     out_schema_address: jlong,
 ) {
-    let decoder = unsafe { &*(handle as *mut JsonDecoder) };
+    let decoder = unsafe { &*(handle as *mut MessageDecoder) };
     let bodies = import_record_batch(in_array_address, in_schema_address);
     export_record_batch(decoder.decode(&bodies), out_array_address, out_schema_address);
 }
@@ -4801,27 +4843,27 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeJson<'l
 /// so the shallow path can terminate with Arrow in Rust (counted in Rust), symmetric with the native
 /// consumer, for an apples-to-apples comparison.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeJsonCount<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeCount<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     in_array_address: jlong,
     in_schema_address: jlong,
 ) -> jlong {
-    let decoder = unsafe { &*(handle as *mut JsonDecoder) };
+    let decoder = unsafe { &*(handle as *mut MessageDecoder) };
     let bodies = import_record_batch(in_array_address, in_schema_address);
     decoder.decode(&bodies).num_rows() as jlong
 }
 
-/// Releases a JSON decode operator handle.
+/// Releases a message decoder handle.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeJsonDecoder<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeDecoder<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut JsonDecoder));
+        drop(Box::from_raw(handle as *mut MessageDecoder));
     }
 }
 
@@ -4867,8 +4909,7 @@ struct Decoded {
 }
 
 /// Decodes a binary "body" batch (one Confluent-Avro message per row) into typed Arrow via arrow-avro,
-/// resolving each row's schema id against the local store.
-#[cfg(feature = "kafka")]
+/// resolving each row's schema id against the local store. Used by `MessageDecoder` for both paths.
 fn decode_avro_body(store: &arrow_avro::schema::SchemaStore, body: &RecordBatch) -> RecordBatch {
     use arrow::array::{Array, BinaryArray};
     let column = body.column(0).as_any().downcast_ref::<BinaryArray>().expect("binary body");
@@ -4954,31 +4995,15 @@ impl KafkaSplitReader {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Decoded>();
         let avro_schema = avro_schema.to_string();
         let decode_thread = std::thread::spawn(move || {
-            // The decoder is built here so its (possibly non-Send) state never crosses threads.
-            enum State {
-                Json(JsonDecoder),
-                Avro(arrow_avro::schema::SchemaStore),
-            }
-            let state = if format == 1 {
-                use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
-                let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
-                store
-                    .set(Fingerprint::Id(schema_id as u32), AvroSchema::new(avro_schema))
-                    .expect("failed to register avro schema");
-                State::Avro(store)
-            } else {
-                State::Json(JsonDecoder::new(output_schema))
-            };
+            // The same format-dispatched decoder the shallow path uses; built here so its state never
+            // crosses threads. Only who produces the body batch (rdkafka vs Flink) differs.
+            let decoder = MessageDecoder::new(format, output_schema, &avro_schema, schema_id);
             while let Ok(work) = raw_rx.recv() {
-                let batch = match &state {
-                    State::Json(decoder) => decoder.decode(&work.body),
-                    State::Avro(store) => decode_avro_body(store, &work.body),
-                };
                 let decoded = Decoded {
                     topic: work.topic,
                     partition: work.partition,
                     next_offset: work.next_offset,
-                    batch,
+                    batch: decoder.decode(&work.body),
                 };
                 if ready_tx.send(decoded).is_err() {
                     break;
@@ -5273,8 +5298,11 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     config_keys: JObjectArray<'local>,
     config_values: JObjectArray<'local>,
     topic: JString<'local>,
+    format: jint,
     schema_array_address: jlong,
     schema_address: jlong,
+    avro_schema: JString<'local>,
+    schema_id: jint,
     max_messages: jlong,
 ) -> jlong {
     let keys = read_string_array(&mut env, &config_keys);
@@ -5282,8 +5310,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let config: Vec<(String, String)> = keys.into_iter().zip(values).collect();
     let topic: String = env.get_string(&topic).expect("failed to read topic").into();
     let schema = import_record_batch(schema_array_address, schema_address).schema();
+    let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
 
-    let mut reader = KafkaSplitReader::open(&config, 0, schema, "", 0);
+    let mut reader = KafkaSplitReader::open(&config, format, schema, &avro_schema, schema_id);
     reader.assign_splits(&[topic], &[0], &[-2]); // partition 0, earliest
 
     let timeout = std::time::Duration::from_millis(250);

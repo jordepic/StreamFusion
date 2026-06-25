@@ -420,19 +420,22 @@ public final class Native {
       byte[] snapshot);
 
   /**
-   * Creates a JSON decode operator and returns an opaque handle, released with {@link
-   * #closeJsonDecoder}. The target schema is taken from an empty batch exported into the C structs at
-   * {@code schemaArrayAddress}/{@code schemaAddress} (built from the plan's row type). The operator
-   * turns a batch of one binary column of raw JSON message bodies into a typed batch of that schema —
-   * the format-decode core the Kafka ingest paths feed bytes into. Stateless, so no snapshot/restore.
+   * Creates the single format-dispatched message decoder shared by every ingest path, released with
+   * {@link #closeDecoder}. It turns a batch of one binary column of raw message bodies into a typed
+   * batch — the format-decode core both the shallow and native Kafka paths feed bytes into. Stateless,
+   * so no snapshot/restore.
    *
+   * @param format 0 = JSON (decoded against the schema C structs), 1 = Confluent Avro
    * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the target schema
    * @param schemaAddress address of the matching exported {@code ArrowSchema}
+   * @param avroSchema writer-schema JSON for Avro (ignored for JSON; pass "")
+   * @param schemaId Confluent schema id the Avro writer schema is registered under (ignored for JSON)
    */
-  public static native long createJsonDecoder(long schemaArrayAddress, long schemaAddress);
+  public static native long createDecoder(
+      int format, long schemaArrayAddress, long schemaAddress, String avroSchema, int schemaId);
 
-  /** Decodes one binary-column input batch into a typed batch, exported into the output C structs. */
-  public static native void decodeJson(
+  /** Decodes one binary-column body batch into a typed batch, exported into the output C structs. */
+  public static native void decodeInto(
       long handle,
       long inArrayAddress,
       long inSchemaAddress,
@@ -443,10 +446,10 @@ public final class Native {
    * Benchmark-only: decode a body batch and return the decoded row count without exporting the result,
    * so the shallow path terminates with Arrow in Rust (symmetric with the native consumer).
    */
-  public static native long decodeJsonCount(long handle, long inArrayAddress, long inSchemaAddress);
+  public static native long decodeCount(long handle, long inArrayAddress, long inSchemaAddress);
 
-  /** Releases a JSON decode operator handle. */
-  public static native void closeJsonDecoder(long handle);
+  /** Releases a message decoder handle. */
+  public static native void closeDecoder(long handle);
 
   /**
    * Benchmark-only: consume an entire topic with a native rdkafka consumer and decode it to typed
@@ -473,8 +476,11 @@ public final class Native {
       String[] configKeys,
       String[] configValues,
       String topic,
+      int format,
       long schemaArrayAddress,
       long schemaAddress,
+      String avroSchema,
+      int schemaId,
       long maxMessages);
 
   /**

@@ -23,6 +23,11 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.flink.table.types.logical.BigIntType;
+import org.apache.flink.table.types.logical.DoubleType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.table.types.logical.VarCharType;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.junit.jupiter.api.Test;
@@ -51,6 +56,14 @@ class KafkaIngestBenchmark {
           ? Integer.parseInt(System.getenv("SF_KAFKA_MESSAGES"))
           : 1_000_000;
   private static final String TOPIC = "bench-json";
+  private static final String AVRO_TOPIC = "bench-avro";
+  private static final int SCHEMA_ID = 1;
+  // Non-nullable row so the Avro schema is a bare record (not a top-level ["null", record] union).
+  private static final RowType ROW_TYPE =
+      RowType.of(
+          false,
+          new LogicalType[] {new BigIntType(), new VarCharType(VarCharType.MAX_LENGTH), new DoubleType()},
+          new String[] {"id", "name", "score"});
 
   @Test
   void shallowVsNativeKafkaIngest() throws Exception {
@@ -77,6 +90,34 @@ class KafkaIngestBenchmark {
 
       System.out.printf(
           "%n[kafka -> Arrow IN RUST, %,d three-field JSON msgs, same plain-JVM harness]%n"
+              + "  shallow (Java batch poll -> native decode): %.2fs  =  %,.0f msgs/s%n"
+              + "  native  (rdkafka poll + native decode):     %.2fs  =  %,.0f msgs/s%n"
+              + "  native speedup: %.2fx%n",
+          MESSAGES, shallow, MESSAGES / shallow, nativeSecs, MESSAGES / nativeSecs, shallow / nativeSecs);
+    }
+  }
+
+  /**
+   * Same comparison as the JSON test but for Confluent-Avro — the format where native decode should
+   * help most (Avro is heavier to deserialize than JSON, and the native path avoids the JVM byte[]).
+   * Both legs decode to Arrow and count in Rust.
+   */
+  @Test
+  void shallowVsNativeAvroIngest() throws Exception {
+    try (KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
+      kafka.start();
+      String brokers = kafka.getBootstrapServers();
+      String avroSchema =
+          org.apache.flink.formats.avro.typeutils.AvroSchemaConverter.convertToSchema(ROW_TYPE)
+              .toString();
+      produceAvro(brokers, MESSAGES, avroSchema);
+
+      double shallow = time(() -> consumeAndDecodeAvro(brokers, avroSchema));
+      double nativeSecs = time(() -> nativeConsumeAndDecodeAvro(brokers, avroSchema));
+
+      System.out.printf(
+          "%n[kafka -> Arrow IN RUST, %,d three-field Confluent-Avro msgs, same plain-JVM harness]%n"
               + "  shallow (Java batch poll -> native decode): %.2fs  =  %,.0f msgs/s%n"
               + "  native  (rdkafka poll + native decode):     %.2fs  =  %,.0f msgs/s%n"
               + "  native speedup: %.2fx%n",
@@ -138,7 +179,12 @@ class KafkaIngestBenchmark {
         CDataDictionaryProvider dictionaries = new CDataDictionaryProvider();
         KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props)) {
       consumer.subscribe(List.of(TOPIC));
-      long handle = withExportedSchema(allocator, dictionaries, Native::createJsonDecoder);
+      long handle =
+          withExportedSchema(
+              allocator,
+              dictionaries,
+              (arrayAddress, schemaAddress) ->
+                  Native.createDecoder(0, arrayAddress, schemaAddress, "", 0));
       try {
         while (seen < MESSAGES) {
           ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofSeconds(5));
@@ -149,7 +195,7 @@ class KafkaIngestBenchmark {
           seen += records.count();
         }
       } finally {
-        Native.closeJsonDecoder(handle);
+        Native.closeDecoder(handle);
       }
     }
     return rows;
@@ -178,7 +224,7 @@ class KafkaIngestBenchmark {
       try (ArrowArray inArray = ArrowArray.allocateNew(allocator);
           ArrowSchema inSchema = ArrowSchema.allocateNew(allocator)) {
         Data.exportVectorSchemaRoot(allocator, in, dictionaries, inArray, inSchema);
-        return Native.decodeJsonCount(handle, inArray.memoryAddress(), inSchema.memoryAddress());
+        return Native.decodeCount(handle, inArray.memoryAddress(), inSchema.memoryAddress());
       }
     }
   }
@@ -198,7 +244,116 @@ class KafkaIngestBenchmark {
           allocator,
           dictionaries,
           (arrayAddress, schemaAddress) ->
-              Native.benchmarkNativeConsume(keys, values, TOPIC, arrayAddress, schemaAddress, MESSAGES));
+              Native.benchmarkNativeConsume(
+                  keys, values, TOPIC, 0, arrayAddress, schemaAddress, "", 0, MESSAGES));
+    }
+  }
+
+  /** Produces Confluent-framed Avro (magic byte + 4-byte schema id + Avro body) to the Avro topic. */
+  private static void produceAvro(String brokers, int messages, String avroSchemaJson) throws Exception {
+    org.apache.avro.Schema schema = new org.apache.avro.Schema.Parser().parse(avroSchemaJson);
+    org.apache.avro.generic.GenericDatumWriter<org.apache.avro.generic.GenericRecord> writer =
+        new org.apache.avro.generic.GenericDatumWriter<>(schema);
+    Properties props = new Properties();
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
+    props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+    props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
+    props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1 << 20);
+    try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props)) {
+      for (int i = 0; i < messages; i++) {
+        org.apache.avro.generic.GenericRecord record = new org.apache.avro.generic.GenericData.Record(schema);
+        record.put("id", (long) i);
+        record.put("name", "row-" + i);
+        record.put("score", (i % 100) + 0.5);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        out.write(0);
+        out.write((SCHEMA_ID >>> 24) & 0xFF);
+        out.write((SCHEMA_ID >>> 16) & 0xFF);
+        out.write((SCHEMA_ID >>> 8) & 0xFF);
+        out.write(SCHEMA_ID & 0xFF);
+        org.apache.avro.io.BinaryEncoder encoder =
+            org.apache.avro.io.EncoderFactory.get().binaryEncoder(out, null);
+        writer.write(record, encoder);
+        encoder.flush();
+        producer.send(new ProducerRecord<>(AVRO_TOPIC, out.toByteArray()));
+      }
+      producer.flush();
+    }
+  }
+
+  /** Shallow Avro: Java batch poll -> bytes -> native Confluent-Avro decode, counted in Rust. */
+  private static long consumeAndDecodeAvro(String brokers, String avroSchema) {
+    Properties props = new Properties();
+    props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
+    props.put(ConsumerConfig.GROUP_ID_CONFIG, "bench-avro-" + System.nanoTime());
+    props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
+    props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
+    props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 8192);
+    props.put(ConsumerConfig.FETCH_MAX_BYTES_CONFIG, 16 << 20);
+
+    long rows = 0;
+    long seen = 0;
+    try (BufferAllocator allocator = new RootAllocator();
+        CDataDictionaryProvider dictionaries = new CDataDictionaryProvider();
+        KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props)) {
+      consumer.subscribe(List.of(AVRO_TOPIC));
+      long handle = Native.createDecoder(1, 0, 0, avroSchema, SCHEMA_ID);
+      try {
+        while (seen < MESSAGES) {
+          ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofSeconds(5));
+          if (records.isEmpty()) {
+            continue;
+          }
+          rows += decodeBatchAvro(handle, records, allocator, dictionaries);
+          seen += records.count();
+        }
+      } finally {
+        Native.closeDecoder(handle);
+      }
+    }
+    return rows;
+  }
+
+  /** Builds the Arrow binary column of a poll's values and Avro-decodes it natively, counting in Rust. */
+  private static long decodeBatchAvro(
+      long handle,
+      ConsumerRecords<byte[], byte[]> records,
+      BufferAllocator allocator,
+      CDataDictionaryProvider dictionaries) {
+    int count = records.count();
+    try (VarBinaryVector body = new VarBinaryVector("body", allocator)) {
+      body.allocateNew(count);
+      int i = 0;
+      for (ConsumerRecord<byte[], byte[]> record : records) {
+        body.setSafe(i++, record.value());
+      }
+      body.setValueCount(count);
+      VectorSchemaRoot in = new VectorSchemaRoot(List.of(body));
+      in.setRowCount(count);
+      try (ArrowArray inArray = ArrowArray.allocateNew(allocator);
+          ArrowSchema inSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportVectorSchemaRoot(allocator, in, dictionaries, inArray, inSchema);
+        return Native.decodeCount(handle, inArray.memoryAddress(), inSchema.memoryAddress());
+      }
+    }
+  }
+
+  /** Native Avro: rdkafka batch consume + native Confluent-Avro decode, counted in Rust. */
+  private static long nativeConsumeAndDecodeAvro(String brokers, String avroSchema) {
+    String[] keys = {
+      "bootstrap.servers", "group.id", "enable.auto.commit", "fetch.queue.backoff.ms", "check.crcs"
+    };
+    String[] values = {brokers, "bench-native-avro-" + System.nanoTime(), "false", "2", "false"};
+    try (BufferAllocator allocator = new RootAllocator();
+        CDataDictionaryProvider dictionaries = new CDataDictionaryProvider()) {
+      return withExportedSchema(
+          allocator,
+          dictionaries,
+          (arrayAddress, schemaAddress) ->
+              Native.benchmarkNativeConsume(
+                  keys, values, AVRO_TOPIC, 1, arrayAddress, schemaAddress, avroSchema, SCHEMA_ID, MESSAGES));
     }
   }
 
