@@ -203,7 +203,11 @@ The native **decoders** are shared; the two source kinds wrap them differently:
     protobuf 4.x; the build pins protobuf 2.5 in test scope so the ORC baseline runs. The native read
     path never touches orc-core, so this is test-only.
 - **Phase 2 — streaming decode operator.** The `ArrowBatch[bytes] → ArrowBatch[decoded]` operator +
-  off-heap Kafka handoff + source-edge planner rule, for JSON/CSV/Avro/Confluent-Avro.
+  off-heap Kafka handoff + source-edge planner rule, for JSON/CSV/Avro/Confluent-Avro. This is also
+  the **fallback** the native Kafka source (ticket 33) degrades to, and the **baseline** the native
+  path is benchmarked against — so it is built first regardless. Sub-steps: (2a) the native
+  format-decode operator (reuses the JSON kernel; the shared "format transpose"), (2b) Flink
+  `KafkaSource` + byte-passthrough deserializer + row→Arrow transpose feeding it.
 - **Phase 3 — CDC family.** Body decode + native envelope → `$row_kind$`, reusing changelog operators.
 - **Phase 4 — Protobuf** (`prost-reflect` + descriptor→Arrow).
 - **Later — fully native Kafka source: ticket 33** (removes the off-heap copy entirely).
