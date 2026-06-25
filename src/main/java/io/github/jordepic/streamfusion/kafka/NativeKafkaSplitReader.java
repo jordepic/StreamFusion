@@ -4,7 +4,11 @@ import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.NativeAllocator;
 import io.github.jordepic.streamfusion.operator.RowDataArrowConverter;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -35,24 +39,39 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
   private final int maxRecords;
   private final long pollTimeoutMillis;
   private final BufferAllocator allocator = NativeAllocator.SHARED;
+  // Bounded mode: concrete stopping offset per split, the last position seen, and splits already
+  // reported finished. A split finishes once its next offset reaches its (concrete) stopping offset.
+  private final Map<String, Long> stoppingOffsets = new HashMap<>();
+  private final Map<String, Long> positions = new HashMap<>();
+  private final Map<String, TopicPartition> partitionsById = new HashMap<>();
+  private final Set<String> finished = new HashSet<>();
 
   NativeKafkaSplitReader(
       String[] configKeys,
       String[] configValues,
+      int format,
       RowType outputType,
+      String avroSchema,
+      int schemaId,
       int maxRecords,
       long pollTimeoutMillis) {
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
     // Export an empty batch of the decoder's output schema so the native side can build the JSON
-    // decoder; the consumer is created here, partitions are assigned later via handleSplitsChanges.
+    // decoder (Avro derives its own schema); the consumer is created here, partitions assigned later.
     try (VectorSchemaRoot template = RowDataArrowConverter.write(List.of(), outputType, allocator);
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, template, NativeAllocator.DICTIONARIES, array, schema);
       this.handle =
           Native.openKafkaConsumer(
-              configKeys, configValues, array.memoryAddress(), schema.memoryAddress());
+              configKeys,
+              configValues,
+              format,
+              array.memoryAddress(),
+              schema.memoryAddress(),
+              avroSchema == null ? "" : avroSchema,
+              schemaId);
     }
   }
 
@@ -71,8 +90,31 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
             Data.importVectorSchemaRoot(allocator, outArray, outSchema, NativeAllocator.DICTIONARIES);
         String splitId =
             KafkaPartitionSplit.toSplitId(new TopicPartition(topic[0], (int) meta[0]));
+        positions.put(splitId, meta[1]);
         builder.add(splitId, new NativeKafkaRecord(new ArrowBatch(root), meta[1]));
       }
+    }
+    // Bounded mode: a split is done once its next offset reaches its stopping offset. (No data exists
+    // past a latest-offset stop at run time, so the emitted batches never overshoot it.) Unassign each
+    // finished partition natively so the consumer stops fetching/blocking on it (no bounded-tail stall).
+    List<TopicPartition> justFinished = new java.util.ArrayList<>();
+    for (Map.Entry<String, Long> stop : stoppingOffsets.entrySet()) {
+      String splitId = stop.getKey();
+      if (!finished.contains(splitId)
+          && positions.getOrDefault(splitId, Long.MIN_VALUE) >= stop.getValue()) {
+        builder.addFinishedSplit(splitId);
+        finished.add(splitId);
+        justFinished.add(partitionsById.get(splitId));
+      }
+    }
+    if (!justFinished.isEmpty()) {
+      String[] topics = new String[justFinished.size()];
+      long[] partitions = new long[justFinished.size()];
+      for (int i = 0; i < justFinished.size(); i++) {
+        topics[i] = justFinished.get(i).topic();
+        partitions[i] = justFinished.get(i).partition();
+      }
+      Native.unassignKafkaSplits(handle, topics, partitions);
     }
     return builder.build();
   }
@@ -88,6 +130,11 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
       topics[i] = split.getTopic();
       partitions[i] = split.getPartition();
       offsets[i] = split.getStartingOffset();
+      partitionsById.put(split.splitId(), split.getTopicPartition());
+      split
+          .getStoppingOffset()
+          .filter(stop -> stop != KafkaPartitionSplit.NO_STOPPING_OFFSET)
+          .ifPresent(stop -> stoppingOffsets.put(split.splitId(), stop));
     }
     Native.assignKafkaSplits(handle, topics, partitions, offsets);
   }

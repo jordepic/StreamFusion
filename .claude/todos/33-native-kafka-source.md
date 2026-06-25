@@ -47,9 +47,10 @@ manager needed):
   so Flink's own Kafka source runs (the fallback). Gated by `NativeConfig.operatorEnabled("kafkaSource")`.
 
 ## Follow-ups (hardening, not core path)
-- **Kerberos/SSL at runtime.** The bundled librdkafka is built without SSL/SASL; the user's cluster is
-  GSSAPI. Add the `ssl` + `gssapi-vendored` rdkafka features (heavier build) so the translator's SASL
-  output is actually honored. Until then SASL tables translate but can't connect natively.
+- **Kerberos/SSL at runtime — DEFERRED, not needed for our cluster.** Our Kafka is PLAINTEXT (Kerberos
+  is only for HDFS), so the bundled librdkafka being built without SSL/SASL is fine. If a SASL/SSL
+  cluster ever matters, add the `ssl` + `gssapi-vendored` rdkafka features (heavier build) so the
+  translator's SASL output is honored; until then SASL tables translate but can't connect natively.
 - **Watermarks/event-time.** The source emits with `noWatermarks()`; per-partition watermarking +
   idleness (matching Flink's model) is not wired yet.
 - **Specific-offsets / topic-pattern startup**, and `key.format`/multi-format tables → currently fall back.

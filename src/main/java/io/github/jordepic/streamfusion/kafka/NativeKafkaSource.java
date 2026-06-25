@@ -47,7 +47,10 @@ public final class NativeKafkaSource
   private final Properties props;
   private final String[] configKeys;
   private final String[] configValues;
+  private final int format;
   private final RowType outputType;
+  private final String avroSchema;
+  private final int schemaId;
   private final int maxRecords;
   private final long pollTimeoutMillis;
 
@@ -59,7 +62,10 @@ public final class NativeKafkaSource
       Properties props,
       String[] configKeys,
       String[] configValues,
+      int format,
       RowType outputType,
+      String avroSchema,
+      int schemaId,
       int maxRecords,
       long pollTimeoutMillis) {
     this.subscriber = subscriber;
@@ -67,9 +73,17 @@ public final class NativeKafkaSource
     this.stoppingOffsets = stoppingOffsets;
     this.boundedness = boundedness;
     this.props = props;
+    // Match KafkaSourceBuilder: a bounded source must disable periodic partition discovery, otherwise
+    // the enumerator never signals no-more-splits and the job never terminates. (Default is 5 minutes.)
+    if (boundedness == Boundedness.BOUNDED) {
+      props.setProperty("partition.discovery.interval.ms", "-1");
+    }
     this.configKeys = configKeys;
     this.configValues = configValues;
+    this.format = format;
     this.outputType = outputType;
+    this.avroSchema = avroSchema;
+    this.schemaId = schemaId;
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
   }
@@ -84,7 +98,14 @@ public final class NativeKafkaSource
     Supplier<SplitReader<NativeKafkaRecord, KafkaPartitionSplit>> splitReaderSupplier =
         () ->
             new NativeKafkaSplitReader(
-                configKeys, configValues, outputType, maxRecords, pollTimeoutMillis);
+                configKeys,
+                configValues,
+                format,
+                outputType,
+                avroSchema,
+                schemaId,
+                maxRecords,
+                pollTimeoutMillis);
     return new NativeKafkaSourceReader(
         splitReaderSupplier, new NativeKafkaRecordEmitter(), toConfiguration(props), context);
   }
