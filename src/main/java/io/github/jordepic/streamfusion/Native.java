@@ -459,6 +459,52 @@ public final class Native {
       String brokers, String topic, long schemaArrayAddress, long schemaAddress, long maxMessages);
 
   /**
+   * Opens a native Kafka split reader for one subtask's assigned splits and returns an opaque handle,
+   * released with {@link #closeKafkaConsumer}. The reader manually assigns each (topic, partition) and
+   * seeks to its starting offset — never subscribe/rebalance — mirroring Flink's
+   * {@code KafkaPartitionSplitReader}.
+   *
+   * @param configKeys translated librdkafka config keys (from {@code KafkaConfigTranslator})
+   * @param configValues values index-aligned with {@code configKeys}, applied verbatim
+   * @param topics split topics, index-aligned with {@code partitions}/{@code startOffsets}
+   * @param partitions split partition ids
+   * @param startOffsets offset to assign+seek each split to (its checkpointed resume position)
+   * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the decoder's schema
+   * @param schemaAddress address of the matching exported {@code ArrowSchema}
+   */
+  public static native long openKafkaConsumer(
+      String[] configKeys,
+      String[] configValues,
+      String[] topics,
+      long[] partitions,
+      long[] startOffsets,
+      long schemaArrayAddress,
+      long schemaAddress);
+
+  /**
+   * Polls one decoded batch from the reader, exporting typed Arrow into the consumer C structs and
+   * writing each split's next offset into {@code nextOffsets} (index-aligned with the open-time splits)
+   * for the JVM to checkpoint. Returns the decoded row count (0 on a poll timeout).
+   *
+   * @param handle reader handle from {@link #openKafkaConsumer}
+   * @param maxRecords cap on messages per poll (the native batch size; Java's {@code max.poll.records})
+   * @param timeoutMillis poll timeout; returns an empty batch if nothing arrives within it
+   * @param nextOffsets output: next offset to resume each open-time split from
+   * @param outArrayAddress address of a consumer {@code ArrowArray} to receive the decoded batch
+   * @param outSchemaAddress address of the matching {@code ArrowSchema}
+   */
+  public static native int pollKafkaBatch(
+      long handle,
+      int maxRecords,
+      long timeoutMillis,
+      long[] nextOffsets,
+      long outArrayAddress,
+      long outSchemaAddress);
+
+  /** Releases a native Kafka split reader, closing the rdkafka consumer's connections. */
+  public static native void closeKafkaConsumer(long handle);
+
+  /**
    * Creates an event-time INNER interval joiner and returns an opaque handle. It buffers both inputs
    * per equi-join key and emits a matched pair when the second of its two rows arrives. The JVM owns
    * the handle across calls and must release it with {@link #closeIntervalJoiner}.
