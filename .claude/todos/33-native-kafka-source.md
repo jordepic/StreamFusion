@@ -1,8 +1,13 @@
 # Fully native Kafka source (Rust consumer → Arrow, no JVM round-trip)
 
-**Status:** open — the fast path for streaming ingest, built alongside ticket 32's shallow path and
-**falling back to it** when the consumer config can't be replicated natively. We build both and
-benchmark the difference to justify the native path's cost rather than assuming it pays off.
+**Status:** open — **justified by benchmark, production build remaining.** A benchmark-grade native
+rdkafka consumer (`Native.benchmarkKafkaConsume`, behind the `kafka-bench` cargo feature) was measured
+head-to-head against the shallow path (`KafkaIngestBenchmark`): on 500k three-field JSON messages,
+**native ~2.7M msgs/s vs shallow ~531k = 5.08x** (local broker, so the gap is pure JVM-client +
+off-heap-copy overhead; decode is shared and cancels). The 5x justifies building the real source. What
+remains is the *production* FLIP-27 source — the benchmark consumer has no enumerator integration,
+offset/checkpoint handling, config fidelity, or fallback. It falls back to ticket 32's shallow path
+when the consumer config can't be translated natively.
 
 ## Relationship to the shallow path (ticket 32) and the deciding benchmark
 The shallow path (Flink's `KafkaSource` + byte-passthrough deserializer → row→Arrow transpose →
