@@ -128,6 +128,21 @@
             <version>3.3.4</version>
             <scope>test</scope>
         </dependency>
+        <!-- Kafka ingest benchmark only (opt-in, Docker-gated). The shallow path is measured with the
+             plain Kafka client (what Flink's KafkaSource wraps), and Testcontainers stands up a
+             throwaway broker both paths consume from. Test-scoped — not part of the shipped library. -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>3.7.1</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <version>1.21.4</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
