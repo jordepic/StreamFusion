@@ -4765,6 +4765,50 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeGroupAgg
     }
 }
 
+/// Creates a JSON decode operator and returns an opaque handle, released with `closeJsonDecoder`. The
+/// target schema is taken from an empty batch the JVM exports (built from the plan's row type); the
+/// operator turns a batch of one binary column of raw JSON message bodies into a typed batch of that
+/// schema. This is the format-decode core both the shallow and native Kafka paths feed bytes into.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createJsonDecoder<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    schema_array_address: jlong,
+    schema_address: jlong,
+) -> jlong {
+    let template = import_record_batch(schema_array_address, schema_address);
+    Box::into_raw(Box::new(JsonDecoder::new(template.schema()))) as jlong
+}
+
+/// Decodes one input batch (a single binary column of JSON bodies) into a typed batch, exporting it
+/// into the consumer-allocated C structs.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_decodeJson<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let decoder = unsafe { &*(handle as *mut JsonDecoder) };
+    let bodies = import_record_batch(in_array_address, in_schema_address);
+    export_record_batch(decoder.decode(&bodies), out_array_address, out_schema_address);
+}
+
+/// Releases a JSON decode operator handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeJsonDecoder<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut JsonDecoder));
+    }
+}
+
 /// Creates an event-time INNER interval joiner and returns an opaque handle. The key/time column
 /// indices locate the equi-join key and rowtime within each side's input batch; `lower`/`upper` are
 /// the inclusive bounds (millis) on `left.rt - right.rt`. The JVM owns the handle across calls.

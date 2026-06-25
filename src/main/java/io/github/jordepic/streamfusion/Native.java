@@ -420,6 +420,29 @@ public final class Native {
       byte[] snapshot);
 
   /**
+   * Creates a JSON decode operator and returns an opaque handle, released with {@link
+   * #closeJsonDecoder}. The target schema is taken from an empty batch exported into the C structs at
+   * {@code schemaArrayAddress}/{@code schemaAddress} (built from the plan's row type). The operator
+   * turns a batch of one binary column of raw JSON message bodies into a typed batch of that schema —
+   * the format-decode core the Kafka ingest paths feed bytes into. Stateless, so no snapshot/restore.
+   *
+   * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the target schema
+   * @param schemaAddress address of the matching exported {@code ArrowSchema}
+   */
+  public static native long createJsonDecoder(long schemaArrayAddress, long schemaAddress);
+
+  /** Decodes one binary-column input batch into a typed batch, exported into the output C structs. */
+  public static native void decodeJson(
+      long handle,
+      long inArrayAddress,
+      long inSchemaAddress,
+      long outArrayAddress,
+      long outSchemaAddress);
+
+  /** Releases a JSON decode operator handle. */
+  public static native void closeJsonDecoder(long handle);
+
+  /**
    * Creates an event-time INNER interval joiner and returns an opaque handle. It buffers both inputs
    * per equi-join key and emits a matched pair when the second of its two rows arrives. The JVM owns
    * the handle across calls and must release it with {@link #closeIntervalJoiner}.
