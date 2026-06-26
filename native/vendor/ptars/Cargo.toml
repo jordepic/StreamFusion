@@ -1,0 +1,28 @@
+# Vendored from https://github.com/0x26res/ptars (Apache-2.0, tag v0.0.17 + 8 commits, 4adf0b5).
+# Local patch: arrow bumped 57.1 -> 58 to match StreamFusion's arrow version (the only change; compiles
+# clean). Vendored rather than a crates.io/git dep because crates.io ptars is pinned to arrow 57 and we
+# need 58 — keeping it in-tree makes the repo self-contained (any clone builds it, no fork to track).
+[dependencies]
+arrow = "58"
+arrow-array = "58"
+arrow-schema = "58"
+chrono = "0.4.42"
+prost = "0.14.1"
+prost-reflect = "0.16.3"
+
+[lib]
+name = "ptars"
+path = "src/lib.rs"
+
+[package]
+authors = ["0x26res <0x26res@gmail.net>"]
+categories = ["encoding", "data-structures"]
+description = "Fast conversion from protobuf to Apache Arrow and back"
+edition = "2021"
+homepage = "https://github.com/0x26res/ptars"
+keywords = ["protobuf", "arrow", "serialization", "data"]
+license = "Apache-2.0"
+name = "ptars"
+readme = "README.md"
+repository = "https://github.com/0x26res/ptars"
+version = "0.0.17"
