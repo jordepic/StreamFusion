@@ -4,6 +4,7 @@ import io.github.jordepic.streamfusion.operator.EncodedPredicate;
 import java.util.ArrayList;
 import java.util.List;
 import org.apache.calcite.rel.core.Calc;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
@@ -283,6 +284,11 @@ final class RexExpression {
     if (call.getKind() == SqlKind.CAST) {
       return emitCast(call);
     }
+    // Reinterpret only re-tags a value's type (e.g. stripping a time-attribute/ROWTIME marker), never
+    // changing the value — an identity projection of its first operand.
+    if (call.getKind() == SqlKind.REINTERPRET) {
+      return emit(call.getOperands().get(0));
+    }
     if ("COALESCE".equalsIgnoreCase(call.getOperator().getName())) {
       return emitCoalesceAsCase(call.getOperands());
     }
@@ -460,8 +466,18 @@ final class RexExpression {
     if (call.getOperands().size() != 1) {
       return reject("unsupported CAST arity");
     }
-    SqlTypeName source = call.getOperands().get(0).getType().getSqlTypeName();
-    SqlTypeName targetType = call.getType().getSqlTypeName();
+    RelDataType sourceType = call.getOperands().get(0).getType();
+    RelDataType resultType = call.getType();
+    // A cast that leaves the value unchanged — same base type and precision/scale, differing only in
+    // nullability or a time-attribute marker (Flink's `CAST(... ):TIMESTAMP_LTZ *ROWTIME*` that marks
+    // the event-time column) — is an identity projection: emit the operand so the column passes through.
+    if (sourceType.getSqlTypeName() == resultType.getSqlTypeName()
+        && sourceType.getPrecision() == resultType.getPrecision()
+        && sourceType.getScale() == resultType.getScale()) {
+      return emit(call.getOperands().get(0));
+    }
+    SqlTypeName source = sourceType.getSqlTypeName();
+    SqlTypeName targetType = resultType.getSqlTypeName();
     int target = wideningTargetCode(source, targetType);
     if (target < 0) {
       return reject("unsupported CAST " + source + "→" + targetType + " (only widening numeric)");
