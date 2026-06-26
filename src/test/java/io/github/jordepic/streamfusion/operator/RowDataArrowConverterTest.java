@@ -80,11 +80,12 @@ class RowDataArrowConverterTest {
       assertEquals(2, root.getRowCount());
       List<RowData> back = RowDataArrowConverter.read(root, SCHEMA);
       assertEquals(2, back.size());
-      GenericRowData backFirst = (GenericRowData) back.get(0);
-      GenericRowData backNulls = (GenericRowData) back.get(1);
+      RowData backFirst = back.get(0);
+      RowData backNulls = back.get(1);
       for (int c = 0; c < COLUMNS; c++) {
-        assertEquals(first.getField(c), backFirst.getField(c), "column " + c);
-        assertEquals(null, backNulls.getField(c), "null column " + c);
+        RowData.FieldGetter getter = RowData.createFieldGetter(SCHEMA.getTypeAt(c), c);
+        assertEquals(first.getField(c), getter.getFieldOrNull(backFirst), "column " + c);
+        assertEquals(null, getter.getFieldOrNull(backNulls), "null column " + c);
       }
     }
   }
