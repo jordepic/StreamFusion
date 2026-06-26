@@ -165,7 +165,10 @@ final class KafkaTables {
     }
     int code = decodeFormatCode(options);
     if (code == 5) {
-      return options.get("protobuf.message-class-name") != null; // needed to derive the descriptor
+      // Protobuf routes only for a flat message of scalar fields the decode reproduces identically to
+      // Flink; enums, nested/repeated/map fields, and bytes fall back (see ProtobufDescriptors).
+      String messageClass = options.get("protobuf.message-class-name");
+      return messageClass != null && ProtobufDescriptors.isFlatScalarMessage(messageClass);
     }
     return code == 0 || code == 2 || code == 3 || code == 4;
   }

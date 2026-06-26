@@ -91,3 +91,8 @@ here when the ticket is deleted.
 - **Fully native Kafka source, no JNI** (ticket 33, back burner): subscribe in Rust, decode →Arrow,
   lifting the connector semantics (partition/offset/checkpoint/watermark) from Arroyo. Removes the one
   off-heap copy ticket 32 pays; only worth it once that decode path proves the copy is the bottleneck.
+- **Columnar sinks + nested boundary types** (ticket 34): the row↔Arrow transpose carries only
+  scalar/temporal columns, so native operators that produce a nested `ROW`/`ARRAY`/`MAP` column can't
+  hand it to a rowwise sink — complex protobuf/Avro/JSON messages therefore fall back today. The end
+  state is custom columnar sinks (no transpose for columnar workflows); the bridge fix is nested-type
+  support in the transpose. Lifts the flat-scalar gate on protobuf decode.
