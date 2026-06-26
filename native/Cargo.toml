@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 jni = "0.21"
-arrow = { version = "58", features = ["ffi", "json"] }
+arrow = { version = "58", features = ["ffi", "json", "csv"] }
 # Native file readers, both driven through DataFusion's file-scan execution (projection pushdown,
 # row-group/stripe range selection) — datafusion's built-in Parquet source and datafusion-orc's ORC
 # source. datafusion-orc is not published for this datafusion version, so it is pinned by git rev;
@@ -21,6 +21,16 @@ parquet = { version = "58", features = ["arrow"] }
 # Native Avro decode incl. the Confluent Schema Registry wire format (magic byte + 4-byte schema id +
 # Avro body), resolved against a local SchemaStore keyed by integer id. Used by the Kafka source.
 arrow-avro = "58"
+# Native Protobuf decode. Flink's `protobuf` format carries the BARE protobuf message bytes (no
+# Confluent framing) decoded against a descriptor from a generated message class. `ptars` converts the
+# protobuf wire format STRAIGHT into Arrow columnar arrays (no per-row DynamicMessage), driven by a
+# runtime `MessageDescriptor` — exactly Flink's dynamic model. prost-reflect (pinned to ptars' 0.16)
+# builds that descriptor from a FileDescriptorSet the JVM serializes off the message class.
+# ptars is VENDORED in-tree (native/vendor/ptars) — crates.io ptars is pinned to arrow 57 and we need
+# 58, so we carry the source with that one-line bump rather than a fork/git dep. Self-contained: any
+# clone builds it. See native/vendor/ptars/Cargo.toml for provenance.
+prost-reflect = "0.16"
+ptars = { path = "vendor/ptars" }
 datafusion = "53.1.0"
 # Native Kafka consumer, behind the `kafka` feature so the normal build pulls in no Kafka code at all.
 # rdkafka-sys builds and statically links its bundled librdkafka (mklove build, needs only a C

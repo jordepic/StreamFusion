@@ -122,6 +122,15 @@
             <version>${flink.version}</version>
             <scope>provided</scope>
         </dependency>
+        <!-- CSV format factory. Flink validates+builds the kafka+csv table source during SQL validation
+             (the native decode node replaces it at physical-plan time); the format factory must be on
+             the classpath for that, like flink-json. Provided at runtime by the Flink distribution. -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-csv</artifactId>
+            <version>${flink.version}</version>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-parquet</artifactId>

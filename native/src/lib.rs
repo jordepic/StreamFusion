@@ -4765,43 +4765,185 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeGroupAgg
     }
 }
 
+/// Decodes a binary "body" batch (one bare protobuf message per row) into typed Arrow, matching Flink's
+/// `protobuf` format: each message is the *whole* serialized protobuf (no Confluent framing), parsed
+/// against a descriptor the JVM serialized off the generated message class into a `FileDescriptorSet`.
+/// `prost-reflect` builds the descriptor pool at open time; `ptars` walks the wire format straight into
+/// Arrow arrays (no per-row `DynamicMessage`), deriving the batch schema from the message descriptor.
+struct ProtobufDecoder {
+    message: prost_reflect::MessageDescriptor,
+    config: ptars::PtarsConfig,
+}
+
+impl ProtobufDecoder {
+    /// `descriptor_set` is an encoded protobuf `FileDescriptorSet` (the message's file + its transitive
+    /// dependencies); `message_name` is the fully-qualified message type to decode each body as.
+    fn new(descriptor_set: &[u8], message_name: &str) -> ProtobufDecoder {
+        let pool = prost_reflect::DescriptorPool::decode(descriptor_set)
+            .expect("failed to decode protobuf FileDescriptorSet");
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("protobuf message {message_name} not found in descriptor"));
+        // ConfluentWirePolicy::Raw (the default) = bare protobuf bytes, which is what Flink's `protobuf`
+        // format carries; the Confluent variant (strip magic+id+message-index) would set it here.
+        ProtobufDecoder { message, config: ptars::PtarsConfig::default() }
+    }
+
+    /// Decodes the single binary body column into a typed batch (schema derived from the descriptor).
+    /// A null body decodes to a null row (ptars keeps the batch 1:1 with the input column).
+    fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
+        use arrow::array::BinaryArray;
+        let column = bodies.column(0).as_any().downcast_ref::<BinaryArray>().expect("binary body");
+        ptars::binary_array_to_record_batch_direct(column, &self.message, &self.config)
+            .expect("failed to decode protobuf batch")
+    }
+}
+
+/// Decodes a binary "body" batch (one CSV record per row, no header) into a batch of the target schema
+/// via `arrow-csv`, matching Flink's `csv` format. Records are fed newline-terminated so the streaming
+/// decoder sees each message as a complete row; a null body contributes no row (like JSON).
+struct CsvDecoder {
+    schema: SchemaRef,
+}
+
+impl CsvDecoder {
+    fn new(schema: SchemaRef) -> CsvDecoder {
+        CsvDecoder { schema }
+    }
+
+    fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
+        let column = bodies.column(0);
+        let row_count = bodies.num_rows();
+        let body = |row: usize| -> Option<&[u8]> { binary_body(column, row) };
+        // Join the rows into one newline-delimited buffer (each Kafka message is one record with no
+        // trailing newline), then stream it through the CSV decoder in one flush.
+        let mut buf = Vec::new();
+        for row in 0..row_count {
+            if let Some(bytes) = body(row) {
+                buf.extend_from_slice(bytes);
+                if !bytes.ends_with(b"\n") {
+                    buf.push(b'\n');
+                }
+            }
+        }
+        let mut decoder = arrow::csv::ReaderBuilder::new(self.schema.clone())
+            .with_header(false)
+            .with_batch_size(row_count.max(1))
+            .build_decoder();
+        let mut offset = 0;
+        while offset < buf.len() {
+            let consumed = decoder.decode(&buf[offset..]).expect("failed to decode CSV record");
+            if consumed == 0 {
+                break;
+            }
+            offset += consumed;
+        }
+        decoder
+            .flush()
+            .expect("failed to flush CSV batch")
+            .unwrap_or_else(|| RecordBatch::new_empty(self.schema.clone()))
+    }
+}
+
+/// Decodes Flink's `raw` format: the message bytes pass through as a single column. The body is already
+/// a binary column, so this just casts it to the target column's type (Binary passthrough, or Binary →
+/// Utf8 for a STRING column) and renames it. 1:1 with the input rows (a null stays null).
+struct RawDecoder {
+    schema: SchemaRef,
+}
+
+impl RawDecoder {
+    fn new(schema: SchemaRef) -> RawDecoder {
+        RawDecoder { schema }
+    }
+
+    fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
+        let target = self.schema.field(0).data_type();
+        let column = arrow::compute::cast(bodies.column(0), target).expect("failed to cast raw column");
+        RecordBatch::try_new(self.schema.clone(), vec![column]).expect("failed to build raw batch")
+    }
+}
+
+/// Reads row `row` of a binary "body" column as bytes, or `None` if the column is null there. Shared by
+/// the JSON/CSV decoders, which accept a Binary, LargeBinary, or Utf8 body column.
+fn binary_body(column: &ArrayRef, row: usize) -> Option<&[u8]> {
+    use arrow::array::{Array, BinaryArray, LargeBinaryArray, StringArray};
+    match column.data_type() {
+        DataType::Binary => {
+            let a = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+            a.is_valid(row).then(|| a.value(row))
+        }
+        DataType::LargeBinary => {
+            let a = column.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            a.is_valid(row).then(|| a.value(row))
+        }
+        DataType::Utf8 => {
+            let a = column.as_any().downcast_ref::<StringArray>().unwrap();
+            a.is_valid(row).then(|| a.value(row).as_bytes())
+        }
+        other => panic!("unsupported body column type {other:?}"),
+    }
+}
+
 /// The single, format-dispatched decode core shared by every ingest path: it turns a batch of one
 /// binary column — raw message bodies, one per row — into a typed Arrow batch. JSON goes through
-/// `arrow-json`; Confluent-Avro through `arrow-avro` against a local schema-id store. Both the shallow
-/// path (Flink polls bytes, hands them here) and the native source (rdkafka polls bytes, hands them
-/// here) feed the *same* `MessageDecoder`; only who produces the body batch differs.
+/// `arrow-json`, CSV through `arrow-csv`, Avro (bare or Confluent-framed) through `arrow-avro` against a
+/// local schema-id store, protobuf through `prost-reflect`/`ptars`, and `raw` is a passthrough. Both the
+/// shallow path (Flink polls bytes, hands them
+/// here) and the native source (rdkafka polls bytes, hands them here) feed the *same* `MessageDecoder`;
+/// only who produces the body batch differs.
 enum MessageDecoder {
     Json(JsonDecoder),
+    Csv(CsvDecoder),
+    Raw(RawDecoder),
+    /// Confluent-framed Avro: each message is `0x00` + 4-byte BE schema id + datum, resolved by id.
     Avro(arrow_avro::schema::SchemaStore),
+    /// Bare Avro (Flink's `avro`): each message is just the datum, decoded against the one reader schema
+    /// registered at synthetic id 0 — we prepend the 5-byte id-0 header so the framed decoder applies.
+    BareAvro(arrow_avro::schema::SchemaStore),
+    Protobuf(ProtobufDecoder),
 }
 
 impl MessageDecoder {
-    /// `format` 0 = JSON (decoded against `output_schema`), 1 = Confluent-Avro (decoded against
-    /// `avro_schema` registered at `schema_id`).
+    /// `format`: 0 = JSON, 2 = CSV, 3 = `raw` — decoded against `output_schema`; 1 = Confluent-Avro
+    /// (`avro_schema` registered at `schema_id`); 4 = bare Avro (`avro_schema` as the reader schema,
+    /// registered at synthetic id 0). (Protobuf is built via `createProtobufDecoder`, not here.)
     fn new(format: i32, output_schema: SchemaRef, avro_schema: &str, schema_id: i32) -> MessageDecoder {
-        if format == 1 {
-            use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
-            let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
-            store
-                .set(Fingerprint::Id(schema_id as u32), AvroSchema::new(avro_schema.to_string()))
-                .expect("failed to register avro schema");
-            MessageDecoder::Avro(store)
-        } else {
-            MessageDecoder::Json(JsonDecoder::new(output_schema))
+        match format {
+            1 => MessageDecoder::Avro(avro_store(avro_schema, schema_id as u32)),
+            4 => MessageDecoder::BareAvro(avro_store(avro_schema, 0)),
+            2 => MessageDecoder::Csv(CsvDecoder::new(output_schema)),
+            3 => MessageDecoder::Raw(RawDecoder::new(output_schema)),
+            _ => MessageDecoder::Json(JsonDecoder::new(output_schema)),
         }
     }
 
     fn decode(&self, body: &RecordBatch) -> RecordBatch {
         match self {
             MessageDecoder::Json(decoder) => decoder.decode(body),
-            MessageDecoder::Avro(store) => decode_avro_body(store, body),
+            MessageDecoder::Csv(decoder) => decoder.decode(body),
+            MessageDecoder::Raw(decoder) => decoder.decode(body),
+            MessageDecoder::Avro(store) => decode_avro_body(store, body, false),
+            MessageDecoder::BareAvro(store) => decode_avro_body(store, body, true),
+            MessageDecoder::Protobuf(decoder) => decoder.decode(body),
         }
     }
 }
 
+/// A single-schema arrow-avro writer store keyed by integer id (the Confluent / id-framing layout).
+fn avro_store(avro_schema: &str, id: u32) -> arrow_avro::schema::SchemaStore {
+    use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
+    let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+    store
+        .set(Fingerprint::Id(id), AvroSchema::new(avro_schema.to_string()))
+        .expect("failed to register avro schema");
+    store
+}
+
 /// Creates a format-dispatched message decoder and returns an opaque handle, released with
-/// `closeDecoder`. The JSON target schema is taken from an empty batch the JVM exports; the Avro writer
-/// schema is `avroSchema` registered under `schemaId`.
+/// `closeDecoder`. Formats 0/2/3 (JSON/CSV/raw) decode against the target schema the JVM exports as an
+/// empty batch; formats 1/4 (Confluent/bare Avro) derive their schema from `avroSchema` (registered
+/// under `schemaId` for Confluent, synthetic id 0 for bare) and ignore the schema C structs.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder<'local>(
     mut env: JNIEnv<'local>,
@@ -4812,15 +4954,34 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder
     avro_schema: JString<'local>,
     schema_id: jint,
 ) -> jlong {
-    // The output schema is only used by JSON decode; Avro derives its own from the writer schema, so
-    // its caller can pass 0/0 for the schema C structs.
-    let schema = if format == 1 {
+    // Avro (1, 4) derives its own schema from the writer schema, so those callers pass 0/0 for the
+    // schema C structs; JSON/CSV/raw (0, 2, 3) decode against the exported target schema.
+    let schema = if format == 1 || format == 4 {
         Arc::new(Schema::empty())
     } else {
         import_record_batch(schema_array_address, schema_address).schema()
     };
     let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
     Box::into_raw(Box::new(MessageDecoder::new(format, schema, &avro_schema, schema_id))) as jlong
+}
+
+/// Creates a protobuf message decoder (Flink's `protobuf` format: bare message bytes, no framing) and
+/// returns an opaque `MessageDecoder` handle, released with `closeDecoder` like any other decoder.
+/// `descriptor` is an encoded `FileDescriptorSet` the JVM serialized off the generated message class
+/// (the message's `.proto` file + transitive dependencies); `messageName` is the fully-qualified type
+/// to decode each body as. The Arrow batch schema is derived from the descriptor by ptars (no schema
+/// C-structs needed, unlike JSON).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createProtobufDecoder<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    descriptor: JByteArray<'local>,
+    message_name: JString<'local>,
+) -> jlong {
+    let descriptor = env.convert_byte_array(&descriptor).expect("failed to read proto descriptor");
+    let message_name: String = env.get_string(&message_name).expect("failed to read message name").into();
+    let decoder = MessageDecoder::Protobuf(ProtobufDecoder::new(&descriptor, &message_name));
+    Box::into_raw(Box::new(decoder)) as jlong
 }
 
 /// Decodes one body batch into a typed batch, exporting it into the consumer-allocated C structs.
@@ -4908,9 +5069,16 @@ struct Decoded {
     batch: RecordBatch,
 }
 
-/// Decodes a binary "body" batch (one Confluent-Avro message per row) into typed Arrow via arrow-avro,
-/// resolving each row's schema id against the local store. Used by `MessageDecoder` for both paths.
-fn decode_avro_body(store: &arrow_avro::schema::SchemaStore, body: &RecordBatch) -> RecordBatch {
+/// Decodes a binary "body" batch into typed Arrow via arrow-avro against the local schema-id store. When
+/// `bare`, each message is a raw datum (Flink's `avro`) and we prepend the 5-byte id-0 Confluent header
+/// (`0x00` + 4-byte 0) so arrow-avro's framed decoder resolves it against the schema at id 0; otherwise
+/// each message already carries its `0x00` + id prefix (Confluent `avro-confluent`). A null body is
+/// skipped. Used by `MessageDecoder` for both Avro variants.
+fn decode_avro_body(
+    store: &arrow_avro::schema::SchemaStore,
+    body: &RecordBatch,
+    bare: bool,
+) -> RecordBatch {
     use arrow::array::{Array, BinaryArray};
     let column = body.column(0).as_any().downcast_ref::<BinaryArray>().expect("binary body");
     let mut decoder = arrow_avro::reader::ReaderBuilder::new()
@@ -4918,8 +5086,20 @@ fn decode_avro_body(store: &arrow_avro::schema::SchemaStore, body: &RecordBatch)
         .with_batch_size(column.len().max(1))
         .build_decoder()
         .expect("failed to build avro decoder");
+    let mut framed = Vec::new();
     for i in 0..column.len() {
-        decoder.decode(column.value(i)).expect("avro decode failed");
+        if !column.is_valid(i) {
+            continue;
+        }
+        let bytes = if bare {
+            framed.clear();
+            framed.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00]); // id-0 Confluent header
+            framed.extend_from_slice(column.value(i));
+            &framed[..]
+        } else {
+            column.value(i)
+        };
+        decoder.decode(bytes).expect("avro decode failed");
     }
     decoder.flush().expect("avro flush failed").expect("empty avro batch")
 }
@@ -5331,6 +5511,158 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
             rows += batch.num_rows() as i64; // consumed in Rust; no JVM export
         }
     }
+    rows
+}
+
+/// Benchmark-only: measure librdkafka's raw delivery rate — batch-consume the whole topic and count
+/// messages with NO decode and no decode thread, isolating the consumer from everything downstream.
+/// Compared against the Java client's raw poll to answer "is librdkafka delivery actually slower here".
+#[cfg(feature = "kafka")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkConsumeOnly<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_keys: JObjectArray<'local>,
+    config_values: JObjectArray<'local>,
+    topic: JString<'local>,
+    max_messages: jlong,
+) -> jlong {
+    use rdkafka::bindings as rdsys;
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+
+    let keys = read_string_array(&mut env, &config_keys);
+    let values = read_string_array(&mut env, &config_values);
+    let topic: String = env.get_string(&topic).expect("failed to read topic").into();
+    let mut client = ClientConfig::new();
+    for (key, value) in keys.iter().zip(&values) {
+        client.set(key, value);
+    }
+    let consumer: BaseConsumer = client.create().expect("failed to create kafka consumer");
+    // Assign every partition at the beginning — librdkafka fetches them all (one FetchRequest per
+    // broker) and merges them onto the single consumer queue this loop drains.
+    let metadata = consumer
+        .fetch_metadata(Some(&topic), std::time::Duration::from_secs(10))
+        .expect("fetch metadata");
+    let partitions = metadata
+        .topics()
+        .iter()
+        .find(|t| t.name() == topic)
+        .expect("topic in metadata")
+        .partitions();
+    let mut tpl = TopicPartitionList::new();
+    for partition in partitions {
+        tpl.add_partition_offset(&topic, partition.id(), Offset::Beginning).expect("add partition");
+    }
+    consumer.assign(&tpl).expect("assign");
+    let queue = unsafe { rdsys::rd_kafka_queue_get_consumer(consumer.client().native_ptr()) };
+
+    let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); 65536];
+    let mut count: i64 = 0;
+    let mut idle = 0;
+    while count < max_messages && idle < 40 {
+        let received =
+            unsafe { rdsys::rd_kafka_consume_batch_queue(queue, 250, messages.as_mut_ptr(), 65536) };
+        if received <= 0 {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        for &message_ptr in &messages[..received as usize] {
+            let message = unsafe { &*message_ptr };
+            if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+                && !message.payload.is_null()
+            {
+                count += 1; // no decode — raw delivery only
+            }
+            unsafe { rdsys::rd_kafka_message_destroy(message_ptr) };
+        }
+    }
+    unsafe { rdsys::rd_kafka_queue_destroy(queue) };
+    count
+}
+
+/// Benchmark-only: the SERIAL counterpart to `benchmarkNativeConsume` — same rdkafka batch consume and
+/// the same `MessageDecoder`, but decode runs INLINE on the consume thread (no decode thread, no channel
+/// handoff). Isolates whether the pipelining helps or whether the per-batch handoff is overhead: for a
+/// cheap decode (Avro) serial should match or beat the pipelined path; for an expensive decode (JSON)
+/// the pipeline should win by overlapping decode with the next poll. Returns the decoded row count.
+#[cfg(feature = "kafka")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNativeConsumeSerial<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_keys: JObjectArray<'local>,
+    config_values: JObjectArray<'local>,
+    topic: JString<'local>,
+    format: jint,
+    schema_array_address: jlong,
+    schema_address: jlong,
+    avro_schema: JString<'local>,
+    schema_id: jint,
+    max_messages: jlong,
+) -> jlong {
+    use arrow::array::BinaryBuilder;
+    use rdkafka::bindings as rdsys;
+    use rdkafka::config::ClientConfig;
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+
+    let keys = read_string_array(&mut env, &config_keys);
+    let values = read_string_array(&mut env, &config_values);
+    let topic: String = env.get_string(&topic).expect("failed to read topic").into();
+    let schema = import_record_batch(schema_array_address, schema_address).schema();
+    let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
+
+    let mut client = ClientConfig::new();
+    for (key, value) in keys.iter().zip(&values) {
+        client.set(key, value);
+    }
+    let consumer: BaseConsumer = client.create().expect("failed to create kafka consumer");
+    let metadata = consumer
+        .fetch_metadata(Some(&topic), std::time::Duration::from_secs(10))
+        .expect("fetch metadata");
+    let mut tpl = TopicPartitionList::new();
+    for partition in metadata.topics().iter().find(|t| t.name() == topic).expect("topic").partitions() {
+        tpl.add_partition_offset(&topic, partition.id(), Offset::Beginning).expect("add partition");
+    }
+    consumer.assign(&tpl).expect("assign");
+    let queue = unsafe { rdsys::rd_kafka_queue_get_consumer(consumer.client().native_ptr()) };
+
+    // The same decoder the pipelined path builds, just driven inline.
+    let decoder = MessageDecoder::new(format, schema, &avro_schema, schema_id);
+    let body_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)]));
+
+    let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); 65536];
+    let mut rows: i64 = 0;
+    let mut idle = 0;
+    while rows < max_messages && idle < 40 {
+        let received =
+            unsafe { rdsys::rd_kafka_consume_batch_queue(queue, 250, messages.as_mut_ptr(), 65536) };
+        if received <= 0 {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        let mut builder = BinaryBuilder::with_capacity(received as usize, received as usize * 64);
+        for &message_ptr in &messages[..received as usize] {
+            let message = unsafe { &*message_ptr };
+            if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+                && !message.payload.is_null()
+            {
+                let payload =
+                    unsafe { std::slice::from_raw_parts(message.payload as *const u8, message.len) };
+                builder.append_value(payload);
+            }
+            unsafe { rdsys::rd_kafka_message_destroy(message_ptr) };
+        }
+        // Decode INLINE — the next batch is not fetched until this returns.
+        let body = RecordBatch::try_new(body_schema.clone(), vec![Arc::new(builder.finish())])
+            .expect("failed to build kafka body batch");
+        rows += decoder.decode(&body).num_rows() as i64;
+    }
+    unsafe { rdsys::rd_kafka_queue_destroy(queue) };
     rows
 }
 
@@ -6149,6 +6481,146 @@ mod tests {
         .unwrap()
     }
 
+    /// A hand-built `FileDescriptorSet` for `bench.Row { int64 id=1; string name=2; double score=3; }`
+    /// — what the JVM would serialize off the generated message class for Flink's `protobuf` format.
+    fn proto_descriptor_set() -> Vec<u8> {
+        use prost_reflect::prost::Message;
+        use prost_reflect::prost_types::{
+            field_descriptor_proto::{Label, Type},
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        };
+        let field = |name: &str, number: i32, ty: Type| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            label: Some(Label::Optional as i32),
+            r#type: Some(ty as i32),
+            ..Default::default()
+        };
+        let message = DescriptorProto {
+            name: Some("Row".to_string()),
+            field: vec![
+                field("id", 1, Type::Int64),
+                field("name", 2, Type::String),
+                field("score", 3, Type::Double),
+            ],
+            ..Default::default()
+        };
+        let file = FileDescriptorProto {
+            name: Some("bench.proto".to_string()),
+            package: Some("bench".to_string()),
+            message_type: vec![message],
+            syntax: Some("proto3".to_string()),
+            ..Default::default()
+        };
+        FileDescriptorSet { file: vec![file] }.encode_to_vec()
+    }
+
+    // Each body is one bare protobuf message (no framing); ptars decodes the wire format straight into
+    // Arrow arrays, deriving the batch schema from the descriptor (columns named by proto field).
+    #[test]
+    fn protobuf_decode_emits_one_row_per_message() {
+        use prost_reflect::prost::Message;
+        use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+        let descriptor = proto_descriptor_set();
+        let message = DescriptorPool::decode(descriptor.as_ref())
+            .unwrap()
+            .get_message_by_name("bench.Row")
+            .unwrap();
+        let encode = |id: i64, name: &str, score: f64| {
+            let mut m = DynamicMessage::new(message.clone());
+            m.set_field_by_name("id", Value::I64(id));
+            m.set_field_by_name("name", Value::String(name.to_string()));
+            m.set_field_by_name("score", Value::F64(score));
+            m.encode_to_vec()
+        };
+        let row0 = encode(1, "a", 1.5);
+        let row1 = encode(2, "b", 2.5);
+        let body = bodies(vec![Some(row0.as_slice()), Some(row1.as_slice())]);
+
+        let out = ProtobufDecoder::new(&descriptor, "bench.Row").decode(&body);
+
+        assert_eq!(out.num_rows(), 2);
+        let id = out.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.values(), &[1, 2]);
+        let names =
+            out.column_by_name("name").unwrap().as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!((names.value(0), names.value(1)), ("a", "b"));
+        let scores =
+            out.column_by_name("score").unwrap().as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+        assert_eq!(scores.values(), &[1.5, 2.5]);
+    }
+
+    // Each body is one CSV record (no header); CSV decode (format 2) emits one typed row per record.
+    #[test]
+    fn csv_decode_emits_one_row_per_record() {
+        let body = bodies(vec![Some(b"1,a,1.5"), Some(b"2,b,2.5")]);
+        let out = MessageDecoder::new(2, json_schema(), "", 0).decode(&body);
+        assert_eq!(out.num_rows(), 2);
+        let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.values(), &[1, 2]);
+        let names = out.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!((names.value(0), names.value(1)), ("a", "b"));
+        let scores = out.column(2).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+        assert_eq!(scores.values(), &[1.5, 2.5]);
+    }
+
+    // `raw` (format 3): the body bytes pass through as the single column, cast to the declared type.
+    #[test]
+    fn raw_decode_passes_bytes_through() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, true)]));
+        let body = bodies(vec![Some(b"hello"), Some(b"world")]);
+        let out = MessageDecoder::new(3, schema, "", 0).decode(&body);
+        assert_eq!(out.num_rows(), 2);
+        let col = out.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!((col.value(0), col.value(1)), ("hello", "world"));
+    }
+
+    // Bare Avro (format 4): each body is a raw datum (no Confluent framing), decoded against the reader
+    // schema we register at synthetic id 0 (the decoder prepends the id-0 header internally).
+    #[test]
+    fn bare_avro_decode_emits_one_row_per_datum() {
+        // Avro binary datum for record { long id; string name; double score }, no framing.
+        fn zigzag_varint(n: i64) -> Vec<u8> {
+            let mut zz = ((n << 1) ^ (n >> 63)) as u64;
+            let mut out = Vec::new();
+            loop {
+                let mut b = (zz & 0x7f) as u8;
+                zz >>= 7;
+                if zz != 0 {
+                    b |= 0x80;
+                }
+                out.push(b);
+                if zz == 0 {
+                    break;
+                }
+            }
+            out
+        }
+        fn datum(id: i64, name: &str, score: f64) -> Vec<u8> {
+            let mut v = zigzag_varint(id);
+            v.extend(zigzag_varint(name.len() as i64));
+            v.extend_from_slice(name.as_bytes());
+            v.extend_from_slice(&score.to_le_bytes());
+            v
+        }
+        let reader_schema = r#"{"type":"record","name":"Row","fields":[
+            {"name":"id","type":"long"},{"name":"name","type":"string"},{"name":"score","type":"double"}]}"#;
+        let m0 = datum(1, "a", 1.5);
+        let m1 = datum(2, "b", 2.5);
+        let body = bodies(vec![Some(m0.as_slice()), Some(m1.as_slice())]);
+
+        let out = MessageDecoder::new(4, Arc::new(Schema::empty()), reader_schema, 0).decode(&body);
+
+        assert_eq!(out.num_rows(), 2);
+        let id = out.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id.values(), &[1, 2]);
+        let names =
+            out.column_by_name("name").unwrap().as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+        assert_eq!((names.value(0), names.value(1)), ("a", "b"));
+    }
+
     // Each input row is one complete JSON document; the decoder emits one typed row per document,
     // matching the target schema's columns and order.
     #[test]
@@ -6892,61 +7364,6 @@ mod tests {
         assert_eq!(first, values(&batch, 0));
     }
 
-    // Pure-native read→write ceiling: time copying a directory of Parquet with no JVM in the loop.
-    // Run with: cargo test -- --ignored --nocapture profile_parquet_copy
-    #[test]
-    #[ignore]
-    fn profile_parquet_copy() {
-        let rows: i64 = 5_000_000;
-        let k: ArrayRef = Arc::new(Int64Array::from((0..rows).collect::<Vec<i64>>()));
-        let v: ArrayRef = Arc::new(Int64Array::from((0..rows).map(|i| i % 100).collect::<Vec<i64>>()));
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int64, true),
-                Field::new("v", DataType::Int64, true),
-            ])),
-            vec![k, v],
-        )
-        .unwrap();
-        let in_dir = std::env::temp_dir().join("sf_profile_in");
-        let out_dir = std::env::temp_dir().join("sf_profile_out");
-        let _ = std::fs::remove_dir_all(&in_dir);
-        let _ = std::fs::remove_dir_all(&out_dir);
-        std::fs::create_dir_all(&in_dir).unwrap();
-        std::fs::create_dir_all(&out_dir).unwrap();
-        write_parquet(&batch, in_dir.join("part-0.parquet").to_str().unwrap());
-
-        let start = std::time::Instant::now();
-        let mut source = ParquetSource::open(in_dir.to_str().unwrap(), vec![], 0, 1);
-        let mut i = 0;
-        let mut read = std::time::Duration::ZERO;
-        let mut write = std::time::Duration::ZERO;
-        loop {
-            let t = std::time::Instant::now();
-            let next = source.next();
-            read += t.elapsed();
-            match next {
-                Some(b) => {
-                    let t = std::time::Instant::now();
-                    write_parquet(&b, out_dir.join(format!("part-{i}.parquet")).to_str().unwrap());
-                    write += t.elapsed();
-                    i += 1;
-                }
-                None => break,
-            }
-        }
-        let elapsed = start.elapsed();
-        eprintln!(
-            "native copy: {} rows, {} batches in {:?} ({:.2} M rows/s); read {:?}, write {:?}",
-            rows,
-            i,
-            elapsed,
-            rows as f64 / elapsed.as_secs_f64() / 1e6,
-            read,
-            write
-        );
-    }
-
     fn ab_batch() -> RecordBatch {
         let a: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
         let b: ArrayRef = Arc::new(Int64Array::from(vec![10i64, 20, 30]));
@@ -7036,26 +7453,6 @@ mod tests {
             }
             assert_eq!(rows, n, "all rows preserved for {num_partitions} partitions");
         }
-    }
-
-    // The Parquet source reads back every batch written across a directory's files.
-    #[test]
-    fn reads_a_parquet_directory() {
-        let dir = std::env::temp_dir().join("streamfusion_source_dir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        write_parquet(&sample_batch(), dir.join("part-0.parquet").to_str().unwrap());
-        write_parquet(&sample_batch(), dir.join("part-1.parquet").to_str().unwrap());
-
-        let mut source = ParquetSource::open(dir.to_str().unwrap(), vec![], 0, 1);
-        let mut rows = 0usize;
-        let mut batches = 0usize;
-        while let Some(batch) = source.next() {
-            rows += batch.num_rows();
-            batches += 1;
-        }
-        assert_eq!(rows, 2 * sample_batch().num_rows());
-        assert!(batches >= 2);
     }
 
     // The compiled predicate is cached after the first batch and reused.
