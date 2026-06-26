@@ -425,7 +425,8 @@ public final class Native {
    * batch — the format-decode core both the shallow and native Kafka paths feed bytes into. Stateless,
    * so no snapshot/restore.
    *
-   * @param format 0 = JSON (decoded against the schema C structs), 1 = Confluent Avro
+   * @param format 0 = JSON, 2 = CSV, 3 = raw (decoded against the schema C structs), 1 = Confluent Avro,
+   *     4 = bare Avro
    * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the target schema
    * @param schemaAddress address of the matching exported {@code ArrowSchema}
    * @param avroSchema writer-schema JSON for Avro (ignored for JSON; pass "")
@@ -433,6 +434,17 @@ public final class Native {
    */
   public static native long createDecoder(
       int format, long schemaArrayAddress, long schemaAddress, String avroSchema, int schemaId);
+
+  /**
+   * Creates a protobuf message decoder (Flink's {@code protobuf} format: bare message bytes, no
+   * Confluent framing), returning a {@link MessageDecoder} handle released with {@link #closeDecoder}.
+   * The Arrow batch schema is derived from the descriptor (no schema C-structs, unlike JSON).
+   *
+   * @param descriptor an encoded protobuf {@code FileDescriptorSet} the JVM serialized off the
+   *     generated message class (the message's {@code .proto} file + its transitive dependencies)
+   * @param messageName the fully-qualified message type to decode each body as
+   */
+  public static native long createProtobufDecoder(byte[] descriptor, String messageName);
 
   /** Decodes one binary-column body batch into a typed batch, exported into the output C structs. */
   public static native void decodeInto(
@@ -482,6 +494,28 @@ public final class Native {
       String avroSchema,
       int schemaId,
       long maxMessages);
+
+  /**
+   * Benchmark-only: the serial counterpart to {@link #benchmarkNativeConsume} — same rdkafka consume and
+   * decoder, but decode runs inline on the consume thread (no decode thread). Returns the row count.
+   */
+  public static native long benchmarkNativeConsumeSerial(
+      String[] configKeys,
+      String[] configValues,
+      String topic,
+      int format,
+      long schemaArrayAddress,
+      long schemaAddress,
+      String avroSchema,
+      int schemaId,
+      long maxMessages);
+
+  /**
+   * Benchmark-only: measure librdkafka's raw delivery rate — batch-consume and count messages with no
+   * decode, to compare the consumer alone against the Java client's poll. Returns the message count.
+   */
+  public static native long benchmarkConsumeOnly(
+      String[] configKeys, String[] configValues, String topic, long maxMessages);
 
   /**
    * Opens a native Kafka split reader for one subtask and returns an opaque handle, released with

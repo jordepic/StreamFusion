@@ -246,6 +246,14 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           scan.getCluster(), scan.getTraitSet(), scan.getRowType(), FilesystemTables.options(scan));
     }
 
+    // Shallow native-decode path: Flink's KafkaSource consumes raw bytes, a native operator decodes
+    // them to Arrow (skipping Flink's RowData decode). Handles the insert-only value formats the native
+    // rdkafka source above declines — CSV/raw today (Avro/protobuf decoders exist; planner wiring is a
+    // follow-up). Reached only after that branch, so a JSON table keeps using the native source.
+    if (KafkaTables.isNativeKafkaDecode(current)) {
+      return kafkaDecode(current);
+    }
+
     if (current instanceof StreamPhysicalCalc && FilterCalcMatcher.matches((Calc) current)) {
       if (!NativeConfig.operatorEnabled("filter")) {
         return noteDisabled(current, "filter");
@@ -686,6 +694,21 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           + " and bigint/int/string/boolean/date keys (docs/aggregate-type-support.md)";
     }
     return null;
+  }
+
+  /**
+   * Substitutes a native-decode Kafka source scan with {@link StreamPhysicalNativeKafkaDecode} (Flink's
+   * own {@code KafkaSource} produces raw bytes, the native operator decodes them to Arrow), unless the
+   * decode operator is disabled.
+   */
+  private RelNode kafkaDecode(RelNode current) {
+    if (!NativeConfig.operatorEnabled("kafkaDecode")) {
+      return noteDisabled(current, "kafkaDecode");
+    }
+    StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
+    substitutions++;
+    return new StreamPhysicalNativeKafkaDecode(
+        scan.getCluster(), scan.getTraitSet(), scan.getRowType(), FilesystemTables.options(scan));
   }
 
   /**

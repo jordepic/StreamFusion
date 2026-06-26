@@ -6,11 +6,17 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import org.apache.calcite.rel.RelNode;
 import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.connector.kafka.source.KafkaSourceBuilder;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.NoStoppingOffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscriber;
+import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 
 /**
  * Maps a Flink Kafka SQL table's options to a {@link NativeKafkaSource}, and decides whether the native
@@ -66,7 +72,14 @@ final class KafkaTables {
   /** Builds the native source for a table {@link #isNativeKafka} accepted. */
   static NativeKafkaSource build(Map<String, String> options, RowType outputType) {
     Properties props = consumerProperties(options);
-    Map<String, String> librdkafka = KafkaConfigTranslator.translate(props).config();
+    Map<String, String> librdkafka =
+        new java.util.HashMap<>(KafkaConfigTranslator.translate(props).config());
+    // librdkafka-specific throughput tuning with no Java analog (so not produced by the translator):
+    // prefetch eagerly instead of idling 1s before refetching, and keep a deep queue so the background
+    // fetcher stays ahead of the reader. Measured to lift native consume throughput meaningfully.
+    librdkafka.putIfAbsent("fetch.queue.backoff.ms", "2");
+    librdkafka.putIfAbsent("queued.min.messages", "1000000");
+    librdkafka.putIfAbsent("queued.max.messages.kbytes", "2097151");
     String[] keys = librdkafka.keySet().toArray(new String[0]);
     String[] values = new String[keys.length];
     for (int i = 0; i < keys.length; i++) {
@@ -88,6 +101,73 @@ final class KafkaTables {
         0,
         MAX_RECORDS,
         POLL_TIMEOUT_MILLIS);
+  }
+
+  // --- Shallow decode path (Phase 2): Flink's own KafkaSource consumes raw value bytes, a native
+  // operator decodes them to Arrow. Insert-only formats (JSON/CSV/raw) route via isNativeKafkaDecode.
+  // Avro/protobuf decoders exist but aren't wired into this planner path yet — see ticket 32.
+
+  /** The {@code MessageDecoder} format code for this table's value format, or -1 if not decodable here. */
+  static int decodeFormatCode(Map<String, String> options) {
+    String format = options.getOrDefault("value.format", options.get("format"));
+    if (format == null) {
+      return -1;
+    }
+    switch (format) {
+      case "json":
+        return 0;
+      case "csv":
+        return 2;
+      case "raw":
+        return 3;
+      default:
+        return -1; // avro / avro-confluent / protobuf: decoder exists, planner wiring is a follow-up
+    }
+  }
+
+  /** The Kafka consume/topic/offset prerequisites the decode path needs, independent of value format. */
+  private static boolean decodeCommon(Map<String, String> options) {
+    if (options == null || !"kafka".equals(options.get("connector"))) {
+      return false;
+    }
+    if (options.containsKey("key.format")) {
+      return false; // a key column would be a second decode the native operator doesn't produce yet
+    }
+    if (options.get("topic") == null || options.get(PROPERTIES_PREFIX + "bootstrap.servers") == null) {
+      return false;
+    }
+    return mapStartupMode(options) != null && boundedModeSupported(options);
+  }
+
+  /** Whether the shallow native-decode path can run this scan for an <em>insert-only</em> value format
+   * (JSON/CSV/raw — codes 0/2/3): Flink consumes bytes, the native operator decodes them to Arrow. */
+  static boolean isNativeKafkaDecode(RelNode node) {
+    if (!(node instanceof StreamPhysicalTableSourceScan)) {
+      return false;
+    }
+    Map<String, String> options = FilesystemTables.options((StreamPhysicalTableSourceScan) node);
+    if (!decodeCommon(options)) {
+      return false;
+    }
+    int code = decodeFormatCode(options);
+    return code == 0 || code == 2 || code == 3;
+  }
+
+  /** Builds Flink's own {@link KafkaSource} producing each record's raw value as a {@code byte[]} (no
+   * decode) — the native decode operator turns those bytes into Arrow. Flink owns consume/offsets/auth. */
+  static KafkaSource<byte[]> buildBytesSource(Map<String, String> options) {
+    Properties props = consumerProperties(options);
+    List<String> topics = Arrays.asList(options.get("topic").split(";"));
+    KafkaSourceBuilder<byte[]> builder =
+        KafkaSource.<byte[]>builder()
+            .setProperties(props)
+            .setTopics(topics)
+            .setStartingOffsets(mapStartupMode(options))
+            .setDeserializer(KafkaRecordDeserializationSchema.valueOnly(ByteArrayDeserializer.class));
+    if ("latest-offset".equals(options.get("scan.bounded.mode"))) {
+      builder.setBounded(OffsetsInitializer.latest());
+    }
+    return builder.build();
   }
 
   /** Whether {@code scan.bounded.mode} is one the native source handles (unbounded or latest-offset). */
