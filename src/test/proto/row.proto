@@ -27,9 +27,18 @@ message Scalars {
   sint64 si64 = 8;
 }
 
-// A message with a non-scalar (nested message) field — the native row boundary cannot carry a ROW
-// column, so a table over this must fall back to Flink rather than routing natively.
+// A message with a nested message field → a ROW column. Now that the row boundary carries nested
+// types, a table over this routes natively (verified identical to Flink).
 message WithNested {
   int64 id = 1;
   Row nested = 2;
+}
+
+// Repeated and map fields → ARRAY and MAP columns, plus a nested message — the full set of complex
+// column shapes the boundary now carries.
+message Complex {
+  int64 id = 1;
+  repeated int64 nums = 2;
+  map<string, int64> tags = 3;
+  Row nested = 4;
 }

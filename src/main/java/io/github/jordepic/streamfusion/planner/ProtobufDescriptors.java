@@ -1,9 +1,11 @@
 package io.github.jordepic.streamfusion.planner;
 
 import java.io.ByteArrayOutputStream;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Extracts a protobuf {@code FileDescriptorSet} and root message name from a Flink protobuf table's
@@ -28,27 +30,62 @@ final class ProtobufDescriptors {
           "INT32", "SINT32", "SFIXED32", "INT64", "SINT64", "SFIXED64", "FLOAT", "DOUBLE", "BOOL",
           "STRING");
 
-  /** Whether the named message is a flat record of only the scalar field types the native decode
-   * reproduces identically to Flink (above) — no repeated/map fields and no nested messages. Anything
-   * else falls back, because either the decode isn't verified identical or the row boundary can't carry
-   * the column type (ROW/ARRAY/MAP/VARBINARY). */
-  static boolean isFlatScalarMessage(String messageClassName) {
+  /** Whether the native decode of the named message is verified identical to Flink — so the planner may
+   * route it. Every field (recursively, through nested messages, repeated fields, and map entries) must
+   * be a supported scalar (above) or a supported message: nested messages → ROW, repeated → ARRAY, map →
+   * MAP, all of which the row boundary now carries. Excluded (fall back): enums and unsigned/fixed ints
+   * (decoded differently here than in Flink), {@code bytes} (decode is fine but {@code byte[]} parity is
+   * not yet test-covered), and the well-known types ({@code google.protobuf.*}), which the Arrow decoder
+   * maps to dedicated Arrow types while Flink treats them as ordinary nested rows. */
+  static boolean isSupportedMessage(String messageClassName) {
     try {
       Object descriptor = Class.forName(messageClassName).getMethod("getDescriptor").invoke(null);
-      List<?> fields = (List<?>) descriptor.getClass().getMethod("getFields").invoke(descriptor);
-      for (Object field : fields) {
-        if ((boolean) field.getClass().getMethod("isRepeated").invoke(field)) {
-          return false; // repeated or map
-        }
-        String type = field.getClass().getMethod("getType").invoke(field).toString();
-        if (!SUPPORTED_FIELD_TYPES.contains(type)) {
-          return false; // unsigned/fixed int, bytes, enum, nested message, group
-        }
-      }
-      return true;
+      return isSupportedMessageDescriptor(descriptor, new HashSet<>());
     } catch (ReflectiveOperationException e) {
       return false; // cannot inspect → fall back safely
     }
+  }
+
+  private static boolean isSupportedMessageDescriptor(Object descriptor, Set<String> visiting)
+      throws ReflectiveOperationException {
+    String fullName = (String) descriptor.getClass().getMethod("getFullName").invoke(descriptor);
+    if (fullName.startsWith("google.protobuf.")) {
+      return false; // well-known types map to dedicated Arrow types, not the nested row Flink produces
+    }
+    if (!visiting.add(fullName)) {
+      return true; // a recursive type already on the path; its fields are validated by the outer call
+    }
+    List<?> fields = (List<?>) descriptor.getClass().getMethod("getFields").invoke(descriptor);
+    for (Object field : fields) {
+      if (!isSupportedField(field, visiting)) {
+        return false;
+      }
+    }
+    visiting.remove(fullName);
+    return true;
+  }
+
+  /** A field is supported if it is a map of supported key/value types, or (singular or repeated) a
+   * supported scalar / a supported nested message. */
+  private static boolean isSupportedField(Object field, Set<String> visiting)
+      throws ReflectiveOperationException {
+    if ((boolean) field.getClass().getMethod("isMapField").invoke(field)) {
+      Object entry = field.getClass().getMethod("getMessageType").invoke(field);
+      Object key = entry.getClass().getMethod("findFieldByName", String.class).invoke(entry, "key");
+      Object value = entry.getClass().getMethod("findFieldByName", String.class).invoke(entry, "value");
+      return isSupportedLeaf(key, visiting) && isSupportedLeaf(value, visiting);
+    }
+    return isSupportedLeaf(field, visiting);
+  }
+
+  private static boolean isSupportedLeaf(Object field, Set<String> visiting)
+      throws ReflectiveOperationException {
+    String type = field.getClass().getMethod("getType").invoke(field).toString();
+    if (type.equals("MESSAGE")) {
+      Object message = field.getClass().getMethod("getMessageType").invoke(field);
+      return isSupportedMessageDescriptor(message, visiting);
+    }
+    return SUPPORTED_FIELD_TYPES.contains(type);
   }
 
   /** The fully-qualified name of the message the named class describes. */

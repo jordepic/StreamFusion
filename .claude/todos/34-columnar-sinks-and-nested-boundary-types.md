@@ -1,6 +1,18 @@
 # Columnar sinks + nested types across the native↔host boundary
 
-**Status:** open
+**Status:** open — **nested-type transpose DONE** (direction 2 below); columnar sinks (direction 1) and
+the protobuf representation reconciliations remain.
+
+## Done (2026-06-26)
+- The row↔Arrow transpose now carries every logical type, including `ROW`/`ARRAY`/`MAP`/`VARBINARY`. We
+  replaced the hand-rolled converter with Flink's own Arrow↔RowData machinery, vendored in-tree
+  (`io.github.jordepic.streamfusion.arrow`, repackaged from `flink-python`, Apache-2.0) — the per-type
+  column readers/field writers plus a trimmed schema/reader/writer factory (`ArrowConversion`), timestamps
+  pinned to nanos to match the native side. `RowDataArrowConverter` is now a thin wrapper (write/read +
+  `$row_kind$`); `read()` is column-backed then deep-copied off the buffers (the boundary operator releases
+  the batch immediately — true zero-copy still wants direction 1).
+- The protobuf gate is loosened accordingly: nested-message (→ROW), repeated (→ARRAY), and map (→MAP)
+  fields of supported scalars now route, parity-tested against Flink (`NativeProtobufDecodeSqlHarnessTest`).
 **Source:** the row↔Arrow transpose (`RowDataArrowConverter`) carries only scalar/string/temporal/
 decimal columns; it has no case for `ROW`/`ARRAY`/`MAP`/`VARBINARY`. So any native operator that
 *produces* a nested column cannot hand it back to a rowwise host operator (a sink, `collect()`, or a
@@ -26,11 +38,13 @@ repeated/map/bytes/enum fall back). The decoders are capable; the boundary is th
    `ListVector`↔`ArrayData`, `MapVector`↔`MapData`, and `VarBinary`↔`byte[]`. This lets complex messages
    route even into a rowwise edge, and benefits **every** format (not just protobuf).
 
-## When this lands, revisit the gates
-- Drop `isFlatScalarMessage` (or widen it) so nested/repeated/map protobuf routes; add parity tests for
-  nested `ROW`, `ARRAY`, and `MAP` against Flink's protobuf format.
-- Revisit the unsigned-int and enum exclusions: `bytes`→`VARBINARY` needs the converter's VARBINARY case
-  (direction 2); enum needs a decision on int-vs-name representation matched to the declared column type;
-  unsigned/fixed ints decode unsigned in the Arrow decoder but signed in Flink (a value divergence to
-  reconcile, not just a boundary gap).
-- Avro/JSON nested-object decode can then route too (same boundary fix).
+## Remaining
+- **Direction 1 (columnar sinks)** — the throughput end state, still open. A native columnar sink + a
+  columnar `collect` consuming `ArrowBatch` directly removes the transpose for columnar workflows and
+  lets `read()` be a true zero-copy view (the batch outlives the rows). Relates to ticket 24.
+- **Protobuf representation reconciliations** (no longer boundary gaps — they're decode-semantics):
+  `enum` (int-vs-name matched to the declared column type), unsigned/`fixed` ints (unsigned here vs signed
+  in Flink — a value divergence), `bytes` (decode works and the boundary carries `VARBINARY`; only the
+  `byte[]` parity *test* comparison is missing), proto3 missing-field defaults, and well-known types
+  (`google.protobuf.*`, dedicated Arrow type vs Flink's nested row). Each gated off until reconciled + parity-tested.
+- **Avro/JSON nested objects** can now route through the boundary too (same fix); wire + parity-test when picked up.

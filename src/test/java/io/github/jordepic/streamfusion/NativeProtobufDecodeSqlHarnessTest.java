@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion;
 
+import io.github.jordepic.streamfusion.proto.Complex;
 import io.github.jordepic.streamfusion.proto.Row;
 import io.github.jordepic.streamfusion.proto.Scalars;
 import io.github.jordepic.streamfusion.proto.WithNested;
@@ -20,27 +21,23 @@ import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * End-to-end tests for the protobuf native-decode path: a {@code CREATE TABLE ...
- * 'connector'='kafka', 'format'='protobuf'} with a {@code protobuf.message-class-name} either routes
- * through the planner to {@link io.github.jordepic.streamfusion.planner.StreamPhysicalNativeKafkaDecode}
- * — Flink consumes the raw messages and a native operator decodes them straight to Arrow against the
- * descriptor reflectively extracted from the generated class — or, for a message the native decode does
- * not reproduce identically, falls back cleanly to Flink's own {@code protobuf} decoder.
+ * End-to-end parity tests for the protobuf native-decode path: a {@code CREATE TABLE ...
+ * 'connector'='kafka', 'format'='protobuf'} with a {@code protobuf.message-class-name} routes through
+ * the planner to {@link io.github.jordepic.streamfusion.planner.StreamPhysicalNativeKafkaDecode} — Flink
+ * consumes the raw messages and a native operator decodes them straight to Arrow against the descriptor
+ * reflectively extracted from the generated class — or falls back when a field type isn't reproduced
+ * identically (enum, unsigned/fixed int, bytes, well-known type).
  *
- * <ul>
- *   <li><b>Flat scalar message</b> (every signed-int/float/double/bool/string field type): routes
- *       natively. {@link NativeParity#assertParity} compares the native decode against Flink's
- *       {@code protobuf} format row for row — a real host-parity comparison, with messages produced via
- *       the same generated class Flink parses.
- *   <li><b>Message with a nested field</b>: the native row boundary cannot carry a {@code ROW} column
- *       (see ticket 34), so the planner gates it to fall back. {@link NativeParity#assertFallback}
- *       asserts the query stays on Flink and still produces Flink's result.
- * </ul>
+ * <p>Each case uses {@link NativeParity#assertParity} to compare the native decode against Flink's own
+ * {@code protobuf} format. Covered: a flat scalar message, a nested message (ROW column), and a message
+ * with repeated and map fields (ARRAY/MAP columns) — the complex shapes the row boundary now carries.
+ * The complex columns are read through extracting projections ({@code nested.id}, {@code nums[1]},
+ * {@code tags['a']}) so the compared values are scalars (Flink's {@code collect()} surfaces ARRAY as a
+ * Java array, which compares by identity); the projection itself runs on the host over the natively
+ * decoded column, exercising the column across the boundary.
  *
- * <p>All fields are set to non-default values, so proto3's missing-field semantics don't enter the
- * comparison. The main module pins protobuf-java 4.x to match Flink's protobuf runtime; the ORC host
- * baseline lives in the {@code orc-baseline} module because the two need incompatible protobuf-java
- * versions. Opt-in via {@code SF_BENCHMARK=true} (Docker for Testcontainers Kafka).
+ * <p>All fields are set to non-default values, so proto3's missing-field semantics don't enter. Opt-in
+ * via {@code SF_BENCHMARK=true} (Docker for Testcontainers Kafka).
  */
 @EnabledIfEnvironmentVariable(named = "SF_BENCHMARK", matches = "true")
 class NativeProtobufDecodeSqlHarnessTest {
@@ -49,13 +46,13 @@ class NativeProtobufDecodeSqlHarnessTest {
   private static final String PKG = "io.github.jordepic.streamfusion.proto";
 
   @Test
-  void flatScalarRoutesWithParity_nestedFallsBack() throws Exception {
+  void protobufMessagesDecodeNativelyWithFlinkParity() throws Exception {
     try (KafkaContainer kafka =
         new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
       kafka.start();
       String brokers = kafka.getBootstrapServers();
 
-      // Every scalar field type the native decode reproduces identically — routes, host-parity verified.
+      // Flat scalar message — every signed-int/float/double/bool/string field type.
       produce(brokers, "pb-scalars", scalarMessages());
       NativeParity.assertParity(
           environment(
@@ -65,15 +62,25 @@ class NativeProtobufDecodeSqlHarnessTest {
               PKG + ".Scalars"),
           "SELECT * FROM t");
 
-      // A nested message field → ROW column the row boundary can't carry → must fall back to Flink.
+      // Nested message → a ROW column; the whole row compares (Flink surfaces ROW as a Row, by value).
       produce(brokers, "pb-nested", nestedMessages());
-      NativeParity.assertFallback(
+      NativeParity.assertParity(
           environment(
               brokers,
               "pb-nested",
               "id BIGINT, nested ROW<id BIGINT, name STRING, score DOUBLE>",
               PKG + ".WithNested"),
           "SELECT * FROM t");
+
+      // Repeated + map (+ nested) → ARRAY/MAP/ROW columns; read element-wise so the comparison is scalar.
+      produce(brokers, "pb-complex", complexMessages());
+      NativeParity.assertParity(
+          environment(
+              brokers,
+              "pb-complex",
+              "id BIGINT, nums ARRAY<BIGINT>, tags MAP<STRING, BIGINT>, nested ROW<id BIGINT, name STRING, score DOUBLE>",
+              PKG + ".Complex"),
+          "SELECT id, nums[1], nums[2], tags['a'], tags['b'], nested.id, nested.name FROM t");
     }
   }
 
@@ -88,7 +95,7 @@ class NativeProtobufDecodeSqlHarnessTest {
               .setF32(i + 0.5f)
               .setF64(i + 0.25)
               .setText("row-" + i)
-              .setSi32(-i - 1) // negative to exercise zigzag decoding
+              .setSi32(-i - 1)
               .setSi64(-i - 1L)
               .build()
               .toByteArray());
@@ -102,6 +109,23 @@ class NativeProtobufDecodeSqlHarnessTest {
       values.add(
           WithNested.newBuilder()
               .setId(i + 1L)
+              .setNested(Row.newBuilder().setId(i).setName("n-" + i).setScore(i + 0.5).build())
+              .build()
+              .toByteArray());
+    }
+    return values;
+  }
+
+  private static List<byte[]> complexMessages() {
+    List<byte[]> values = new ArrayList<>(MESSAGES);
+    for (int i = 0; i < MESSAGES; i++) {
+      values.add(
+          Complex.newBuilder()
+              .setId(i + 1L)
+              .addNums(i)
+              .addNums(i + 100L)
+              .putTags("a", i + 1L)
+              .putTags("b", i + 2L)
               .setNested(Row.newBuilder().setId(i).setName("n-" + i).setScore(i + 0.5).build())
               .build()
               .toByteArray());
