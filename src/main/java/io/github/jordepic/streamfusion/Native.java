@@ -642,9 +642,22 @@ public final class Native {
    * @param joinType 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL, 4=SEMI, 5=ANTI
    * @param leftSchemaAddress C Data Interface address of the left input's (data-only) Arrow schema
    * @param rightSchemaAddress C Data Interface address of the right input's (data-only) Arrow schema
+   * @param predKinds residual non-equi predicate, encoded over the joined {@code [left.., right..]}
+   *     row (empty {@code predKinds} ⇒ no predicate); the {@code pred*} arrays are the same encoding
+   *     {@link #createFilterExpression} consumes
    */
   public static native long createUpdatingJoiner(
-      int[] leftKeys, int[] rightKeys, int joinType, long leftSchemaAddress, long rightSchemaAddress);
+      int[] leftKeys,
+      int[] rightKeys,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings);
 
   /** Pushes a left batch, exporting the join changelog (left columns, right columns, row kind). */
   public static native void pushLeftUpdatingJoiner(
@@ -667,6 +680,12 @@ public final class Native {
       int joinType,
       long leftSchemaAddress,
       long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings,
       byte[] snapshot);
 
   /**

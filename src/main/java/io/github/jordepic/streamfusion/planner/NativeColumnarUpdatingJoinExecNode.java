@@ -20,12 +20,17 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
     implements StreamExecNode<ArrowBatch> {
 
   private static final String TRANSFORMATION = "native-updating-join";
+  private static final int[] EMPTY_INT = new int[0];
+  private static final long[] EMPTY_LONG = new long[0];
+  private static final double[] EMPTY_DOUBLE = new double[0];
+  private static final String[] EMPTY_STRING = new String[0];
 
   private final int[] leftKeys;
   private final int[] rightKeys;
   private final int joinType;
   private final RowType leftType;
   private final RowType rightType;
+  private final RexExpression predicate;
 
   public NativeColumnarUpdatingJoinExecNode(
       ReadableConfig tableConfig,
@@ -37,7 +42,8 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
       int[] rightKeys,
       int joinType,
       RowType leftType,
-      RowType rightType) {
+      RowType rightType,
+      RexExpression predicate) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-updating-join_1"),
@@ -50,6 +56,7 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
     this.joinType = joinType;
     this.leftType = leftType;
     this.rightType = rightType;
+    this.predicate = predicate;
   }
 
   @Override
@@ -64,7 +71,18 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
         left,
         right,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarUpdatingJoinOperator(leftKeys, rightKeys, joinType, leftType, rightType),
+        new NativeColumnarUpdatingJoinOperator(
+            leftKeys,
+            rightKeys,
+            joinType,
+            leftType,
+            rightType,
+            predicate == null ? EMPTY_INT : predicate.kinds(),
+            predicate == null ? EMPTY_INT : predicate.payload(),
+            predicate == null ? EMPTY_INT : predicate.childCounts(),
+            predicate == null ? EMPTY_LONG : predicate.longs(),
+            predicate == null ? EMPTY_DOUBLE : predicate.doubles(),
+            predicate == null ? EMPTY_STRING : predicate.strings()),
         ArrowBatchTypeInformation.INSTANCE,
         left.getParallelism(),
         false);

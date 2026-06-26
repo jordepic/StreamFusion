@@ -76,6 +76,24 @@ class FlinkRegularJoinSqlHarnessTest {
   }
 
   @Test
+  void innerJoinWithNonEquiPredicateMatchesHost() throws Exception {
+    // A residual non-equi condition (a.v < b.w) gates which same-key pairs match; an INNER append
+    // join stays insert-only.
+    NativeParity.assertParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v, b.w FROM A AS a JOIN B AS b ON a.k = b.k AND a.v < b.w");
+  }
+
+  @Test
+  void leftJoinWithNonEquiPredicateMatchesHost() throws Exception {
+    // The predicate (a.v > b.w) holds for no pair here, so every left row is null-padded — exercising
+    // the degree and the residual predicate together. The output is a changelog.
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v, b.w FROM A AS a LEFT JOIN B AS b ON a.k = b.k AND a.v > b.w");
+  }
+
+  @Test
   void leftJoinOfChangelogStreamsMatchesHost() throws Exception {
     NativeParity.assertChangelogParity(
         FlinkRegularJoinSqlHarnessTest::environment,

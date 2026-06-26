@@ -175,7 +175,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             join.getRowType(),
             leftKeys,
             rightKeys,
-            RegularJoinMatcher.joinTypeCode(join));
+            RegularJoinMatcher.joinTypeCode(join),
+            RegularJoinMatcher.nonEquiPredicate(join));
       }
     }
 

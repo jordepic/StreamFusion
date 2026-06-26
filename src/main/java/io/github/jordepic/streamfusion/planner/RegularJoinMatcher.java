@@ -1,6 +1,9 @@
 package io.github.jordepic.streamfusion.planner;
 
 import io.github.jordepic.streamfusion.operator.RowDataArrowConverter;
+import java.util.Optional;
+import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.exec.spec.JoinSpec;
 import org.apache.flink.table.planner.plan.nodes.physical.common.CommonPhysicalJoin;
@@ -33,8 +36,8 @@ final class RegularJoinMatcher {
     if (leftKeys.length == 0 || leftKeys.length != joinSpec.getRightKeys().length) {
       return "regular join: needs at least one equi-join key";
     }
-    if (joinSpec.getNonEquiCondition().isPresent()) {
-      return "regular join: a residual non-equi condition is not applied";
+    if (joinSpec.getNonEquiCondition().isPresent() && nonEquiPredicate(join) == null) {
+      return "regular join: the residual non-equi condition is not natively expressible";
     }
     for (boolean filterNull : joinSpec.getFilterNulls()) {
       if (!filterNull) {
@@ -72,6 +75,21 @@ final class RegularJoinMatcher {
 
   static int joinTypeCode(StreamPhysicalJoin join) {
     return joinTypeCode(((CommonPhysicalJoin) join).joinSpec().getJoinType());
+  }
+
+  /**
+   * The encoded residual non-equi join condition (its input refs index into the joined
+   * {@code [left.., right..]} row), or null when the join has none or it is not natively expressible.
+   * Search expressions are expanded first, as the Calc path does.
+   */
+  static RexExpression nonEquiPredicate(StreamPhysicalJoin join) {
+    Optional<RexNode> condition = ((CommonPhysicalJoin) join).joinSpec().getNonEquiCondition();
+    if (condition.isEmpty()) {
+      return null;
+    }
+    RexNode expanded =
+        RexUtil.expandSearch(join.getCluster().getRexBuilder(), null, condition.get());
+    return RexExpression.encode(expanded);
   }
 
   static int[] leftKeys(StreamPhysicalJoin join) {

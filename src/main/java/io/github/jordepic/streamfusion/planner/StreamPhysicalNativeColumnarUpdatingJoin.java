@@ -26,6 +26,7 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
   private final int[] leftKeys;
   private final int[] rightKeys;
   private final int joinType;
+  private final RexExpression predicate;
 
   public StreamPhysicalNativeColumnarUpdatingJoin(
       RelOptCluster cluster,
@@ -35,12 +36,14 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
       RelDataType outputRowType,
       int[] leftKeys,
       int[] rightKeys,
-      int joinType) {
+      int joinType,
+      RexExpression predicate) {
     super(cluster, traitSet, left, right);
     this.outputRowType = outputRowType;
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.joinType = joinType;
+    this.predicate = predicate;
   }
 
   @Override
@@ -56,7 +59,15 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeColumnarUpdatingJoin(
-        getCluster(), traitSet, inputs.get(0), inputs.get(1), outputRowType, leftKeys, rightKeys, joinType);
+        getCluster(),
+        traitSet,
+        inputs.get(0),
+        inputs.get(1),
+        outputRowType,
+        leftKeys,
+        rightKeys,
+        joinType,
+        predicate);
   }
 
   @Override
@@ -71,6 +82,7 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
         rightKeys,
         joinType,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getLeft().getRowType()),
-        FlinkTypeFactory$.MODULE$.toLogicalRowType(getRight().getRowType()));
+        FlinkTypeFactory$.MODULE$.toLogicalRowType(getRight().getRowType()),
+        predicate);
   }
 }

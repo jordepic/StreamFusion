@@ -40,6 +40,14 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
   private final int joinType;
   private final RowType leftType;
   private final RowType rightType;
+  // Residual non-equi predicate, encoded over the joined [left.., right..] row (empty = none); the
+  // same encoding the filter engine consumes.
+  private final int[] predKinds;
+  private final int[] predPayload;
+  private final int[] predChildCounts;
+  private final long[] predLongs;
+  private final double[] predDoubles;
+  private final String[] predStrings;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
@@ -47,12 +55,28 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
   private transient ListState<byte[]> handleState;
 
   public NativeColumnarUpdatingJoinOperator(
-      int[] leftKeys, int[] rightKeys, int joinType, RowType leftType, RowType rightType) {
+      int[] leftKeys,
+      int[] rightKeys,
+      int joinType,
+      RowType leftType,
+      RowType rightType,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.joinType = joinType;
     this.leftType = leftType;
     this.rightType = rightType;
+    this.predKinds = predKinds;
+    this.predPayload = predPayload;
+    this.predChildCounts = predChildCounts;
+    this.predLongs = predLongs;
+    this.predDoubles = predDoubles;
+    this.predStrings = predStrings;
   }
 
   @Override
@@ -80,13 +104,29 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
       handle =
           snapshot == null
               ? Native.createUpdatingJoiner(
-                  leftKeys, rightKeys, joinType, leftSchema.memoryAddress(), rightSchema.memoryAddress())
+                  leftKeys,
+                  rightKeys,
+                  joinType,
+                  leftSchema.memoryAddress(),
+                  rightSchema.memoryAddress(),
+                  predKinds,
+                  predPayload,
+                  predChildCounts,
+                  predLongs,
+                  predDoubles,
+                  predStrings)
               : Native.restoreUpdatingJoiner(
                   leftKeys,
                   rightKeys,
                   joinType,
                   leftSchema.memoryAddress(),
                   rightSchema.memoryAddress(),
+                  predKinds,
+                  predPayload,
+                  predChildCounts,
+                  predLongs,
+                  predDoubles,
+                  predStrings,
                   snapshot);
     }
   }
