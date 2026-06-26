@@ -2579,6 +2579,69 @@ struct OuterRecord {
     num_assoc: i32,
 }
 
+/// A residual non-equi join predicate (Flink's `joinSpec.getNonEquiCondition()`), encoded in the same
+/// pre-order form as the filter engine and evaluated over candidate `[left.., right..]` pairs. A pair
+/// is a match only when the predicate is true (null ⇒ not a match, as a join condition treats it), so
+/// it gates which rows feed the degree and the emitted output — mirroring Flink's `condition.apply`
+/// filter inside the associated-records iterator. The compiled expression is built once against the
+/// joined schema and cached.
+struct JoinPredicate {
+    kinds: Vec<i64>,
+    payload: Vec<i64>,
+    child_counts: Vec<i64>,
+    longs: Vec<i64>,
+    doubles: Vec<f64>,
+    strings: Vec<Option<String>>,
+    /// The joined `[left fields.., right fields..]` schema the predicate's column refs index into.
+    schema: SchemaRef,
+    compiled: Option<Arc<dyn PhysicalExpr>>,
+}
+
+impl JoinPredicate {
+    fn compiled(&mut self) -> Arc<dyn PhysicalExpr> {
+        if let Some(expr) = &self.compiled {
+            return expr.clone();
+        }
+        let df_schema = Arc::new(
+            DFSchema::try_from(self.schema.as_ref().clone()).expect("failed to build join-predicate schema"),
+        );
+        let physical = compile_expr(
+            &self.schema,
+            &df_schema,
+            &self.kinds,
+            &self.payload,
+            &self.child_counts,
+            &self.longs,
+            &self.doubles,
+            &self.strings,
+            0,
+        );
+        self.compiled = Some(physical.clone());
+        physical
+    }
+
+    /// Evaluates the predicate over the candidate `[left.., right..]` rows, returning one boolean per
+    /// row (a null result is `false` — not a match).
+    fn evaluate(&mut self, rows: &[JoinRow]) -> Vec<bool> {
+        let types: Vec<DataType> =
+            self.schema.fields().iter().map(|f| f.data_type().clone()).collect();
+        let columns: Vec<ArrayRef> = (0..types.len())
+            .map(|j| scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), &types[j]))
+            .collect();
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .expect("failed to build join-predicate batch");
+        let predicate = self.compiled();
+        let evaluated = predicate
+            .evaluate(&batch)
+            .expect("failed to evaluate join predicate")
+            .into_array(batch.num_rows())
+            .expect("failed to materialize join predicate");
+        let mask =
+            evaluated.as_any().downcast_ref::<BooleanArray>().expect("join predicate must be boolean");
+        (0..mask.len()).map(|i| mask.is_valid(i) && mask.value(i)).collect()
+    }
+}
+
 /// Regular (non-windowed) equi-join over a changelog, the "updating join" — INNER, LEFT/RIGHT/FULL
 /// outer, and SEMI/ANTI. Unlike the time-bounded interval/window joins (which buffer a batch and
 /// delegate the match to a DataFusion hash join), this keeps a per-side keyed multiset of live rows
@@ -2600,6 +2663,7 @@ struct UpdatingJoiner {
     kind: JoinKind,
     left_schema: SchemaRef,
     right_schema: SchemaRef,
+    predicate: Option<JoinPredicate>,
     left_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
     right_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
 }
@@ -2611,6 +2675,7 @@ impl UpdatingJoiner {
         kind: JoinKind,
         left_schema: SchemaRef,
         right_schema: SchemaRef,
+        predicate: Option<JoinPredicate>,
     ) -> Self {
         UpdatingJoiner {
             left_keys,
@@ -2618,9 +2683,45 @@ impl UpdatingJoiner {
             kind,
             left_schema,
             right_schema,
+            predicate,
             left_state: HashMap::new(),
             right_state: HashMap::new(),
         }
+    }
+
+    /// The joined `[left fields.., right fields..]` schema (columns named `c0..`) the non-equi
+    /// predicate's input refs index into.
+    fn joined_schema(left_schema: &SchemaRef, right_schema: &SchemaRef) -> SchemaRef {
+        let fields: Vec<Field> = left_schema
+            .fields()
+            .iter()
+            .chain(right_schema.fields().iter())
+            .enumerate()
+            .map(|(j, f)| Field::new(format!("c{j}"), f.data_type().clone(), true))
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Drops the candidate matches whose `[left.., right..]` pair fails the residual non-equi
+    /// predicate, so only condition-satisfying rows feed the degree and the emitted output (Flink's
+    /// `condition.apply` filter). A no-op when there is no predicate.
+    fn filter_associated(&mut self, full: &JoinRow, is_left: bool, associated: &mut Vec<OuterRecord>) {
+        if associated.is_empty() || self.predicate.is_none() {
+            return;
+        }
+        let pairs: Vec<JoinRow> = associated
+            .iter()
+            .map(|other| {
+                if is_left {
+                    full.iter().chain(&other.record).cloned().collect()
+                } else {
+                    other.record.iter().chain(full).cloned().collect()
+                }
+            })
+            .collect();
+        let mask = self.predicate.as_mut().expect("predicate present").evaluate(&pairs);
+        let mut keep = mask.into_iter();
+        associated.retain(|_| keep.next().unwrap_or(false));
     }
 
     fn left_types(&self) -> Vec<DataType> {
@@ -2795,19 +2896,21 @@ impl UpdatingJoiner {
             }
         };
 
-        let (input_state, other_state) = if is_left {
-            (&mut self.left_state, &mut self.right_state)
-        } else {
-            (&mut self.right_state, &mut self.left_state)
-        };
+        // Gather the matching other-side rows (immutable read), then drop those failing the residual
+        // non-equi predicate — Flink's `condition.apply` filter inside the associated iterator. Done
+        // before the per-side mutations below so no state borrow is held across the predicate eval.
+        let mut associated = Self::associated(
+            if is_left { &self.right_state } else { &self.left_state },
+            key,
+        );
+        self.filter_associated(full, is_left, &mut associated);
 
         if accumulate {
-            let associated = Self::associated(other_state, key);
             if input_is_outer {
                 if associated.is_empty() {
                     out_rows.push(input_padded);
                     out_kinds.push(0); // +I[record+null]
-                    Self::add_record(input_state, key, full, 0);
+                    Self::add_record(self.input_state(is_left), key, full, 0);
                 } else {
                     let num = associated.len() as i32;
                     for other in &associated {
@@ -2816,22 +2919,22 @@ impl UpdatingJoiner {
                                 out_rows.push(other_padded(&other.record));
                                 out_kinds.push(3); // -D[null+other]
                             }
-                            Self::update_num_assoc(other_state, key, &other.record, other.num_assoc + 1);
+                            Self::update_num_assoc(self.other_state(is_left), key, &other.record, other.num_assoc + 1);
                         }
                         out_rows.push(paired(&other.record));
                         out_kinds.push(0); // +I[record+other]
                     }
-                    Self::add_record(input_state, key, full, num);
+                    Self::add_record(self.input_state(is_left), key, full, num);
                 }
             } else {
-                Self::add_record(input_state, key, full, -1);
+                Self::add_record(self.input_state(is_left), key, full, -1);
                 for other in &associated {
                     if other_is_outer {
                         if other.num_assoc == 0 {
                             out_rows.push(other_padded(&other.record));
                             out_kinds.push(3); // -D[null+other]
                         }
-                        Self::update_num_assoc(other_state, key, &other.record, other.num_assoc + 1);
+                        Self::update_num_assoc(self.other_state(is_left), key, &other.record, other.num_assoc + 1);
                         out_rows.push(paired(&other.record));
                         out_kinds.push(0); // +I[record+other]
                     } else {
@@ -2841,8 +2944,7 @@ impl UpdatingJoiner {
                 }
             }
         } else {
-            Self::retract_record(input_state, key, full);
-            let associated = Self::associated(other_state, key);
+            Self::retract_record(self.input_state(is_left), key, full);
             if associated.is_empty() {
                 if input_is_outer {
                     out_rows.push(input_padded);
@@ -2857,11 +2959,21 @@ impl UpdatingJoiner {
                             out_rows.push(other_padded(&other.record));
                             out_kinds.push(0); // +I[null+other]
                         }
-                        Self::update_num_assoc(other_state, key, &other.record, other.num_assoc - 1);
+                        Self::update_num_assoc(self.other_state(is_left), key, &other.record, other.num_assoc - 1);
                     }
                 }
             }
         }
+    }
+
+    /// The state map for the arriving (input) side.
+    fn input_state(&mut self, is_left: bool) -> &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>> {
+        if is_left { &mut self.left_state } else { &mut self.right_state }
+    }
+
+    /// The state map for the side opposite the arriving one.
+    fn other_state(&mut self, is_left: bool) -> &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>> {
+        if is_left { &mut self.right_state } else { &mut self.left_state }
     }
 
     /// SEMI/ANTI — a faithful port of `StreamingSemiAntiJoinOperator`. The left side carries the
@@ -2881,7 +2993,8 @@ impl UpdatingJoiner {
         if is_left {
             // processElement1: emit the input row when it has (semi) / lacks (anti) a match, then
             // record it with its current match count as its degree.
-            let associated = Self::associated(&self.right_state, key);
+            let mut associated = Self::associated(&self.right_state, key);
+            self.filter_associated(full, true, &mut associated);
             let matched = !associated.is_empty();
             if matched != is_anti {
                 out_rows.push(full.clone());
@@ -2895,7 +3008,8 @@ impl UpdatingJoiner {
         } else {
             // processElement2: a right row flips associated left rows' degree across 0↔1, emitting or
             // retracting them (semi) or the inverse (anti).
-            let associated = Self::associated(&self.left_state, key);
+            let mut associated = Self::associated(&self.left_state, key);
+            self.filter_associated(full, false, &mut associated);
             if accumulate {
                 Self::add_record(&mut self.right_state, key, full, -1);
                 for other in &associated {
@@ -2966,9 +3080,11 @@ impl UpdatingJoiner {
         kind: JoinKind,
         left_schema: SchemaRef,
         right_schema: SchemaRef,
+        predicate: Option<JoinPredicate>,
         bytes: &[u8],
     ) -> Self {
-        let mut joiner = UpdatingJoiner::new(left_keys, right_keys, kind, left_schema, right_schema);
+        let mut joiner =
+            UpdatingJoiner::new(left_keys, right_keys, kind, left_schema, right_schema, predicate);
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
         joiner.load_side(true, &bytes[4..4 + left_len]);
         joiner.load_side(false, &bytes[4 + left_len..]);
@@ -6523,29 +6639,80 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreInterv
     ))) as jlong
 }
 
-/// Creates a regular (non-windowed) INNER updating joiner and returns an opaque handle. The key
-/// column indices locate the equi-join key within each side's input batch (whose trailing column is
-/// the `$row_kind$` byte). The JVM owns the handle and must release it with the matching close.
+/// Reads the encoded residual non-equi join predicate (empty `kinds` ⇒ no predicate), building it
+/// against the joined `[left.., right..]` schema its column refs index into.
+#[allow(clippy::too_many_arguments)]
+fn read_join_predicate(
+    env: &mut JNIEnv,
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    kinds: &JIntArray,
+    payload: &JIntArray,
+    child_counts: &JIntArray,
+    longs: &JLongArray,
+    doubles: &JDoubleArray,
+    strings: &JObjectArray,
+) -> Option<JoinPredicate> {
+    let kinds = read_int_array(env, kinds);
+    if kinds.is_empty() {
+        return None;
+    }
+    Some(JoinPredicate {
+        kinds,
+        payload: read_int_array(env, payload),
+        child_counts: read_int_array(env, child_counts),
+        longs: read_longs(env, longs),
+        doubles: read_doubles(env, doubles),
+        strings: read_strings(env, strings),
+        schema: UpdatingJoiner::joined_schema(left_schema, right_schema),
+        compiled: None,
+    })
+}
+
+/// Creates a regular (non-windowed) updating joiner and returns an opaque handle. The key column
+/// indices locate the equi-join key within each side's input batch (whose trailing column is the
+/// `$row_kind$` byte); the join type selects INNER/outer/semi-anti; the two schema addresses seed the
+/// per-side data schemas (so outer null-padding can be typed); the encoded arrays carry the optional
+/// residual non-equi predicate. The JVM owns the handle and must release it with the matching close.
+#[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createUpdatingJoiner<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     left_keys: JIntArray<'local>,
     right_keys: JIntArray<'local>,
     join_type: jint,
     left_schema_address: jlong,
     right_schema_address: jlong,
+    pred_kinds: JIntArray<'local>,
+    pred_payload: JIntArray<'local>,
+    pred_child_counts: JIntArray<'local>,
+    pred_longs: JLongArray<'local>,
+    pred_doubles: JDoubleArray<'local>,
+    pred_strings: JObjectArray<'local>,
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
     let left_schema = import_schema(left_schema_address);
     let right_schema = import_schema(right_schema_address);
+    let predicate = read_join_predicate(
+        &mut env,
+        &left_schema,
+        &right_schema,
+        &pred_kinds,
+        &pred_payload,
+        &pred_child_counts,
+        &pred_longs,
+        &pred_doubles,
+        &pred_strings,
+    );
     Box::into_raw(Box::new(UpdatingJoiner::new(
         left,
         right,
         JoinKind::from_code(join_type),
         left_schema,
         right_schema,
+        predicate,
     ))) as jlong
 }
 
@@ -6597,20 +6764,38 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotUpdat
 
 /// Rebuilds an updating joiner from a snapshot and returns a fresh handle.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreUpdatingJoiner<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     left_keys: JIntArray<'local>,
     right_keys: JIntArray<'local>,
     join_type: jint,
     left_schema_address: jlong,
     right_schema_address: jlong,
+    pred_kinds: JIntArray<'local>,
+    pred_payload: JIntArray<'local>,
+    pred_child_counts: JIntArray<'local>,
+    pred_longs: JLongArray<'local>,
+    pred_doubles: JDoubleArray<'local>,
+    pred_strings: JObjectArray<'local>,
     snapshot: JByteArray<'local>,
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
     let left_schema = import_schema(left_schema_address);
     let right_schema = import_schema(right_schema_address);
+    let predicate = read_join_predicate(
+        &mut env,
+        &left_schema,
+        &right_schema,
+        &pred_kinds,
+        &pred_payload,
+        &pred_child_counts,
+        &pred_longs,
+        &pred_doubles,
+        &pred_strings,
+    );
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read updating-join snapshot");
     Box::into_raw(Box::new(UpdatingJoiner::restore(
         left,
@@ -6618,6 +6803,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreUpdati
         JoinKind::from_code(join_type),
         left_schema,
         right_schema,
+        predicate,
         &bytes,
     ))) as jlong
 }
@@ -7824,7 +8010,7 @@ mod tests {
     }
 
     fn inner_joiner() -> UpdatingJoiner {
-        UpdatingJoiner::new(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema())
+        UpdatingJoiner::new(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema(), None)
     }
 
     // A `[k, v, $row_kind$]` changelog batch (k join key at col 0) for the updating-join tests.
@@ -7924,7 +8110,7 @@ mod tests {
         joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false); // buffer right
         let snapshot = joiner.snapshot();
         let mut restored =
-            UpdatingJoiner::restore(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema(), &snapshot);
+            UpdatingJoiner::restore(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema(), None, &snapshot);
         let out = restored.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
         assert_eq!(out.num_rows(), 1);
         assert_eq!(values(&out, 1), vec![10]);
@@ -7936,7 +8122,7 @@ mod tests {
     #[test]
     fn updating_join_left_outer_null_pads_then_retracts() {
         let mut joiner =
-            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema(), None);
         // Left row k=1, v=10: no right match → +I[left + null].
         let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
         assert_eq!(row_kinds(&out), vec![0]);
@@ -7955,7 +8141,7 @@ mod tests {
     #[test]
     fn updating_join_left_outer_unmatched_retract() {
         let mut joiner =
-            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema(), None);
         let out = joiner.push(&changelog_join_batch(vec![7], vec![70], vec![0]), true);
         assert_eq!(row_kinds(&out), vec![0]); // +I[left + null]
         let out = joiner.push(&changelog_join_batch(vec![7], vec![70], vec![3]), true);
@@ -7966,7 +8152,7 @@ mod tests {
     // SEMI: a left row is emitted once it has a right match; ANTI would emit it while unmatched.
     #[test]
     fn updating_join_semi_emits_on_match() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Semi, kv_schema(), kv_schema());
+        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Semi, kv_schema(), kv_schema(), None);
         // Left row with no right match → nothing (semi).
         assert_eq!(joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true).num_rows(), 0);
         // Right row arrives → emit the left row (+I), one column-set (left only).
@@ -7979,7 +8165,7 @@ mod tests {
     // ANTI: a left row is emitted while it has no match, and retracted (-D) once a match arrives.
     #[test]
     fn updating_join_anti_retracts_on_match() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Anti, kv_schema(), kv_schema());
+        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Anti, kv_schema(), kv_schema(), None);
         let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
         assert_eq!(row_kinds(&out), vec![0]); // +I[left] (no match yet)
         let out = joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);
@@ -7987,12 +8173,43 @@ mod tests {
         assert_eq!(values(&out, 1), vec![10]);
     }
 
+    // A residual non-equi predicate gates which same-key pairs are matches. `left.v > right.v`
+    // (cols [k, lv, k0, rv] = indices [0,1,2,3]) over an INNER join: of two buffered right rows only
+    // the one whose v is below the left's v matches.
+    #[test]
+    fn updating_join_applies_non_equi_predicate() {
+        let predicate = JoinPredicate {
+            kinds: vec![6, 0, 0],      // CALL(>), input_ref, input_ref
+            payload: vec![10, 1, 3],   // op GREATER_THAN; left.v (col 1) > right.v (col 3)
+            child_counts: vec![2, 0, 0],
+            longs: vec![],
+            doubles: vec![],
+            strings: vec![],
+            schema: UpdatingJoiner::joined_schema(&kv_schema(), &kv_schema()),
+            compiled: None,
+        };
+        let mut joiner = UpdatingJoiner::new(
+            vec![0],
+            vec![0],
+            JoinKind::Inner,
+            kv_schema(),
+            kv_schema(),
+            Some(predicate),
+        );
+        // Buffer two right rows for k=1: v=5 and v=20.
+        joiner.push(&changelog_join_batch(vec![1, 1], vec![5, 20], vec![0, 0]), false);
+        // Left row k=1, v=10 → matches only the right v=5 (10 > 5), not v=20.
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(values(&out, 3), vec![5]); // the one right row passing left.v > right.v
+    }
+
     // The degree survives a checkpoint: a restored LEFT OUTER joiner still retracts the null-pad when
     // the first match arrives post-restore.
     #[test]
     fn updating_join_outer_degree_survives_snapshot_restore() {
         let mut joiner =
-            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema(), None);
         joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true); // +I[left+null], degree 0
         let snapshot = joiner.snapshot();
         let mut restored = UpdatingJoiner::restore(
@@ -8001,6 +8218,7 @@ mod tests {
             JoinKind::LeftOuter,
             kv_schema(),
             kv_schema(),
+            None,
             &snapshot,
         );
         let out = restored.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);

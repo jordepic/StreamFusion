@@ -31,7 +31,18 @@ class NativeColumnarUpdatingJoinOperatorTest {
           new String[] {"k", "lv", "k0", "rv"});
 
   private static NativeColumnarUpdatingJoinOperator operator() {
-    return new NativeColumnarUpdatingJoinOperator(new int[] {0}, new int[] {0}, 0, LEFT, RIGHT);
+    return new NativeColumnarUpdatingJoinOperator(
+        new int[] {0},
+        new int[] {0},
+        0,
+        LEFT,
+        RIGHT,
+        new int[0],
+        new int[0],
+        new int[0],
+        new long[0],
+        new double[0],
+        new String[0]);
   }
 
   @Test
