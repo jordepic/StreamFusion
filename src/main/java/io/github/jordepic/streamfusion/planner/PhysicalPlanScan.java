@@ -583,6 +583,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             WindowJoinMatcher.leftWindowEnd(join),
             WindowJoinMatcher.rightWindowStart(join),
             WindowJoinMatcher.rightWindowEnd(join),
+            WindowJoinMatcher.joinTypeCode(join),
             WindowJoinMatcher.nonEquiPredicate(join));
       }
     }

@@ -58,16 +58,29 @@ class FlinkWindowJoinSqlHarnessTest {
   }
 
   @Test
-  void leftWindowJoinFallsBackToHost() throws Exception {
-    // A LEFT outer window join is append-only (so it reaches the matcher) but the native operator
-    // only does INNER — it must fall back cleanly. SELECT * so no projection Calc routes either.
-    NativeParity.assertFallback(
-        FlinkWindowJoinSqlHarnessTest::dataStreamEnvironment,
-        "SELECT * FROM "
-            + "(SELECT * FROM TABLE(TUMBLE(TABLE A, DESCRIPTOR(rt), INTERVAL '1' SECOND))) a "
-            + "LEFT JOIN "
-            + "(SELECT * FROM TABLE(TUMBLE(TABLE B, DESCRIPTOR(rt), INTERVAL '1' SECOND))) b "
-            + "ON a.k = b.k AND a.window_start = b.window_start AND a.window_end = b.window_end");
+  void leftWindowJoinMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkWindowJoinSqlHarnessTest::dataStreamEnvironment, outerJoin("LEFT"));
+  }
+
+  @Test
+  void rightWindowJoinMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkWindowJoinSqlHarnessTest::dataStreamEnvironment, outerJoin("RIGHT"));
+  }
+
+  @Test
+  void fullWindowJoinMatchesHost() throws Exception {
+    NativeParity.assertParity(FlinkWindowJoinSqlHarnessTest::dataStreamEnvironment, outerJoin("FULL"));
+  }
+
+  // A window join over two TUMBLE inputs; an outer join is append-only (the unmatched row is
+  // null-padded once the window closes), so the result set matches the host.
+  private static String outerJoin(String side) {
+    return "SELECT a.k, a.v, b.v FROM "
+        + "(SELECT * FROM TABLE(TUMBLE(TABLE A, DESCRIPTOR(rt), INTERVAL '1' SECOND))) a "
+        + side
+        + " JOIN "
+        + "(SELECT * FROM TABLE(TUMBLE(TABLE B, DESCRIPTOR(rt), INTERVAL '1' SECOND))) b "
+        + "ON a.k = b.k AND a.window_start = b.window_start AND a.window_end = b.window_end";
   }
 
   private static TableEnvironment dataStreamEnvironment() {

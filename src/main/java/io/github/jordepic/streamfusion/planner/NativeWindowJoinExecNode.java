@@ -27,6 +27,9 @@ public class NativeWindowJoinExecNode extends ExecNodeBase<ArrowBatch>
   private final int leftWindowEnd;
   private final int rightWindowStart;
   private final int rightWindowEnd;
+  private final int joinType;
+  private final RowType leftType;
+  private final RowType rightType;
   private final RexExpression predicate;
 
   public NativeWindowJoinExecNode(
@@ -41,6 +44,9 @@ public class NativeWindowJoinExecNode extends ExecNodeBase<ArrowBatch>
       int leftWindowEnd,
       int rightWindowStart,
       int rightWindowEnd,
+      int joinType,
+      RowType leftType,
+      RowType rightType,
       RexExpression predicate) {
     super(
         ExecNodeContext.newNodeId(),
@@ -55,6 +61,9 @@ public class NativeWindowJoinExecNode extends ExecNodeBase<ArrowBatch>
     this.leftWindowEnd = leftWindowEnd;
     this.rightWindowStart = rightWindowStart;
     this.rightWindowEnd = rightWindowEnd;
+    this.joinType = joinType;
+    this.leftType = leftType;
+    this.rightType = rightType;
     this.predicate = predicate;
   }
 
@@ -77,6 +86,9 @@ public class NativeWindowJoinExecNode extends ExecNodeBase<ArrowBatch>
             leftWindowEnd,
             rightWindowStart,
             rightWindowEnd,
+            joinType,
+            leftType,
+            rightType,
             RexExpression.toEncodedPredicate(predicate)),
         ArrowBatchTypeInformation.INSTANCE,
         left.getParallelism(),

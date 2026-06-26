@@ -9,7 +9,6 @@ import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
 import org.apache.flink.table.planner.plan.nodes.exec.spec.JoinSpec;
 import org.apache.flink.table.planner.plan.nodes.physical.common.CommonPhysicalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
-import org.apache.flink.table.runtime.operators.join.FlinkJoinType;
 
 /**
  * Recognizes the event-time INNER window joins the native operator implements:
@@ -30,8 +29,8 @@ final class WindowJoinMatcher {
   /** The specific reason this window join is not accelerable, or null if it is. */
   static String unsupportedReason(StreamPhysicalWindowJoin join) {
     JoinSpec joinSpec = ((CommonPhysicalJoin) join).joinSpec();
-    if (joinSpec.getJoinType() != FlinkJoinType.INNER) {
-      return "window join: only INNER joins (outer/semi/anti emit nulls or differ)";
+    if (IntervalJoinMatcher.joinTypeCode(joinSpec.getJoinType()) < 0) {
+      return "window join: only INNER/LEFT/RIGHT/FULL joins (semi/anti are regular joins)";
     }
     int[] leftKeys = joinSpec.getLeftKeys();
     int[] rightKeys = joinSpec.getRightKeys();
@@ -77,6 +76,11 @@ final class WindowJoinMatcher {
     RexNode expanded =
         RexUtil.expandSearch(join.getCluster().getRexBuilder(), null, condition.get());
     return RexExpression.encode(expanded);
+  }
+
+  /** The native join-type code (0=INNER,1=LEFT,2=RIGHT,3=FULL); never -1 once {@link #matches}. */
+  static int joinTypeCode(StreamPhysicalWindowJoin join) {
+    return IntervalJoinMatcher.joinTypeCode(((CommonPhysicalJoin) join).joinSpec().getJoinType());
   }
 
   static int[] leftKeys(StreamPhysicalWindowJoin join) {

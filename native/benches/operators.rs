@@ -305,7 +305,8 @@ fn bench_window_join(c: &mut Criterion) {
     group.bench_function("equi_key_flush", |b| {
         b.iter_batched(
             || {
-                let mut join = WindowJoin::new(vec![0], vec![0], 2, 3, 2, 3);
+                let mut join =
+                    WindowJoin::new(vec![0], vec![0], 2, 3, 2, 3, batch.schema(), batch.schema());
                 join.push_left(batch.clone());
                 join.push_right(batch.clone());
                 join
