@@ -1,6 +1,7 @@
 package io.github.jordepic.streamfusion.operator;
 
 import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.arrow.ArrowConversion;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
@@ -16,6 +17,7 @@ import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.types.logical.RowType;
 
 /**
  * Columnar event-time INNER window join (Arrow in on both inputs, Arrow out): the join of two
@@ -39,6 +41,9 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
   private final int leftWindowEnd;
   private final int rightWindowStart;
   private final int rightWindowEnd;
+  private final int joinType;
+  private final RowType leftType;
+  private final RowType rightType;
   private final EncodedPredicate predicate;
 
   private transient BufferAllocator allocator;
@@ -53,6 +58,9 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
       int leftWindowEnd,
       int rightWindowStart,
       int rightWindowEnd,
+      int joinType,
+      RowType leftType,
+      RowType rightType,
       EncodedPredicate predicate) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
@@ -60,6 +68,9 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
     this.leftWindowEnd = leftWindowEnd;
     this.rightWindowStart = rightWindowStart;
     this.rightWindowEnd = rightWindowEnd;
+    this.joinType = joinType;
+    this.leftType = leftType;
+    this.rightType = rightType;
     this.predicate = predicate;
   }
 
@@ -77,35 +88,48 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
     for (byte[] entry : handleState.get()) {
       snapshot = entry;
     }
-    handle =
-        snapshot == null
-            ? Native.createWindowJoiner(
-                leftKeys,
-                rightKeys,
-                leftWindowStart,
-                leftWindowEnd,
-                rightWindowStart,
-                rightWindowEnd,
-                predicate.kinds,
-                predicate.payload,
-                predicate.childCounts,
-                predicate.longs,
-                predicate.doubles,
-                predicate.strings)
-            : Native.restoreWindowJoiner(
-                leftKeys,
-                rightKeys,
-                leftWindowStart,
-                leftWindowEnd,
-                rightWindowStart,
-                rightWindowEnd,
-                predicate.kinds,
-                predicate.payload,
-                predicate.childCounts,
-                predicate.longs,
-                predicate.doubles,
-                predicate.strings,
-                snapshot);
+    BufferAllocator alloc = NativeAllocator.SHARED;
+    CDataDictionaryProvider dicts = NativeAllocator.DICTIONARIES;
+    try (ArrowSchema leftSchema = ArrowSchema.allocateNew(alloc);
+        ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
+      Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
+      Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      handle =
+          snapshot == null
+              ? Native.createWindowJoiner(
+                  leftKeys,
+                  rightKeys,
+                  leftWindowStart,
+                  leftWindowEnd,
+                  rightWindowStart,
+                  rightWindowEnd,
+                  joinType,
+                  leftSchema.memoryAddress(),
+                  rightSchema.memoryAddress(),
+                  predicate.kinds,
+                  predicate.payload,
+                  predicate.childCounts,
+                  predicate.longs,
+                  predicate.doubles,
+                  predicate.strings)
+              : Native.restoreWindowJoiner(
+                  leftKeys,
+                  rightKeys,
+                  leftWindowStart,
+                  leftWindowEnd,
+                  rightWindowStart,
+                  rightWindowEnd,
+                  joinType,
+                  leftSchema.memoryAddress(),
+                  rightSchema.memoryAddress(),
+                  predicate.kinds,
+                  predicate.payload,
+                  predicate.childCounts,
+                  predicate.longs,
+                  predicate.doubles,
+                  predicate.strings,
+                  snapshot);
+    }
   }
 
   @Override

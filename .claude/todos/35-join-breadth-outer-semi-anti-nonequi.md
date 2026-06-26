@@ -1,11 +1,12 @@
 # Join breadth: outer / semi / anti, and a residual non-equi predicate
 
-**Status:** mostly done. **Regular updating join — DONE** (INNER/LEFT/RIGHT/FULL/SEMI/ANTI +
-residual non-equi predicate; commits "Add outer and semi/anti to the regular updating join",
-"Apply a residual non-equi predicate in the regular updating join"). **Interval/window non-equi
-predicate — DONE** (commit "Apply a residual non-equi predicate in the interval and window joins").
-**Remaining: interval/window LEFT/RIGHT/FULL outer** (semi/anti do not arise as time-bounded joins —
-Flink plans those as regular joins). Design below.
+**Status:** DONE. **Regular updating join** — INNER/LEFT/RIGHT/FULL/SEMI/ANTI + residual non-equi
+predicate. **Interval and window joins** — INNER/LEFT/RIGHT/FULL + residual non-equi predicate (semi/anti
+do not arise as time-bounded joins — Flink plans those as regular joins). All parity-tested against the
+host; see the readme compatibility chart. Commits: "Add outer and semi/anti to the regular updating join",
+"Apply a residual non-equi predicate in the regular updating join", "Apply a residual non-equi predicate in
+the interval and window joins", "Add LEFT/RIGHT/FULL outer to the event-time interval join", "Add
+LEFT/RIGHT/FULL outer to the event-time window join". The design notes below are kept for reference.
 **Source:** the operator-coverage gap (ticket 11) — joins are the highest-value remaining breadth.
 
 ## Remaining: interval/window outer (LEFT/RIGHT/FULL) — design

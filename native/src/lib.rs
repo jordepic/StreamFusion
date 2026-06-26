@@ -2232,7 +2232,6 @@ impl IntervalJoiner {
         filter: Option<JoinFilter>,
     ) -> RecordBatch {
         let left_arity = self.left_data_schema.fields().len();
-        let right_arity = self.right_data_schema.fields().len();
         let joined = hash_join_inner(left_tagged, right_tagged, &self.key_pairs(), filter);
         if joined.num_rows() == 0 {
             return empty_batch();
@@ -2351,18 +2350,7 @@ impl IntervalJoiner {
             self.left_data_schema.fields().iter().map(|f| f.data_type().clone()).collect();
         let right_types: Vec<DataType> =
             self.right_data_schema.fields().iter().map(|f| f.data_type().clone()).collect();
-        let n = rows.num_rows();
-        let data_arity = if is_left { left_types.len() } else { right_types.len() };
-        let data: Vec<ArrayRef> = (0..data_arity).map(|i| rows.column(i).clone()).collect();
-        let columns: Vec<ArrayRef> = if is_left {
-            data.into_iter().chain(null_columns(&right_types, n)).collect()
-        } else {
-            null_columns(&left_types, n).into_iter().chain(data).collect()
-        };
-        let types: Vec<DataType> = left_types.into_iter().chain(right_types).collect();
-        let fields: Vec<Field> =
-            (0..types.len()).map(|j| Field::new(format!("c{j}"), types[j].clone(), true)).collect();
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("build interval null-pad")
+        build_null_pad(rows, &left_types, &right_types, is_left)
     }
 
     /// Serializes both buffers and (for an outer join) the per-side matched row-id sets, length-framed.
@@ -2452,6 +2440,49 @@ fn append_rowids(batch: &RecordBatch, next_id: &mut i64) -> RecordBatch {
 /// All-null columns of the given types, `n` rows each — to null-pad the absent side of an outer row.
 fn null_columns(types: &[DataType], n: usize) -> Vec<ArrayRef> {
     types.iter().map(|t| new_null_array(t, n)).collect()
+}
+
+/// Null-pads the rows of a closed window-join side whose transient row-id (== row index) is not in
+/// `matched`, or None when every row matched. Used by the window join, where a window's rows all close
+/// together so match state is known within the flush.
+fn unmatched_null_pad(
+    rows: &RecordBatch,
+    matched: &HashSet<i64>,
+    left_types: &[DataType],
+    right_types: &[DataType],
+    is_left: bool,
+) -> Option<RecordBatch> {
+    let mask: BooleanArray =
+        (0..rows.num_rows()).map(|i| Some(!matched.contains(&(i as i64)))).collect();
+    let unmatched = filter_record_batch(rows, &mask).expect("filter unmatched window rows");
+    if unmatched.num_rows() == 0 {
+        None
+    } else {
+        Some(build_null_pad(&unmatched, left_types, right_types, is_left))
+    }
+}
+
+/// Builds null-padded output `[left data.., right data..]` (columns `c0..`) for the rows of one side:
+/// that side's first `left_types.len()`/`right_types.len()` columns of `rows` (any trailing `__rowid__`
+/// ignored) beside all-null columns for the other side.
+fn build_null_pad(
+    rows: &RecordBatch,
+    left_types: &[DataType],
+    right_types: &[DataType],
+    is_left: bool,
+) -> RecordBatch {
+    let n = rows.num_rows();
+    let data_arity = if is_left { left_types.len() } else { right_types.len() };
+    let data: Vec<ArrayRef> = (0..data_arity).map(|i| rows.column(i).clone()).collect();
+    let columns: Vec<ArrayRef> = if is_left {
+        data.into_iter().chain(null_columns(right_types, n)).collect()
+    } else {
+        null_columns(left_types, n).into_iter().chain(data).collect()
+    };
+    let types: Vec<DataType> = left_types.iter().chain(right_types).cloned().collect();
+    let fields: Vec<Field> =
+        (0..types.len()).map(|j| Field::new(format!("c{j}"), types[j].clone(), true)).collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("build null-pad")
 }
 
 /// The largest `__rowid__` across a side's buffered batches, or -1 if none.
@@ -2670,6 +2701,11 @@ struct WindowJoiner {
     right_wstart: usize,
     right_wend: usize,
     predicate: Option<JoinPredicate>,
+    join_type: JoinKind,
+    // Eager data schemas, seeded at construction so an outer join can type the null-padding for a side
+    // that never saw a row.
+    left_data_schema: SchemaRef,
+    right_data_schema: SchemaRef,
     left_schema: Option<SchemaRef>,
     right_schema: Option<SchemaRef>,
     left_buffered: Vec<RecordBatch>,
@@ -2686,6 +2722,9 @@ impl WindowJoiner {
         right_wstart: usize,
         right_wend: usize,
         predicate: Option<JoinPredicate>,
+        join_type: JoinKind,
+        left_data_schema: SchemaRef,
+        right_data_schema: SchemaRef,
     ) -> Self {
         WindowJoiner {
             left_keys,
@@ -2695,6 +2734,9 @@ impl WindowJoiner {
             right_wstart,
             right_wend,
             predicate,
+            join_type,
+            left_data_schema,
+            right_data_schema,
             left_schema: None,
             right_schema: None,
             left_buffered: Vec::new(),
@@ -2734,24 +2776,87 @@ impl WindowJoiner {
         Some(closed)
     }
 
-    /// Joins and evicts the windows the watermark has closed (empty batch if nothing matches).
+    /// Joins and evicts the windows the watermark has closed. For an outer join the unmatched rows of
+    /// the closed windows are null-padded here too: because a window's rows on both sides close in the
+    /// same flush, the INNER join over the closed rows sees every potential match, so a closed row that
+    /// does not appear in it never matched. Empty batch when nothing is emitted.
     fn flush(&mut self, watermark: i64) -> RecordBatch {
         let left = Self::split_closed(&mut self.left_buffered, &self.left_schema, self.left_wend, watermark);
         let right =
             Self::split_closed(&mut self.right_buffered, &self.right_schema, self.right_wend, watermark);
-        match (left, right) {
-            (Some(left), Some(right)) if left.num_rows() > 0 && right.num_rows() > 0 => {
-                // Join on the user keys plus the window bounds, so only rows of the same window match.
-                let mut on: Vec<(usize, usize)> =
-                    self.left_keys.iter().zip(&self.right_keys).map(|(&l, &r)| (l, r)).collect();
-                on.push((self.left_wstart, self.right_wstart));
-                on.push((self.left_wend, self.right_wend));
-                // A window join has no interval bounds; the only residual is the optional non-equi
-                // predicate over the joined row.
-                let filter = residual_filter(&left.schema(), &right.schema(), None, self.predicate.as_mut());
-                hash_join_inner(left, right, &on, filter)
+        // Join on the user keys plus the window bounds, so only rows of the same window match.
+        let mut on: Vec<(usize, usize)> =
+            self.left_keys.iter().zip(&self.right_keys).map(|(&l, &r)| (l, r)).collect();
+        on.push((self.left_wstart, self.right_wstart));
+        on.push((self.left_wend, self.right_wend));
+        let filter =
+            residual_filter(&self.left_data_schema, &self.right_data_schema, None, self.predicate.as_mut());
+
+        if self.join_type == JoinKind::Inner {
+            return match (left, right) {
+                (Some(left), Some(right)) if left.num_rows() > 0 && right.num_rows() > 0 => {
+                    hash_join_inner(left, right, &on, filter)
+                }
+                _ => empty_batch(),
+            };
+        }
+
+        // Outer: tag the closed rows with transient row-ids (== row index), join, and from the matched
+        // row-ids null-pad the closed rows of each outer side that never appeared in a pair.
+        let left_closed = left.filter(|b| b.num_rows() > 0);
+        let right_closed = right.filter(|b| b.num_rows() > 0);
+        let left_types: Vec<DataType> =
+            self.left_data_schema.fields().iter().map(|f| f.data_type().clone()).collect();
+        let right_types: Vec<DataType> =
+            self.right_data_schema.fields().iter().map(|f| f.data_type().clone()).collect();
+        let mut outputs: Vec<RecordBatch> = Vec::new();
+        let mut matched_left: HashSet<i64> = HashSet::new();
+        let mut matched_right: HashSet<i64> = HashSet::new();
+        if let (Some(left), Some(right)) = (&left_closed, &right_closed) {
+            let (mut lc, mut rc) = (0i64, 0i64);
+            let joined = hash_join_inner(
+                append_rowids(left, &mut lc),
+                append_rowids(right, &mut rc),
+                &on,
+                filter,
+            );
+            if joined.num_rows() > 0 {
+                let total = joined.num_columns();
+                let lrid = joined.column(left_types.len()).as_any().downcast_ref::<Int64Array>().expect("lrid");
+                let rrid = joined.column(total - 1).as_any().downcast_ref::<Int64Array>().expect("rrid");
+                for i in 0..joined.num_rows() {
+                    matched_left.insert(lrid.value(i));
+                    matched_right.insert(rrid.value(i));
+                }
+                let keep: Vec<usize> =
+                    (0..left_types.len()).chain(left_types.len() + 1..total - 1).collect();
+                let fields: Vec<Field> = keep
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &i)| Field::new(format!("c{j}"), joined.schema().field(i).data_type().clone(), true))
+                    .collect();
+                let columns: Vec<ArrayRef> = keep.iter().map(|&i| joined.column(i).clone()).collect();
+                outputs.push(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("window pairs"));
             }
-            _ => RecordBatch::new_empty(Arc::new(Schema::empty())),
+        }
+        if self.join_type.left_is_outer() {
+            if let Some(left) = &left_closed {
+                if let Some(pad) = unmatched_null_pad(left, &matched_left, &left_types, &right_types, true) {
+                    outputs.push(pad);
+                }
+            }
+        }
+        if self.join_type.right_is_outer() {
+            if let Some(right) = &right_closed {
+                if let Some(pad) = unmatched_null_pad(right, &matched_right, &left_types, &right_types, false) {
+                    outputs.push(pad);
+                }
+            }
+        }
+        match outputs.len() {
+            0 => empty_batch(),
+            1 => outputs.pop().expect("one output"),
+            _ => concat_batches(&outputs[0].schema(), outputs.iter()).expect("concat window outputs"),
         }
     }
 
@@ -2780,6 +2885,9 @@ impl WindowJoiner {
         right_wstart: usize,
         right_wend: usize,
         predicate: Option<JoinPredicate>,
+        join_type: JoinKind,
+        left_data_schema: SchemaRef,
+        right_data_schema: SchemaRef,
         bytes: &[u8],
     ) -> Self {
         let mut joiner = WindowJoiner::new(
@@ -2790,6 +2898,9 @@ impl WindowJoiner {
             right_wstart,
             right_wend,
             predicate,
+            join_type,
+            left_data_schema,
+            right_data_schema,
         );
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
         for batch in read_ipc_if_present(&bytes[4..4 + left_len]) {
@@ -7275,6 +7386,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createWindowJ
     left_window_end: jint,
     right_window_start: jint,
     right_window_end: jint,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
     pred_kinds: JIntArray<'local>,
     pred_payload: JIntArray<'local>,
     pred_child_counts: JIntArray<'local>,
@@ -7284,6 +7398,8 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createWindowJ
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
     let predicate = read_join_predicate(
         &mut env,
         &pred_kinds,
@@ -7301,6 +7417,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createWindowJ
         right_window_start as usize,
         right_window_end as usize,
         predicate,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
     ))) as jlong
 }
 
@@ -7382,6 +7501,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindow
     left_window_end: jint,
     right_window_start: jint,
     right_window_end: jint,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
     pred_kinds: JIntArray<'local>,
     pred_payload: JIntArray<'local>,
     pred_child_counts: JIntArray<'local>,
@@ -7392,6 +7514,8 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindow
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
     let predicate = read_join_predicate(
         &mut env,
         &pred_kinds,
@@ -7410,6 +7534,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindow
         right_window_start as usize,
         right_window_end as usize,
         predicate,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
         &bytes,
     ))) as jlong
 }
@@ -7666,6 +7793,7 @@ pub mod bench {
 
     impl WindowJoin {
         #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             left_keys: Vec<usize>,
             right_keys: Vec<usize>,
@@ -7673,6 +7801,8 @@ pub mod bench {
             left_window_end: usize,
             right_window_start: usize,
             right_window_end: usize,
+            left_schema: SchemaRef,
+            right_schema: SchemaRef,
         ) -> Self {
             WindowJoin(WindowJoiner::new(
                 left_keys,
@@ -7682,6 +7812,9 @@ pub mod bench {
                 right_window_start,
                 right_window_end,
                 None,
+                JoinKind::Inner,
+                left_schema,
+                right_schema,
             ))
         }
 
@@ -8697,22 +8830,29 @@ mod tests {
         assert_eq!(joiner.push_right(join_batch(vec![1], vec![100], vec![5500])).num_rows(), 0);
     }
 
+    // The `[k, v, window_start, window_end]` data schema the window-join tests carry.
+    fn window_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ]))
+    }
+
+    // A window joiner of the given kind (key col 0, window bounds cols 2/3) over `window_schema`.
+    fn window_joiner(kind: JoinKind) -> WindowJoiner {
+        WindowJoiner::new(vec![0], vec![0], 2, 3, 2, 3, None, kind, window_schema(), window_schema())
+    }
+
     // A `[k, v, window_start, window_end]` batch (window bounds as int64 millis) for window-join tests.
     fn window_batch(k: Vec<i64>, v: Vec<i64>, ws: Vec<i64>, we: Vec<i64>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int64, false),
-                Field::new("v", DataType::Int64, true),
-                Field::new("window_start", DataType::Int64, false),
-                Field::new("window_end", DataType::Int64, false),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(k)),
-                Arc::new(Int64Array::from(v)),
-                Arc::new(Int64Array::from(ws)),
-                Arc::new(Int64Array::from(we)),
-            ],
-        )
+        RecordBatch::try_new(window_schema(), vec![
+            Arc::new(Int64Array::from(k)),
+            Arc::new(Int64Array::from(v)),
+            Arc::new(Int64Array::from(ws)),
+            Arc::new(Int64Array::from(we)),
+        ])
         .unwrap()
     }
 
@@ -8730,7 +8870,7 @@ mod tests {
     #[test]
     fn window_join_emits_matches_when_window_closes() {
         // keys col 0; window_start col 2, window_end col 3 on both sides.
-        let mut joiner = WindowJoiner::new(vec![0], vec![0], 2, 3, 2, 3, None);
+        let mut joiner = window_joiner(JoinKind::Inner);
         // Window [0,1000): left k=1 (two rows) and k=2; right k=1 and k=3.
         joiner.push_left(window_batch(vec![1, 1, 2], vec![10, 11, 20], vec![0, 0, 0], vec![1000, 1000, 1000]));
         joiner.push_right(window_batch(vec![1, 3], vec![100, 300], vec![0, 0], vec![1000, 1000]));
@@ -8750,13 +8890,44 @@ mod tests {
     // Buffered window-join rows survive a snapshot/restore round trip.
     #[test]
     fn window_join_restores_buffered_rows() {
-        let mut joiner = WindowJoiner::new(vec![0], vec![0], 2, 3, 2, 3, None);
+        let mut joiner = window_joiner(JoinKind::Inner);
         joiner.push_left(window_batch(vec![1], vec![10], vec![0], vec![1000]));
         joiner.push_right(window_batch(vec![1], vec![100], vec![0], vec![1000]));
         let snapshot = joiner.snapshot();
-        let mut restored = WindowJoiner::restore(vec![0], vec![0], 2, 3, 2, 3, None, &snapshot);
+        let mut restored = WindowJoiner::restore(
+            vec![0],
+            vec![0],
+            2,
+            3,
+            2,
+            3,
+            None,
+            JoinKind::Inner,
+            window_schema(),
+            window_schema(),
+            &snapshot,
+        );
         let out = restored.flush(1000);
         assert_eq!(left_right_values(&out), vec![(10, 100)]);
+    }
+
+    // LEFT window join: a left row whose window has no matching right row is null-padded when the
+    // window closes (append-only — emitted once at flush).
+    #[test]
+    fn window_left_join_null_pads_unmatched() {
+        let mut joiner = window_joiner(JoinKind::LeftOuter);
+        // Window [0,1000): left k=1 (matches right) and k=2 (no right match); right k=1 only.
+        joiner.push_left(window_batch(vec![1, 2], vec![10, 20], vec![0, 0], vec![1000, 1000]));
+        joiner.push_right(window_batch(vec![1], vec![100], vec![0], vec![1000]));
+        let out = joiner.flush(1000);
+        // k=1 emits the matched pair [10,100]; k=2 emits [20, null].
+        assert_eq!(out.num_rows(), 2);
+        let mut left_vs = values(&out, 1);
+        left_vs.sort_unstable();
+        assert_eq!(left_vs, vec![10, 20]);
+        // Exactly one row (k=2) has a null right v (column 5).
+        let null_right = (0..out.num_rows()).filter(|&i| out.column(5).is_null(i)).count();
+        assert_eq!(null_right, 1);
     }
 
     // Buffered rows survive a snapshot/restore round trip and still match afterward.
