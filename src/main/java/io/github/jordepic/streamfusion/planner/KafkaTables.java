@@ -121,6 +121,8 @@ final class KafkaTables {
         return 2;
       case "raw":
         return 3;
+      case "avro":
+        return 4; // bare Avro; the reader schema is derived from the table's RowType
       case "debezium-json":
         return 6;
       case "ogg-json":
@@ -149,8 +151,8 @@ final class KafkaTables {
   }
 
   /** Whether the shallow native-decode path can run this scan for an <em>insert-only</em> value format
-   * (JSON/CSV/raw — codes 0/2/3): Flink consumes bytes, the native operator decodes them to Arrow. CDC
-   * changelog formats are handled separately by {@link #isCdcDecode}. */
+   * (JSON/CSV/raw/bare-Avro — codes 0/2/3/4): Flink consumes bytes, the native operator decodes them to
+   * Arrow. CDC changelog formats are handled separately by {@link #isCdcDecode}. */
   static boolean isNativeKafkaDecode(RelNode node) {
     if (!(node instanceof StreamPhysicalTableSourceScan)) {
       return false;
@@ -160,7 +162,7 @@ final class KafkaTables {
       return false;
     }
     int code = decodeFormatCode(options);
-    return code == 0 || code == 2 || code == 3;
+    return code == 0 || code == 2 || code == 3 || code == 4;
   }
 
   /** Whether this scan is a CDC changelog format the native decode reproduces <em>identically</em> to

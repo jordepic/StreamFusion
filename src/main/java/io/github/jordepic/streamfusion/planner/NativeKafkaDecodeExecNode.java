@@ -10,6 +10,7 @@ import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.connector.kafka.source.KafkaSource;
+import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -34,6 +35,8 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
   // Bytes accumulated into one Arrow body batch before a native decode (matches the columnar batch size
   // the rest of the pipeline uses).
   private static final int BATCH_SIZE = 8192;
+  // The MessageDecoder code for bare Avro (the only routed format whose decode needs a derived schema).
+  private static final int BARE_AVRO = 4;
 
   private final RowType outputType;
   private final Map<String, String> options;
@@ -63,11 +66,19 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
             SOURCE_TRANSFORMATION,
             PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO);
     int format = KafkaTables.decodeFormatCode(options);
+    // Bare Avro decodes against a reader schema, not the exported target schema: derive it from the
+    // table's RowType with the same converter Flink's own `avro` format uses, so the decode matches. The
+    // row is forced non-null first (a record, never a `["null", record]` union — which both Flink's own
+    // format and the Arrow reader treat as a record, the row itself never being null).
+    String avroSchema =
+        format == BARE_AVRO
+            ? AvroSchemaConverter.convertToSchema(outputType.copy(false)).toString()
+            : "";
     DataStream<ArrowBatch> decoded =
         bytes.transform(
             DECODE_TRANSFORMATION,
             ArrowBatchTypeInformation.INSTANCE,
-            new NativeBytesDecodeOperator(outputType, BATCH_SIZE, format, "", 0, null, null));
+            new NativeBytesDecodeOperator(outputType, BATCH_SIZE, format, avroSchema, 0, null, null));
     return decoded.getTransformation();
   }
 }
