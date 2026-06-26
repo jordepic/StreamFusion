@@ -68,6 +68,20 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   @Test
+  void keyedSessionOverColumnarSourceMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("csession-in");
+    writeInput(input);
+    // Fully-columnar session: native source → watermark assigner → columnar keyed exchange → columnar
+    // session aggregator, the gap-merged per-key windows folded from Arrow with no transpose at the
+    // input. Output rows match the host.
+    NativeParity.assertParity(
+        () -> readEnvironment(input, "ONE_PHASE"),
+        "SELECT k, window_start, window_end, SUM(v) AS total "
+            + "FROM TABLE(SESSION(TABLE t PARTITION BY k, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void partitionedOverColumnarSourceMatchesHost() throws Exception {
     Path input = Files.createTempDirectory("cover-in");
     writeInput(input);
