@@ -72,6 +72,20 @@ class NativeCdcDecodeSqlHarnessTest {
                   + "\"after\":{\"id\":1,\"name\":\"a2\",\"score\":1.5},\"op_type\":\"U\"}",
               "{\"before\":{\"id\":2,\"name\":\"b\",\"score\":2.5},\"after\":null,\"op_type\":\"D\"}"));
 
+      // Debezium with a nested ROW column — exercises nested envelope decode + the per-field gather
+      // (interleave over a nested struct child) through the changelog.
+      assertParity(
+          brokers,
+          "cdc-nested",
+          "debezium-json",
+          "id BIGINT, info ROW<x BIGINT, y STRING>",
+          List.of(
+              "{\"before\":null,\"after\":{\"id\":1,\"info\":{\"x\":10,\"y\":\"a\"}},\"op\":\"c\"}",
+              "{\"before\":null,\"after\":{\"id\":2,\"info\":{\"x\":30,\"y\":\"c\"}},\"op\":\"c\"}",
+              "{\"before\":{\"id\":1,\"info\":{\"x\":10,\"y\":\"a\"}},"
+                  + "\"after\":{\"id\":1,\"info\":{\"x\":20,\"y\":\"b\"}},\"op\":\"u\"}",
+              "{\"before\":{\"id\":2,\"info\":{\"x\":30,\"y\":\"c\"}},\"after\":null,\"op\":\"d\"}"));
+
       // Maxwell: partial `old` merge — must fall back to Flink (not bit-identical natively).
       assertFallback(
           brokers,
@@ -97,30 +111,43 @@ class NativeCdcDecodeSqlHarnessTest {
     }
   }
 
+  private static final String SCALAR_COLUMNS = "id BIGINT, name STRING, score DOUBLE";
+
   private static void assertParity(
       String brokers, String topic, String format, List<String> messages) throws Exception {
+    assertParity(brokers, topic, format, SCALAR_COLUMNS, messages);
+  }
+
+  private static void assertParity(
+      String brokers, String topic, String format, String columns, List<String> messages)
+      throws Exception {
     produce(brokers, topic, messages);
-    NativeParity.assertChangelogParity(environment(brokers, topic, format), "SELECT * FROM cdc");
+    NativeParity.assertChangelogParity(
+        environment(brokers, topic, format, columns), "SELECT * FROM cdc");
   }
 
   private static void assertFallback(
       String brokers, String topic, String format, List<String> messages) throws Exception {
     produce(brokers, topic, messages);
-    NativeParity.assertFallback(environment(brokers, topic, format), "SELECT * FROM cdc");
+    NativeParity.assertFallback(
+        environment(brokers, topic, format, SCALAR_COLUMNS), "SELECT * FROM cdc");
   }
 
-  private static Supplier<TableEnvironment> environment(String brokers, String topic, String format) {
+  private static Supplier<TableEnvironment> environment(
+      String brokers, String topic, String format, String columns) {
     return () -> {
       StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
       env.setParallelism(1);
       StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
-      tEnv.executeSql(cdcTable(brokers, topic, format));
+      tEnv.executeSql(cdcTable(brokers, topic, format, columns));
       return tEnv;
     };
   }
 
-  private static String cdcTable(String brokers, String topic, String format) {
-    return "CREATE TABLE cdc (id BIGINT, name STRING, score DOUBLE) WITH ("
+  private static String cdcTable(String brokers, String topic, String format, String columns) {
+    return "CREATE TABLE cdc ("
+        + columns
+        + ") WITH ("
         + "'connector' = 'kafka', "
         + "'topic' = '"
         + topic
