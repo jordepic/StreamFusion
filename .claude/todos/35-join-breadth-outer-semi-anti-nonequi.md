@@ -1,7 +1,42 @@
 # Join breadth: outer / semi / anti, and a residual non-equi predicate
 
-**Status:** open — planned, not started. All three native joins are INNER-equi only.
+**Status:** mostly done. **Regular updating join — DONE** (INNER/LEFT/RIGHT/FULL/SEMI/ANTI +
+residual non-equi predicate; commits "Add outer and semi/anti to the regular updating join",
+"Apply a residual non-equi predicate in the regular updating join"). **Interval/window non-equi
+predicate — DONE** (commit "Apply a residual non-equi predicate in the interval and window joins").
+**Remaining: interval/window LEFT/RIGHT/FULL outer** (semi/anti do not arise as time-bounded joins —
+Flink plans those as regular joins). Design below.
 **Source:** the operator-coverage gap (ticket 11) — joins are the highest-value remaining breadth.
+
+## Remaining: interval/window outer (LEFT/RIGHT/FULL) — design
+The matched pairs already flow correctly via the incremental INNER DataFusion join (emit-as-they-match);
+outer adds only the **unmatched** rows, emitted once at eviction. Append-only output (the null-pad is
+emitted once when the row's window/interval closes and is never retracted), so parity is `assertParity`.
+
+Why eviction-time is correct: an outer row is evicted only once the watermark has passed the point where
+any future other-side row could still match it, so by eviction *all* its potential matches have been seen
+(even if some were themselves already evicted). A per-row "has matched" flag is therefore final at
+eviction. (Re-deriving matches from the surviving buffer at eviction does **not** work — matching rows may
+have been evicted first.)
+
+Mechanism — per-row match tracking via row-ids:
+- Append a synthetic `__rowid__` (Int64, per-side monotonic) to each buffered row; keep a per-side
+  `matched: HashMap<i64, bool>`.
+- On each incremental join, carry both sides' row-ids through the DataFusion join (they ride as extra
+  columns); read the output's `left.__rowid__`/`right.__rowid__` to set `matched[id] = true` on both sides,
+  then project the row-ids back out of the emitted pairs.
+- `advance`/`flush` (eviction): for rows leaving an **outer** side whose `matched` is false, emit the row
+  null-padded on the other side; drop evicted ids from the map. `advance` must now **return** a batch (the
+  null-pads) that the operator emits; today it returns nothing.
+- Null-padding needs the other side's column types before that side's first batch — pass both input Arrow
+  schemas at construction via the C Data Interface (as the updating join's `createUpdatingJoiner` does).
+- Snapshot must persist the buffers' `__rowid__` column, the `matched` maps, and the id counters.
+
+Files: `IntervalJoiner`/`WindowJoiner` (join type + rowid/matched + eviction emission + snapshot), the
+create/advance/flush JNI, `NativeIntervalJoinOperator`/`NativeWindowJoinOperator` (emit advance/flush
+output; pass schemas + join type), the matchers (relax the INNER gate, pass the join-type code), and the
+physical/exec nodes. Parity: `assertParity` for LEFT/RIGHT/FULL over append inputs (data-stream and the
+columnar Parquet path). Order: interval first, then window.
 
 ## Current state (what to extend)
 Three native joins, all gated to **INNER** with **no residual non-equi predicate**:
