@@ -47,6 +47,15 @@ fn import_record_batch(array_address: jlong, schema_address: jlong) -> RecordBat
     RecordBatch::from(StructArray::from(data))
 }
 
+/// Takes ownership of a schema the JVM exported through the C Data Interface (schema only, no data),
+/// swapping in a released placeholder so the producer's release callback fires once.
+fn import_schema(schema_address: jlong) -> SchemaRef {
+    let ffi_schema = unsafe {
+        std::ptr::replace(schema_address as *mut FFI_ArrowSchema, FFI_ArrowSchema::empty())
+    };
+    Arc::new(Schema::try_from(&ffi_schema).expect("failed to import Arrow schema"))
+}
+
 /// Exports a batch into consumer-allocated C structs; the JVM owns and releases it after import.
 fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address: jlong) {
     let out_data = StructArray::from(batch).to_data();
@@ -2503,56 +2512,206 @@ impl WindowJoiner {
 /// A full input row carried as scalars, used as a multiset key in the updating join's state.
 type JoinRow = Vec<ScalarValue>;
 
-/// Regular (non-windowed) INNER equi-join over a changelog, the "updating join". Unlike the
-/// time-bounded interval/window joins — which buffer a batch and delegate the match to a DataFusion
-/// hash join — this keeps a per-side keyed multiset of live rows and probes it incrementally per
-/// input row, because retract correctness needs per-row counts a batch join does not give. This is
-/// how the standalone streaming engines do it (RisingWave's `JoinHashMap`, Proton's `MemoryHashJoin`;
-/// see divergences/14); INNER needs no match-degree table (only outer/semi/anti would).
+/// Reads a batch's data schema (every column except a trailing `$row_kind$`, if present).
+fn data_schema(batch: &RecordBatch) -> SchemaRef {
+    let arity = data_arity(batch);
+    Arc::new(Schema::new(
+        batch.schema().fields().iter().take(arity).map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
+    ))
+}
+
+/// One distinct stored row's bookkeeping: how many times it currently appears (`count`, ≥1 while
+/// present — Flink's "appear-times") and its match-degree (`num_assoc`, the count of currently
+/// associated rows on the other side). The degree is maintained only when this side is an outer side
+/// (the outer input of LEFT/RIGHT/FULL, or the probe side of SEMI/ANTI); otherwise it stays `-1` and
+/// is ignored — mirroring Flink's `OuterJoinRecordStateView` vs `JoinRecordStateView` and RisingWave's
+/// optional degree table.
+#[derive(Clone, Copy)]
+struct RowMeta {
+    count: i64,
+    num_assoc: i32,
+}
+
+/// The join family the updating joiner runs. INNER carries no degree; LEFT/RIGHT/FULL maintain a
+/// per-row degree on the outer side(s); SEMI/ANTI maintain a degree on the left (probe) side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinKind {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+    Semi,
+    Anti,
+}
+
+impl JoinKind {
+    fn from_code(code: i32) -> Self {
+        match code {
+            0 => JoinKind::Inner,
+            1 => JoinKind::LeftOuter,
+            2 => JoinKind::RightOuter,
+            3 => JoinKind::FullOuter,
+            4 => JoinKind::Semi,
+            5 => JoinKind::Anti,
+            other => panic!("unknown updating-join type code {other}"),
+        }
+    }
+
+    fn left_is_outer(self) -> bool {
+        matches!(self, JoinKind::LeftOuter | JoinKind::FullOuter)
+    }
+
+    fn right_is_outer(self) -> bool {
+        matches!(self, JoinKind::RightOuter | JoinKind::FullOuter)
+    }
+
+    fn is_semi_anti(self) -> bool {
+        matches!(self, JoinKind::Semi | JoinKind::Anti)
+    }
+}
+
+/// One associated row gathered from the other side when probing for matches: a clone of the stored
+/// row and the match-degree it carried at probe time (`-1` when the other side keeps no degree). The
+/// degree is captured once per distinct row and shared across its copies, exactly as Flink's
+/// `OuterJoinRecordStateViews` iterator reuses one `numOfAssociations` for a record's appear-times.
+struct OuterRecord {
+    record: JoinRow,
+    num_assoc: i32,
+}
+
+/// Regular (non-windowed) equi-join over a changelog, the "updating join" — INNER, LEFT/RIGHT/FULL
+/// outer, and SEMI/ANTI. Unlike the time-bounded interval/window joins (which buffer a batch and
+/// delegate the match to a DataFusion hash join), this keeps a per-side keyed multiset of live rows
+/// and probes it incrementally per input row, because retract correctness needs per-row counts a
+/// batch join does not give. This is how the standalone streaming engines do it (RisingWave's
+/// `JoinHashMap` + optional degree table, Proton's `MemoryHashJoin`; see divergences/14).
 ///
-/// On each input row the arriving side emits one output per matching row on the *other* side
-/// (repeated by that row's multiset count), carrying the input row's `RowKind` — so a `+I`/`+U`
-/// produces inserts/update-afters and a `-U`/`-D` produces the matching retractions — then folds the
-/// row into its own side's multiset. State grows until rows are retracted (no time eviction). The
-/// emitted batch is `[left cols.., right cols..]` plus the `$row_kind$` byte column.
+/// The output the operator must reproduce is Flink's collapsed changelog. The per-element state
+/// machine is a faithful port of `StreamingJoinOperator` (INNER/outer) and
+/// `StreamingSemiAntiJoinOperator` (semi/anti): on an accumulate/retract row the arriving side emits
+/// one output per matching row on the other side (repeated by that row's multiset count) carrying the
+/// input `RowKind`, and — when a side is outer — emits or retracts null-padded rows as a row's degree
+/// crosses 0↔1, tracking that degree on the outer side's stored rows. State grows until rows are
+/// retracted (no time eviction). The emitted batch is `[left cols.., right cols..]` (inner/outer) or
+/// `[left cols..]` (semi/anti) plus the `$row_kind$` byte column.
 struct UpdatingJoiner {
     left_keys: Vec<usize>,
     right_keys: Vec<usize>,
-    left_schema: Option<SchemaRef>,
-    right_schema: Option<SchemaRef>,
-    left_state: HashMap<GroupKey, HashMap<JoinRow, i64>>,
-    right_state: HashMap<GroupKey, HashMap<JoinRow, i64>>,
+    kind: JoinKind,
+    left_schema: SchemaRef,
+    right_schema: SchemaRef,
+    left_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+    right_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
 }
 
 impl UpdatingJoiner {
-    fn new(left_keys: Vec<usize>, right_keys: Vec<usize>) -> Self {
+    fn new(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        kind: JoinKind,
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+    ) -> Self {
         UpdatingJoiner {
             left_keys,
             right_keys,
-            left_schema: None,
-            right_schema: None,
+            kind,
+            left_schema,
+            right_schema,
             left_state: HashMap::new(),
             right_state: HashMap::new(),
         }
     }
 
-    /// Reads a batch's data schema (every column except a trailing `$row_kind$`, if present).
-    fn data_schema(batch: &RecordBatch) -> SchemaRef {
-        let arity = data_arity(batch);
-        Arc::new(Schema::new(
-            batch.schema().fields().iter().take(arity).map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
-        ))
+    fn left_types(&self) -> Vec<DataType> {
+        self.left_schema.fields().iter().map(|f| f.data_type().clone()).collect()
+    }
+
+    fn right_types(&self) -> Vec<DataType> {
+        self.right_schema.fields().iter().map(|f| f.data_type().clone()).collect()
+    }
+
+    /// A null row sized for one side (every column a typed NULL), used to null-pad the absent side.
+    fn null_row(types: &[DataType]) -> JoinRow {
+        types.iter().map(null_scalar).collect()
+    }
+
+    /// Gathers the matching rows on `other_state` for `key`, expanding each distinct row by its
+    /// appear-times (so multiplicity is preserved) and capturing its degree once per distinct row. A
+    /// null in the equi-key matches nothing (Flink's null-filtering equi semantics), so an empty key
+    /// match means "no associated rows".
+    fn associated(
+        other_state: &HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        key: &GroupKey,
+    ) -> Vec<OuterRecord> {
+        if key.iter().any(ScalarValue::is_null) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Some(bucket) = other_state.get(key) {
+            for (row, meta) in bucket.iter() {
+                for _ in 0..meta.count.max(0) {
+                    out.push(OuterRecord { record: row.clone(), num_assoc: meta.num_assoc });
+                }
+            }
+        }
+        out
+    }
+
+    /// `state.addRecord(record, num_assoc)` — bumps appear-times and (re)sets the degree, as Flink's
+    /// no-unique-key `OuterJoinRecordStateView.addRecord`.
+    fn add_record(
+        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        key: &GroupKey,
+        row: &JoinRow,
+        num_assoc: i32,
+    ) {
+        let bucket = state.entry(key.clone()).or_default();
+        bucket
+            .entry(row.clone())
+            .and_modify(|m| {
+                m.count += 1;
+                m.num_assoc = num_assoc;
+            })
+            .or_insert(RowMeta { count: 1, num_assoc });
+    }
+
+    /// `state.updateNumOfAssociations(record, num_assoc)` — sets the degree of an existing row.
+    fn update_num_assoc(
+        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        key: &GroupKey,
+        row: &JoinRow,
+        num_assoc: i32,
+    ) {
+        let bucket = state.entry(key.clone()).or_default();
+        bucket
+            .entry(row.clone())
+            .and_modify(|m| m.num_assoc = num_assoc)
+            .or_insert(RowMeta { count: 1, num_assoc });
+    }
+
+    /// `state.retractRecord(record)` — drops one appear-time, removing the row (and emptied key) at 0.
+    fn retract_record(
+        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        key: &GroupKey,
+        row: &JoinRow,
+    ) {
+        if let Some(bucket) = state.get_mut(key) {
+            if let Some(meta) = bucket.get_mut(row) {
+                meta.count -= 1;
+                if meta.count <= 0 {
+                    bucket.remove(row);
+                }
+            }
+            if bucket.is_empty() {
+                state.remove(key);
+            }
+        }
     }
 
     /// Folds an input batch into its side and emits the join changelog it produces.
     fn push(&mut self, batch: &RecordBatch, is_left: bool) -> RecordBatch {
         let arity = data_arity(batch);
-        let schema = Self::data_schema(batch);
-        if is_left {
-            self.left_schema = Some(schema);
-        } else {
-            self.right_schema = Some(schema);
-        }
         let key_indices = if is_left { &self.left_keys } else { &self.right_keys };
         let key_arrays: Vec<&ArrayRef> = key_indices.iter().map(|&i| batch.column(i)).collect();
         let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
@@ -2564,60 +2723,26 @@ impl UpdatingJoiner {
         for row in 0..batch.num_rows() {
             // Absent `$row_kind$` (insert-only columnar input) ⇒ every row is an INSERT.
             let kind = row_kinds.map_or(0, |kinds| kinds.value(row));
-            let retract = kind == 1 || kind == 3;
             let key = read_key(&key_arrays, row);
-            // INNER equi-join: a null in the join key can never satisfy `a.k = b.k`, so the row
-            // neither joins nor is stored (the host's null-filtering INNER semantics).
-            if key.iter().any(ScalarValue::is_null) {
-                continue;
-            }
             let full: JoinRow = data_arrays
                 .iter()
                 .map(|a| ScalarValue::try_from_array(a, row).expect("join row scalar"))
                 .collect();
-            // Emit against the other side's current multiset for this key (it is unaffected by the
-            // update to our own side below, so order does not matter).
-            {
-                let other = if is_left { &self.right_state } else { &self.left_state };
-                if let Some(matches) = other.get(&key) {
-                    for (other_row, &count) in matches.iter() {
-                        let output: JoinRow = if is_left {
-                            full.iter().chain(other_row).cloned().collect()
-                        } else {
-                            other_row.iter().chain(&full).cloned().collect()
-                        };
-                        for _ in 0..count.max(0) {
-                            out_rows.push(output.clone());
-                            out_kinds.push(kind);
-                        }
-                    }
-                }
-            }
-            // Fold the row into our own side's multiset.
-            let own = if is_left { &mut self.left_state } else { &mut self.right_state };
-            let bucket = own.entry(key.clone()).or_default();
-            let next = bucket.get(&full).copied().unwrap_or(0) + if retract { -1 } else { 1 };
-            if next <= 0 {
-                bucket.remove(&full);
+            if self.kind.is_semi_anti() {
+                self.process_semi_anti(&key, &full, kind, is_left, &mut out_rows, &mut out_kinds);
             } else {
-                bucket.insert(full, next);
-            }
-            if bucket.is_empty() {
-                own.remove(&key);
+                self.process_inner_outer(&key, &full, kind, is_left, &mut out_rows, &mut out_kinds);
             }
         }
 
         if out_rows.is_empty() {
             return RecordBatch::new_empty(Arc::new(Schema::empty()));
         }
-        let left_schema = self.left_schema.as_ref().expect("left schema once a pair matched");
-        let right_schema = self.right_schema.as_ref().expect("right schema once a pair matched");
-        let types: Vec<DataType> = left_schema
-            .fields()
-            .iter()
-            .chain(right_schema.fields().iter())
-            .map(|f| f.data_type().clone())
-            .collect();
+        let types: Vec<DataType> = if self.kind.is_semi_anti() {
+            self.left_types()
+        } else {
+            self.left_types().into_iter().chain(self.right_types()).collect()
+        };
         let mut fields: Vec<Field> = (0..types.len())
             .map(|j| Field::new(format!("c{j}"), types[j].clone(), true))
             .collect();
@@ -2630,21 +2755,184 @@ impl UpdatingJoiner {
             .expect("failed to build updating-join changelog batch")
     }
 
-    /// Serializes one side's multiset as `[data cols.., __count__]` (one row per distinct live row),
-    /// or no bytes when the side has no schema or no rows yet.
-    fn serialize_side(&self, is_left: bool) -> Vec<u8> {
-        let (schema, state) = if is_left {
-            (&self.left_schema, &self.left_state)
-        } else {
-            (&self.right_schema, &self.right_state)
+    /// INNER/LEFT/RIGHT/FULL — a faithful port of `StreamingJoinOperator.processElement`. `is_left`
+    /// is whether the input arrived on the left; `kind` is the input row's `RowKind` byte
+    /// (0=+I,1=-U,2=+U,3=-D). Output rows are `[left cols.., right cols..]`.
+    fn process_inner_outer(
+        &mut self,
+        key: &GroupKey,
+        full: &JoinRow,
+        kind: i8,
+        is_left: bool,
+        out_rows: &mut Vec<JoinRow>,
+        out_kinds: &mut Vec<i8>,
+    ) {
+        let accumulate = kind == 0 || kind == 2;
+        let input_is_outer = if is_left { self.kind.left_is_outer() } else { self.kind.right_is_outer() };
+        let other_is_outer = if is_left { self.kind.right_is_outer() } else { self.kind.left_is_outer() };
+        let right_nulls = Self::null_row(&self.right_types());
+        let left_nulls = Self::null_row(&self.left_types());
+        // `output(input, other)` builds `[left.., right..]` placing the input on its side.
+        let paired = |other: &JoinRow| -> JoinRow {
+            if is_left {
+                full.iter().chain(other).cloned().collect()
+            } else {
+                other.iter().chain(full).cloned().collect()
+            }
         };
-        let Some(schema) = schema else { return Vec::new() };
+        // `outputNullPadding(input)` — the input row with the other side nulled.
+        let input_padded: JoinRow = if is_left {
+            full.iter().chain(&right_nulls).cloned().collect()
+        } else {
+            left_nulls.iter().chain(full).cloned().collect()
+        };
+        // `outputNullPadding(other)` — an other-side row with the input side nulled.
+        let other_padded = |other: &JoinRow| -> JoinRow {
+            if is_left {
+                left_nulls.iter().chain(other).cloned().collect()
+            } else {
+                other.iter().chain(&right_nulls).cloned().collect()
+            }
+        };
+
+        let (input_state, other_state) = if is_left {
+            (&mut self.left_state, &mut self.right_state)
+        } else {
+            (&mut self.right_state, &mut self.left_state)
+        };
+
+        if accumulate {
+            let associated = Self::associated(other_state, key);
+            if input_is_outer {
+                if associated.is_empty() {
+                    out_rows.push(input_padded);
+                    out_kinds.push(0); // +I[record+null]
+                    Self::add_record(input_state, key, full, 0);
+                } else {
+                    let num = associated.len() as i32;
+                    for other in &associated {
+                        if other_is_outer {
+                            if other.num_assoc == 0 {
+                                out_rows.push(other_padded(&other.record));
+                                out_kinds.push(3); // -D[null+other]
+                            }
+                            Self::update_num_assoc(other_state, key, &other.record, other.num_assoc + 1);
+                        }
+                        out_rows.push(paired(&other.record));
+                        out_kinds.push(0); // +I[record+other]
+                    }
+                    Self::add_record(input_state, key, full, num);
+                }
+            } else {
+                Self::add_record(input_state, key, full, -1);
+                for other in &associated {
+                    if other_is_outer {
+                        if other.num_assoc == 0 {
+                            out_rows.push(other_padded(&other.record));
+                            out_kinds.push(3); // -D[null+other]
+                        }
+                        Self::update_num_assoc(other_state, key, &other.record, other.num_assoc + 1);
+                        out_rows.push(paired(&other.record));
+                        out_kinds.push(0); // +I[record+other]
+                    } else {
+                        out_rows.push(paired(&other.record));
+                        out_kinds.push(kind); // +I/+U[record+other] (input RowKind)
+                    }
+                }
+            }
+        } else {
+            Self::retract_record(input_state, key, full);
+            let associated = Self::associated(other_state, key);
+            if associated.is_empty() {
+                if input_is_outer {
+                    out_rows.push(input_padded);
+                    out_kinds.push(3); // -D[record+null]
+                }
+            } else {
+                for other in &associated {
+                    out_rows.push(paired(&other.record));
+                    out_kinds.push(if input_is_outer { 3 } else { kind }); // -D / -D|-U (input RowKind)
+                    if other_is_outer {
+                        if other.num_assoc == 1 {
+                            out_rows.push(other_padded(&other.record));
+                            out_kinds.push(0); // +I[null+other]
+                        }
+                        Self::update_num_assoc(other_state, key, &other.record, other.num_assoc - 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// SEMI/ANTI — a faithful port of `StreamingSemiAntiJoinOperator`. The left side carries the
+    /// degree (it is the side whose rows are emitted); the right side is plain. Output rows are the
+    /// left columns only.
+    fn process_semi_anti(
+        &mut self,
+        key: &GroupKey,
+        full: &JoinRow,
+        kind: i8,
+        is_left: bool,
+        out_rows: &mut Vec<JoinRow>,
+        out_kinds: &mut Vec<i8>,
+    ) {
+        let accumulate = kind == 0 || kind == 2;
+        let is_anti = self.kind == JoinKind::Anti;
+        if is_left {
+            // processElement1: emit the input row when it has (semi) / lacks (anti) a match, then
+            // record it with its current match count as its degree.
+            let associated = Self::associated(&self.right_state, key);
+            let matched = !associated.is_empty();
+            if matched != is_anti {
+                out_rows.push(full.clone());
+                out_kinds.push(kind); // forward input RowKind
+            }
+            if accumulate {
+                Self::add_record(&mut self.left_state, key, full, associated.len() as i32);
+            } else {
+                Self::retract_record(&mut self.left_state, key, full);
+            }
+        } else {
+            // processElement2: a right row flips associated left rows' degree across 0↔1, emitting or
+            // retracting them (semi) or the inverse (anti).
+            let associated = Self::associated(&self.left_state, key);
+            if accumulate {
+                Self::add_record(&mut self.right_state, key, full, -1);
+                for other in &associated {
+                    if other.num_assoc == 0 {
+                        // anti: -D[left]; semi: +I/+U[left] (input RowKind)
+                        out_rows.push(other.record.clone());
+                        out_kinds.push(if is_anti { 3 } else { kind });
+                    }
+                    Self::update_num_assoc(&mut self.left_state, key, &other.record, other.num_assoc + 1);
+                }
+            } else {
+                Self::retract_record(&mut self.right_state, key, full);
+                for other in &associated {
+                    if other.num_assoc == 1 {
+                        // semi: -D/-U[left] (input RowKind); anti: +I[left]
+                        out_rows.push(other.record.clone());
+                        out_kinds.push(if is_anti { 0 } else { kind });
+                    }
+                    Self::update_num_assoc(&mut self.left_state, key, &other.record, other.num_assoc - 1);
+                }
+            }
+        }
+    }
+
+    /// Serializes one side's multiset as `[data cols.., __count__, __assoc__]` (one row per distinct
+    /// live row), or no bytes when the side has no rows yet.
+    fn serialize_side(&self, is_left: bool) -> Vec<u8> {
+        let (schema, state) =
+            if is_left { (&self.left_schema, &self.left_state) } else { (&self.right_schema, &self.right_state) };
         let mut rows: Vec<&JoinRow> = Vec::new();
         let mut counts: Vec<i64> = Vec::new();
+        let mut assocs: Vec<i32> = Vec::new();
         for bucket in state.values() {
-            for (row, &count) in bucket.iter() {
+            for (row, meta) in bucket.iter() {
                 rows.push(row);
-                counts.push(count);
+                counts.push(meta.count);
+                assocs.push(meta.num_assoc);
             }
         }
         if rows.is_empty() {
@@ -2658,6 +2946,8 @@ impl UpdatingJoiner {
             .collect();
         fields.push(Field::new("__count__", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(counts)));
+        fields.push(Field::new("__assoc__", DataType::Int32, false));
+        columns.push(Arc::new(Int32Array::from(assocs)));
         write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("join side"))
     }
 
@@ -2670,8 +2960,15 @@ impl UpdatingJoiner {
         out
     }
 
-    fn restore(left_keys: Vec<usize>, right_keys: Vec<usize>, bytes: &[u8]) -> Self {
-        let mut joiner = UpdatingJoiner::new(left_keys, right_keys);
+    fn restore(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        kind: JoinKind,
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+        bytes: &[u8],
+    ) -> Self {
+        let mut joiner = UpdatingJoiner::new(left_keys, right_keys, kind, left_schema, right_schema);
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
         joiner.load_side(true, &bytes[4..4 + left_len]);
         joiner.load_side(false, &bytes[4 + left_len..]);
@@ -2680,27 +2977,23 @@ impl UpdatingJoiner {
 
     fn load_side(&mut self, is_left: bool, bytes: &[u8]) {
         for batch in read_ipc_if_present(bytes) {
-            // The snapshot side batch is `[data cols.., __count__]`; the data schema is all but the
-            // trailing count (not a `$row_kind$` column, so `data_schema` does not apply here).
-            let arity = batch.num_columns() - 1;
-            let schema = Arc::new(Schema::new(
-                batch.schema().fields().iter().take(arity).map(|f| f.as_ref().clone()).collect::<Vec<_>>(),
-            ));
+            // The snapshot side batch is `[data cols.., __count__, __assoc__]`; the data columns are
+            // all but the two trailing bookkeeping columns.
+            let arity = batch.num_columns() - 2;
             let key_indices = if is_left { &self.left_keys } else { &self.right_keys };
             let key_arrays: Vec<&ArrayRef> = key_indices.iter().map(|&i| batch.column(i)).collect();
             let counts = column_i64(&batch, "__count__");
+            let assocs = column_i32(&batch, "__assoc__");
             let state = if is_left { &mut self.left_state } else { &mut self.right_state };
             for row in 0..batch.num_rows() {
                 let key = read_key(&key_arrays, row);
                 let full: JoinRow = (0..arity)
                     .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("join row scalar"))
                     .collect();
-                state.entry(key).or_default().insert(full, counts.value(row));
-            }
-            if is_left {
-                self.left_schema = Some(schema);
-            } else {
-                self.right_schema = Some(schema);
+                state.entry(key).or_default().insert(
+                    full,
+                    RowMeta { count: counts.value(row), num_assoc: assocs.value(row) },
+                );
             }
         }
     }
@@ -2779,7 +3072,7 @@ impl TopNRanker {
 
     fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
         let arity = data_arity(batch);
-        self.schema = Some(UpdatingJoiner::data_schema(batch));
+        self.schema = Some(data_schema(batch));
         let partition_arrays: Vec<&ArrayRef> =
             self.partition_columns.iter().map(|&i| batch.column(i)).collect();
         let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
@@ -3180,6 +3473,16 @@ fn column_i64<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap_or_else(|| panic!("column {name} must be int64"))
+}
+
+/// Downcasts a named int32 column, with a clear message if it is missing or the wrong type.
+fn column_i32<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int32Array {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("missing column {name}"))
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap_or_else(|| panic!("column {name} must be int32"))
 }
 
 /// The native data plane runs stateful operators as asynchronous plans, so the work is driven on a
@@ -6229,10 +6532,21 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createUpdatin
     _class: JClass<'local>,
     left_keys: JIntArray<'local>,
     right_keys: JIntArray<'local>,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
-    Box::into_raw(Box::new(UpdatingJoiner::new(left, right))) as jlong
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
+    Box::into_raw(Box::new(UpdatingJoiner::new(
+        left,
+        right,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
+    ))) as jlong
 }
 
 /// Folds a left batch into state and exports the join changelog it produces (left cols, right cols,
@@ -6288,12 +6602,24 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreUpdati
     _class: JClass<'local>,
     left_keys: JIntArray<'local>,
     right_keys: JIntArray<'local>,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
     snapshot: JByteArray<'local>,
 ) -> jlong {
     let left = read_columns(&env, &left_keys);
     let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read updating-join snapshot");
-    Box::into_raw(Box::new(UpdatingJoiner::restore(left, right, &bytes))) as jlong
+    Box::into_raw(Box::new(UpdatingJoiner::restore(
+        left,
+        right,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
+        &bytes,
+    ))) as jlong
 }
 
 /// Releases an updating joiner handle.
@@ -7489,6 +7815,18 @@ mod tests {
         assert_eq!(values(&out, 1), vec![5, 1]);
     }
 
+    // The `[k, v]` data schema (no `$row_kind$`) both sides carry in the updating-join tests.
+    fn kv_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    fn inner_joiner() -> UpdatingJoiner {
+        UpdatingJoiner::new(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema())
+    }
+
     // A `[k, v, $row_kind$]` changelog batch (k join key at col 0) for the updating-join tests.
     fn changelog_join_batch(k: Vec<i64>, v: Vec<i64>, kinds: Vec<i8>) -> RecordBatch {
         RecordBatch::try_new(
@@ -7510,7 +7848,7 @@ mod tests {
     // carrying the arriving row's kind; the output is left columns then right columns.
     #[test]
     fn updating_join_emits_matches_with_arriving_kind() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0]);
+        let mut joiner = inner_joiner();
         // Buffer a left row (k=1, v=10); no right yet, so nothing emits.
         assert_eq!(
             joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true).num_rows(),
@@ -7534,7 +7872,7 @@ mod tests {
     // never match.
     #[test]
     fn updating_join_is_cartesian_per_key() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0]);
+        let mut joiner = inner_joiner();
         joiner.push(&changelog_join_batch(vec![1, 1, 2], vec![100, 200, 300], vec![0, 0, 0]), false);
         let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
         assert_eq!(out.num_rows(), 2); // matches both k=1 right rows, not the k=2 one
@@ -7547,7 +7885,7 @@ mod tests {
     // nor stored.
     #[test]
     fn updating_join_drops_null_keys() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0]);
+        let mut joiner = inner_joiner();
         // A right row with a null key, then a left row with a null key — no match either way.
         let right = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -7582,14 +7920,91 @@ mod tests {
     // The per-side multiset survives a checkpoint, so a post-restore arrival still finds its match.
     #[test]
     fn updating_join_state_survives_snapshot_restore() {
-        let mut joiner = UpdatingJoiner::new(vec![0], vec![0]);
+        let mut joiner = inner_joiner();
         joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false); // buffer right
         let snapshot = joiner.snapshot();
-        let mut restored = UpdatingJoiner::restore(vec![0], vec![0], &snapshot);
+        let mut restored =
+            UpdatingJoiner::restore(vec![0], vec![0], JoinKind::Inner, kv_schema(), kv_schema(), &snapshot);
         let out = restored.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
         assert_eq!(out.num_rows(), 1);
         assert_eq!(values(&out, 1), vec![10]);
         assert_eq!(values(&out, 3), vec![100]);
+    }
+
+    // LEFT OUTER: a left row with no right match emits a null-padded row immediately; when a right
+    // row later matches, the null-pad is retracted (-D) and the matched pair emitted (+I).
+    #[test]
+    fn updating_join_left_outer_null_pads_then_retracts() {
+        let mut joiner =
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+        // Left row k=1, v=10: no right match → +I[left + null].
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
+        assert_eq!(row_kinds(&out), vec![0]);
+        assert_eq!(values(&out, 1), vec![10]); // left v
+        assert!(out.column(3).is_null(0)); // right v nulled
+        // Right row k=1, v=100 arrives: -D[left + null], +I[left + right].
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);
+        assert_eq!(row_kinds(&out), vec![3, 0]);
+        assert!(out.column(3).is_null(0)); // the retracted null-pad's right v
+        assert!(!out.column(3).is_null(1)); // the matched pair's right v is present
+        assert_eq!(values(&out, 1), vec![10, 10]); // both rows carry the left v
+    }
+
+    // LEFT OUTER on a left key that never matches: the null-pad is emitted once and retracted when
+    // the left row is deleted — net materialized result is empty.
+    #[test]
+    fn updating_join_left_outer_unmatched_retract() {
+        let mut joiner =
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+        let out = joiner.push(&changelog_join_batch(vec![7], vec![70], vec![0]), true);
+        assert_eq!(row_kinds(&out), vec![0]); // +I[left + null]
+        let out = joiner.push(&changelog_join_batch(vec![7], vec![70], vec![3]), true);
+        assert_eq!(row_kinds(&out), vec![3]); // -D[left + null]
+        assert!(out.column(3).is_null(0));
+    }
+
+    // SEMI: a left row is emitted once it has a right match; ANTI would emit it while unmatched.
+    #[test]
+    fn updating_join_semi_emits_on_match() {
+        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Semi, kv_schema(), kv_schema());
+        // Left row with no right match → nothing (semi).
+        assert_eq!(joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true).num_rows(), 0);
+        // Right row arrives → emit the left row (+I), one column-set (left only).
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);
+        assert_eq!(row_kinds(&out), vec![0]);
+        assert_eq!(out.num_columns(), 3); // left k, left v, $row_kind$ (no right columns)
+        assert_eq!(values(&out, 1), vec![10]);
+    }
+
+    // ANTI: a left row is emitted while it has no match, and retracted (-D) once a match arrives.
+    #[test]
+    fn updating_join_anti_retracts_on_match() {
+        let mut joiner = UpdatingJoiner::new(vec![0], vec![0], JoinKind::Anti, kv_schema(), kv_schema());
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true);
+        assert_eq!(row_kinds(&out), vec![0]); // +I[left] (no match yet)
+        let out = joiner.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);
+        assert_eq!(row_kinds(&out), vec![3]); // -D[left] (now matched)
+        assert_eq!(values(&out, 1), vec![10]);
+    }
+
+    // The degree survives a checkpoint: a restored LEFT OUTER joiner still retracts the null-pad when
+    // the first match arrives post-restore.
+    #[test]
+    fn updating_join_outer_degree_survives_snapshot_restore() {
+        let mut joiner =
+            UpdatingJoiner::new(vec![0], vec![0], JoinKind::LeftOuter, kv_schema(), kv_schema());
+        joiner.push(&changelog_join_batch(vec![1], vec![10], vec![0]), true); // +I[left+null], degree 0
+        let snapshot = joiner.snapshot();
+        let mut restored = UpdatingJoiner::restore(
+            vec![0],
+            vec![0],
+            JoinKind::LeftOuter,
+            kv_schema(),
+            kv_schema(),
+            &snapshot,
+        );
+        let out = restored.push(&changelog_join_batch(vec![1], vec![100], vec![0]), false);
+        assert_eq!(row_kinds(&out), vec![3, 0]); // -D[left+null], +I[left+right]
     }
 
     // A `[k, v, rt]` batch with int64 rowtime (epoch millis) for the interval-join tests.

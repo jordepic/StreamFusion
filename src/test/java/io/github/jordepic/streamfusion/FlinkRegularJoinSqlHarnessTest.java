@@ -1,9 +1,5 @@
 package io.github.jordepic.streamfusion;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-import io.github.jordepic.streamfusion.planner.NativePlanner;
-import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -12,15 +8,16 @@ import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.types.Row;
-import org.apache.flink.util.CloseableIterator;
 import org.junit.jupiter.api.Test;
 
 /**
- * Regular (non-windowed) INNER equi-join ({@code a JOIN b ON a.k = b.k}) matches the host. The native
- * updating join keeps a per-side keyed multiset and emits the join changelog; over append-only
- * inputs that is insert-only, and over changelog inputs (e.g. two aggregations joined) it retracts a
- * matched pair when either side retracts. The parity harness compares the full set of emitted change
- * rows, so a differing changelog fails.
+ * Regular (non-windowed) equi-joins match the host — INNER, LEFT/RIGHT/FULL outer, and SEMI/ANTI. The
+ * native updating join keeps a per-side keyed multiset and, for the outer/semi/anti families, a
+ * per-row match-degree, emitting the join changelog (null-padded outer rows, bare semi/anti rows). An
+ * INNER append join is insert-only; outer/anti joins retract null-pads as matches arrive, so their
+ * output is a changelog even over append-only inputs. Where the output is a changelog the collapsed
+ * (net materialized) result is compared, since a two-input join's raw changelog is
+ * interleaving-dependent but its materialization is deterministic.
  */
 class FlinkRegularJoinSqlHarnessTest {
 
@@ -44,25 +41,56 @@ class FlinkRegularJoinSqlHarnessTest {
   }
 
   @Test
-  void leftJoinDoesNotRoute() throws Exception {
-    // An outer join is not INNER, so the native join declines it (and its non-deterministic
-    // null-padded changelog makes a result comparison unsound — hence a routing-only check).
-    assertEquals(
-        0,
-        substitutions("SELECT a.k, a.v, b.w FROM A AS a LEFT JOIN B AS b ON a.k = b.k"),
-        "outer join unexpectedly routed to native");
+  void leftJoinMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v, b.w FROM A AS a LEFT JOIN B AS b ON a.k = b.k");
   }
 
-  /** Installs native substitution, drives the query to completion, and returns the substitution count. */
-  private static int substitutions(String sql) throws Exception {
-    TableEnvironment tEnv = environment();
-    PhysicalPlanScan scan = NativePlanner.install(tEnv);
-    try (CloseableIterator<Row> it = tEnv.executeSql(sql).collect()) {
-      while (it.hasNext()) {
-        it.next();
-      }
-    }
-    return scan.substitutions();
+  @Test
+  void rightJoinMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v, b.w FROM A AS a RIGHT JOIN B AS b ON a.k = b.k");
+  }
+
+  @Test
+  void fullJoinMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v, b.w FROM A AS a FULL JOIN B AS b ON a.k = b.k");
+  }
+
+  @Test
+  void semiJoinMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v FROM A AS a WHERE EXISTS (SELECT 1 FROM B AS b WHERE b.k = a.k)");
+  }
+
+  @Test
+  void antiJoinMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v FROM A AS a WHERE NOT EXISTS (SELECT 1 FROM B AS b WHERE b.k = a.k)");
+  }
+
+  @Test
+  void leftJoinOfChangelogStreamsMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT la.k, la.sv, rb.sw FROM "
+            + "(SELECT k, SUM(v) AS sv FROM A GROUP BY k) la LEFT JOIN "
+            + "(SELECT k, SUM(w) AS sw FROM B GROUP BY k) rb ON la.k = rb.k");
+  }
+
+  @Test
+  void fullJoinOfChangelogStreamsMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT la.k, la.sv, rb.sw FROM "
+            + "(SELECT k, SUM(v) AS sv FROM A GROUP BY k) la FULL JOIN "
+            + "(SELECT k, SUM(w) AS sw FROM B GROUP BY k) rb ON la.k = rb.k");
   }
 
   private static TableEnvironment environment() {

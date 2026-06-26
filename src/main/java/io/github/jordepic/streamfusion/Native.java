@@ -630,15 +630,21 @@ public final class Native {
       byte[] snapshot);
 
   /**
-   * Creates a regular (non-windowed) INNER updating joiner and returns an opaque handle. It keeps a
+   * Creates a regular (non-windowed) updating joiner and returns an opaque handle. It keeps a
    * per-side keyed multiset of live rows and, on each input row, emits the join changelog against the
-   * other side (carrying the input row's kind from the trailing {@code $row_kind$} column). The JVM
-   * owns the handle and must release it with {@link #closeUpdatingJoiner}.
+   * other side (carrying the input row's kind from the trailing {@code $row_kind$} column). For
+   * LEFT/RIGHT/FULL outer and SEMI/ANTI it also tracks a per-row match-degree on the outer side to
+   * emit/retract null-padded (outer) or bare (semi/anti) rows. The JVM owns the handle and must
+   * release it with {@link #closeUpdatingJoiner}.
    *
    * @param leftKeys equi-join key column indices in the left input batch
    * @param rightKeys equi-join key column indices in the right input batch
+   * @param joinType 0=INNER, 1=LEFT, 2=RIGHT, 3=FULL, 4=SEMI, 5=ANTI
+   * @param leftSchemaAddress C Data Interface address of the left input's (data-only) Arrow schema
+   * @param rightSchemaAddress C Data Interface address of the right input's (data-only) Arrow schema
    */
-  public static native long createUpdatingJoiner(int[] leftKeys, int[] rightKeys);
+  public static native long createUpdatingJoiner(
+      int[] leftKeys, int[] rightKeys, int joinType, long leftSchemaAddress, long rightSchemaAddress);
 
   /** Pushes a left batch, exporting the join changelog (left columns, right columns, row kind). */
   public static native void pushLeftUpdatingJoiner(
@@ -655,7 +661,13 @@ public final class Native {
   public static native byte[] snapshotUpdatingJoiner(long handle);
 
   /** Rebuilds an updating joiner from a snapshot and returns a fresh handle. */
-  public static native long restoreUpdatingJoiner(int[] leftKeys, int[] rightKeys, byte[] snapshot);
+  public static native long restoreUpdatingJoiner(
+      int[] leftKeys,
+      int[] rightKeys,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      byte[] snapshot);
 
   /**
    * Creates an append-only streaming Top-N ranker ({@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY

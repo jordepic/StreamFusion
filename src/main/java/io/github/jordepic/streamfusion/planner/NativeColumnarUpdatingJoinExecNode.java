@@ -23,6 +23,9 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
 
   private final int[] leftKeys;
   private final int[] rightKeys;
+  private final int joinType;
+  private final RowType leftType;
+  private final RowType rightType;
 
   public NativeColumnarUpdatingJoinExecNode(
       ReadableConfig tableConfig,
@@ -31,7 +34,10 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
       RowType outputType,
       String description,
       int[] leftKeys,
-      int[] rightKeys) {
+      int[] rightKeys,
+      int joinType,
+      RowType leftType,
+      RowType rightType) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-updating-join_1"),
@@ -41,6 +47,9 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
         description);
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
+    this.joinType = joinType;
+    this.leftType = leftType;
+    this.rightType = rightType;
   }
 
   @Override
@@ -55,7 +64,7 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
         left,
         right,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarUpdatingJoinOperator(leftKeys, rightKeys),
+        new NativeColumnarUpdatingJoinOperator(leftKeys, rightKeys, joinType, leftType, rightType),
         ArrowBatchTypeInformation.INSTANCE,
         left.getParallelism(),
         false);
