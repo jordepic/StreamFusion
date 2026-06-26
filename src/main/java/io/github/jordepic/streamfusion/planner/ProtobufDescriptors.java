@@ -19,6 +19,38 @@ final class ProtobufDescriptors {
 
   private ProtobufDescriptors() {}
 
+  /** Proto field types whose native Arrow decode is verified identical to Flink and whose Arrow type
+   * the row boundary carries: signed integers, float, double, bool, string. Excluded (so they fall
+   * back): unsigned/fixed ints (decoded unsigned here, signed in Flink), bytes/enum (no supported
+   * row-boundary type, and enum representation is unverified), and any message/group/repeated/map. */
+  private static final java.util.Set<String> SUPPORTED_FIELD_TYPES =
+      java.util.Set.of(
+          "INT32", "SINT32", "SFIXED32", "INT64", "SINT64", "SFIXED64", "FLOAT", "DOUBLE", "BOOL",
+          "STRING");
+
+  /** Whether the named message is a flat record of only the scalar field types the native decode
+   * reproduces identically to Flink (above) — no repeated/map fields and no nested messages. Anything
+   * else falls back, because either the decode isn't verified identical or the row boundary can't carry
+   * the column type (ROW/ARRAY/MAP/VARBINARY). */
+  static boolean isFlatScalarMessage(String messageClassName) {
+    try {
+      Object descriptor = Class.forName(messageClassName).getMethod("getDescriptor").invoke(null);
+      List<?> fields = (List<?>) descriptor.getClass().getMethod("getFields").invoke(descriptor);
+      for (Object field : fields) {
+        if ((boolean) field.getClass().getMethod("isRepeated").invoke(field)) {
+          return false; // repeated or map
+        }
+        String type = field.getClass().getMethod("getType").invoke(field).toString();
+        if (!SUPPORTED_FIELD_TYPES.contains(type)) {
+          return false; // unsigned/fixed int, bytes, enum, nested message, group
+        }
+      }
+      return true;
+    } catch (ReflectiveOperationException e) {
+      return false; // cannot inspect → fall back safely
+    }
+  }
+
   /** The fully-qualified name of the message the named class describes. */
   static String messageName(String messageClassName) {
     try {
