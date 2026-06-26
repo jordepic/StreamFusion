@@ -2,7 +2,9 @@ package io.github.jordepic.streamfusion;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.function.Supplier;
 import org.apache.avro.Schema;
@@ -27,74 +29,99 @@ import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * End-to-end parity test for the bare-Avro native-decode path: a {@code CREATE TABLE ...
- * 'connector'='kafka', 'format'='avro'} routes through the planner to {@link
- * io.github.jordepic.streamfusion.planner.StreamPhysicalNativeKafkaDecode} — Flink's own KafkaSource
- * consumes the raw Avro datums and a native operator decodes them straight to Arrow, against the reader
- * schema derived from the table's {@code RowType} with the same converter Flink's {@code avro} format
- * uses.
+ * End-to-end parity tests for the bare-Avro native-decode path: a {@code 'format'='avro'} Kafka table
+ * routes to a native operator that decodes the raw datums to Arrow against the reader schema derived from
+ * the table's {@code RowType} with the same converter Flink's {@code avro} format uses, so the two decode
+ * the same bytes. {@link NativeParity#assertParity} compares against Flink's own {@code avro} decoder.
  *
- * <p>{@link NativeParity#assertParity} runs the query on stock Flink (its own {@code avro} decoder) and
- * on the native decode and asserts the rows match, so the native decode reproduces Flink's result. The
- * messages are produced as bare Avro datums (no Confluent framing, no object-container header), which is
- * exactly what Flink's {@code avro} value format reads.
- *
- * <p>Opt-in via {@code SF_BENCHMARK=true} (Docker for Testcontainers Kafka). A bounded ({@code
- * latest-offset}) scan so both runs terminate.
+ * <p>Covers a flat record and a record with a nested record, an array, and a map — the complex column
+ * shapes the row boundary carries. Complex columns are read element-wise ({@code nested.a}, {@code
+ * nums[1]}, {@code tags['a']}) so the compared values are scalars. Opt-in via {@code SF_BENCHMARK=true}.
  */
 @EnabledIfEnvironmentVariable(named = "SF_BENCHMARK", matches = "true")
 class NativeAvroDecodeSqlHarnessTest {
 
-  private static final String TOPIC = "native-avro-decode-sql-it";
   private static final int MESSAGES = 2_000;
 
-  private static final RowType ROW_TYPE =
-      (RowType)
-          DataTypes.ROW(
-                  DataTypes.FIELD("id", DataTypes.BIGINT()),
-                  DataTypes.FIELD("name", DataTypes.STRING()),
-                  DataTypes.FIELD("score", DataTypes.DOUBLE()))
-              .getLogicalType();
-
   @Test
-  void avroKafkaTableDecodesNativelyWithFlinkParity() throws Exception {
+  void avroMessagesDecodeNativelyWithFlinkParity() throws Exception {
     try (KafkaContainer kafka =
         new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
       kafka.start();
       String brokers = kafka.getBootstrapServers();
-      produceAvro(brokers, MESSAGES);
 
-      Supplier<TableEnvironment> environment =
-          () -> {
-            StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-            env.setParallelism(1);
-            StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
-            tEnv.executeSql(avroTable("t", brokers));
-            return tEnv;
-          };
+      RowType flat =
+          (RowType)
+              DataTypes.ROW(
+                      DataTypes.FIELD("id", DataTypes.BIGINT()),
+                      DataTypes.FIELD("name", DataTypes.STRING()),
+                      DataTypes.FIELD("score", DataTypes.DOUBLE()))
+                  .getLogicalType();
+      produce(brokers, "avro-flat", flat, NativeAvroDecodeSqlHarnessTest::flatRecord);
+      NativeParity.assertParity(
+          environment(brokers, "avro-flat", "id BIGINT, name STRING, score DOUBLE"), "SELECT * FROM t");
 
-      NativeParity.assertParity(environment, "SELECT * FROM t");
+      RowType complex =
+          (RowType)
+              DataTypes.ROW(
+                      DataTypes.FIELD("id", DataTypes.BIGINT()),
+                      DataTypes.FIELD(
+                          "nested",
+                          DataTypes.ROW(
+                              DataTypes.FIELD("a", DataTypes.BIGINT()),
+                              DataTypes.FIELD("b", DataTypes.STRING()))),
+                      DataTypes.FIELD("nums", DataTypes.ARRAY(DataTypes.BIGINT())),
+                      DataTypes.FIELD("tags", DataTypes.MAP(DataTypes.STRING(), DataTypes.BIGINT())))
+                  .getLogicalType();
+      produce(brokers, "avro-complex", complex, NativeAvroDecodeSqlHarnessTest::complexRecord);
+      NativeParity.assertParity(
+          environment(
+              brokers,
+              "avro-complex",
+              "id BIGINT, nested ROW<a BIGINT, b STRING>, nums ARRAY<BIGINT>, tags MAP<STRING, BIGINT>"),
+          "SELECT id, nested.a, nested.b, nums[1], nums[2], tags['a'], tags['b'] FROM t");
     }
   }
 
-  private static String avroTable(String name, String brokers) {
-    return "CREATE TABLE "
-        + name
-        + " (id BIGINT, name STRING, score DOUBLE) WITH ("
-        + "'connector' = 'kafka', "
-        + "'topic' = '"
-        + TOPIC
-        + "', 'properties.bootstrap.servers' = '"
-        + brokers
-        + "', 'properties.group.id' = 'native-avro-decode-sql-it', "
-        + "'scan.startup.mode' = 'earliest-offset', 'scan.bounded.mode' = 'latest-offset', "
-        + "'format' = 'avro')";
+  private static void flatRecord(GenericRecord record, int i, Schema schema) {
+    record.put("id", (long) i);
+    record.put("name", "row-" + i);
+    record.put("score", i + 0.5);
   }
 
-  private static void produceAvro(String brokers, int messages) throws Exception {
+  private static void complexRecord(GenericRecord record, int i, Schema schema) {
+    record.put("id", (long) i);
+    GenericRecord nested = new GenericData.Record(recordBranch(schema.getField("nested").schema()));
+    nested.put("a", (long) (i + 1));
+    nested.put("b", "b-" + i);
+    record.put("nested", nested);
+    record.put("nums", List.of((long) i, (long) (i + 100)));
+    Map<String, Long> tags = new HashMap<>();
+    tags.put("a", (long) (i + 1));
+    tags.put("b", (long) (i + 2));
+    record.put("tags", tags);
+  }
+
+  /** The record branch of a (possibly null-union-wrapped) Avro field schema. */
+  private static Schema recordBranch(Schema fieldSchema) {
+    if (fieldSchema.getType() == Schema.Type.RECORD) {
+      return fieldSchema;
+    }
+    return fieldSchema.getTypes().stream()
+        .filter(s -> s.getType() == Schema.Type.RECORD)
+        .findFirst()
+        .orElseThrow();
+  }
+
+  private interface Filler {
+    void fill(GenericRecord record, int i, Schema schema);
+  }
+
+  private static void produce(String brokers, String topic, RowType rowType, Filler filler)
+      throws Exception {
     // The same reader schema the planner derives (the row forced non-null → a record, not a top-level
     // union), so the produced datums decode identically on both paths.
-    Schema schema = AvroSchemaConverter.convertToSchema(ROW_TYPE.copy(false));
+    Schema schema = AvroSchemaConverter.convertToSchema(rowType.copy(false));
     GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>(schema);
 
     Properties props = new Properties();
@@ -104,12 +131,10 @@ class NativeAvroDecodeSqlHarnessTest {
     props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
     props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1 << 20);
     try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props)) {
-      List<byte[]> values = new ArrayList<>(messages);
-      for (int i = 0; i < messages; i++) {
+      List<byte[]> values = new ArrayList<>(MESSAGES);
+      for (int i = 0; i < MESSAGES; i++) {
         GenericRecord record = new GenericData.Record(schema);
-        record.put("id", (long) i);
-        record.put("name", "row-" + i);
-        record.put("score", i + 0.5);
+        filler.fill(record, i, schema);
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
         writer.write(record, encoder);
@@ -117,9 +142,29 @@ class NativeAvroDecodeSqlHarnessTest {
         values.add(out.toByteArray());
       }
       for (byte[] value : values) {
-        producer.send(new ProducerRecord<>(TOPIC, 0, null, value));
+        producer.send(new ProducerRecord<>(topic, 0, null, value));
       }
       producer.flush();
     }
+  }
+
+  private static Supplier<TableEnvironment> environment(String brokers, String topic, String columns) {
+    return () -> {
+      StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+      env.setParallelism(1);
+      StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+      tEnv.executeSql(
+          "CREATE TABLE t ("
+              + columns
+              + ") WITH ('connector' = 'kafka', 'topic' = '"
+              + topic
+              + "', 'properties.bootstrap.servers' = '"
+              + brokers
+              + "', 'properties.group.id' = '"
+              + topic
+              + "', 'scan.startup.mode' = 'earliest-offset', 'scan.bounded.mode' = 'latest-offset', "
+              + "'format' = 'avro')");
+      return tEnv;
+    };
   }
 }
