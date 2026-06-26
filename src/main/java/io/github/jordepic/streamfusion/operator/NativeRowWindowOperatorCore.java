@@ -20,7 +20,7 @@ import org.apache.flink.table.types.logical.RowType;
  * type ({@code [key?, agg…, window_start, window_end]}). Window operators that produce final per-window
  * results (single-phase, global, session) extend this; the partial-emitting local operator extends the
  * output-agnostic {@link NativeWindowOperatorCore} directly. Every native operator but a source/sink is
- * Arrow → Arrow (ticket 36), so the final aggregates emit Arrow too; the transpose to {@code RowData}
+ * Arrow → Arrow, so the final aggregates emit Arrow too; the transpose to {@code RowData}
  * for a rowwise sink is the dedicated {@code ArrowToRowDataOperator}, inserted by the planner at the
  * island perimeter.
  */

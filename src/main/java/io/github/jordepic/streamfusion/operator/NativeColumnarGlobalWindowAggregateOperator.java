@@ -14,7 +14,7 @@ import org.apache.flink.table.types.logical.RowType;
  * Columnar global half of two-phase window aggregation: the same merge as {@link
  * NativeGlobalWindowAggregateOperator}, but fed the partial-state Arrow batches the columnar local
  * half emits directly — no row→Arrow rebuild — and emitting the final per-window results as Arrow
- * ({@code [key?, agg…, window_start, window_end]}). Arrow → Arrow (ticket 36); a rowwise sink is
+ * ({@code [key?, agg…, window_start, window_end]}). Arrow → Arrow; a rowwise sink is
  * reached through the dedicated {@code ArrowToRowDataOperator} at the island perimeter.
  */
 public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindowOperatorCore

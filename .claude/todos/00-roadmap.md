@@ -28,10 +28,20 @@ here when the ticket is deleted.
   bigint/int/string (the wider-key carriage exists; admitting it there just needs tests).
 - **Columnar flow, end to end:** `ArrowBatch` stream type + IPC serializer, the two
   transpose operators, the transition-inserter pass, `ColumnarInput`/`ColumnarOutput` markers, a
-  **columnar watermark assigner**, and a **columnar keyed shuffle** (native by-key split +
-  `ColumnarKeyGroupPartitioner`, own consistent hash — divergences/10). Columnar today: source, sink,
-  filter/calc, all window aggregates (one- and two-phase), `OVER`, and both joins — a windowed/keyed
-  pipeline (source → watermark assigner → exchange → operator) flows Arrow with no transpose.
+  **columnar watermark assigner**, a **columnar keyed shuffle** (native by-key split +
+  `ColumnarKeyGroupPartitioner`, own consistent hash — divergences/10), and a **columnar windowing
+  table function** (stateless `TUMBLE`/`HOP`/`CUMULATE` window assignment, fanning rows out for
+  hopping/cumulative; shares the window aggregate's assignment math). Columnar today: source, sink,
+  filter/calc, all window aggregates (one- and two-phase), `OVER`, both joins, and the windowing TVF —
+  a windowed/keyed pipeline (source → watermark assigner → exchange → operator) flows Arrow with no
+  transpose.
+- **Fully-columnar native islands (the standing invariant — shipped):** every native operator but a
+  source/sink is `Arrow → Arrow`; `RowData` appears only where the native region meets a *rowwise*
+  source/sink, via the two transpose operators, never between native operators. Acceleration is
+  **whole-query all-or-nothing** — if any non-source/sink operator would run row-wise, the planner
+  substitutes nothing and the query runs as stock Flink (a rowwise source/sink is bridged by a
+  perimeter transpose, not a fall-back trigger). Top-N and the updating join keep row-materialized
+  *internal* state for sort/retract correctness — fine, since their boundary is Arrow.
 - **Joins delegate the match to DataFusion** (`HashJoinExec` over the batches we buffer), like
   Arroyo; we own buffering + watermark eviction (divergences/12).
 - **Profiling/benchmarks (ticket 20):** Criterion native micro-benches; `ThroughputBenchmark`
@@ -48,15 +58,6 @@ here when the ticket is deleted.
   below 1× (its `RowData → Arrow → RowData` round-trip); leave it on the host via the per-operator flag.
 
 ## Next, roughly in order
-0. **Fully-columnar native islands** (ticket 36): the standing invariant — every native operator except
-   sources and sinks is `Arrow → Arrow`; `RowData` appears only where the native region meets a *rowwise*
-   source/sink, via the two dedicated transpose operators, never between native operators; and a query is
-   **whole-query all-or-nothing** — if any non-source/sink operator would fall back to row-wise, we
-   substitute nothing and run stock Flink (a rowwise source/sink is handled by a perimeter transpose, not
-   a fall-back trigger). Remaining work: make the 3 single-phase/final aggregates emit Arrow (Group A),
-   delete the 4 row-fed aggregate variants (Group B), and replace the operator-by-operator scan with the
-   whole-query decision in the planner. The joins, filter/calc, GROUP BY, Top-N, OVER, exchange, and
-   watermark already comply.
 1. **Expression layer stage 3 tail** (ticket 19): general projection (the planner's `Calc` node —
    an optional filter plus projections in one node — handled natively) and a broad function set are
    done (`/` `%`, COALESCE/NULLIF/NULL, narrow-int arithmetic, and the common string/exact-math

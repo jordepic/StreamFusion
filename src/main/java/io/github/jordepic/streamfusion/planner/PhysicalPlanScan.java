@@ -20,6 +20,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalT
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWatermarkAssigner;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowTableFunction;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.plan.optimize.program.StreamOptimizeContext;
@@ -53,7 +54,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
     // Pass 1 substitutes native (columnar) operators.
     RelNode substituted = rewrite(root);
-    // Whole-query all-or-nothing (ticket 36): every native operator but a source/sink is Arrow → Arrow.
+    // Whole-query all-or-nothing: every native operator but a source/sink is Arrow → Arrow.
     // If any operator other than a source (a leaf) or the sink (the plan root) is still row-wise, the
     // query cannot run as one columnar island, so accelerate nothing — it runs as stock Flink. The only
     // row-wise operator allowed is a rowwise source/sink, bridged by a transpose at the perimeter.
@@ -357,6 +358,30 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    // A windowing table function assigns each row to its window(s) and appends
+    // window_start/window_end/window_time — a stateless per-row map, so it is columnar in and out and
+    // never appears fused into a window aggregate (Flink collapses TVF + windowed GROUP BY into one
+    // node); it survives standalone only feeding a window join/Top-N. Its rewritten input is wrapped
+    // by the transition pass at the perimeter (the TVF does not shuffle, so no keyed exchange here).
+    if (current instanceof StreamPhysicalWindowTableFunction) {
+      StreamPhysicalWindowTableFunction tvf = (StreamPhysicalWindowTableFunction) current;
+      if (WindowTableFunctionMatcher.matches(tvf)) {
+        if (!NativeConfig.operatorEnabled("windowTableFunction")) {
+          return noteDisabled(current, "windowTableFunction");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeWindowTableFunction(
+            tvf.getCluster(),
+            tvf.getTraitSet(),
+            tvf.getInputs().get(0),
+            tvf.getRowType(),
+            WindowTableFunctionMatcher.timeColumn(tvf),
+            WindowTableFunctionMatcher.windowMillis(tvf),
+            WindowTableFunctionMatcher.slideMillis(tvf),
+            WindowTableFunctionMatcher.cumulative(tvf));
+      }
+    }
+
     if (current instanceof StreamPhysicalWindowAggregate) {
       StreamPhysicalWindowAggregate agg = (StreamPhysicalWindowAggregate) current;
       if (WindowAggregateMatcher.matches(
@@ -374,7 +399,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] valueTypes =
             WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType());
         int[] kinds = WindowAggregateMatcher.kinds(agg.aggCalls());
-        // Always columnar (ticket 36): the keyed shuffle stays Arrow where it sits on a columnar
+        // Always columnar: the keyed shuffle stays Arrow where it sits on a columnar
         // producer (a native exchange splits the batch by the grouping keys), otherwise the transition
         // pass inserts a row→Arrow transpose at the boundary. The exchange only co-locates each key's
         // rows on one channel — the window re-groups by key itself — so its hash need not match Flink's.
@@ -402,7 +427,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] valueTypes =
             WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType());
         int[] kinds = WindowAggregateMatcher.kinds(agg.aggCalls());
-        // Always columnar (ticket 36): the keyed shuffle stays Arrow where it sits on a columnar
+        // Always columnar: the keyed shuffle stays Arrow where it sits on a columnar
         // producer, otherwise the transition pass transposes at the boundary.
         return new StreamPhysicalNativeColumnarSessionWindowAggregate(
             agg.getCluster(),
@@ -477,7 +502,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         long sliceSize = WindowAggregateMatcher.sliceSize(agg.windowing());
         int timeColumn = WindowAggregateMatcher.timeColumn(agg.windowing());
         int[] keyColumns = WindowAggregateMatcher.keyColumns(agg.grouping());
-        // Always columnar (ticket 36): the local pre-aggregate emits Arrow partials. Its input feeds
+        // Always columnar: the local pre-aggregate emits Arrow partials. Its input feeds
         // directly (no shuffle precedes a local); the transition pass inserts a row→Arrow transpose
         // when the producer is rowwise.
         return new StreamPhysicalNativeColumnarLocalWindowAggregate(
@@ -506,7 +531,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] keyColumns = OverAggregateMatcher.keyColumns(over);
         int valueType = OverAggregateMatcher.valueTypeCode(over);
         int[] kinds = OverAggregateMatcher.kinds(over);
-        // Always columnar (ticket 36): the keyed shuffle becomes a native exchange (split by the
+        // Always columnar: the keyed shuffle becomes a native exchange (split by the
         // partition keys); the transition pass transposes below it only when the producer is rowwise.
         return new StreamPhysicalNativeOverAggregate(
             over.getCluster(),
@@ -596,7 +621,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] keyColumns = GlobalWindowAggregateMatcher.keyColumns(agg);
         int[] valueTypes = GlobalWindowAggregateMatcher.valueTypes(agg);
         int[] kinds = GlobalWindowAggregateMatcher.kinds(agg);
-        // Always columnar (ticket 36): the columnar local emits Arrow partials, a native exchange
+        // Always columnar: the columnar local emits Arrow partials, a native exchange
         // splits them by key, and the columnar global merges — the whole two-phase pipeline flows
         // Arrow. (columnarInput keeps the partial shuffle Arrow; the local is always a columnar
         // producer now, so no transpose arises here.)
@@ -666,6 +691,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (node instanceof StreamPhysicalWindowJoin) {
       return WindowJoinMatcher.unsupportedReason((StreamPhysicalWindowJoin) node);
     }
+    if (node instanceof StreamPhysicalWindowTableFunction) {
+      return WindowTableFunctionMatcher.unsupportedReason((StreamPhysicalWindowTableFunction) node);
+    }
     if (node instanceof StreamPhysicalGlobalWindowAggregate) {
       return GlobalWindowAggregateMatcher.unsupportedReason(
           (StreamPhysicalGlobalWindowAggregate) node);
@@ -700,7 +728,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
 
   /**
    * Replaces a keyed host exchange with a native columnar one (splitting the batch by the key), so the
-   * shuffle is always part of the columnar island (ticket 36). When the exchange's producer is rowwise
+   * shuffle is always part of the columnar island. When the exchange's producer is rowwise
    * the transition pass inserts a single transpose below the native exchange (the island perimeter);
    * when it is columnar no transpose is needed. A non-exchange input is returned unchanged.
    */

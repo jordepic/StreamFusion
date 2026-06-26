@@ -13,43 +13,39 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * The columnar twin of {@link StreamPhysicalNativeGlobalWindowAggregate}: the global merge consuming
- * the partial-state Arrow batches the columnar local half emits ({@link ColumnarInput}) and emitting
- * the final per-window results as Arrow ({@link ColumnarOutput}). Arrow → Arrow like every native
- * operator but a source/sink; the planner inserts the {@code ArrowToRowData} transpose
- * before a rowwise sink at the island perimeter. The partial columns / slice-end position are not
- * needed — the batch already carries the native partial schema, fed straight to the aggregator.
+ * Physical node standing in for a {@link
+ * org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowTableFunction} the
+ * native operator runs: an event-time TUMBLE/HOP/CUMULATE windowing TVF over a local-time-zone
+ * rowtime. Columnar on its input and output ({@link ColumnarInput} and {@link ColumnarOutput}): it
+ * assigns each Arrow row to its window(s) and emits the input columns (fanned out one copy per window
+ * for hopping/cumulative) with window_start/window_end/window_time appended. It does no buffering, so
+ * watermarks pass straight through; it requires an upstream watermark because its rowtime windowing
+ * is what the downstream window join/aggregate triggers on.
  */
-public class StreamPhysicalNativeColumnarGlobalWindowAggregate extends SingleRel
+public class StreamPhysicalNativeWindowTableFunction extends SingleRel
     implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
 
   private final RelDataType outputRowType;
+  private final int timeColumn;
   private final long windowMillis;
   private final long slideMillis;
   private final boolean cumulative;
-  private final int[] keyColumns;
-  private final int[] valueTypes;
-  private final int[] aggregateKinds;
 
-  public StreamPhysicalNativeColumnarGlobalWindowAggregate(
+  public StreamPhysicalNativeWindowTableFunction(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
+      int timeColumn,
       long windowMillis,
       long slideMillis,
-      boolean cumulative,
-      int[] keyColumns,
-      int[] valueTypes,
-      int[] aggregateKinds) {
+      boolean cumulative) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
+    this.timeColumn = timeColumn;
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.cumulative = cumulative;
-    this.keyColumns = keyColumns;
-    this.valueTypes = valueTypes;
-    this.aggregateKinds = aggregateKinds;
   }
 
   @Override
@@ -64,31 +60,27 @@ public class StreamPhysicalNativeColumnarGlobalWindowAggregate extends SingleRel
 
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-    return new StreamPhysicalNativeColumnarGlobalWindowAggregate(
+    return new StreamPhysicalNativeWindowTableFunction(
         getCluster(),
         traitSet,
         inputs.get(0),
         outputRowType,
+        timeColumn,
         windowMillis,
         slideMillis,
-        cumulative,
-        keyColumns,
-        valueTypes,
-        aggregateKinds);
+        cumulative);
   }
 
   @Override
   public ExecNode<?> translateToExecNode() {
-    return new NativeColumnarGlobalWindowAggExecNode(
+    return new NativeWindowTableFunctionExecNode(
         ShortcutUtils.unwrapTableConfig(this),
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
+        timeColumn,
         windowMillis,
         slideMillis,
-        cumulative,
-        keyColumns,
-        valueTypes,
-        aggregateKinds);
+        cumulative);
   }
 }

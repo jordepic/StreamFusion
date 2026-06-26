@@ -10,7 +10,7 @@ import org.apache.flink.table.types.logical.RowType;
  * Columnar single-phase session-window aggregation: the same native session aggregator as {@link
  * NativeSessionWindowAggregateOperator}, but fed Arrow batches directly instead of buffered rows, and
  * emitting Arrow batches ({@code [key?, agg…, window_start, window_end]}). The whole operator is
- * Arrow → Arrow (ticket 36); a rowwise sink is reached through the dedicated {@code ArrowToRowDataOperator}
+ * Arrow → Arrow; a rowwise sink is reached through the dedicated {@code ArrowToRowDataOperator}
  * the planner inserts at the island perimeter.
  */
 public class NativeColumnarSessionWindowAggregateOperator extends NativeRowWindowOperatorCore
