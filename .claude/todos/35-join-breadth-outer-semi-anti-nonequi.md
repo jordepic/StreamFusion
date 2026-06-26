@@ -24,15 +24,25 @@ retract the null-padded row (outer) or the bare row (semi/anti). Our INNER join 
 keyed multiset; the extension adds the degree.
 
 ## Reference-first (consult before writing)
-- **Flink** `~/data/flink/flink-table/flink-table-runtime/.../operators/join/stream/`:
-  - `StreamingJoinOperator` — INNER + LEFT/RIGHT/FULL outer; uses the `state/` record-state views plus an
-    association count to decide null-row emit/retract. This is the exact state machine to mirror.
-  - `StreamingSemiAntiJoinOperator` — SEMI/ANTI.
-  - `state/` — `JoinRecordStateView` / `OuterJoinRecordStateView` (the degree/association state).
+Implementation reference priority: **Arroyo > RisingWave > Proton**. Flink is the *parity target*, not the
+implementation reference (its output is what we must match bit-for-bit, or fall back).
+- **Arroyo (primary)** `~/data/arroyo/crates/arroyo-worker/src/arrow/join_with_expiration.rs` +
+  `crates/arroyo-planner/src/plan/join.rs` — the time-bounded (interval/window) join: buffer both sides,
+  delegate the whole join (type + non-equi `filter`) to a DataFusion `Join`/`HashJoinExec`, re-run per
+  incoming batch. Mirror this for interval/window outer/semi/anti and for the residual non-equi filter
+  (Arroyo passes `join.filter` straight to the DataFusion `Join`). Caveat: Arroyo rejects *updating* join
+  inputs and its per-batch re-run does **not** retract stale null-pads — so it cannot match Flink's
+  collapsed retract stream for the regular updating join. Use RisingWave there instead.
+- **RisingWave (secondary)** `~/data/risingwave/src/stream/src/executor/hash_join.rs` +
+  `join/{hash_join,row}.rs` — the regular updating join's degree state: a per-row `DegreeType` = count of
+  matches on the other side, kept only when `need_degree_table` (outer/semi/anti); degree 0 ⇒ emit a
+  null-pad. This equals Flink's `numOfAssociations`.
+- **Flink (parity target)** `~/data/flink/.../operators/join/stream/`: `StreamingJoinOperator` (INNER +
+  LEFT/RIGHT/FULL outer) and `StreamingSemiAntiJoinOperator` (SEMI/ANTI) — the exact emit/retract state
+  machine the collapsed result must reproduce; `state/OuterJoinRecordStateViews` stores
+  `(appear-times, numOfAssociations)` per distinct row.
 - **divergences/14** — the degree-table rationale and our guest-state stance (state snapshots into Flink, in
   memory not paged).
-- **Arroyo** `~/data/arroyo/crates/arroyo-worker/src/arrow/join_with_expiration.rs` — the interval/window
-  (time-bounded) join reference.
 
 ## Plan, by family (each its own change + parity test)
 1. **Regular updating join — outer/semi/anti** (highest value; the changelog join SQL hits most):

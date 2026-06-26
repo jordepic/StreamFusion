@@ -1,6 +1,7 @@
 package io.github.jordepic.streamfusion.operator;
 
 import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.arrow.ArrowConversion;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.CDataDictionaryProvider;
@@ -15,30 +16,43 @@ import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.TwoInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.table.types.logical.RowType;
 
 /**
- * Regular (non-windowed) INNER updating join, fed Arrow batches on both inputs and emitting Arrow
- * batches. The changelog flows Arrow with no per-operator transpose; each keyed shuffle stays
- * columnar where the input is a columnar producer, and the row↔Arrow conversion happens only at the
- * host edges. Each input batch is folded into its side and
- * the join changelog it produces is emitted immediately (carrying the changelog kind on the output
- * batch's {@code $row_kind$} column); the other side's state is unaffected by the update, so no
- * cross-input buffering is needed.
+ * Regular (non-windowed) updating join, fed Arrow batches on both inputs and emitting Arrow batches.
+ * Supports INNER, LEFT/RIGHT/FULL outer, and SEMI/ANTI: the native joiner keeps a per-side keyed
+ * multiset and, for the outer/semi/anti families, a per-row match-degree to emit and retract
+ * null-padded (outer) or bare (semi/anti) rows as a row's degree crosses 0↔1 — a faithful port of
+ * Flink's {@code StreamingJoinOperator}/{@code StreamingSemiAntiJoinOperator}. The changelog flows
+ * Arrow with no per-operator transpose; the row↔Arrow conversion happens only at the host edges. Each
+ * input batch is folded into its side and the join changelog it produces is emitted immediately
+ * (carrying the changelog kind on the output batch's {@code $row_kind$} column).
+ *
+ * <p>The left/right input schemas are handed to the joiner at construction (exported through the C
+ * Data Interface) so an outer join can type the null-padding for a side before its first batch
+ * arrives.
  */
 public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<ArrowBatch>
     implements TwoInputStreamOperator<ArrowBatch, ArrowBatch, ArrowBatch> {
 
   private final int[] leftKeys;
   private final int[] rightKeys;
+  private final int joinType;
+  private final RowType leftType;
+  private final RowType rightType;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
   private transient ListState<byte[]> handleState;
 
-  public NativeColumnarUpdatingJoinOperator(int[] leftKeys, int[] rightKeys) {
+  public NativeColumnarUpdatingJoinOperator(
+      int[] leftKeys, int[] rightKeys, int joinType, RowType leftType, RowType rightType) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
+    this.joinType = joinType;
+    this.leftType = leftType;
+    this.rightType = rightType;
   }
 
   @Override
@@ -55,10 +69,26 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
     for (byte[] entry : handleState.get()) {
       snapshot = entry;
     }
-    handle =
-        snapshot == null
-            ? Native.createUpdatingJoiner(leftKeys, rightKeys)
-            : Native.restoreUpdatingJoiner(leftKeys, rightKeys, snapshot);
+    // The joiner needs both sides' Arrow schemas up front (to type outer null-padding); export them
+    // through the C Data Interface for the create/restore call to import.
+    BufferAllocator alloc = NativeAllocator.SHARED;
+    CDataDictionaryProvider dicts = NativeAllocator.DICTIONARIES;
+    try (ArrowSchema leftSchema = ArrowSchema.allocateNew(alloc);
+        ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
+      Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
+      Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      handle =
+          snapshot == null
+              ? Native.createUpdatingJoiner(
+                  leftKeys, rightKeys, joinType, leftSchema.memoryAddress(), rightSchema.memoryAddress())
+              : Native.restoreUpdatingJoiner(
+                  leftKeys,
+                  rightKeys,
+                  joinType,
+                  leftSchema.memoryAddress(),
+                  rightSchema.memoryAddress(),
+                  snapshot);
+    }
   }
 
   @Override
