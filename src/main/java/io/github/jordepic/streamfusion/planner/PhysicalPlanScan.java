@@ -384,17 +384,49 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       if (WindowAggregateMatcher.matchesSession(
           agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())) {
         substitutions++;
+        long gapMillis = WindowAggregateMatcher.gapMillis(agg.windowing());
+        int timeColumn = WindowAggregateMatcher.timeColumn(agg.windowing());
+        int[] valueColumns = WindowAggregateMatcher.valueColumns(agg.aggCalls());
+        int[] keyColumns = WindowAggregateMatcher.keyColumns(agg.grouping());
+        int[] valueTypes =
+            WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType());
+        int[] kinds = WindowAggregateMatcher.kinds(agg.aggCalls());
+        // As with the fixed-window aggregate above: if the session sits on an exchange over a columnar
+        // producer, keep the shuffle columnar and feed Arrow straight into the session aggregator with
+        // no row transpose at the input. Otherwise stay row-fed.
+        RelNode sessionInput = agg.getInputs().get(0);
+        if (sessionInput instanceof StreamPhysicalExchange
+            && sessionInput.getInputs().get(0) instanceof ColumnarOutput) {
+          RelNode columnarExchange =
+              new StreamPhysicalNativeColumnarExchange(
+                  sessionInput.getCluster(),
+                  sessionInput.getTraitSet(),
+                  sessionInput.getInputs().get(0),
+                  sessionInput.getRowType(),
+                  keyColumns);
+          return new StreamPhysicalNativeColumnarSessionWindowAggregate(
+              agg.getCluster(),
+              agg.getTraitSet(),
+              columnarExchange,
+              agg.getRowType(),
+              gapMillis,
+              timeColumn,
+              valueColumns,
+              keyColumns,
+              valueTypes,
+              kinds);
+        }
         return new StreamPhysicalNativeSessionWindowAggregate(
             agg.getCluster(),
             agg.getTraitSet(),
             agg.getInputs().get(0),
             agg.getRowType(),
-            WindowAggregateMatcher.gapMillis(agg.windowing()),
-            WindowAggregateMatcher.timeColumn(agg.windowing()),
-            WindowAggregateMatcher.valueColumns(agg.aggCalls()),
-            WindowAggregateMatcher.keyColumns(agg.grouping()),
-            WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType()),
-            WindowAggregateMatcher.kinds(agg.aggCalls()));
+            gapMillis,
+            timeColumn,
+            valueColumns,
+            keyColumns,
+            valueTypes,
+            kinds);
       }
     }
 
