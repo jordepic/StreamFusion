@@ -16,7 +16,7 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
  * The columnar twin of {@link StreamPhysicalNativeWindowAggregate}: the same single-phase event-time
  * window aggregate, consuming Arrow batches ({@link ColumnarInput}) from a columnar exchange and
  * emitting the window-result batches as Arrow ({@link ColumnarOutput}). Every native operator but a
- * source/sink is Arrow → Arrow (ticket 36); the planner inserts the {@code ArrowToRowData} transpose
+ * source/sink is Arrow → Arrow; the planner inserts the {@code ArrowToRowData} transpose
  * before a rowwise sink at the island perimeter.
  */
 public class StreamPhysicalNativeColumnarWindowAggregate extends SingleRel

@@ -113,6 +113,31 @@ public final class Native {
   public static native void closeFilterExpression(long handle);
 
   /**
+   * Runs a batch the JVM exported through the stateless windowing table function, writing the
+   * fanned-out batch (input columns, one copy per window for hopping/cumulative, plus appended
+   * {@code window_start}/{@code window_end}/{@code window_time}) into the consumer-allocated output C
+   * structs. Stateless — there is no handle to create or release.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
+   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
+   * @param timeColumn index of the event-time column the window is assigned over
+   * @param windowMillis window size in millis (the max size for cumulative)
+   * @param slideMillis slide in millis (the size for tumbling, the step for cumulative)
+   * @param cumulative whether the window is cumulative (nested windows sharing a start)
+   */
+  public static native void assignWindows(
+      long inArrayAddress,
+      long inSchemaAddress,
+      long outArrayAddress,
+      long outSchemaAddress,
+      int timeColumn,
+      long windowMillis,
+      long slideMillis,
+      boolean cumulative);
+
+  /**
    * Compiles an encoded Calc — an optional condition tree plus the projection trees, sharing one set
    * of pools, with each tree's root in {@code projectionRoots}/{@code conditionRoot} — into a
    * reusable handle. Released with {@link #closeCalcExpression(long)}.

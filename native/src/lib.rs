@@ -560,6 +560,100 @@ fn null_scalar(data_type: &DataType) -> ScalarValue {
     ScalarValue::try_from(data_type).expect("null scalar of type")
 }
 
+/// Every aligned window a timestamp (millis) belongs to, as (start, end) millis pairs, appended to
+/// `windows` (cleared first) so the caller can reuse one buffer. Tumbling yields one window; hopping
+/// yields the `size / slide` overlapping windows; cumulative yields the nested windows
+/// `[base, base + k*step)` whose end is past the timestamp, all sharing the bucket start. Shared by
+/// the window aggregate and the windowing TVF so their assignment is byte-for-byte identical.
+fn windows_for(
+    timestamp: i64,
+    window_millis: i64,
+    slide_millis: i64,
+    cumulative: bool,
+    windows: &mut Vec<(i64, i64)>,
+) {
+    windows.clear();
+    if cumulative {
+        let base = timestamp - timestamp.rem_euclid(window_millis);
+        let mut end = base + slide_millis;
+        while end <= base + window_millis {
+            if end > timestamp {
+                windows.push((base, end));
+            }
+            end += slide_millis;
+        }
+    } else {
+        let mut start = timestamp - timestamp.rem_euclid(slide_millis);
+        while start + window_millis > timestamp {
+            windows.push((start, start + window_millis));
+            start -= slide_millis;
+        }
+    }
+}
+
+/// Stateless windowing table function (Flink's `WindowTableFunctionOperator`): assigns each input
+/// row to its window(s) and emits the input columns — fanned out, one copy per window for
+/// hopping/cumulative — with `window_start`, `window_end`, and `window_time` (= `window_end - 1ms`)
+/// appended. The downstream window join/aggregate does the event-time buffering; this is a pure
+/// per-row map, so watermarks pass straight through (the wrapper operator forwards them).
+///
+/// Timestamps are nanosecond / no time zone — the unit `ArrowConversion` pins both `TIMESTAMP` and
+/// `TIMESTAMP_LTZ` to — while the window math runs in millis, identical to the window aggregate
+/// (shared [`windows_for`]). A trailing `$row_kind$` changelog tag stays the last output column, so
+/// the window columns land at the input-column count (the indices the join/aggregate expect).
+fn assign_windows(
+    input: &RecordBatch,
+    time_col: usize,
+    window_millis: i64,
+    slide_millis: i64,
+    cumulative: bool,
+) -> RecordBatch {
+    let schema = input.schema();
+    let row_kind_idx = schema.fields().iter().position(|f| f.name() == ROW_KIND_COLUMN);
+    let data_end = row_kind_idx.unwrap_or_else(|| schema.fields().len());
+
+    let times = input
+        .column(time_col)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("windowing TVF time column must be timestamp(ns)");
+
+    // One take index per output row (the input row it copies), plus that row's window bounds in nanos.
+    let mut take_indices: Vec<u32> = Vec::with_capacity(input.num_rows());
+    let mut starts: Vec<i64> = Vec::new();
+    let mut ends: Vec<i64> = Vec::new();
+    let mut windows: Vec<(i64, i64)> = Vec::new();
+    for row in 0..input.num_rows() {
+        windows_for(times.value(row) / 1_000_000, window_millis, slide_millis, cumulative, &mut windows);
+        for &(start, end) in &windows {
+            take_indices.push(row as u32);
+            starts.push(start * 1_000_000);
+            ends.push(end * 1_000_000);
+        }
+    }
+    let indices = UInt32Array::from(take_indices);
+    let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
+
+    let mut fields: Vec<Field> = Vec::with_capacity(data_end + 4);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(data_end + 4);
+    for i in 0..data_end {
+        fields.push(schema.field(i).as_ref().clone());
+        columns.push(take(input.column(i), &indices, None).expect("failed to fan out column"));
+    }
+    let window_time: Vec<i64> = ends.iter().map(|end| end - 1_000_000).collect();
+    for name in ["window_start", "window_end", "window_time"] {
+        fields.push(Field::new(name, timestamp.clone(), false));
+    }
+    columns.push(Arc::new(TimestampNanosecondArray::from(starts)));
+    columns.push(Arc::new(TimestampNanosecondArray::from(ends)));
+    columns.push(Arc::new(TimestampNanosecondArray::from(window_time)));
+    if let Some(idx) = row_kind_idx {
+        fields.push(schema.field(idx).as_ref().clone());
+        columns.push(take(input.column(idx), &indices, None).expect("failed to fan out row kind"));
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("failed to build TVF batch")
+}
+
 /// One open aligned window: its start, plus the per-key accumulators folding in matching rows. The
 /// owning map keys windows by their *end*, which is unique even for cumulative windows that share a
 /// start, so the start is carried here.
@@ -609,23 +703,7 @@ impl TumblingAggregator {
     /// yields the `size / slide` overlapping windows; cumulative yields the nested windows
     /// `[base, base + k*step)` whose end is past the timestamp, all sharing the bucket start.
     fn windows_for(&self, timestamp: i64, windows: &mut Vec<(i64, i64)>) {
-        windows.clear();
-        if self.cumulative {
-            let base = timestamp - timestamp.rem_euclid(self.window_millis);
-            let mut end = base + self.slide_millis;
-            while end <= base + self.window_millis {
-                if end > timestamp {
-                    windows.push((base, end));
-                }
-                end += self.slide_millis;
-            }
-        } else {
-            let mut start = timestamp - timestamp.rem_euclid(self.slide_millis);
-            while start + self.window_millis > timestamp {
-                windows.push((start, start + self.window_millis));
-                start -= self.slide_millis;
-            }
-        }
+        windows_for(timestamp, self.window_millis, self.slide_millis, self.cumulative, windows);
     }
 
     /// The N accumulators (one per aggregate) for a (window, key), created on first touch. Windows
@@ -4747,6 +4825,32 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeCalcExpr
     unsafe {
         drop(Box::from_raw(handle as *mut CalcExpression));
     }
+}
+
+/// Runs a batch through the stateless windowing table function, exporting the fanned-out batch with
+/// window_start/window_end/window_time appended. Stateless, so there is no handle to create or close.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignWindows<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+    time_col: jint,
+    window_millis: jlong,
+    slide_millis: jlong,
+    cumulative: jboolean,
+) {
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let result = assign_windows(
+        &batch,
+        time_col as usize,
+        window_millis,
+        slide_millis,
+        cumulative != 0,
+    );
+    export_record_batch(result, out_array_address, out_schema_address);
 }
 
 /// Encodes a single Arrow batch to a Parquet file. The core of the native columnar sink: the batch
