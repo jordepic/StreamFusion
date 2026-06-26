@@ -48,6 +48,12 @@ here when the ticket is deleted.
   below 1× (its `RowData → Arrow → RowData` round-trip); leave it on the host via the per-operator flag.
 
 ## Next, roughly in order
+0. **Fully-columnar native islands** (ticket 36): the standing invariant — every native operator except
+   sources and sinks is `Arrow → Arrow`; `RowData` appears only at an island's perimeter via the two
+   dedicated transpose operators, never between native operators; a region accelerates all-columnar or
+   not at all. Remaining work: make the 3 single-phase/final aggregates emit Arrow (Group A), delete the
+   4 row-fed aggregate variants (Group B), and enforce the perimeter-only-transpose island model in the
+   planner. The joins, filter/calc, GROUP BY, Top-N, OVER, exchange, and watermark already comply.
 1. **Expression layer stage 3 tail** (ticket 19): general projection (the planner's `Calc` node —
    an optional filter plus projections in one node — handled natively) and a broad function set are
    done (`/` `%`, COALESCE/NULLIF/NULL, narrow-int arithmetic, and the common string/exact-math
