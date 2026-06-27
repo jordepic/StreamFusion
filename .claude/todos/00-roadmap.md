@@ -15,7 +15,10 @@ here when the ticket is deleted.
 - **Changelog / retract — done.** `RowKind` crosses the boundary as a four-way byte column
   (divergences/13), and three operators both emit and consume a retract changelog: the non-windowed
   `GROUP BY` aggregate (SUM/COUNT/MIN/MAX retract), the regular (updating) INNER equi-join, and
-  append-only streaming Top-N (`ROW_NUMBER`). The streaming engines RisingWave/Proton informed these
+  append-only streaming Top-N (`ROW_NUMBER`), which the global `FETCH`/`LIMIT` reuses — `ORDER BY …
+  LIMIT n` (`SortLimit`) and plain `LIMIT n` (`Limit`) both lower to a global no-partition
+  ROW_NUMBER rank, so they run on the same native Top-N operator with an empty partition key (no new
+  operator). The streaming engines RisingWave/Proton informed these
   (divergences/14). All three are **columnar** (Arrow in/out) per the CLAUDE.md principle — the
   row↔Arrow conversion is paid only at host edges, so a native changelog chain has no per-operator
   transpose. Feature tails — outer/semi/anti joins, rank-number / `RANK` / retracting-input Top-N —

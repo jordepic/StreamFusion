@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Calc;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
@@ -11,11 +12,13 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalG
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalJoin;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLimit;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRank;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSink;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSortLimit;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTemporalSort;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalUnion;
@@ -266,6 +269,43 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             TopNMatcher.sortNullsFirst(rank),
             TopNMatcher.limit(rank));
       }
+    }
+
+    // A global FETCH/LIMIT — ORDER BY … LIMIT n (StreamPhysicalSortLimit) or plain LIMIT n
+    // (StreamPhysicalLimit). Both lower to a global (no-partition) ROW_NUMBER rank, so they reuse the
+    // native columnar Top-N operator with an empty partition key: the sort-limit carries the order
+    // keys and emits a changelog as the top set changes; the plain limit has no sort keys, so the
+    // ranker keeps the first n rows by arrival (the newest beyond n never enters — insert-only). Like
+    // the Top-N above it emits a changelog, so it sits before the insert-only guard and requires an
+    // insert-only input (only the append-only ranker is implemented; a retracting input falls back).
+    if (current instanceof StreamPhysicalSortLimit || current instanceof StreamPhysicalLimit) {
+      Sort sort = (Sort) current;
+      boolean insertOnlyInput = ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) sort.getInput());
+      if (LimitMatcher.matches(sort) && insertOnlyInput) {
+        if (!NativeConfig.operatorEnabled("limit")) {
+          return noteDisabled(current, "limit");
+        }
+        substitutions++;
+        int[] partitionColumns = new int[0]; // global limit — a single gather, no partition
+        return new StreamPhysicalNativeColumnarTopN(
+            sort.getCluster(),
+            sort.getTraitSet(),
+            columnarInput(sort.getInput(), partitionColumns),
+            sort.getRowType(),
+            partitionColumns,
+            LimitMatcher.sortIndices(sort),
+            LimitMatcher.sortAscending(sort),
+            LimitMatcher.sortNullsFirst(sort),
+            LimitMatcher.limit(sort));
+      }
+      // Recognized but not substituted. A sort-limit emits a changelog, so it would otherwise slip
+      // past the insert-only guard below unreported; record why here so a non-accelerating query can
+      // explain itself (ticket 29). A retracting input is the one reason not in unsupportedReason.
+      recordFallback(
+          insertOnlyInput
+              ? LimitMatcher.unsupportedReason(sort)
+              : "limit: needs an insert-only input (the append-only ranker is implemented)");
+      return current;
     }
 
     // A CDC changelog source (Debezium/OGG) emits a changelog itself: the native decode operator turns
@@ -817,6 +857,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
     if (node instanceof StreamPhysicalUnion) {
       return UnionMatcher.unsupportedReason((StreamPhysicalUnion) node);
+    }
+    if (node instanceof StreamPhysicalSortLimit || node instanceof StreamPhysicalLimit) {
+      return LimitMatcher.unsupportedReason((Sort) node);
     }
     if (node instanceof StreamPhysicalWindowRank) {
       return WindowRankMatcher.unsupportedReason((StreamPhysicalWindowRank) node);
