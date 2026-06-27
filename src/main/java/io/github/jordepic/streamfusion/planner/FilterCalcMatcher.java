@@ -61,28 +61,42 @@ final class FilterCalcMatcher {
     return columns;
   }
 
-  /** Whether every input column has a type the whole-row converter can carry. */
+  /**
+   * Whether every input column has a type the Arrow boundary can carry. Unlike the scalar-only gate
+   * the stateful operators use ({@code RowDataArrowConverter.supports}), this admits nested
+   * ARRAY/MAP/ROW (recursively, down to supported leaf types) — a filter/projection only passes those
+   * columns through, never keying/sorting/aggregating on them, so the round-trip through
+   * {@code ArrowConversion} is all that's required (and it handles nested types).
+   */
   static boolean convertibleRow(RelDataType inputType) {
-    for (RelDataType field : inputType.getFieldList().stream().map(f -> f.getType()).toList()) {
-      switch (field.getSqlTypeName()) {
-        case TINYINT:
-        case SMALLINT:
-        case INTEGER:
-        case BIGINT:
-        case FLOAT:
-        case DOUBLE:
-        case BOOLEAN:
-        case CHAR:
-        case VARCHAR:
-        case TIMESTAMP:
-        case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
-        case DATE:
-        case DECIMAL:
-          break;
-        default:
-          return false;
-      }
+    return inputType.getFieldList().stream().allMatch(f -> isConvertibleType(f.getType()));
+  }
+
+  private static boolean isConvertibleType(RelDataType type) {
+    switch (type.getSqlTypeName()) {
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+      case BIGINT:
+      case FLOAT:
+      case DOUBLE:
+      case BOOLEAN:
+      case CHAR:
+      case VARCHAR:
+      case TIMESTAMP:
+      case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+      case DATE:
+      case DECIMAL:
+        return true;
+      case ARRAY:
+      case MULTISET:
+        return isConvertibleType(type.getComponentType());
+      case MAP:
+        return isConvertibleType(type.getKeyType()) && isConvertibleType(type.getValueType());
+      case ROW:
+        return convertibleRow(type);
+      default:
+        return false;
     }
-    return true;
   }
 }
