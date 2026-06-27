@@ -2086,6 +2086,92 @@ impl OverWindowAggregator {
     }
 }
 
+/// Event-time sort (Flink's `RowTimeSortOperator`): buffers input rows and, on a watermark, emits
+/// the rows whose rowtime is at or before it in ascending rowtime order, keeping the rest. Insert-
+/// only — the watermark guarantees no earlier-rowtime row can still arrive, so the emitted order is
+/// final. Ties at the same rowtime keep arrival order (a stable sort), matching the host. There is no
+/// key (a single distribution gathers the stream), so this is the columnar analog of the host's
+/// single-input event-time sort.
+struct TemporalSorter {
+    rt_column: usize,
+    buffered: Vec<RecordBatch>,
+    input_schema: Option<SchemaRef>,
+}
+
+impl TemporalSorter {
+    fn new(rt_column: usize) -> Self {
+        TemporalSorter { rt_column, buffered: Vec::new(), input_schema: None }
+    }
+
+    fn push(&mut self, batch: RecordBatch) {
+        self.input_schema = Some(batch.schema());
+        self.buffered.push(batch);
+    }
+
+    /// Emits the rows the watermark has completed, sorted ascending by rowtime, and keeps the rest
+    /// buffered. Returns an empty batch when nothing is complete.
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        let schema = match &self.input_schema {
+            Some(schema) => schema.clone(),
+            None => return RecordBatch::new_empty(Arc::new(Schema::empty())),
+        };
+        let all = concat_batches(&schema, &self.buffered).expect("failed to concat sort buffer");
+        let rt_millis = rt_to_millis(all.column(self.rt_column));
+        let complete_mask: BooleanArray =
+            rt_millis.iter().map(|v| Some(v.unwrap() <= watermark)).collect();
+        let complete = filter_record_batch(&all, &complete_mask).expect("failed to filter complete");
+        let pending_mask = arrow::compute::not(&complete_mask).expect("failed to negate mask");
+        let pending = filter_record_batch(&all, &pending_mask).expect("failed to filter pending");
+        self.buffered = if pending.num_rows() > 0 { vec![pending] } else { Vec::new() };
+        if complete.num_rows() == 0 {
+            return RecordBatch::new_empty(schema);
+        }
+        // Stable ascending sort by rowtime: Rust's sort_by_key is stable, so equal-rowtime rows keep
+        // their arrival order, as the host's sort does.
+        let rt_complete = rt_to_millis(complete.column(self.rt_column));
+        let values = rt_complete.values();
+        let mut order: Vec<u32> = (0..complete.num_rows() as u32).collect();
+        order.sort_by_key(|&i| values[i as usize]);
+        let indices = UInt32Array::from(order);
+        let columns: Vec<ArrayRef> = complete
+            .columns()
+            .iter()
+            .map(|c| take(c, &indices, None).expect("failed to sort column"))
+            .collect();
+        RecordBatch::try_new(complete.schema(), columns).expect("failed to build sorted batch")
+    }
+
+    fn snapshot(&mut self) -> Vec<u8> {
+        match (&self.input_schema, self.buffered.is_empty()) {
+            (Some(schema), false) => {
+                let all = concat_batches(schema, &self.buffered).expect("concat sort buffer");
+                let mut bytes = Vec::new();
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &all.schema())
+                    .expect("sort buffer writer");
+                writer.write(&all).expect("write sort buffer");
+                writer.finish().expect("finish sort buffer");
+                drop(writer);
+                bytes
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn restore(rt_column: usize, bytes: &[u8]) -> Self {
+        let mut sorter = TemporalSorter::new(rt_column);
+        if !bytes.is_empty() {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(bytes, None).expect("sort buffer reader");
+            for batch in reader {
+                let batch = batch.expect("read sort buffer");
+                sorter.input_schema = Some(batch.schema());
+                sorter.buffered.push(batch);
+            }
+        }
+        sorter
+    }
+}
+
 /// Reads a timestamp column as epoch millis, regardless of its stored unit.
 fn rt_to_millis(array: &ArrayRef) -> Int64Array {
     use arrow::datatypes::TimeUnit;
@@ -5606,6 +5692,82 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAg
         keys,
         &bytes,
     ))) as jlong
+}
+
+/// Creates an event-time sorter over the given rowtime column and returns an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTemporalSorter<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    rt_column: jint,
+) -> jlong {
+    Box::into_raw(Box::new(TemporalSorter::new(rt_column as usize))) as jlong
+}
+
+/// Buffers an input batch (no output); the rows are emitted later, in rowtime order, as watermarks
+/// complete them.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushTemporalSorter<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let sorter = unsafe { &mut *(handle as *mut TemporalSorter) };
+    sorter.push(import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Exports the rows the watermark has completed, sorted ascending by rowtime.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushTemporalSorter<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let sorter = unsafe { &mut *(handle as *mut TemporalSorter) };
+    let result = sorter.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases the event-time sorter and its buffered rows.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTemporalSorter<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut TemporalSorter));
+    }
+}
+
+/// Serializes the sorter's buffered rows for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTemporalSorter<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let sorter = unsafe { &mut *(handle as *mut TemporalSorter) };
+    env.byte_array_from_slice(&sorter.snapshot())
+        .expect("failed to allocate sort snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds an event-time sorter from a snapshot taken by a prior run and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTemporalSorter<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    rt_column: jint,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read sort snapshot");
+    Box::into_raw(Box::new(TemporalSorter::restore(rt_column as usize, &bytes))) as jlong
 }
 
 /// Creates a non-windowed `GROUP BY` aggregator and returns an opaque handle. The aggregate kinds

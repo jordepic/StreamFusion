@@ -405,6 +405,31 @@ public final class Native {
       byte[] snapshot);
 
   /**
+   * Creates an event-time sorter over the given rowtime column and returns an opaque handle. Each
+   * input batch is buffered; on a watermark the sorter emits the rows whose rowtime is at or before
+   * it, ascending by rowtime (stable for ties), and keeps the rest. Released with {@link
+   * #closeTemporalSorter}.
+   */
+  public static native long createTemporalSorter(int rtColumn);
+
+  /** Buffers an input batch; rows are emitted in rowtime order as watermarks complete them. */
+  public static native void pushTemporalSorter(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /** Exports the rows the watermark has completed, sorted ascending by rowtime. */
+  public static native void flushTemporalSorter(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases the event-time sorter and its buffered rows. */
+  public static native void closeTemporalSorter(long handle);
+
+  /** Serializes the sorter's buffered rows for a checkpoint. */
+  public static native byte[] snapshotTemporalSorter(long handle);
+
+  /** Rebuilds an event-time sorter from a snapshot and returns a fresh handle. */
+  public static native long restoreTemporalSorter(int rtColumn, byte[] snapshot);
+
+  /**
    * Creates a non-windowed {@code GROUP BY} aggregator and returns an opaque handle. Each input batch
    * folds into per-key state and the aggregator exports the changelog rows it produces, with the row
    * kinds carried on the {@code $row_kind$} column. Released with {@link #closeGroupAggregator}.

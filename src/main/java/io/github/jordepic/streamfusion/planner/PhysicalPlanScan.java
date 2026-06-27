@@ -17,6 +17,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalSink;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTemporalSort;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWatermarkAssigner;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
@@ -358,6 +359,25 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    // Event-time sort (ORDER BY rowtime): buffer rows, release them in rowtime order as the watermark
+    // advances. Insert-only. Its single (gather) exchange becomes a native columnar exchange with no
+    // key (an empty key list, like the non-partitioned OVER), so the whole thing stays columnar.
+    if (current instanceof StreamPhysicalTemporalSort) {
+      StreamPhysicalTemporalSort sort = (StreamPhysicalTemporalSort) current;
+      if (TemporalSortMatcher.matches(sort)) {
+        if (!NativeConfig.operatorEnabled("temporalSort")) {
+          return noteDisabled(current, "temporalSort");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeTemporalSort(
+            sort.getCluster(),
+            sort.getTraitSet(),
+            columnarInput(sort.getInputs().get(0), new int[0]),
+            sort.getRowType(),
+            TemporalSortMatcher.rowtimeColumn(sort));
+      }
+    }
+
     // A windowing table function assigns each row to its window(s) and appends
     // window_start/window_end/window_time — a stateless per-row map, so it is columnar in and out and
     // never appears fused into a window aggregate (Flink collapses TVF + windowed GROUP BY into one
@@ -693,6 +713,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
     if (node instanceof StreamPhysicalWindowTableFunction) {
       return WindowTableFunctionMatcher.unsupportedReason((StreamPhysicalWindowTableFunction) node);
+    }
+    if (node instanceof StreamPhysicalTemporalSort) {
+      return TemporalSortMatcher.unsupportedReason((StreamPhysicalTemporalSort) node);
     }
     if (node instanceof StreamPhysicalGlobalWindowAggregate) {
       return GlobalWindowAggregateMatcher.unsupportedReason(
