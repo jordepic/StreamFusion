@@ -16,9 +16,9 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalO
  * Recognizes the event-time {@code OVER} aggregations the native operator implements: a single
  * window group ordered by a rowtime (local-time-zone) attribute, the default {@code RANGE BETWEEN
  * UNBOUNDED PRECEDING AND CURRENT ROW} frame, optional {@code PARTITION BY} on bigint/int/string/boolean/date/timestamp/decimal
- * keys, and one or more {@code SUM}/{@code MIN}/{@code MAX}/{@code COUNT} aggregates that all read
- * the same bigint/int/double value column. Anything else (ROWS frame, a bounded frame, proctime,
- * AVG, multiple value columns, an unsupported key type) falls back to the host.
+ * keys, and one or more {@code SUM}/{@code MIN}/{@code MAX}/{@code COUNT}/{@code FIRST_VALUE}/{@code
+ * LAST_VALUE} aggregates that all read the same bigint/int/double value column. Anything else (ROWS
+ * frame, a bounded frame, proctime, AVG, multiple value columns, an unsupported key type) falls back.
  */
 final class OverAggregateMatcher {
 
@@ -187,7 +187,16 @@ final class OverAggregateMatcher {
    * row, so it is never empty and {@code $SUM0} equals {@code SUM}.
    */
   private static int overKind(SqlKind kind) {
-    return kind == SqlKind.SUM0 ? 0 : WindowAggregateMatcher.aggregateKind(kind);
+    if (kind == SqlKind.SUM0) {
+      return 0;
+    }
+    if (kind == SqlKind.FIRST_VALUE) {
+      return 5;
+    }
+    if (kind == SqlKind.LAST_VALUE) {
+      return 6;
+    }
+    return WindowAggregateMatcher.aggregateKind(kind);
   }
 }
 

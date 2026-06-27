@@ -70,6 +70,25 @@ class FlinkOverAggregateSqlHarnessTest {
   }
 
   @Test
+  void firstAndLastValueMatchHost() throws Exception {
+    // FIRST_VALUE/LAST_VALUE over the default RANGE frame, partitioned by k so each key's rowtimes
+    // are distinct: FIRST_VALUE is the earliest row's value (set once), LAST_VALUE the current row's.
+    NativeParity.assertParity(
+        FlinkOverAggregateSqlHarnessTest::environment,
+        "SELECT k, v, FIRST_VALUE(v) OVER w AS fv, LAST_VALUE(v) OVER w AS lv "
+            + "FROM src WINDOW w AS (PARTITION BY k ORDER BY rt)");
+  }
+
+  @Test
+  void firstValueUnpartitionedMatchesHost() throws Exception {
+    // Unpartitioned FIRST_VALUE: the earliest rowtime (0L) is unique, so the first value is
+    // unambiguous across the whole stream.
+    NativeParity.assertParity(
+        FlinkOverAggregateSqlHarnessTest::environment,
+        "SELECT v, FIRST_VALUE(v) OVER (ORDER BY rt) AS fv FROM src");
+  }
+
+  @Test
   void booleanPartitionKeyMatchesHost() throws Exception {
     // PARTITION BY a boolean key — exercises the wider partition-key set (the native key path is
     // type-general; boolean/date/timestamp/decimal are admitted, not just bigint/int/string).

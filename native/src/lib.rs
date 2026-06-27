@@ -1133,6 +1133,14 @@ enum RunningAgg {
     MinF64(Option<f64>),
     MaxF64(Option<f64>),
     Count(i64),
+    // FIRST_VALUE / LAST_VALUE: hold the first / most-recent non-null value seen (None until one
+    // arrives → emits NULL, matching Flink, which ignores nulls in these functions).
+    FirstI64(Option<i64>),
+    LastI64(Option<i64>),
+    FirstI32(Option<i32>),
+    LastI32(Option<i32>),
+    FirstF64(Option<f64>),
+    LastF64(Option<f64>),
 }
 
 impl RunningAgg {
@@ -1141,15 +1149,25 @@ impl RunningAgg {
         if kind == 3 {
             return Count(0);
         }
-        match value_type {
-            DataType::Int64 => [SumI64(None), MinI64(None), MaxI64(None)],
-            DataType::Int32 => [SumI32(None), MinI32(None), MaxI32(None)],
-            DataType::Float64 => [SumF64(None), MinF64(None), MaxF64(None)],
-            other => panic!("unsupported OVER value type: {other:?}"),
+        // kind: 0=SUM, 1=MIN, 2=MAX, 5=FIRST_VALUE, 6=LAST_VALUE (3=COUNT handled above).
+        match (kind, value_type) {
+            (0, DataType::Int64) => SumI64(None),
+            (1, DataType::Int64) => MinI64(None),
+            (2, DataType::Int64) => MaxI64(None),
+            (5, DataType::Int64) => FirstI64(None),
+            (6, DataType::Int64) => LastI64(None),
+            (0, DataType::Int32) => SumI32(None),
+            (1, DataType::Int32) => MinI32(None),
+            (2, DataType::Int32) => MaxI32(None),
+            (5, DataType::Int32) => FirstI32(None),
+            (6, DataType::Int32) => LastI32(None),
+            (0, DataType::Float64) => SumF64(None),
+            (1, DataType::Float64) => MinF64(None),
+            (2, DataType::Float64) => MaxF64(None),
+            (5, DataType::Float64) => FirstF64(None),
+            (6, DataType::Float64) => LastF64(None),
+            (k, other) => panic!("unsupported OVER aggregate kind {k} for value type {other:?}"),
         }
-        .into_iter()
-        .nth(kind as usize)
-        .expect("kind 0=SUM, 1=MIN, 2=MAX")
     }
 
     /// Folds one non-null value into the running state.
@@ -1166,6 +1184,13 @@ impl RunningAgg {
             (MinF64(m), Num::F64(v)) => *m = Some(m.map_or(v, |x| x.min(v))),
             (MaxF64(m), Num::F64(v)) => *m = Some(m.map_or(v, |x| x.max(v))),
             (Count(c), _) => *c += 1,
+            // FIRST_VALUE keeps the earliest value (set once); LAST_VALUE takes the most recent.
+            (FirstI64(f), Num::I64(v)) => *f = Some(f.unwrap_or(v)),
+            (LastI64(l), Num::I64(v)) => *l = Some(v),
+            (FirstI32(f), Num::I32(v)) => *f = Some(f.unwrap_or(v)),
+            (LastI32(l), Num::I32(v)) => *l = Some(v),
+            (FirstF64(f), Num::F64(v)) => *f = Some(f.unwrap_or(v)),
+            (LastF64(l), Num::F64(v)) => *l = Some(v),
             _ => unreachable!("OVER value type does not match aggregate state"),
         }
     }
@@ -1188,9 +1213,9 @@ impl RunningAgg {
     fn emit(&self) -> ScalarValue {
         use RunningAgg::*;
         match self {
-            SumI64(v) | MinI64(v) | MaxI64(v) => ScalarValue::Int64(*v),
-            SumI32(v) | MinI32(v) | MaxI32(v) => ScalarValue::Int32(*v),
-            SumF64(v) | MinF64(v) | MaxF64(v) => ScalarValue::Float64(*v),
+            SumI64(v) | MinI64(v) | MaxI64(v) | FirstI64(v) | LastI64(v) => ScalarValue::Int64(*v),
+            SumI32(v) | MinI32(v) | MaxI32(v) | FirstI32(v) | LastI32(v) => ScalarValue::Int32(*v),
+            SumF64(v) | MinF64(v) | MaxF64(v) | FirstF64(v) | LastF64(v) => ScalarValue::Float64(*v),
             Count(c) => ScalarValue::Int64(Some(*c)),
         }
     }
@@ -1198,9 +1223,11 @@ impl RunningAgg {
     fn result_type(&self) -> DataType {
         use RunningAgg::*;
         match self {
-            SumI64(_) | MinI64(_) | MaxI64(_) | Count(_) => DataType::Int64,
-            SumI32(_) | MinI32(_) | MaxI32(_) => DataType::Int32,
-            SumF64(_) | MinF64(_) | MaxF64(_) => DataType::Float64,
+            SumI64(_) | MinI64(_) | MaxI64(_) | Count(_) | FirstI64(_) | LastI64(_) => {
+                DataType::Int64
+            }
+            SumI32(_) | MinI32(_) | MaxI32(_) | FirstI32(_) | LastI32(_) => DataType::Int32,
+            SumF64(_) | MinF64(_) | MaxF64(_) | FirstF64(_) | LastF64(_) => DataType::Float64,
         }
     }
 
@@ -1208,9 +1235,16 @@ impl RunningAgg {
         use RunningAgg::*;
         match (self, scalar) {
             (Count(c), ScalarValue::Int64(Some(v))) => *c = *v,
-            (SumI64(s) | MinI64(s) | MaxI64(s), ScalarValue::Int64(v)) => *s = *v,
-            (SumI32(s) | MinI32(s) | MaxI32(s), ScalarValue::Int32(v)) => *s = *v,
-            (SumF64(s) | MinF64(s) | MaxF64(s), ScalarValue::Float64(v)) => *s = *v,
+            (SumI64(s) | MinI64(s) | MaxI64(s) | FirstI64(s) | LastI64(s), ScalarValue::Int64(v)) => {
+                *s = *v
+            }
+            (SumI32(s) | MinI32(s) | MaxI32(s) | FirstI32(s) | LastI32(s), ScalarValue::Int32(v)) => {
+                *s = *v
+            }
+            (
+                SumF64(s) | MinF64(s) | MaxF64(s) | FirstF64(s) | LastF64(s),
+                ScalarValue::Float64(v),
+            ) => *s = *v,
             _ => panic!("OVER state type mismatch on restore"),
         }
     }
