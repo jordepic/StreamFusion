@@ -37,10 +37,12 @@ here when the ticket is deleted.
   hopping/cumulative; shares the window aggregate's assignment math). Columnar today: source, sink,
   filter/calc, all window aggregates (one- and two-phase), `OVER`, both joins, the windowing TVF,
   **event-time sort** (`ORDER BY rowtime`), **keep-first deduplication** (rowtime `ROW_NUMBER … = 1`),
-  **window Top-N / window deduplication** (over the windowing TVF), and **`UNION ALL`** (a pure
-  stream merge — no operator, just a `UnionTransformation` over the inputs' Arrow streams) — a
+  **window Top-N / window deduplication** (over the windowing TVF), **`UNION ALL`** (a pure
+  stream merge — no operator, just a `UnionTransformation` over the inputs' Arrow streams), and
+  **`GROUPING SETS`/`CUBE`/`ROLLUP`** (a stateless `Expand` fan-out feeding the native GROUP BY) — a
   windowed/keyed pipeline (source → watermark assigner → exchange → operator) flows Arrow with no
-  transpose.
+  transpose. The GROUP BY now also emits **NULL group keys** (grouped-out keys / Flink's null-as-key),
+  a fix that fell out of GROUPING SETS.
 - **Fully-columnar native islands (the standing invariant — shipped):** every native operator but a
   source/sink is `Arrow → Arrow`; `RowData` appears only where the native region meets a *rowwise*
   source/sink, via the two transpose operators, never between native operators. Acceleration is

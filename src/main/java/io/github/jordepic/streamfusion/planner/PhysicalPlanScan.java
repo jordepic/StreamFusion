@@ -8,6 +8,7 @@ import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExpand;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
@@ -355,6 +356,32 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           calc.getInputs().get(0),
           calc.getRowType(),
           CalcMatcher.encode(calc));
+    }
+
+    // GROUPING SETS / CUBE / ROLLUP expansion: fan each row out to one row per grouping set (copy
+    // grouped-in columns, null grouped-out ones, stamp the expand id), feeding the downstream native
+    // GROUP BY over the keys plus the expand-id column. Stateless and changelog-transparent (the
+    // `$row_kind$` tag rides through), so — like the Calc/union — it is exempt from the insert-only
+    // guard below and runs over either insert-only or changelog input.
+    if (current instanceof StreamPhysicalExpand) {
+      StreamPhysicalExpand expand = (StreamPhysicalExpand) current;
+      if (ExpandMatcher.matches(expand)) {
+        if (!NativeConfig.operatorEnabled("expand")) {
+          return noteDisabled(current, "expand");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeExpand(
+            expand.getCluster(),
+            expand.getTraitSet(),
+            expand.getInputs().get(0),
+            expand.getRowType(),
+            ExpandMatcher.numExpandRows(expand),
+            ExpandMatcher.numOutputColumns(expand),
+            expand.expandIdIndex(),
+            ExpandMatcher.expandIdIsLong(expand),
+            ExpandMatcher.copyIndices(expand),
+            ExpandMatcher.expandIdValues(expand));
+      }
     }
 
     // A UNION ALL is a pure stream merge — every input record flows through unchanged, with no
@@ -857,6 +884,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
     if (node instanceof StreamPhysicalUnion) {
       return UnionMatcher.unsupportedReason((StreamPhysicalUnion) node);
+    }
+    if (node instanceof StreamPhysicalExpand) {
+      return ExpandMatcher.unsupportedReason((StreamPhysicalExpand) node);
     }
     if (node instanceof StreamPhysicalSortLimit || node instanceof StreamPhysicalLimit) {
       return LimitMatcher.unsupportedReason((Sort) node);

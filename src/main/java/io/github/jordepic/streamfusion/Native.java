@@ -138,6 +138,28 @@ public final class Native {
       boolean cumulative);
 
   /**
+   * Stateless GROUPING SETS / CUBE / ROLLUP expansion: fans each input row out to {@code
+   * numExpandRows} output rows, one per grouping set. For output column {@code c} and expand row
+   * {@code r}, {@code copyIndices[r*numOutCols + c]} is the input column to copy (an {@code InputRef}
+   * cell) or {@code -1} for a literal — the expand-id column ({@code expandIdIndex}) takes the per-row
+   * grouping id {@code expandIdValues[r]}, every other literal cell is a typed NULL (a grouped-out
+   * key). The {@code $row_kind$} tag rides through, so the expansion is changelog-transparent.
+   *
+   * @param expandIdIsLong whether the expand-id column is BIGINT (Int64) rather than INT (Int32)
+   */
+  public static native void expand(
+      long inArrayAddress,
+      long inSchemaAddress,
+      long outArrayAddress,
+      long outSchemaAddress,
+      int numExpandRows,
+      int numOutCols,
+      int expandIdIndex,
+      boolean expandIdIsLong,
+      int[] copyIndices,
+      long[] expandIdValues);
+
+  /**
    * Compiles an encoded Calc — an optional condition tree plus the projection trees, sharing one set
    * of pools, with each tree's root in {@code projectionRoots}/{@code conditionRoot} — into a
    * reusable handle. Released with {@link #closeCalcExpression(long)}.

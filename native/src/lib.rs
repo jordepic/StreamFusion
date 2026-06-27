@@ -654,6 +654,88 @@ fn assign_windows(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("failed to build TVF batch")
 }
 
+/// Stateless GROUPING SETS / CUBE / ROLLUP expansion (Flink's `ExpandFunction`): each input row is
+/// fanned out to `num_expand_rows` output rows, one per grouping set. Per output column `c` and
+/// expand row `r`, `copy_indices[r*num_out_cols + c]` is either the input column index to copy
+/// (an `InputRef` cell) or `-1` for a literal — the expand-id column (`expand_id_index`) takes the
+/// per-row grouping id `expand_id_values[r]` (Int32 or Int64), every other literal cell is a typed
+/// NULL (a grouped-out key). Built block by block (all input rows for expand row 0, then expand row
+/// 1, …) and concatenated; the host downstream GROUP BY is order-insensitive, so this multiset
+/// matches Flink's per-input-row interleaving. The `$row_kind$` tag rides through (repeated per
+/// block), so the expansion is changelog-transparent.
+fn expand(
+    input: &RecordBatch,
+    num_expand_rows: usize,
+    num_out_cols: usize,
+    expand_id_index: usize,
+    expand_id_is_long: bool,
+    copy_indices: &[i64],
+    expand_id_values: &[i64],
+) -> RecordBatch {
+    let schema = input.schema();
+    let row_kind_idx = schema.fields().iter().position(|f| f.name() == ROW_KIND_COLUMN);
+    let n = input.num_rows();
+    let id_type = if expand_id_is_long { DataType::Int64 } else { DataType::Int32 };
+
+    // Each non-expand-id output column is an InputRef in at least one expand row (a grouped-out key
+    // is NULL elsewhere but InputRef where it is grouped-in); take its type/name from that copy row.
+    let mut out_types: Vec<DataType> = Vec::with_capacity(num_out_cols);
+    let mut out_names: Vec<String> = Vec::with_capacity(num_out_cols);
+    for c in 0..num_out_cols {
+        if c == expand_id_index {
+            out_types.push(id_type.clone());
+            out_names.push("$e".to_string());
+        } else {
+            let src = (0..num_expand_rows)
+                .map(|r| copy_indices[r * num_out_cols + c])
+                .find(|&s| s >= 0)
+                .expect("a non-expand-id column must be an InputRef in some expand row");
+            out_types.push(input.column(src as usize).data_type().clone());
+            out_names.push(schema.field(src as usize).name().to_string());
+        }
+    }
+
+    let mut blocks: Vec<Vec<ArrayRef>> = vec![Vec::with_capacity(num_expand_rows); num_out_cols];
+    let mut row_kind_blocks: Vec<ArrayRef> = Vec::with_capacity(num_expand_rows);
+    for r in 0..num_expand_rows {
+        for c in 0..num_out_cols {
+            let arr: ArrayRef = if c == expand_id_index {
+                if expand_id_is_long {
+                    Arc::new(Int64Array::from(vec![expand_id_values[r]; n]))
+                } else {
+                    Arc::new(Int32Array::from(vec![expand_id_values[r] as i32; n]))
+                }
+            } else {
+                let src = copy_indices[r * num_out_cols + c];
+                if src >= 0 {
+                    input.column(src as usize).clone()
+                } else {
+                    new_null_array(&out_types[c], n)
+                }
+            };
+            blocks[c].push(arr);
+        }
+        if let Some(idx) = row_kind_idx {
+            row_kind_blocks.push(input.column(idx).clone());
+        }
+    }
+
+    let mut fields: Vec<Field> = Vec::with_capacity(num_out_cols + 1);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_out_cols + 1);
+    for c in 0..num_out_cols {
+        let refs: Vec<&dyn Array> = blocks[c].iter().map(|a| a.as_ref()).collect();
+        // A grouped-out key carries nulls, so every non-expand-id column is nullable.
+        fields.push(Field::new(&out_names[c], out_types[c].clone(), c != expand_id_index));
+        columns.push(arrow::compute::concat(&refs).expect("failed to concat expand column"));
+    }
+    if row_kind_idx.is_some() {
+        let refs: Vec<&dyn Array> = row_kind_blocks.iter().map(|a| a.as_ref()).collect();
+        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
+        columns.push(arrow::compute::concat(&refs).expect("failed to concat row kind"));
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("failed to build expand batch")
+}
+
 /// One open aligned window: its start, plus the per-key accumulators folding in matching rows. The
 /// owning map keys windows by their *end*, which is unique even for cumulative windows that share a
 /// start, so the start is carried here.
@@ -4449,9 +4531,11 @@ fn read_key(arrays: &[&ArrayRef], row: usize) -> GroupKey {
         .collect()
 }
 
-/// The `key0..key{n-1}` schema fields for an emitted batch, one per stored key type.
+/// The `key0..key{n-1}` schema fields for an emitted batch, one per stored key type. Nullable: a
+/// group key can be NULL (Flink groups nulls as their own key), and GROUPING SETS/CUBE/ROLLUP makes a
+/// grouped-out key NULL routinely — so the emitted column may carry nulls.
 fn key_fields(types: &[DataType]) -> Vec<Field> {
-    types.iter().enumerate().map(|(j, t)| Field::new(format!("key{j}"), t.clone(), false)).collect()
+    types.iter().enumerate().map(|(j, t)| Field::new(format!("key{j}"), t.clone(), true)).collect()
 }
 
 /// Transposes per-row composite keys into one typed column per key position.
@@ -5251,6 +5335,37 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignWindows
         window_millis,
         slide_millis,
         cumulative != 0,
+    );
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Stateless GROUPING SETS / CUBE / ROLLUP expansion over an Arrow batch the JVM exported.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_expand<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+    num_expand_rows: jint,
+    num_out_cols: jint,
+    expand_id_index: jint,
+    expand_id_is_long: jboolean,
+    copy_indices: JIntArray<'local>,
+    expand_id_values: JLongArray<'local>,
+) {
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let copy = read_int_array(&env, &copy_indices);
+    let ids = read_longs(&env, &expand_id_values);
+    let result = expand(
+        &batch,
+        num_expand_rows as usize,
+        num_out_cols as usize,
+        expand_id_index as usize,
+        expand_id_is_long != 0,
+        &copy,
+        &ids,
     );
     export_record_batch(result, out_array_address, out_schema_address);
 }
