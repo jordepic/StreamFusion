@@ -20,7 +20,9 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalT
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTemporalSort;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWatermarkAssigner;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowDeduplicate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowRank;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowTableFunction;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
@@ -427,6 +429,59 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    // Window Top-N over a windowing-TVF input: per window and partition key, keep the top-N rows by
+    // the order key and emit them when a watermark closes the window. Append-only; the keyed shuffle
+    // (or single gather when there is no partition key) stays columnar via columnarInput.
+    if (current instanceof StreamPhysicalWindowRank) {
+      StreamPhysicalWindowRank rank = (StreamPhysicalWindowRank) current;
+      if (WindowRankMatcher.matches(rank)) {
+        if (!NativeConfig.operatorEnabled("windowRank")) {
+          return noteDisabled(current, "windowRank");
+        }
+        substitutions++;
+        int[] partitionColumns = WindowRankMatcher.partitionColumns(rank);
+        return new StreamPhysicalNativeWindowRank(
+            rank.getCluster(),
+            rank.getTraitSet(),
+            columnarInput(rank.getInputs().get(0), partitionColumns),
+            rank.getRowType(),
+            WindowRankMatcher.windowStartColumn(rank),
+            WindowRankMatcher.windowEndColumn(rank),
+            partitionColumns,
+            WindowRankMatcher.sortIndices(rank),
+            WindowRankMatcher.sortAscending(rank),
+            WindowRankMatcher.sortNullsFirst(rank),
+            WindowRankMatcher.limit(rank),
+            WindowRankMatcher.outputRankNumber(rank));
+      }
+    }
+
+    // Window deduplication: the limit=1 case of window Top-N (keep-first/last by rowtime per window
+    // and key), reusing the same native window-rank operator with a single rowtime sort column.
+    if (current instanceof StreamPhysicalWindowDeduplicate) {
+      StreamPhysicalWindowDeduplicate dedup = (StreamPhysicalWindowDeduplicate) current;
+      if (WindowDeduplicateMatcher.matches(dedup)) {
+        if (!NativeConfig.operatorEnabled("windowRank")) {
+          return noteDisabled(current, "windowRank");
+        }
+        substitutions++;
+        int[] partitionColumns = WindowDeduplicateMatcher.partitionColumns(dedup);
+        return new StreamPhysicalNativeWindowRank(
+            dedup.getCluster(),
+            dedup.getTraitSet(),
+            columnarInput(dedup.getInputs().get(0), partitionColumns),
+            dedup.getRowType(),
+            WindowDeduplicateMatcher.windowStartColumn(dedup),
+            WindowDeduplicateMatcher.windowEndColumn(dedup),
+            partitionColumns,
+            WindowDeduplicateMatcher.sortIndices(dedup),
+            WindowDeduplicateMatcher.sortAscending(dedup),
+            WindowDeduplicateMatcher.sortNullsFirst(dedup),
+            1,
+            false);
+      }
+    }
+
     if (current instanceof StreamPhysicalWindowAggregate) {
       StreamPhysicalWindowAggregate agg = (StreamPhysicalWindowAggregate) current;
       if (WindowAggregateMatcher.matches(
@@ -741,6 +796,12 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     }
     if (node instanceof StreamPhysicalTemporalSort) {
       return TemporalSortMatcher.unsupportedReason((StreamPhysicalTemporalSort) node);
+    }
+    if (node instanceof StreamPhysicalWindowRank) {
+      return WindowRankMatcher.unsupportedReason((StreamPhysicalWindowRank) node);
+    }
+    if (node instanceof StreamPhysicalWindowDeduplicate) {
+      return WindowDeduplicateMatcher.unsupportedReason((StreamPhysicalWindowDeduplicate) node);
     }
     if (node instanceof StreamPhysicalGlobalWindowAggregate) {
       return GlobalWindowAggregateMatcher.unsupportedReason(

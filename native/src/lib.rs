@@ -4020,6 +4020,161 @@ impl KeepFirstDeduplicator {
     }
 }
 
+/// Window Top-N / window deduplication over a windowing-TVF input (Flink's `WindowRank` /
+/// `WindowDeduplicate`): within each window (the attached `window_start`/`window_end` columns) and
+/// partition key, rank rows by the sort key and keep the top N, emitting them once the watermark
+/// closes the window. Append-only — a closed window's rows are emitted exactly once. Window
+/// deduplication is the `limit = 1` case (keep-first = sort by rowtime ascending, keep-last =
+/// descending). Late rows (whose window already closed) are dropped, matching the host.
+struct WindowRanker {
+    window_start_col: usize,
+    window_end_col: usize,
+    partition_columns: Vec<usize>,
+    sort_columns: Vec<SortColumn>,
+    limit: i64,
+    output_rank_number: bool,
+    current_watermark: i64,
+    /// Bounded, sorted top-N buffer per (window_end, window_start, partition key).
+    groups: HashMap<(i64, i64, GroupKey), Vec<JoinRow>>,
+    schema: Option<SchemaRef>,
+}
+
+impl WindowRanker {
+    fn new(
+        window_start_col: usize,
+        window_end_col: usize,
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        output_rank_number: bool,
+    ) -> Self {
+        WindowRanker {
+            window_start_col,
+            window_end_col,
+            partition_columns,
+            sort_columns,
+            limit,
+            output_rank_number,
+            current_watermark: i64::MIN,
+            groups: HashMap::new(),
+            schema: None,
+        }
+    }
+
+    fn push(&mut self, batch: &RecordBatch) {
+        let arity = data_arity(batch);
+        self.schema = Some(data_schema(batch));
+        let ws = rt_to_millis(batch.column(self.window_start_col));
+        let we = rt_to_millis(batch.column(self.window_end_col));
+        let partition_arrays: Vec<&ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+        for row in 0..batch.num_rows() {
+            let window_end = we.value(row);
+            if window_end <= self.current_watermark {
+                continue; // late: the window already closed and emitted
+            }
+            let window_start = ws.value(row);
+            let key = read_key(&partition_arrays, row);
+            let full: JoinRow = data_arrays
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, row).expect("window-rank row scalar"))
+                .collect();
+            let buffer = self.groups.entry((window_end, window_start, key)).or_default();
+            // Insert after rows ordering equal-or-before, preserving arrival order for ties (the
+            // ROW_NUMBER tie-break), then drop anything past rank N.
+            let pos = buffer
+                .partition_point(|r| compare_rows(r, &full, &self.sort_columns) != std::cmp::Ordering::Greater);
+            buffer.insert(pos, full);
+            if buffer.len() as i64 > self.limit {
+                buffer.truncate(self.limit as usize);
+            }
+        }
+    }
+
+    /// Emits the top-N rows of every window the watermark has closed, in rank order (with the rank
+    /// number appended when the host projects it), and evicts those windows.
+    fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.current_watermark = watermark;
+        let mut ready: Vec<(i64, i64, GroupKey)> =
+            self.groups.keys().filter(|(we, _, _)| *we <= watermark).cloned().collect();
+        // Evict in (window_end, window_start) order for a deterministic emission sequence.
+        ready.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let mut rows: Vec<JoinRow> = Vec::new();
+        let mut ranks: Vec<i64> = Vec::new();
+        for group in ready {
+            let buffer = self.groups.remove(&group).expect("ready group present");
+            for (rank, row) in buffer.into_iter().enumerate() {
+                rows.push(row);
+                ranks.push(rank as i64 + 1);
+            }
+        }
+        self.emit(rows, ranks)
+    }
+
+    fn emit(&self, rows: Vec<JoinRow>, ranks: Vec<i64>) -> RecordBatch {
+        let schema = match &self.schema {
+            Some(schema) => schema.clone(),
+            None => return RecordBatch::new_empty(Arc::new(Schema::empty())),
+        };
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type()))
+            .collect();
+        if self.output_rank_number {
+            fields.push(Field::new("w0$o0", DataType::Int64, false));
+            columns.push(Arc::new(Int64Array::from(ranks)));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("window-rank output batch")
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut out = self.current_watermark.to_le_bytes().to_vec();
+        let Some(schema) = &self.schema else { return out };
+        let rows: Vec<&JoinRow> = self.groups.values().flatten().collect();
+        if rows.is_empty() {
+            return out;
+        }
+        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type()))
+            .collect();
+        out.extend_from_slice(&write_ipc(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("window-rank snapshot"),
+        ));
+        out
+    }
+
+    fn restore(
+        window_start_col: usize,
+        window_end_col: usize,
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        output_rank_number: bool,
+        bytes: &[u8],
+    ) -> Self {
+        let mut ranker = WindowRanker::new(
+            window_start_col,
+            window_end_col,
+            partition_columns,
+            sort_columns,
+            limit,
+            output_rank_number,
+        );
+        if bytes.len() < 8 {
+            return ranker;
+        }
+        ranker.current_watermark = i64::from_le_bytes(bytes[0..8].try_into().expect("watermark"));
+        // Re-inserting through push reproduces each group's sorted, truncated buffer; buffered rows
+        // have window_end > the watermark, so none are dropped as late.
+        for batch in read_ipc_if_present(&bytes[8..]) {
+            ranker.push(&batch);
+        }
+        ranker
+    }
+}
+
 /// One open session for a key: its end (the latest element's timestamp plus the gap) and the
 /// incremental accumulators folding in its rows. The start is the map key that holds it.
 struct Session {
@@ -6021,6 +6176,117 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepFi
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read dedup snapshot");
     Box::into_raw(Box::new(KeepFirstDeduplicator::restore(partitions, rt_column as usize, &bytes)))
         as jlong
+}
+
+/// Creates a window-rank ranker (window Top-N / window deduplication) over the attached
+/// window_start/window_end columns and returns an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createWindowRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    window_start_col: jint,
+    window_end_col: jint,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    limit: jlong,
+    output_rank_number: jboolean,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    Box::into_raw(Box::new(WindowRanker::new(
+        window_start_col as usize,
+        window_end_col as usize,
+        partitions,
+        sort,
+        limit,
+        output_rank_number != 0,
+    ))) as jlong
+}
+
+/// Buffers an input batch (no output); each window's top-N rows are emitted when the watermark
+/// closes the window.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushWindowRanker<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let ranker = unsafe { &mut *(handle as *mut WindowRanker) };
+    ranker.push(&import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Exports the top-N rows of every window the watermark has closed (with the rank number appended
+/// when the host projects it).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushWindowRanker<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    watermark_millis: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let ranker = unsafe { &mut *(handle as *mut WindowRanker) };
+    let result = ranker.flush(watermark_millis);
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Releases the window-rank ranker and its per-window state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeWindowRanker<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut WindowRanker));
+    }
+}
+
+/// Serializes the ranker's per-window buffers and watermark for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotWindowRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let ranker = unsafe { &mut *(handle as *mut WindowRanker) };
+    env.byte_array_from_slice(&ranker.snapshot())
+        .expect("failed to allocate window-rank snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds a window-rank ranker from a snapshot and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindowRanker<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    window_start_col: jint,
+    window_end_col: jint,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    limit: jlong,
+    output_rank_number: jboolean,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read window-rank snapshot");
+    Box::into_raw(Box::new(WindowRanker::restore(
+        window_start_col as usize,
+        window_end_col as usize,
+        partitions,
+        sort,
+        limit,
+        output_rank_number != 0,
+        &bytes,
+    ))) as jlong
 }
 
 /// Creates a non-windowed `GROUP BY` aggregator and returns an opaque handle. The aggregate kinds

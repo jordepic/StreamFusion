@@ -32,9 +32,10 @@ here when the ticket is deleted.
   `ColumnarKeyGroupPartitioner`, own consistent hash — divergences/10), and a **columnar windowing
   table function** (stateless `TUMBLE`/`HOP`/`CUMULATE` window assignment, fanning rows out for
   hopping/cumulative; shares the window aggregate's assignment math). Columnar today: source, sink,
-  filter/calc, all window aggregates (one- and two-phase), `OVER`, both joins, and the windowing TVF —
-  a windowed/keyed pipeline (source → watermark assigner → exchange → operator) flows Arrow with no
-  transpose.
+  filter/calc, all window aggregates (one- and two-phase), `OVER`, both joins, the windowing TVF,
+  **event-time sort** (`ORDER BY rowtime`), **keep-first deduplication** (rowtime `ROW_NUMBER … = 1`),
+  and **window Top-N / window deduplication** (over the windowing TVF) — a windowed/keyed pipeline
+  (source → watermark assigner → exchange → operator) flows Arrow with no transpose.
 - **Fully-columnar native islands (the standing invariant — shipped):** every native operator but a
   source/sink is `Arrow → Arrow`; `RowData` appears only where the native region meets a *rowwise*
   source/sink, via the two transpose operators, never between native operators. Acceleration is
@@ -93,11 +94,12 @@ here when the ticket is deleted.
   (non-blocking), not block the task thread.
 
 ## Breadth / longer horizon
-- **Arroyo operator coverage tracker** (ticket 11): append-only dedup, window Top-N, event-time
-  sort remain, plus operator feature tails (outer/semi/anti joins, rank-number / `RANK` /
-  retracting-input Top-N). (Two-phase cumulative windows, event-time joins, the non-windowed GROUP BY
-  aggregate, the regular updating join, and append-only Top-N — emitting *and* consuming a changelog
-  — are now done.)
+- **Arroyo operator coverage tracker** (ticket 11): what remains is async-gated (lookup join, async
+  UDF — ticket 01) plus operator feature tails (rank-number / `RANK` / retracting-input Top-N, OVER
+  frames / `FIRST_VALUE`/`LAST_VALUE`, proctime variants). (Two-phase cumulative windows, event-time
+  joins incl. outer/semi/anti, the non-windowed GROUP BY aggregate, the regular updating join,
+  append-only Top-N, keep-first deduplication, window Top-N / window deduplication, and event-time
+  sort are now done.)
 - **Fully native Kafka source, no JNI** (ticket 33, back burner): subscribe in Rust, decode →Arrow,
   lifting the connector semantics (partition/offset/checkpoint/watermark) from Arroyo. Removes the one
   off-heap copy ticket 32 pays; only worth it once that decode path proves the copy is the bottleneck.

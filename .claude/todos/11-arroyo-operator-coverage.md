@@ -52,6 +52,16 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       per-partition bounded buffer emitting the insert/delete changelog (divergences/14).
       Remaining: rank-number output (rank-shift updates), `RANK`/`DENSE_RANK`, an offset,
       and a retracting input.
+- [x] Keep-first deduplication — `ROW_NUMBER() OVER (PARTITION BY k ORDER BY rowtime ASC) = 1`,
+      a rowtime-ordered rank-1 the host plans as an insert-only row-time deduplicate. Per key,
+      emit the minimum-rowtime row once the watermark reaches it; drop late rows. Keep-last
+      (descending) is retracting and falls back.
+- [x] Window Top-N / window deduplication — `WindowRank`/`WindowDeduplicate` over the windowing
+      TVF: per window and partition key, keep the top-N (or first/last) rows and emit them when a
+      watermark closes the window. Append-only; one native window-rank operator serves both
+      (dedup = limit 1). window_start/window_end rendered session-local on emit (UTC internally).
+- [x] Event-time sort (`TemporalSort`) — `ORDER BY rowtime`: buffer rows, release them in
+      ascending rowtime order as the watermark advances (stable for ties). Insert-only.
 - [ ] Lookup join (`lookup_join.rs`) — stateless async enrichment against an external
       table; uses ticket 01's async pattern, not the synchronous stateful path.
 - [ ] Async UDF (`async_udf.rs`) — async scalar UDF; same async dependency (ticket 01).

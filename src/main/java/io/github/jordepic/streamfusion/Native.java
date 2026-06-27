@@ -456,6 +456,49 @@ public final class Native {
       int[] partitionColumns, int rtColumn, byte[] snapshot);
 
   /**
+   * Creates a window-rank ranker (window Top-N / window deduplication) over the attached
+   * {@code window_start}/{@code window_end} columns and returns an opaque handle. Within each window
+   * and partition key it keeps the {@code limit} rows ordered by the sort columns, emitting them
+   * (with the rank number appended when {@code outputRankNumber}) once a watermark closes the window.
+   * Released with {@link #closeWindowRanker}.
+   */
+  public static native long createWindowRanker(
+      int windowStartColumn,
+      int windowEndColumn,
+      int[] partitionColumns,
+      int[] sortIndices,
+      int[] sortAscending,
+      int[] sortNullsFirst,
+      long limit,
+      boolean outputRankNumber);
+
+  /** Buffers an input batch; each window's top-N rows are emitted when a watermark closes it. */
+  public static native void pushWindowRanker(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /** Exports the top-N rows of every window the watermark has closed. */
+  public static native void flushWindowRanker(
+      long handle, long watermarkMillis, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases the window-rank ranker and its per-window state. */
+  public static native void closeWindowRanker(long handle);
+
+  /** Serializes the ranker's per-window buffers and watermark for a checkpoint. */
+  public static native byte[] snapshotWindowRanker(long handle);
+
+  /** Rebuilds a window-rank ranker from a snapshot and returns a fresh handle. */
+  public static native long restoreWindowRanker(
+      int windowStartColumn,
+      int windowEndColumn,
+      int[] partitionColumns,
+      int[] sortIndices,
+      int[] sortAscending,
+      int[] sortNullsFirst,
+      long limit,
+      boolean outputRankNumber,
+      byte[] snapshot);
+
+  /**
    * Creates a non-windowed {@code GROUP BY} aggregator and returns an opaque handle. Each input batch
    * folds into per-key state and the aggregator exports the changelog rows it produces, with the row
    * kinds carried on the {@code $row_kind$} column. Released with {@link #closeGroupAggregator}.
