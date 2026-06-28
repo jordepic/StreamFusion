@@ -54,6 +54,22 @@ class FlinkUnnestSqlHarnessTest {
   }
 
   @Test
+  void unnestRowArrayFlattensFieldsMatchesHost() throws Exception {
+    // UNNEST of an ARRAY<ROW> flattens the element struct into separate columns ([k, a, b]).
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::rowArrayEnvironment,
+        "SELECT k, a, b FROM t CROSS JOIN UNNEST(rs) AS u(a, b)");
+  }
+
+  @Test
+  void unnestRowArrayWithNullElementMatchesHost() throws Exception {
+    // A null ROW element flattens to all-null fields (the struct null mask folded into each child).
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::rowArrayEnvironment,
+        "SELECT k, a, b FROM t CROSS JOIN UNNEST(rs) AS u(a, b) WHERE k = 3");
+  }
+
+  @Test
   void perOperatorFlagKeepsUnnestOnHost() throws Exception {
     System.setProperty("streamfusion.operator.unnest.enabled", "false");
     try {
@@ -84,6 +100,35 @@ class FlinkUnnestSqlHarnessTest {
         Schema.newBuilder()
             .column("k", DataTypes.BIGINT())
             .column("vs", DataTypes.ARRAY(DataTypes.BIGINT()))
+            .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment rowArrayEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(
+                new String[] {"k", "rs"},
+                Types.LONG,
+                Types.OBJECT_ARRAY(
+                    Types.ROW_NAMED(new String[] {"a", "b"}, Types.LONG, Types.STRING))),
+            Row.of(1L, new Row[] {Row.of(10L, "x"), Row.of(20L, "y")}),
+            Row.of(2L, new Row[] {Row.of(30L, "z")}),
+            Row.of(3L, new Row[] {Row.of(40L, "p"), null})); // null ROW element → all-null fields
+    tEnv.createTemporaryView(
+        "t",
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column(
+                "rs",
+                DataTypes.ARRAY(
+                    DataTypes.ROW(
+                        DataTypes.FIELD("a", DataTypes.BIGINT()),
+                        DataTypes.FIELD("b", DataTypes.STRING()))))
             .build());
     return tEnv;
   }

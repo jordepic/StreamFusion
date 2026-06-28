@@ -765,6 +765,8 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
         .expect("UNNEST column must be a List");
     let offsets = list.value_offsets();
     let values = list.values();
+    // Flink keeps a null *scalar* element (emits a null row) but drops a null *ROW* element entirely.
+    let drop_null_elements = matches!(values.data_type(), DataType::Struct(_));
 
     // One take index per output row: which input row it copies (passthrough columns) and which child
     // element it carries. A null/empty array contributes nothing (INNER).
@@ -775,6 +777,9 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
             continue;
         }
         for k in offsets[row]..offsets[row + 1] {
+            if drop_null_elements && values.is_null(k as usize) {
+                continue;
+            }
             take_rows.push(row as u32);
             take_elems.push(k as u32);
         }
@@ -793,8 +798,26 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
         fields.push(schema.field(i).as_ref().clone());
         columns.push(take(input.column(i), &rows_idx, None).expect("failed to fan out column"));
     }
-    fields.push(Field::new("f0", element_type, true));
-    columns.push(take(values.as_ref(), &elems_idx, None).expect("failed to take unnest element"));
+    let element = take(values.as_ref(), &elems_idx, None).expect("failed to take unnest element");
+    match element.data_type() {
+        // ARRAY<ROW>: Flink flattens the element struct into one output column per field. A null
+        // struct element makes every flattened field null, so the struct's null mask is folded into
+        // each child.
+        DataType::Struct(struct_fields) => {
+            // Null struct elements were dropped above, so each taken child stands alone (a non-null
+            // struct with a null field is captured by that child's own null).
+            let struct_array =
+                element.as_any().downcast_ref::<StructArray>().expect("struct element");
+            for (i, field) in struct_fields.iter().enumerate() {
+                fields.push(field.as_ref().clone());
+                columns.push(struct_array.column(i).clone());
+            }
+        }
+        _ => {
+            fields.push(Field::new("f0", element_type, true));
+            columns.push(element);
+        }
+    }
     if let Some(idx) = row_kind_idx {
         fields.push(schema.field(idx).as_ref().clone());
         columns.push(take(input.column(idx), &rows_idx, None).expect("failed to fan out row kind"));
