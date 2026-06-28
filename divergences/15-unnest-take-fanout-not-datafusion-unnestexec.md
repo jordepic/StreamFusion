@@ -22,10 +22,10 @@ shape as our windowing TVF `assign_windows` and `Expand`). Reasons:
    and `Expand` — already fan out with `ListArray`/`take`. UNNEST is the same shape: take the child
    values by element index, repeat the input columns by row index. ~15 lines, no plan construction.
 
-Scope today: **INNER `UNNEST` of a single `ARRAY` or `MAP` column**. A scalar `ARRAY` element appends
+Scope today: **INNER/LEFT `UNNEST` of a single `ARRAY`, `MAP`, or `MULTISET` column**. A scalar `ARRAY` element appends
 one column; an `ARRAY<ROW>` element is flattened into one column per struct field; a `MAP` appends a
-key and a value column (Flink's behavior — a MAP is read as an Arrow `MapArray`, a list of key/value
-entry structs). `WITH ORDINALITY` appends a trailing 1-based INTEGER ordinal (the element's position
+key and a value column; a `MULTISET` (carried as a MAP<element, count> at the Arrow boundary) appends
+the element repeated by its count (Flink's behavior — a MAP/MULTISET is read as an Arrow `MapArray`). `WITH ORDINALITY` appends a trailing 1-based INTEGER ordinal (the element's position
 in its collection). A null `ROW` element is dropped — Flink keeps a null *scalar* element (a null row)
 but drops a null *ROW* element entirely, so the take loop skips null elements only for a struct child.
 A filter pushed into the `Correlate` as a `condition`
@@ -34,6 +34,5 @@ condition indexes the table-function output, so its refs are shifted by the inpu
 `[input.., element]` output, then encoded by the expression engine and run as a `StreamPhysicalNativeFilter`
 on top of the unnest (it composes — no new operator). A LEFT (outer) unnest is supported: a row whose
 collection produces no element emits one row with the appended columns null (a null take index makes
-`take` emit null; the appended fields are relaxed to nullable). A `MULTISET` unnest, a condition the
-expression engine can't encode, and a pushed condition over a LEFT unnest (it changes outer semantics)
-all fall back.
+`take` emit null; the appended fields are relaxed to nullable). A condition the expression engine can't encode, and a pushed condition over a LEFT unnest (it changes
+outer semantics), fall back.

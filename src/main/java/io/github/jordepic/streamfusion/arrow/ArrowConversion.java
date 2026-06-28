@@ -106,6 +106,7 @@ import org.apache.flink.table.types.logical.IntType;
 import org.apache.flink.table.types.logical.LocalZonedTimestampType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.MapType;
+import org.apache.flink.table.types.logical.MultisetType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimeType;
@@ -140,6 +141,20 @@ public final class ArrowConversion {
     return new Schema(fields);
   }
 
+  /**
+   * The (key, value) logical types of a map-like column: a {@link MapType}'s key/value, or — for a
+   * {@link MultisetType}, carried as a MAP&lt;element, count&gt; — the element type and a non-null INT
+   * count.
+   */
+  private static LogicalType[] mapKeyValue(LogicalType logicalType) {
+    if (logicalType instanceof MapType) {
+      MapType mapType = (MapType) logicalType;
+      return new LogicalType[] {mapType.getKeyType(), mapType.getValueType()};
+    }
+    MultisetType multisetType = (MultisetType) logicalType;
+    return new LogicalType[] {multisetType.getElementType(), new IntType(false)};
+  }
+
   private static Field toArrowField(String fieldName, LogicalType logicalType) {
     FieldType fieldType =
         new FieldType(
@@ -155,8 +170,9 @@ public final class ArrowConversion {
       for (RowType.RowField field : rowType.getFields()) {
         children.add(toArrowField(field.getName(), field.getType()));
       }
-    } else if (logicalType instanceof MapType) {
-      MapType mapType = (MapType) logicalType;
+    } else if (logicalType instanceof MapType || logicalType instanceof MultisetType) {
+      // A MAP, or a MULTISET carried as MAP<element, count> (mapKeyValue resolves which).
+      LogicalType[] kv = mapKeyValue(logicalType);
       children =
           Collections.singletonList(
               new Field(
@@ -165,8 +181,8 @@ public final class ArrowConversion {
                   Arrays.asList(
                       // Map keys are non-null in Flink's data model; force it so the decoder builds a
                       // non-nullable key (a nullable one is rejected when read back as MapData).
-                      toArrowField("key", mapType.getKeyType().copy(false)),
-                      toArrowField("value", mapType.getValueType()))));
+                      toArrowField("key", kv[0].copy(false)),
+                      toArrowField("value", kv[1]))));
     }
     return new Field(fieldName, fieldType, children);
   }
@@ -231,8 +247,9 @@ public final class ArrowConversion {
       return new ArrowTimestampColumnVector(vector);
     } else if (vector instanceof MapVector) {
       MapVector mapVector = (MapVector) vector;
-      LogicalType keyType = ((MapType) fieldType).getKeyType();
-      LogicalType valueType = ((MapType) fieldType).getValueType();
+      LogicalType[] kv = mapKeyValue(fieldType);
+      LogicalType keyType = kv[0];
+      LogicalType valueType = kv[1];
       StructVector structVector = (StructVector) mapVector.getDataVector();
       return new ArrowMapColumnVector(
           mapVector,
@@ -299,8 +316,9 @@ public final class ArrowConversion {
       return TimestampWriter.forRow(vector, precision);
     } else if (vector instanceof MapVector) {
       MapVector mapVector = (MapVector) vector;
-      LogicalType keyType = ((MapType) fieldType).getKeyType();
-      LogicalType valueType = ((MapType) fieldType).getValueType();
+      LogicalType[] kv = mapKeyValue(fieldType);
+      LogicalType keyType = kv[0];
+      LogicalType valueType = kv[1];
       StructVector structVector = (StructVector) mapVector.getDataVector();
       return MapWriter.forRow(
           mapVector,
@@ -367,8 +385,9 @@ public final class ArrowConversion {
       return TimestampWriter.forArray(vector, precision);
     } else if (vector instanceof MapVector) {
       MapVector mapVector = (MapVector) vector;
-      LogicalType keyType = ((MapType) fieldType).getKeyType();
-      LogicalType valueType = ((MapType) fieldType).getValueType();
+      LogicalType[] kv = mapKeyValue(fieldType);
+      LogicalType keyType = kv[0];
+      LogicalType valueType = kv[1];
       StructVector structVector = (StructVector) mapVector.getDataVector();
       return MapWriter.forArray(
           mapVector,
@@ -502,6 +521,12 @@ public final class ArrowConversion {
 
     @Override
     public ArrowType visit(MapType mapType) {
+      return new ArrowType.Map(false);
+    }
+
+    @Override
+    public ArrowType visit(MultisetType multisetType) {
+      // A MULTISET<E> is carried as a MAP<E, INT> (element → occurrence count).
       return new ArrowType.Map(false);
     }
 

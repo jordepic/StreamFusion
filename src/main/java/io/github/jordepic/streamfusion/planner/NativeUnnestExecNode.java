@@ -25,6 +25,7 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
   private final int arrayColumn;
   private final boolean withOrdinality;
   private final boolean isLeft;
+  private final boolean isMultiset;
 
   public NativeUnnestExecNode(
       ReadableConfig tableConfig,
@@ -33,7 +34,8 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
       String description,
       int arrayColumn,
       boolean withOrdinality,
-      boolean isLeft) {
+      boolean isLeft,
+      boolean isMultiset) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-unnest_1"),
@@ -44,6 +46,7 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
     this.arrayColumn = arrayColumn;
     this.withOrdinality = withOrdinality;
     this.isLeft = isLeft;
+    this.isMultiset = isMultiset;
   }
 
   @Override
@@ -55,7 +58,7 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarUnnestOperator(arrayColumn, withOrdinality, isLeft),
+        new NativeColumnarUnnestOperator(arrayColumn, withOrdinality, isLeft, isMultiset),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

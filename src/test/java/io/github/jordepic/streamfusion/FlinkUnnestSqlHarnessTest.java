@@ -101,6 +101,14 @@ class FlinkUnnestSqlHarnessTest {
   }
 
   @Test
+  void unnestMultisetMatchesHost() throws Exception {
+    // UNNEST of a MULTISET (a MAP<element,count>) repeats each element by its count.
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::multisetEnvironment,
+        "SELECT k, e FROM t CROSS JOIN UNNEST(ms) AS u(e)");
+  }
+
+  @Test
   void unnestMapMatchesHost() throws Exception {
     // UNNEST of a MAP yields one row per entry, appending a key and a value column.
     NativeParity.assertParity(
@@ -159,6 +167,27 @@ class FlinkUnnestSqlHarnessTest {
         Schema.newBuilder()
             .column("k", DataTypes.BIGINT())
             .column("m", DataTypes.MAP(DataTypes.STRING(), DataTypes.BIGINT()))
+            .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment multisetEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    // A MULTISET<STRING> is carried as a MAP<element, count>.
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(
+                new String[] {"k", "ms"}, Types.LONG, Types.MAP(Types.STRING, Types.INT)),
+            Row.of(1L, java.util.Map.of("a", 2, "b", 1)),
+            Row.of(2L, java.util.Map.of("c", 3)));
+    tEnv.createTemporaryView(
+        "t",
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column("ms", DataTypes.MULTISET(DataTypes.STRING()))
             .build());
     return tEnv;
   }

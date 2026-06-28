@@ -27,6 +27,7 @@ public class StreamPhysicalNativeUnnest extends SingleRel
   private final int arrayColumn;
   private final boolean withOrdinality;
   private final boolean isLeft;
+  private final boolean isMultiset;
 
   public StreamPhysicalNativeUnnest(
       RelOptCluster cluster,
@@ -35,12 +36,14 @@ public class StreamPhysicalNativeUnnest extends SingleRel
       RelDataType outputRowType,
       int arrayColumn,
       boolean withOrdinality,
-      boolean isLeft) {
+      boolean isLeft,
+      boolean isMultiset) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.arrayColumn = arrayColumn;
     this.withOrdinality = withOrdinality;
     this.isLeft = isLeft;
+    this.isMultiset = isMultiset;
   }
 
   @Override
@@ -56,7 +59,14 @@ public class StreamPhysicalNativeUnnest extends SingleRel
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeUnnest(
-        getCluster(), traitSet, inputs.get(0), outputRowType, arrayColumn, withOrdinality, isLeft);
+        getCluster(),
+        traitSet,
+        inputs.get(0),
+        outputRowType,
+        arrayColumn,
+        withOrdinality,
+        isLeft,
+        isMultiset);
   }
 
   @Override
@@ -68,6 +78,7 @@ public class StreamPhysicalNativeUnnest extends SingleRel
         getRelDetailedDescription(),
         arrayColumn,
         withOrdinality,
-        isLeft);
+        isLeft,
+        isMultiset);
   }
 }

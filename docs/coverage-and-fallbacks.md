@@ -22,7 +22,7 @@ These have no matcher; any query containing one falls back entirely.
 
 | Operator | SQL surface |
 |---|---|
-| `Correlate` | lateral table functions, and `UNNEST` beyond the INNER/LEFT `ARRAY`/`MAP` case (a `MULTISET` unnest, a pushed condition the expression engine can't encode, or a condition over a LEFT unnest). INNER **or LEFT** `UNNEST` of a single `ARRAY` (scalar or `ROW` element, flattened) or `MAP` (key+value) column — optionally `WITH ORDINALITY`, INNER including a pushed element filter — **is** supported (see the chart). |
+| `Correlate` | lateral table functions, and `UNNEST` with a pushed condition the expression engine can't encode (or any condition over a LEFT unnest). INNER **or LEFT** `UNNEST` of a single `ARRAY` (scalar or `ROW` element, flattened), `MAP` (key+value), or `MULTISET` (element by count) column — optionally `WITH ORDINALITY`, INNER including a pushed element filter — **is** supported (see the chart). |
 | `TemporalJoin` | `FOR SYSTEM_TIME AS OF` versioned-table join |
 | `LookupJoin` | dimension-table / async lookup join |
 | `Match` | `MATCH_RECOGNIZE` (CEP / row-pattern) |
@@ -116,10 +116,11 @@ These have no matcher; any query containing one falls back entirely.
   Anything outside that — `TIME`, interval, raw/binary — falls back. Both gates
   (`FilterCalcMatcher.convertibleRow` for filter/`Calc`, `RowDataArrowConverter.supports` for the
   keyed/stateful operators) check this recursively.
-- **Nested `ARRAY`/`MAP`/`ROW` are supported** (recursively, down to supported leaves): carried through
-  filters/projections, usable as a GROUP BY / join / dedup **key** (the nested value rides the row
-  state as a DataFusion `ScalarValue` and is cast back to its declared column type on emit), and as a
-  `COUNT` value column (counted for null-ness only). What still falls back for a nested column:
+- **Nested `ARRAY`/`MAP`/`ROW`/`MULTISET` are supported** (recursively, down to supported leaves; a
+  `MULTISET<E>` rides the Arrow boundary as a `MAP<E, INT>`): carried through filters/projections,
+  usable as a GROUP BY / join / dedup **key** (the nested value rides the row state as a DataFusion
+  `ScalarValue` and is cast back to its declared column type on emit), and as a `COUNT` value column
+  (counted for null-ness only). What still falls back for a nested column:
   - **Ordering a nested value** — `MAX`/`MIN` over it, `ORDER BY` it, or a Top-N/sort on it. Flink
     itself rejects `MAX(array)` and `ORDER BY array`, so this matches the host.
 - **Key types** outside bigint/int/string/boolean/date/timestamp/decimal **(plus the nested types

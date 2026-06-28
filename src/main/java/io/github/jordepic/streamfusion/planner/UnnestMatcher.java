@@ -15,15 +15,16 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
 /**
  * Recognizes the INNER {@code UNNEST} of an array the native operator reproduces: a {@link
  * StreamPhysicalCorrelate} whose table function is Flink's internal {@code $UNNEST_ROWS$} over a
- * single {@code ARRAY} or {@code MAP} column with an INNER join. The native operator fans each input
- * row out to one row per element — exactly Flink's `$UNNEST_ROWS$`. A scalar ARRAY element is appended
- * as one column; an {@code ARRAY<ROW>} element is flattened into one column per struct field; a
- * {@code MAP} appends a key and a value column; {@code WITH ORDINALITY} appends a trailing 1-based
- * ordinal (Flink's behavior). A filter pushed into the correlate (e.g. {@code … WHERE element > x})
- * becomes a {@code condition} on the node; it is applied as a native filter over the unnest output,
- * so it is supported when the expression engine can encode it. A LEFT (outer) unnest is supported —
- * a row whose collection is empty/null is kept with the appended columns null. A {@code MULTISET}
- * unnest, a condition the expression engine can't encode, or a condition over a LEFT unnest fall back.
+ * single {@code ARRAY}, {@code MAP}, or {@code MULTISET} column with an INNER or LEFT join. The native
+ * operator fans each input row out to one row per element — exactly Flink's `$UNNEST_ROWS$`. A scalar
+ * ARRAY element is appended as one column; an {@code ARRAY<ROW>} element is flattened into one column
+ * per struct field; a {@code MAP} appends a key and a value column; a {@code MULTISET} appends the
+ * element, repeated by its count; {@code WITH ORDINALITY} appends a trailing 1-based ordinal; a LEFT
+ * unnest keeps a row whose collection is empty/null with the appended columns null (Flink's behavior).
+ * A filter pushed into the correlate (e.g. {@code … WHERE element > x}) becomes a {@code condition} on
+ * the node; it is applied as a native filter over the unnest output (INNER only), so it is supported
+ * when the expression engine can encode it. A condition the expression engine can't encode, or a
+ * condition over a LEFT unnest, fall back.
  */
 final class UnnestMatcher {
 
@@ -56,7 +57,8 @@ final class UnnestMatcher {
     RelDataType collType =
         correlate.getInput().getRowType().getFieldList().get(arrayColumn(correlate)).getType();
     // Columns appended to the input row: a scalar ARRAY element adds one, an ARRAY<ROW> flattens to
-    // one per struct field, a MAP adds two (key, value), and WITH ORDINALITY adds a trailing ordinal.
+    // one per struct field, a MAP adds two (key, value), a MULTISET adds one (the element, repeated by
+    // its count), and WITH ORDINALITY adds a trailing ordinal.
     int appended;
     switch (collType.getSqlTypeName()) {
       case ARRAY:
@@ -66,8 +68,11 @@ final class UnnestMatcher {
       case MAP:
         appended = 2;
         break;
+      case MULTISET:
+        appended = 1;
+        break;
       default:
-        return false; // the native side reads a List or Map; MULTISET etc. fall back
+        return false; // the native side reads a List or Map
     }
     if (withOrdinality(correlate)) {
       appended += 1;
@@ -90,6 +95,13 @@ final class UnnestMatcher {
   /** Whether this is a LEFT (outer) unnest, which null-pads an empty/null collection. */
   static boolean isLeft(StreamPhysicalCorrelate correlate) {
     return joinType(correlate) == JoinRelType.LEFT;
+  }
+
+  /** Whether the unnested column is a MULTISET (a MAP&lt;T,count&gt;: each element repeated by count). */
+  static boolean isMultiset(StreamPhysicalCorrelate correlate) {
+    return correlate.getInput().getRowType().getFieldList().get(arrayColumn(correlate)).getType()
+            .getSqlTypeName()
+        == SqlTypeName.MULTISET;
   }
 
   /** Whether this is {@code UNNEST … WITH ORDINALITY} (a trailing 1-based ordinal column). */
@@ -135,8 +147,8 @@ final class UnnestMatcher {
   }
 
   static String unsupportedReason(StreamPhysicalCorrelate correlate) {
-    return "correlate: only an INNER/LEFT UNNEST of a single ARRAY (scalar or ROW element) or MAP"
-        + " column, optionally WITH ORDINALITY, is supported — MULTISET, a non-encodable condition, or"
-        + " a condition over a LEFT unnest fall back";
+    return "correlate: only an INNER/LEFT UNNEST of a single ARRAY (scalar or ROW element), MAP, or"
+        + " MULTISET column, optionally WITH ORDINALITY, is supported — a non-encodable condition or a"
+        + " condition over a LEFT unnest fall back";
   }
 }
