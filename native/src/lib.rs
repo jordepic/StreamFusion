@@ -753,8 +753,9 @@ fn expand(
 /// element (a null row) but drops a null *ROW* element, so null elements are skipped only for a
 /// struct child. The `$row_kind$` tag rides through (repeated per element), so it is
 /// changelog-transparent. The same take-based fan-out as the windowing TVF / Expand — see
-/// divergences/15 for why we don't drive DataFusion's UnnestExec.
-fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
+/// divergences/15 for why we don't drive DataFusion's UnnestExec. With `with_ordinality`, a trailing
+/// 1-based INTEGER ordinality column (the element's position in its collection) is appended.
+fn unnest_array(input: &RecordBatch, array_col: usize, with_ordinality: bool) -> RecordBatch {
     let schema = input.schema();
     let row_kind_idx = schema.fields().iter().position(|f| f.name() == ROW_KIND_COLUMN);
     let data_end = row_kind_idx.unwrap_or_else(|| schema.fields().len());
@@ -804,11 +805,13 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
     // carries. A null/empty collection contributes nothing (INNER); a null struct element is dropped.
     let mut take_rows: Vec<u32> = Vec::new();
     let mut take_elems: Vec<u32> = Vec::new();
+    let mut ordinals: Vec<i32> = Vec::new();
     for row in 0..input.num_rows() {
         if column.is_null(row) {
             continue;
         }
-        for k in offsets[row]..offsets[row + 1] {
+        let start = offsets[row];
+        for k in start..offsets[row + 1] {
             if let Some(child) = &null_check {
                 if child.is_null(k as usize) {
                     continue;
@@ -816,6 +819,7 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
             }
             take_rows.push(row as u32);
             take_elems.push(k as u32);
+            ordinals.push((k - start) + 1); // 1-based position in this row's collection
         }
     }
     let rows_idx = UInt32Array::from(take_rows);
@@ -830,6 +834,10 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
     for (field, child) in &children {
         fields.push(field.clone());
         columns.push(take(child.as_ref(), &elems_idx, None).expect("failed to take unnest element"));
+    }
+    if with_ordinality {
+        fields.push(Field::new("ordinality", DataType::Int32, false));
+        columns.push(Arc::new(Int32Array::from(ordinals)));
     }
     if let Some(idx) = row_kind_idx {
         fields.push(schema.field(idx).as_ref().clone());
@@ -5703,9 +5711,10 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unnest<'local
     out_array_address: jlong,
     out_schema_address: jlong,
     array_col: jint,
+    with_ordinality: jboolean,
 ) {
     let batch = import_record_batch(in_array_address, in_schema_address);
-    let result = unnest_array(&batch, array_col as usize);
+    let result = unnest_array(&batch, array_col as usize, with_ordinality != 0);
     export_record_batch(result, out_array_address, out_schema_address);
 }
 

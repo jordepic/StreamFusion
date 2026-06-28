@@ -70,6 +70,21 @@ class FlinkUnnestSqlHarnessTest {
   }
 
   @Test
+  void unnestWithOrdinalityMatchesHost() throws Exception {
+    // WITH ORDINALITY appends a 1-based position column (the element's index in its array).
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::environment,
+        "SELECT k, e, o FROM t CROSS JOIN UNNEST(vs) WITH ORDINALITY AS u(e, o)");
+  }
+
+  @Test
+  void unnestMapWithOrdinalityMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::mapEnvironment,
+        "SELECT k, mk, mv, o FROM t CROSS JOIN UNNEST(m) WITH ORDINALITY AS u(mk, mv, o)");
+  }
+
+  @Test
   void unnestMapMatchesHost() throws Exception {
     // UNNEST of a MAP yields one row per entry, appending a key and a value column.
     NativeParity.assertParity(
