@@ -18,27 +18,31 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
  * single {@code ARRAY} or {@code MAP} column with an INNER join. The native operator fans each input
  * row out to one row per element — exactly Flink's `$UNNEST_ROWS$`. A scalar ARRAY element is appended
  * as one column; an {@code ARRAY<ROW>} element is flattened into one column per struct field; a
- * {@code MAP} appends a key and a value column (Flink's behavior). A filter pushed into the correlate
- * (e.g. {@code … WHERE element > x}) becomes a {@code condition} on the node; it is applied as a native
- * filter over the unnest output, so it is supported when the expression engine can encode it. A
- * {@code MULTISET} unnest, {@code WITH ORDINALITY}, a LEFT (outer) unnest, or a condition the
- * expression engine can't encode fall back.
+ * {@code MAP} appends a key and a value column; {@code WITH ORDINALITY} appends a trailing 1-based
+ * ordinal (Flink's behavior). A filter pushed into the correlate (e.g. {@code … WHERE element > x})
+ * becomes a {@code condition} on the node; it is applied as a native filter over the unnest output,
+ * so it is supported when the expression engine can encode it. A {@code MULTISET} unnest, a LEFT
+ * (outer) unnest, or a condition the expression engine can't encode fall back.
  */
 final class UnnestMatcher {
 
   private UnnestMatcher() {}
 
-  // The internal name of Flink's BuiltInFunctionDefinitions.INTERNAL_UNNEST_ROWS (the with-ordinality
-  // variant has a distinct name, so it is naturally excluded).
+  // Internal names of Flink's BuiltInFunctionDefinitions.INTERNAL_UNNEST_ROWS and its
+  // with-ordinality variant (the latter appends a 1-based ordinality column).
   private static final String UNNEST_ROWS = "$UNNEST_ROWS$1";
+  private static final String UNNEST_ROWS_WITH_ORDINALITY = "$UNNEST_ROWS_WITH_ORDINALITY$1";
 
   static boolean matches(StreamPhysicalCorrelate correlate) {
     if (joinType(correlate) != JoinRelType.INNER) {
       return false; // only INNER UNNEST (a LEFT unnest null-pads empty arrays)
     }
     RexNode call = correlate.scan().getCall();
-    if (!(call instanceof RexCall)
-        || !((RexCall) call).getOperator().getName().equals(UNNEST_ROWS)) {
+    if (!(call instanceof RexCall)) {
+      return false;
+    }
+    String operator = ((RexCall) call).getOperator().getName();
+    if (!operator.equals(UNNEST_ROWS) && !operator.equals(UNNEST_ROWS_WITH_ORDINALITY)) {
       return false;
     }
     RexCall unnest = (RexCall) call;
@@ -50,8 +54,7 @@ final class UnnestMatcher {
     RelDataType collType =
         correlate.getInput().getRowType().getFieldList().get(arrayColumn(correlate)).getType();
     // Columns appended to the input row: a scalar ARRAY element adds one, an ARRAY<ROW> flattens to
-    // one per struct field, a MAP adds two (key, value). A MULTISET (or a wider output, e.g. WITH
-    // ORDINALITY which adds an ordinal) is not reproduced.
+    // one per struct field, a MAP adds two (key, value), and WITH ORDINALITY adds a trailing ordinal.
     int appended;
     switch (collType.getSqlTypeName()) {
       case ARRAY:
@@ -64,6 +67,9 @@ final class UnnestMatcher {
       default:
         return false; // the native side reads a List or Map; MULTISET etc. fall back
     }
+    if (withOrdinality(correlate)) {
+      appended += 1;
+    }
     if (correlate.getRowType().getFieldCount() != inputArity + appended) {
       return false;
     }
@@ -73,6 +79,14 @@ final class UnnestMatcher {
     // A pushed condition (… WHERE element > x) must be encodable by the expression engine; it is
     // applied as a native filter over the unnest output.
     return !correlate.condition().isDefined() || encodedCondition(correlate) != null;
+  }
+
+  /** Whether this is {@code UNNEST … WITH ORDINALITY} (a trailing 1-based ordinal column). */
+  static boolean withOrdinality(StreamPhysicalCorrelate correlate) {
+    return ((RexCall) correlate.scan().getCall())
+        .getOperator()
+        .getName()
+        .equals(UNNEST_ROWS_WITH_ORDINALITY);
   }
 
   /**
@@ -110,7 +124,8 @@ final class UnnestMatcher {
   }
 
   static String unsupportedReason(StreamPhysicalCorrelate correlate) {
-    return "correlate: only an INNER UNNEST of a single ARRAY (scalar or ROW element) or MAP column"
-        + " is supported — MULTISET, WITH ORDINALITY, LEFT, or a non-encodable condition fall back";
+    return "correlate: only an INNER UNNEST of a single ARRAY (scalar or ROW element) or MAP column,"
+        + " optionally WITH ORDINALITY, is supported — MULTISET, LEFT, or a non-encodable condition"
+        + " fall back";
   }
 }

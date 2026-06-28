@@ -22,12 +22,14 @@ public class NativeColumnarUnnestOperator extends AbstractStreamOperator<ArrowBa
     implements OneInputStreamOperator<ArrowBatch, ArrowBatch> {
 
   private final int arrayColumn;
+  private final boolean withOrdinality;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
 
-  public NativeColumnarUnnestOperator(int arrayColumn) {
+  public NativeColumnarUnnestOperator(int arrayColumn, boolean withOrdinality) {
     this.arrayColumn = arrayColumn;
+    this.withOrdinality = withOrdinality;
   }
 
   @Override
@@ -53,7 +55,8 @@ public class NativeColumnarUnnestOperator extends AbstractStreamOperator<ArrowBa
           inSchema.memoryAddress(),
           outArray.memoryAddress(),
           outSchema.memoryAddress(),
-          arrayColumn);
+          arrayColumn,
+          withOrdinality);
       unnested = Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries);
     } finally {
       in.close();

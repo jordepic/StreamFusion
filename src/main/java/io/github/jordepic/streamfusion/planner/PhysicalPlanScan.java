@@ -401,7 +401,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
                 correlate.getTraitSet(),
                 correlate.getInputs().get(0),
                 correlate.getRowType(),
-                UnnestMatcher.arrayColumn(correlate));
+                UnnestMatcher.arrayColumn(correlate),
+                UnnestMatcher.withOrdinality(correlate));
         RexExpression condition = UnnestMatcher.encodedCondition(correlate);
         if (condition == null) {
           return unnest;

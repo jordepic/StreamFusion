@@ -23,13 +23,15 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
   private static final String TRANSFORMATION = "native-unnest";
 
   private final int arrayColumn;
+  private final boolean withOrdinality;
 
   public NativeUnnestExecNode(
       ReadableConfig tableConfig,
       InputProperty inputProperty,
       RowType outputType,
       String description,
-      int arrayColumn) {
+      int arrayColumn,
+      boolean withOrdinality) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-unnest_1"),
@@ -38,6 +40,7 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.arrayColumn = arrayColumn;
+    this.withOrdinality = withOrdinality;
   }
 
   @Override
@@ -49,7 +52,7 @@ public class NativeUnnestExecNode extends ExecNodeBase<ArrowBatch>
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarUnnestOperator(arrayColumn),
+        new NativeColumnarUnnestOperator(arrayColumn, withOrdinality),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);
