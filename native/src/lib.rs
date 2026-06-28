@@ -1977,6 +1977,116 @@ impl GroupAggregator {
     }
 }
 
+/// Local half of two-phase non-windowed `GROUP BY`: a transient mini-batch pre-aggregate. It folds
+/// each incoming (insert-only) batch into per-key accumulators held in memory and, on a flush (driven
+/// by the mini-batch marker, a size trigger, or a pre-checkpoint drain on the JVM side), emits one
+/// partial row per buffered key — `[key0.., partial0..]`, no `$row_kind$` (insert-only) — the
+/// intermediate accumulator the stateful global half then merges. The buffer is transient: it is
+/// always drained before a checkpoint barrier, so nothing is persisted here (the global keeps the
+/// durable state). This mirrors Flink's `MapBundleOperator` + `MiniBatchLocalGroupAggFunction` and
+/// RisingWave's stateless two-phase local. SUM/MIN/MAX emit NULL for an all-null group; COUNT(*)
+/// counts rows. Group order follows first appearance across the buffered batches.
+struct LocalGroupAggregator {
+    kinds: Vec<i64>,
+    value_types: Vec<DataType>,
+    value_columns: Vec<i64>,
+    key_columns: Vec<usize>,
+    result_types: Vec<DataType>,
+    order: Vec<GroupKey>,
+    states: HashMap<GroupKey, Vec<GroupAggState>>,
+    key_types: Vec<DataType>,
+}
+
+impl LocalGroupAggregator {
+    fn new(
+        kinds: Vec<i64>,
+        value_types: Vec<i64>,
+        value_columns: Vec<i64>,
+        key_columns: Vec<usize>,
+    ) -> Self {
+        let value_types: Vec<DataType> = value_types.iter().map(|&c| value_data_type(c)).collect();
+        let result_types = kinds
+            .iter()
+            .zip(&value_types)
+            .map(|(&kind, vt)| RunningAgg::new(kind, vt).result_type())
+            .collect();
+        LocalGroupAggregator {
+            kinds,
+            value_types,
+            value_columns,
+            key_columns,
+            result_types,
+            order: Vec::new(),
+            states: HashMap::new(),
+            key_types: Vec::new(),
+        }
+    }
+
+    /// Folds the batch's rows into the buffered per-key accumulators (append-only — the local's input
+    /// is insert-only, so there is no retraction). Nothing is emitted until a flush.
+    fn update(&mut self, batch: &RecordBatch) {
+        let n = batch.num_rows();
+        let num_agg = self.kinds.len();
+        // `None` is a COUNT(*) aggregate (no argument); a present column folds/counts non-null rows.
+        let cols: Vec<Option<ValueColumn>> = (0..num_agg)
+            .map(|i| {
+                if self.value_columns[i] < 0 {
+                    return None;
+                }
+                let column = batch.column(self.value_columns[i] as usize);
+                Some(match column.data_type() {
+                    DataType::Int64 => ValueColumn::I64(column.as_any().downcast_ref().expect("int64 value")),
+                    DataType::Int32 => ValueColumn::I32(column.as_any().downcast_ref().expect("int32 value")),
+                    DataType::Float64 => ValueColumn::F64(column.as_any().downcast_ref().expect("float64 value")),
+                    _ => ValueColumn::NullOnly(column),
+                })
+            })
+            .collect();
+        let key_arrays: Vec<&ArrayRef> = self.key_columns.iter().map(|&i| batch.column(i)).collect();
+        self.key_types = key_types(&key_arrays);
+        for row in 0..n {
+            let key = read_key(&key_arrays, row);
+            if !self.states.contains_key(&key) {
+                let init: Vec<GroupAggState> = self
+                    .kinds
+                    .iter()
+                    .zip(&self.value_types)
+                    .map(|(&kind, vt)| GroupAggState::new(kind, vt))
+                    .collect();
+                self.order.push(key.clone());
+                self.states.insert(key.clone(), init);
+            }
+            let entry = self.states.get_mut(&key).expect("key present");
+            for i in 0..num_agg {
+                match &cols[i] {
+                    None => entry[i].accumulate(Num::I64(0)),
+                    Some(column) => {
+                        if let Some(num) = column.at(row) {
+                            entry[i].accumulate(num);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emits the buffered partials (`[key0.., partial0..]`, in first-appearance order) and clears the
+    /// buffer; the key types are retained so an empty flush still carries the right schema.
+    fn flush(&mut self) -> RecordBatch {
+        let order = std::mem::take(&mut self.order);
+        let states = std::mem::take(&mut self.states);
+        let mut fields = key_fields(&self.key_types);
+        let mut columns = key_columns(&order, &self.key_types);
+        for (i, rt) in self.result_types.iter().enumerate() {
+            let scalars: Vec<ScalarValue> = order.iter().map(|key| states[key][i].emit(rt)).collect();
+            fields.push(Field::new(format!("partial{i}"), rt.clone(), true));
+            columns.push(scalars_to_array(scalars, rt));
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build local group-by partial batch")
+    }
+}
+
 /// Window-function code: a SQL `OVER` analytic function that is *not* a mergeable aggregate.
 fn is_window_function_kind(kind: i64) -> bool {
     kind >= 10
@@ -5737,6 +5847,64 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_expand<'local
         &ids,
     );
     export_record_batch(result, out_array_address, out_schema_address);
+}
+
+/// Creates a buffering local two-phase GROUP BY pre-aggregate and returns an opaque handle. It
+/// accumulates across batches in memory until flushed; the buffer is transient (drained before each
+/// checkpoint on the JVM side), so there is no snapshot/restore.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createLocalGroupAggregator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    aggregate_kinds: JIntArray<'local>,
+    value_types: JIntArray<'local>,
+    value_columns: JIntArray<'local>,
+    key_columns: JIntArray<'local>,
+) -> jlong {
+    let kinds = read_int_array(&env, &aggregate_kinds);
+    let value_types = read_int_array(&env, &value_types);
+    let value_columns = read_int_array(&env, &value_columns);
+    let key_cols = read_columns(&env, &key_columns);
+    Box::into_raw(Box::new(LocalGroupAggregator::new(kinds, value_types, value_columns, key_cols)))
+        as jlong
+}
+
+/// Folds an Arrow batch the JVM exported into the buffered per-key accumulators; emits nothing.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateLocalGroupAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut LocalGroupAggregator) };
+    aggregator.update(&import_record_batch(in_array_address, in_schema_address));
+}
+
+/// Emits the buffered partials (one row per key) and clears the buffer.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushLocalGroupAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut LocalGroupAggregator) };
+    let result = aggregator.flush();
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeLocalGroupAggregator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut LocalGroupAggregator));
+    }
 }
 
 /// Stateless INNER UNNEST of an ARRAY column over an Arrow batch the JVM exported.

@@ -177,6 +177,28 @@ public final class Native {
       boolean isMultiset);
 
   /**
+   * Creates a buffering local half of a two-phase non-windowed {@code GROUP BY} and returns an opaque
+   * handle. It accumulates rows by key across batches in memory (each aggregate folds its {@code
+   * valueColumns} entry, or {@code -1} for COUNT(*), read as {@code valueTypes}; SUM kind 0, MIN 1,
+   * MAX 2, COUNT 3) and emits one partial row per key ({@code [key0.., partial0..]}, no {@code
+   * $row_kind$} — insert-only) when flushed. The buffer is transient (drained before each checkpoint
+   * by the operator), so there is no snapshot/restore — the global half keeps the durable state.
+   * Released with {@link #closeLocalGroupAggregator(long)}.
+   */
+  public static native long createLocalGroupAggregator(
+      int[] aggregateKinds, int[] valueTypes, int[] valueColumns, int[] keyColumns);
+
+  /** Folds a batch into the buffered per-key accumulators; emits nothing. */
+  public static native void updateLocalGroupAggregator(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /** Emits the buffered partials (one row per key) and clears the buffer. */
+  public static native void flushLocalGroupAggregator(
+      long handle, long outArrayAddress, long outSchemaAddress);
+
+  public static native void closeLocalGroupAggregator(long handle);
+
+  /**
    * Compiles an encoded Calc — an optional condition tree plus the projection trees, sharing one set
    * of pools, with each tree's root in {@code projectionRoots}/{@code conditionRoot} — into a
    * reusable handle. Released with {@link #closeCalcExpression(long)}.

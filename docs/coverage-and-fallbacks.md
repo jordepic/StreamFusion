@@ -27,7 +27,7 @@ These have no matcher; any query containing one falls back entirely.
 | `LookupJoin` | dimension-table / async lookup join |
 | `Match` | `MATCH_RECOGNIZE` (CEP / row-pattern) |
 | `GroupWindowAggregate`, `GroupWindowTableAggregate` | legacy `GROUP BY TUMBLE(...)` windowing, and proctime group windows |
-| `LocalGroupAggregate` + `GlobalGroupAggregate` + `IncrementalGroupAggregate` + `MiniBatchAssigner` | two-phase / mini-batch non-windowed `GROUP BY` (only single-phase `GroupAggregate` is native) |
+| `IncrementalGroupAggregate` | the three-phase (distinct) non-windowed `GROUP BY`. The ordinary two-phase / mini-batch `LocalGroupAggregate` + `GlobalGroupAggregate` (+ `MiniBatchAssigner`) **is** native — see the feature gaps and §2 below |
 | `GroupTableAggregate` | `TableAggregateFunction` |
 | `DropUpdateBefore`, `Values`, plain `Sort` | misc |
 | `LegacyTableSourceScan`, `LegacySink` | legacy connectors |
@@ -40,6 +40,14 @@ These have no matcher; any query containing one falls back entirely.
 - **Aggregates** — `SUM`/`AVG` over decimal; two-phase `AVG`; window `AVG` only as a lone aggregate;
   non-windowed `GROUP BY` `AVG` only via the host's SUM/COUNT rewrite (not modeled natively); value
   types outside bigint/double/int/smallint/tinyint/float (see `aggregate-type-support.md`).
+- **Two-phase (mini-batch) `GROUP BY`** — all four operators run native: a native `MiniBatchAssigner`
+  emits the proc-time marker, the local is a transient in-memory bundle flushed on that marker / a
+  `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
+  `MapBundleOperator`), the keyed shuffle is a native exchange, and the global reuses the single-phase
+  group-aggregate operator (`COUNT` merges as a `SUM` over partial counts).
+  Scope: SUM/MIN/MAX/COUNT over bigint/int/double, with **no widening of the partial** — `SUM(INT)`
+  (whose partial Flink widens to bigint) routes single-phase, as does `AVG`/distinct (the latter plans
+  as `IncrementalGroupAggregate`). Row-time mini-batch falls back.
 - **`OVER`** — only the `RANGE UNBOUNDED PRECEDING … CURRENT ROW` frame (no `ROWS` frame, no bounded
   frame); value column bigint/int/double only; `LAG` (model mismatch), `LEAD` (Flink-unsupported in
   streaming).
@@ -65,8 +73,9 @@ These have no matcher; any query containing one falls back entirely.
   CDC source, `Calc`, `UNION ALL`, `Expand`, `ChangelogNormalize`, streaming Top-N / `LIMIT`) requires
   an insert-only input; a retracting/updating input falls it back.
 - **Per-operator kill switch**: `-Dstreamfusion.operator.<name>.enabled=false` (e.g. `filter`,
-  `groupAggregate`, `union`, `limit`, `expand`, `changelogNormalize`, `windowRank`, …). `kafkaSource`
-  defaults to *false*.
+  `groupAggregate`, `union`, `limit`, `expand`, `changelogNormalize`, `windowRank`,
+  `localGroupAggregate`, `miniBatchAssigner`, …). The two-phase global half reuses the
+  `groupAggregate` switch. `kafkaSource` defaults to *false*.
 
 ### 2. Per-operator matcher declines (exact conditions)
 - **OVER** — more than one window group; frame ≠ `UNBOUNDED PRECEDING…CURRENT ROW`; order key not
@@ -84,6 +93,12 @@ These have no matcher; any query containing one falls back entirely.
   two-phase partials not single-field bigint/double.
 - **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, distinct, UDAF);
   idle-state TTL ≠ 0; an unsupported key/value column type.
+- **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT;
+  a value type outside bigint/int/double; a partial Flink widens past the value type (e.g. `SUM(INT)`);
+  an unsupported grouping-key/input column type.
+- **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT; a partial
+  column outside bigint/int/double; an unsupported grouping-key/output column type. (Both halves must
+  match for the query to accelerate — one staying on the host drags the whole query back via the gate.)
 - **Top-N / LIMIT** — not `ROW_NUMBER`; rank range not a constant starting at 1 (an `OFFSET`); a row
   type the converter can't carry; (`LIMIT`) missing `FETCH`, or an `OFFSET`.
 - **Deduplicate** — not rowtime-`ASC` rank-1 keep-first.
