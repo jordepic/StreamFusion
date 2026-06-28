@@ -22,12 +22,13 @@ shape as our windowing TVF `assign_windows` and `Expand`). Reasons:
    and `Expand` — already fan out with `ListArray`/`take`. UNNEST is the same shape: take the child
    values by element index, repeat the input columns by row index. ~15 lines, no plan construction.
 
-Scope today: **INNER `UNNEST` of a single `ARRAY` column** whose element is one supported column
-(`UNNEST(array_of_ints/strings/…)`). A filter pushed into the `Correlate` as a `condition`
+Scope today: **INNER `UNNEST` of a single `ARRAY` column**, scalar or `ROW` element. An `ARRAY<ROW>`
+element is flattened into one output column per struct field (Flink's behavior), and a null `ROW`
+element is dropped — Flink keeps a null *scalar* element (a null row) but drops a null *ROW* element
+entirely, so the take loop skips null elements only for a struct child. A filter pushed into the
+`Correlate` as a `condition`
 (`… WHERE element > x`) is applied as a native filter over the unnest output: Flink's correlate
 condition indexes the table-function output, so its refs are shifted by the input arity to index the
 `[input.., element]` output, then encoded by the expression engine and run as a `StreamPhysicalNativeFilter`
-on top of the unnest (it composes — no new operator). A `MAP`/`MULTISET` unnest, an `ARRAY<ROW>` unnest
-(element flattens to several columns), `WITH ORDINALITY`, a `LEFT` (outer) unnest, and a pushed
-condition the expression engine can't encode all fall back. INNER semantics: a null/empty array yields
-no rows; a null element inside a non-null array yields a null row — matching Flink.
+on top of the unnest (it composes — no new operator). A `MAP`/`MULTISET` unnest, `WITH ORDINALITY`, a
+`LEFT` (outer) unnest, and a pushed condition the expression engine can't encode all fall back.

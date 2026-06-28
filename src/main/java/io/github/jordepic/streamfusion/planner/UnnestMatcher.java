@@ -2,6 +2,7 @@ package io.github.jordepic.streamfusion.planner;
 
 import java.lang.reflect.Field;
 import org.apache.calcite.rel.core.JoinRelType;
+import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexFieldAccess;
 import org.apache.calcite.rex.RexNode;
@@ -14,14 +15,13 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
 /**
  * Recognizes the INNER {@code UNNEST} of an array the native operator reproduces: a {@link
  * StreamPhysicalCorrelate} whose table function is Flink's internal {@code $UNNEST_ROWS$} over a
- * single {@code ARRAY} column, with an INNER join and no extra condition, where the unnested element
- * is a single column (output arity = input arity + 1). The native operator fans each input row out to
- * one row per array element — exactly Flink's `$UNNEST_ROWS$` — appending the element. A filter pushed
- * into the correlate (e.g. {@code … WHERE element > x}) becomes a {@code condition} on the node; it is
- * applied as a native filter over the unnest output, so it is supported when the expression engine can
- * encode it. A `MAP`/`MULTISET` unnest (element is a key/value row), an `ARRAY<ROW>` unnest (element
- * flattens to several columns), {@code WITH ORDINALITY}, a LEFT (outer) unnest, or a condition the
- * expression engine can't encode all fall back.
+ * single {@code ARRAY} column with an INNER join. The native operator fans each input row out to one
+ * row per array element — exactly Flink's `$UNNEST_ROWS$`. A scalar element is appended as one column;
+ * an {@code ARRAY<ROW>} element is flattened into one column per struct field (Flink's behavior). A
+ * filter pushed into the correlate (e.g. {@code … WHERE element > x}) becomes a {@code condition} on
+ * the node; it is applied as a native filter over the unnest output, so it is supported when the
+ * expression engine can encode it. A `MAP`/`MULTISET` unnest (element is a key/value row), {@code WITH
+ * ORDINALITY}, a LEFT (outer) unnest, or a condition the expression engine can't encode fall back.
  */
 final class UnnestMatcher {
 
@@ -46,15 +46,18 @@ final class UnnestMatcher {
       return false; // a single, directly-referenced array column
     }
     int inputArity = correlate.getInput().getRowType().getFieldCount();
-    // Single appended element column: a MAP (key,value), ARRAY<ROW> (flattened fields), or
-    // with-ordinality unnest would widen the output by more than one.
-    if (correlate.getRowType().getFieldCount() != inputArity + 1) {
-      return false;
+    RelDataType arrayType =
+        correlate.getInput().getRowType().getFieldList().get(arrayColumn(correlate)).getType();
+    if (arrayType.getSqlTypeName() != SqlTypeName.ARRAY) {
+      return false; // the unnested column must be an ARRAY (the native side reads a List); MAP/MULTISET fall back
     }
-    if (correlate.getInput().getRowType().getFieldList().get(arrayColumn(correlate)).getType()
-            .getSqlTypeName()
-        != SqlTypeName.ARRAY) {
-      return false; // the unnested column must be an ARRAY (the native side reads a List)
+    // The element is appended to the input columns: a scalar element adds one column, an ARRAY<ROW>
+    // flattens to one column per struct field. A wider output (e.g. WITH ORDINALITY adds an ordinal)
+    // is not reproduced.
+    RelDataType elementType = arrayType.getComponentType();
+    int appended = elementType.isStruct() ? elementType.getFieldCount() : 1;
+    if (correlate.getRowType().getFieldCount() != inputArity + appended) {
+      return false;
     }
     if (!FilterCalcMatcher.convertibleRow(correlate.getRowType())) {
       return false;
@@ -99,8 +102,7 @@ final class UnnestMatcher {
   }
 
   static String unsupportedReason(StreamPhysicalCorrelate correlate) {
-    return "correlate: only an INNER UNNEST of a single ARRAY column (element a single supported"
-        + " column) is supported — MAP/MULTISET, ARRAY<ROW>, WITH ORDINALITY, LEFT, or an extra"
-        + " condition fall back";
+    return "correlate: only an INNER UNNEST of a single ARRAY column (scalar or ROW element) is"
+        + " supported — MAP/MULTISET, WITH ORDINALITY, LEFT, or a non-encodable condition fall back";
   }
 }
