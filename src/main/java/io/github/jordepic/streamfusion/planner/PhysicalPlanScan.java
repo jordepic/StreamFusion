@@ -11,12 +11,15 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCorrelate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExpand;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLimit;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalWindowAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalMiniBatchAssigner;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalOverAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRank;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
@@ -31,6 +34,9 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalW
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowRank;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowTableFunction;
+import org.apache.flink.table.planner.plan.trait.MiniBatchInterval;
+import org.apache.flink.table.planner.plan.trait.MiniBatchIntervalTraitDef$;
+import org.apache.flink.table.planner.plan.trait.MiniBatchMode;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.plan.optimize.program.StreamOptimizeContext;
@@ -194,6 +200,57 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             keyColumns,
             GroupAggregateMatcher.generateUpdateBefore(agg));
       }
+    }
+
+    // The global half of a two-phase non-windowed GROUP BY. It merges the local half's partials into
+    // the final per-key result and emits a changelog exactly like the single-phase GROUP BY above —
+    // so it reuses the same native group-aggregate operator, fed positional partial columns (COUNT
+    // merges as a SUM over its partial counts). Exempt from the insert-only guard for the same reason.
+    if (current instanceof StreamPhysicalGlobalGroupAggregate) {
+      StreamPhysicalGlobalGroupAggregate agg = (StreamPhysicalGlobalGroupAggregate) current;
+      if (GlobalGroupAggregateMatcher.matches(agg)) {
+        if (!NativeConfig.operatorEnabled("groupAggregate")) {
+          return noteDisabled(current, "groupAggregate");
+        }
+        substitutions++;
+        int[] keyColumns = GlobalGroupAggregateMatcher.keyColumns(agg);
+        return new StreamPhysicalNativeColumnarGroupAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            columnarInput(agg.getInputs().get(0), keyColumns),
+            agg.getRowType(),
+            GlobalGroupAggregateMatcher.kinds(agg),
+            GlobalGroupAggregateMatcher.valueTypeCodes(agg),
+            GlobalGroupAggregateMatcher.valueColumns(agg),
+            keyColumns,
+            GlobalGroupAggregateMatcher.generateUpdateBefore(agg));
+      }
+    }
+
+    // The MiniBatchAssigner emits the processing-time mini-batch marker that drives the local
+    // aggregate's bundle flush. Substitute a native columnar assigner that forwards Arrow and emits
+    // the same marker watermark, so the whole island shares one mini-batch cadence — matching Flink's
+    // ProcTimeMiniBatchAssignerOperator + MapBundleOperator wiring. (Row-time mini-batch falls back.)
+    if (current instanceof StreamPhysicalMiniBatchAssigner) {
+      MiniBatchInterval interval =
+          current
+              .getTraitSet()
+              .getTrait(MiniBatchIntervalTraitDef$.MODULE$.INSTANCE())
+              .getMiniBatchInterval();
+      if (interval.getMode() != MiniBatchMode.ProcTime) {
+        recordFallback("miniBatchAssigner: only processing-time mini-batch is supported");
+        return current;
+      }
+      if (!NativeConfig.operatorEnabled("miniBatchAssigner")) {
+        return noteDisabled(current, "miniBatchAssigner");
+      }
+      substitutions++;
+      return new StreamPhysicalNativeMiniBatchAssigner(
+          current.getCluster(),
+          current.getTraitSet(),
+          current.getInputs().get(0),
+          current.getRowType(),
+          interval.getInterval());
     }
 
     // A regular (non-windowed) join emits a changelog and consumes one on either side, so it is
@@ -702,6 +759,29 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    // The local half of a two-phase non-windowed GROUP BY: a stateless per-batch pre-aggregate that
+    // emits partials for the global half to merge. Insert-only (append-only partials), so it sits
+    // after the guard. Its input feeds directly (no shuffle precedes a local — the keyed exchange sits
+    // between the local and the global); the transition pass transposes below only if rowwise.
+    if (current instanceof StreamPhysicalLocalGroupAggregate) {
+      StreamPhysicalLocalGroupAggregate agg = (StreamPhysicalLocalGroupAggregate) current;
+      if (LocalGroupAggregateMatcher.matches(agg)) {
+        if (!NativeConfig.operatorEnabled("localGroupAggregate")) {
+          return noteDisabled(current, "localGroupAggregate");
+        }
+        substitutions++;
+        return new StreamPhysicalNativeColumnarLocalGroupAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            agg.getInputs().get(0),
+            agg.getRowType(),
+            LocalGroupAggregateMatcher.kinds(agg),
+            LocalGroupAggregateMatcher.valueTypeCodes(agg),
+            LocalGroupAggregateMatcher.valueColumns(agg),
+            LocalGroupAggregateMatcher.keyColumns(agg));
+      }
+    }
+
     if (current instanceof StreamPhysicalLocalWindowAggregate) {
       StreamPhysicalLocalWindowAggregate agg = (StreamPhysicalLocalWindowAggregate) current;
       // Tumbling local (single-field partials, no AVG; bigint or double values), or a hopping local
@@ -980,6 +1060,15 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     if (node instanceof StreamPhysicalGlobalWindowAggregate) {
       return GlobalWindowAggregateMatcher.unsupportedReason(
           (StreamPhysicalGlobalWindowAggregate) node);
+    }
+    if (node instanceof StreamPhysicalGlobalGroupAggregate) {
+      return GlobalGroupAggregateMatcher.unsupportedReason(
+          (StreamPhysicalGlobalGroupAggregate) node);
+    }
+    if (node instanceof StreamPhysicalLocalGroupAggregate) {
+      return "local group aggregate: needs SUM/MIN/MAX/COUNT (no AVG/distinct) over"
+          + " bigint/int/double values with no widening of the partial, and"
+          + " bigint/int/string/boolean/date/timestamp/decimal grouping keys";
     }
     // The row/local window-aggregate path matches several variants (tumbling/hopping/cumulative
     // local) with extra gates, so a precise per-condition reason would be unreliable; keep a coarse

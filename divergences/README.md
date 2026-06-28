@@ -50,6 +50,7 @@ host — verified by the parity harness.
 - [12 — Joins delegate the match, own the state](12-joins-delegate-match-own-state.md) — interval/window joins run the match as a DataFusion `HashJoinExec` (aligned with Arroyo) but own buffering + watermark eviction via Flink state (Arroyo uses its own expiring key-time tables); INNER + equi-key scope.
 - [13 — RowKind carriage as a four-way byte column](13-rowkind-carriage-meta-column.md) — a changelog row's `RowKind` rides the Arrow batch as a hidden byte column carrying all four Flink kinds, not Arroyo's two-way `is_retract` flag, so the `-U`/`-D` distinction upsert sinks need survives the boundary (research §6 width gap).
 - [14 — Standalone columnar streaming engines (RisingWave, Proton)](14-standalone-streaming-engines.md) — what RisingWave and Proton confirmed (four-way changelog, MIN/MAX value-multiset, degree-free INNER join) and where we differ as a Flink guest (state in Flink not an LSM; updating join probes natively while time-bounded joins delegate to DataFusion; row↔Arrow transpose at host edges).
+- [15 — UNNEST as a take-based fan-out, not DataFusion's `UnnestExec`](15-unnest-take-fanout-not-datafusion-unnestexec.md) — we fan rows out with an Arrow `take` (the `expand`/`assign_windows` shape) rather than Arroyo's rewrite-to-`LogicalPlan::Unnest`, because we must match Flink's `Correlate` output and thread `$row_kind$`, and DataFusion's batch kernel is private.
 
 ## Known transitional gap (not yet a deliberate divergence)
 
