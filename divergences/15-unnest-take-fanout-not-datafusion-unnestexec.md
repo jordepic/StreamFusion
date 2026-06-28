@@ -22,13 +22,14 @@ shape as our windowing TVF `assign_windows` and `Expand`). Reasons:
    and `Expand` — already fan out with `ListArray`/`take`. UNNEST is the same shape: take the child
    values by element index, repeat the input columns by row index. ~15 lines, no plan construction.
 
-Scope today: **INNER `UNNEST` of a single `ARRAY` column**, scalar or `ROW` element. An `ARRAY<ROW>`
-element is flattened into one output column per struct field (Flink's behavior), and a null `ROW`
-element is dropped — Flink keeps a null *scalar* element (a null row) but drops a null *ROW* element
-entirely, so the take loop skips null elements only for a struct child. A filter pushed into the
+Scope today: **INNER `UNNEST` of a single `ARRAY` or `MAP` column**. A scalar `ARRAY` element appends
+one column; an `ARRAY<ROW>` element is flattened into one column per struct field; a `MAP` appends a
+key and a value column (Flink's behavior — a MAP is read as an Arrow `MapArray`, a list of key/value
+entry structs). A null `ROW` element is dropped — Flink keeps a null *scalar* element (a null row) but
+drops a null *ROW* element entirely, so the take loop skips null elements only for a struct child. A filter pushed into the
 `Correlate` as a `condition`
 (`… WHERE element > x`) is applied as a native filter over the unnest output: Flink's correlate
 condition indexes the table-function output, so its refs are shifted by the input arity to index the
 `[input.., element]` output, then encoded by the expression engine and run as a `StreamPhysicalNativeFilter`
-on top of the unnest (it composes — no new operator). A `MAP`/`MULTISET` unnest, `WITH ORDINALITY`, a
+on top of the unnest (it composes — no new operator). A `MULTISET` unnest, `WITH ORDINALITY`, a
 `LEFT` (outer) unnest, and a pushed condition the expression engine can't encode all fall back.

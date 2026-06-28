@@ -1,6 +1,6 @@
 use arrow::array::{
     make_array, new_empty_array, new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Float32Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, RecordBatch, StringArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StringArray,
     StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     UInt32Array,
 };
@@ -745,40 +745,74 @@ fn expand(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("failed to build expand batch")
 }
 
-/// Stateless INNER UNNEST of an ARRAY column (Flink's `$UNNEST_ROWS$` / `Correlate`): each input row
-/// is fanned out to one output row per element of its array column `array_col`, the input columns
-/// repeated and the element appended (Flink keeps the array column and appends the element, so the
-/// output is `[input cols.., element]`). A NULL array yields no rows and an empty array yields no
-/// rows (INNER semantics); a null *element* inside a non-null array is emitted as a null row, matching
-/// Flink. The `$row_kind$` tag rides through (repeated per element), so it is changelog-transparent.
-/// The same take-based fan-out as the windowing TVF / Expand — see divergences/15 for why we don't
-/// drive DataFusion's UnnestExec.
+/// Stateless INNER UNNEST of an ARRAY or MAP column (Flink's `$UNNEST_ROWS$` / `Correlate`): each
+/// input row is fanned out to one output row per element of its collection column `array_col`, the
+/// input columns repeated and the element appended. A scalar `ARRAY` element appends one column; an
+/// `ARRAY<ROW>` element flattens to one column per struct field; a `MAP` element appends two columns
+/// (key, value). A NULL or empty collection yields no rows (INNER); Flink keeps a null *scalar*
+/// element (a null row) but drops a null *ROW* element, so null elements are skipped only for a
+/// struct child. The `$row_kind$` tag rides through (repeated per element), so it is
+/// changelog-transparent. The same take-based fan-out as the windowing TVF / Expand — see
+/// divergences/15 for why we don't drive DataFusion's UnnestExec.
 fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
     let schema = input.schema();
     let row_kind_idx = schema.fields().iter().position(|f| f.name() == ROW_KIND_COLUMN);
     let data_end = row_kind_idx.unwrap_or_else(|| schema.fields().len());
+    let column = input.column(array_col);
 
-    let list = input
-        .column(array_col)
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .expect("UNNEST column must be a List");
-    let offsets = list.value_offsets();
-    let values = list.values();
-    // Flink keeps a null *scalar* element (emits a null row) but drops a null *ROW* element entirely.
-    let drop_null_elements = matches!(values.data_type(), DataType::Struct(_));
+    // Per source type: the per-row offsets, the array whose null drops an element (only ARRAY<ROW>:
+    // Flink drops a null ROW element but keeps a null scalar/value), and the flattened child arrays
+    // to append (each taken by element index below). ARRAY<scalar> appends one column, ARRAY<ROW>
+    // one per struct field, MAP a key and a value.
+    let (offsets, null_check, children): (&[i32], Option<ArrayRef>, Vec<(Field, ArrayRef)>) =
+        match column.data_type() {
+            DataType::List(_) => {
+                let list = column.as_any().downcast_ref::<ListArray>().expect("list");
+                let values = list.values().clone();
+                match values.data_type() {
+                    DataType::Struct(sfields) => {
+                        let sa = values.as_any().downcast_ref::<StructArray>().expect("struct");
+                        let children = sfields
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| (f.as_ref().clone(), sa.column(i).clone()))
+                            .collect();
+                        (list.value_offsets(), Some(values.clone()), children)
+                    }
+                    elem => (
+                        list.value_offsets(),
+                        None,
+                        vec![(Field::new("f0", elem.clone(), true), values.clone())],
+                    ),
+                }
+            }
+            DataType::Map(..) => {
+                let map = column.as_any().downcast_ref::<MapArray>().expect("map");
+                let entries = map.entries();
+                let children = entries
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.as_ref().clone(), entries.column(i).clone()))
+                    .collect();
+                (map.value_offsets(), None, children)
+            }
+            other => panic!("UNNEST column must be a List or Map, got {other:?}"),
+        };
 
-    // One take index per output row: which input row it copies (passthrough columns) and which child
-    // element it carries. A null/empty array contributes nothing (INNER).
+    // One take index per output row: the input row it copies (passthrough) and the child element it
+    // carries. A null/empty collection contributes nothing (INNER); a null struct element is dropped.
     let mut take_rows: Vec<u32> = Vec::new();
     let mut take_elems: Vec<u32> = Vec::new();
     for row in 0..input.num_rows() {
-        if list.is_null(row) {
+        if column.is_null(row) {
             continue;
         }
         for k in offsets[row]..offsets[row + 1] {
-            if drop_null_elements && values.is_null(k as usize) {
-                continue;
+            if let Some(child) = &null_check {
+                if child.is_null(k as usize) {
+                    continue;
+                }
             }
             take_rows.push(row as u32);
             take_elems.push(k as u32);
@@ -787,36 +821,15 @@ fn unnest_array(input: &RecordBatch, array_col: usize) -> RecordBatch {
     let rows_idx = UInt32Array::from(take_rows);
     let elems_idx = UInt32Array::from(take_elems);
 
-    let element_type = match list.data_type() {
-        DataType::List(field) => field.data_type().clone(),
-        other => panic!("UNNEST column must be a List, got {other:?}"),
-    };
-
-    let mut fields: Vec<Field> = Vec::with_capacity(data_end + 2);
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(data_end + 2);
+    let mut fields: Vec<Field> = Vec::with_capacity(data_end + children.len() + 1);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(data_end + children.len() + 1);
     for i in 0..data_end {
         fields.push(schema.field(i).as_ref().clone());
         columns.push(take(input.column(i), &rows_idx, None).expect("failed to fan out column"));
     }
-    let element = take(values.as_ref(), &elems_idx, None).expect("failed to take unnest element");
-    match element.data_type() {
-        // ARRAY<ROW>: Flink flattens the element struct into one output column per field. A null
-        // struct element makes every flattened field null, so the struct's null mask is folded into
-        // each child.
-        DataType::Struct(struct_fields) => {
-            // Null struct elements were dropped above, so each taken child stands alone (a non-null
-            // struct with a null field is captured by that child's own null).
-            let struct_array =
-                element.as_any().downcast_ref::<StructArray>().expect("struct element");
-            for (i, field) in struct_fields.iter().enumerate() {
-                fields.push(field.as_ref().clone());
-                columns.push(struct_array.column(i).clone());
-            }
-        }
-        _ => {
-            fields.push(Field::new("f0", element_type, true));
-            columns.push(element);
-        }
+    for (field, child) in &children {
+        fields.push(field.clone());
+        columns.push(take(child.as_ref(), &elems_idx, None).expect("failed to take unnest element"));
     }
     if let Some(idx) = row_kind_idx {
         fields.push(schema.field(idx).as_ref().clone());

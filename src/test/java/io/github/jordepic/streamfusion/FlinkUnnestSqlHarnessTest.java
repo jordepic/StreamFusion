@@ -70,6 +70,14 @@ class FlinkUnnestSqlHarnessTest {
   }
 
   @Test
+  void unnestMapMatchesHost() throws Exception {
+    // UNNEST of a MAP yields one row per entry, appending a key and a value column.
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::mapEnvironment,
+        "SELECT k, mk, mv FROM t CROSS JOIN UNNEST(m) AS u(mk, mv)");
+  }
+
+  @Test
   void perOperatorFlagKeepsUnnestOnHost() throws Exception {
     System.setProperty("streamfusion.operator.unnest.enabled", "false");
     try {
@@ -100,6 +108,26 @@ class FlinkUnnestSqlHarnessTest {
         Schema.newBuilder()
             .column("k", DataTypes.BIGINT())
             .column("vs", DataTypes.ARRAY(DataTypes.BIGINT()))
+            .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment mapEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(
+                new String[] {"k", "m"}, Types.LONG, Types.MAP(Types.STRING, Types.LONG)),
+            Row.of(1L, java.util.Map.of("a", 10L, "b", 20L)),
+            Row.of(2L, java.util.Map.of("c", 30L)));
+    tEnv.createTemporaryView(
+        "t",
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column("m", DataTypes.MAP(DataTypes.STRING(), DataTypes.BIGINT()))
             .build());
     return tEnv;
   }
