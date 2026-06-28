@@ -395,12 +395,37 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "unnest");
         }
         substitutions++;
-        return new StreamPhysicalNativeUnnest(
+        RelNode unnest =
+            new StreamPhysicalNativeUnnest(
+                correlate.getCluster(),
+                correlate.getTraitSet(),
+                correlate.getInputs().get(0),
+                correlate.getRowType(),
+                UnnestMatcher.arrayColumn(correlate));
+        RexExpression condition = UnnestMatcher.encodedCondition(correlate);
+        if (condition == null) {
+          return unnest;
+        }
+        // A filter pushed into the correlate (… WHERE element > x) is applied as a native filter
+        // over the unnest output, with an identity projection (the unnest already produced the
+        // correlate's output columns). The condition's refs were shifted to index that output.
+        int arity = correlate.getRowType().getFieldCount();
+        int[] identity = new int[arity];
+        for (int i = 0; i < arity; i++) {
+          identity[i] = i;
+        }
+        return new StreamPhysicalNativeFilter(
             correlate.getCluster(),
             correlate.getTraitSet(),
-            correlate.getInputs().get(0),
+            unnest,
             correlate.getRowType(),
-            UnnestMatcher.arrayColumn(correlate));
+            identity,
+            condition.kinds(),
+            condition.payload(),
+            condition.childCounts(),
+            condition.longs(),
+            condition.doubles(),
+            condition.strings());
       }
     }
 

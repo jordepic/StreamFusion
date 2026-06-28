@@ -31,13 +31,19 @@ class FlinkUnnestSqlHarnessTest {
   }
 
   @Test
-  void unnestWithPushedFilterFallsBack() throws Exception {
-    // A filter on the unnested element is pushed into the Correlate as a `condition` (not a separate
-    // Calc); the native operator doesn't apply that condition, so it falls back cleanly. Filtering on
-    // an input column (not the element) stays a separate Calc and accelerates.
-    NativeParity.assertFallback(
+  void unnestWithPushedFilterMatchesHost() throws Exception {
+    // A filter on the unnested element is pushed into the Correlate as a `condition`; it is applied
+    // as a native filter over the unnest output (the condition's ref shifted to index the element).
+    NativeParity.assertParity(
         FlinkUnnestSqlHarnessTest::environment,
         "SELECT k, e FROM t CROSS JOIN UNNEST(vs) AS u(e) WHERE e > 25");
+  }
+
+  @Test
+  void unnestWithComputedFilterMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        FlinkUnnestSqlHarnessTest::environment,
+        "SELECT k, e FROM t CROSS JOIN UNNEST(vs) AS u(e) WHERE e + 5 < 40");
   }
 
   @Test

@@ -23,7 +23,11 @@ shape as our windowing TVF `assign_windows` and `Expand`). Reasons:
    values by element index, repeat the input columns by row index. ~15 lines, no plan construction.
 
 Scope today: **INNER `UNNEST` of a single `ARRAY` column** whose element is one supported column
-(`UNNEST(array_of_ints/strings/…)`). A `MAP`/`MULTISET` unnest, an `ARRAY<ROW>` unnest (element
-flattens to several columns), `WITH ORDINALITY`, a `LEFT` (outer) unnest, and a filter pushed into the
-`Correlate` as a `condition` all fall back. INNER semantics: a null/empty array yields no rows; a null
-element inside a non-null array yields a null row — matching Flink.
+(`UNNEST(array_of_ints/strings/…)`). A filter pushed into the `Correlate` as a `condition`
+(`… WHERE element > x`) is applied as a native filter over the unnest output: Flink's correlate
+condition indexes the table-function output, so its refs are shifted by the input arity to index the
+`[input.., element]` output, then encoded by the expression engine and run as a `StreamPhysicalNativeFilter`
+on top of the unnest (it composes — no new operator). A `MAP`/`MULTISET` unnest, an `ARRAY<ROW>` unnest
+(element flattens to several columns), `WITH ORDINALITY`, a `LEFT` (outer) unnest, and a pushed
+condition the expression engine can't encode all fall back. INNER semantics: a null/empty array yields
+no rows; a null element inside a non-null array yields a null row — matching Flink.

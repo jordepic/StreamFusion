@@ -5,6 +5,7 @@ import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexFieldAccess;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCorrelate;
@@ -15,9 +16,12 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalC
  * StreamPhysicalCorrelate} whose table function is Flink's internal {@code $UNNEST_ROWS$} over a
  * single {@code ARRAY} column, with an INNER join and no extra condition, where the unnested element
  * is a single column (output arity = input arity + 1). The native operator fans each input row out to
- * one row per array element — exactly Flink's `$UNNEST_ROWS$` — appending the element. A `MAP`/
- * `MULTISET` unnest (element is a key/value row), an `ARRAY<ROW>` unnest (element flattens to several
- * columns), {@code WITH ORDINALITY}, a LEFT (outer) unnest, or an extra condition all fall back.
+ * one row per array element — exactly Flink's `$UNNEST_ROWS$` — appending the element. A filter pushed
+ * into the correlate (e.g. {@code … WHERE element > x}) becomes a {@code condition} on the node; it is
+ * applied as a native filter over the unnest output, so it is supported when the expression engine can
+ * encode it. A `MAP`/`MULTISET` unnest (element is a key/value row), an `ARRAY<ROW>` unnest (element
+ * flattens to several columns), {@code WITH ORDINALITY}, a LEFT (outer) unnest, or a condition the
+ * expression engine can't encode all fall back.
  */
 final class UnnestMatcher {
 
@@ -28,9 +32,6 @@ final class UnnestMatcher {
   private static final String UNNEST_ROWS = "$UNNEST_ROWS$1";
 
   static boolean matches(StreamPhysicalCorrelate correlate) {
-    if (correlate.condition().isDefined()) {
-      return false; // an extra correlate condition is not reproduced
-    }
     if (joinType(correlate) != JoinRelType.INNER) {
       return false; // only INNER UNNEST (a LEFT unnest null-pads empty arrays)
     }
@@ -55,7 +56,28 @@ final class UnnestMatcher {
         != SqlTypeName.ARRAY) {
       return false; // the unnested column must be an ARRAY (the native side reads a List)
     }
-    return FilterCalcMatcher.convertibleRow(correlate.getRowType());
+    if (!FilterCalcMatcher.convertibleRow(correlate.getRowType())) {
+      return false;
+    }
+    // A pushed condition (… WHERE element > x) must be encodable by the expression engine; it is
+    // applied as a native filter over the unnest output.
+    return !correlate.condition().isDefined() || encodedCondition(correlate) != null;
+  }
+
+  /**
+   * The pushed correlate condition, encoded against the unnest output row, or null if there is none.
+   * Flink's correlate condition indexes the table-function output (the element at function-output 0);
+   * shift its refs by the input arity so they index the {@code [input cols.., element]} output the
+   * native filter sees.
+   */
+  static RexExpression encodedCondition(StreamPhysicalCorrelate correlate) {
+    if (!correlate.condition().isDefined()) {
+      return null;
+    }
+    int inputArity = correlate.getInput().getRowType().getFieldCount();
+    RexNode shifted = RexUtil.shift(correlate.condition().get(), inputArity);
+    RexNode expanded = RexUtil.expandSearch(correlate.getCluster().getRexBuilder(), null, shifted);
+    return RexExpression.encode(expanded);
   }
 
   /** Index of the unnested array column in the correlate's input row. */
