@@ -135,6 +135,29 @@ class FlinkColumnarWindowSqlHarnessTest {
             + "GROUP BY window_start, window_end, k");
   }
 
+  @Test
+  void proctimeHopWindowRoutesToNative() throws Exception {
+    // A proctime HOP window (slide divides size): overlapping windows close on chained processing-time
+    // timers. Non-deterministic boundaries (see the CLAUDE.md note) — assert it routes and runs;
+    // NativeColumnarWindowAggregateOperatorTest pins the chained-timer correctness with a fixed clock.
+    NativeParity.assertRoutes(
+        FlinkColumnarWindowSqlHarnessTest::proctimeEnvironment,
+        "SELECT window_start, window_end, k, SUM(v) AS s "
+            + "FROM TABLE(HOP(TABLE src, DESCRIPTOR(pt), INTERVAL '2' SECOND, INTERVAL '4' SECOND)) "
+            + "GROUP BY window_start, window_end, k");
+  }
+
+  @Test
+  void proctimeCumulateWindowRoutesToNative() throws Exception {
+    // A proctime CUMULATE window: nested windows sharing a start close on chained timers as the clock
+    // crosses each step. Non-deterministic boundaries — assert it routes and runs.
+    NativeParity.assertRoutes(
+        FlinkColumnarWindowSqlHarnessTest::proctimeEnvironment,
+        "SELECT window_start, window_end, k, SUM(v) AS s "
+            + "FROM TABLE(CUMULATE(TABLE src, DESCRIPTOR(pt), INTERVAL '1' SECOND, INTERVAL '3' SECOND)) "
+            + "GROUP BY window_start, window_end, k");
+  }
+
   private static TableEnvironment proctimeEnvironment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);

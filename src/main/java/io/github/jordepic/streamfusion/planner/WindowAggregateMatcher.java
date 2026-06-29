@@ -47,9 +47,14 @@ final class WindowAggregateMatcher {
       aligned = false;
     }
     if (windowing.isProctime()) {
-      // Proctime windows fire on a processing-time timer and assign by the clock. Only single-phase
-      // TUMBLE is supported so far (one open window at a time keeps the timer model simple).
-      return spec instanceof TumblingWindowSpec
+      // Proctime windows fire on a processing-time timer chained at each slide boundary and assign by
+      // the clock. The timer walks slide boundaries, so the slide must divide the size for every
+      // window end to land on one — true for tumbling (slide == size) and the aligned hopping/
+      // cumulative cases (a non-dividing hop falls back). Single-phase only.
+      long slide = windowSlide(windowing);
+      boolean slideDividesSize = slide > 0 && windowSize(windowing) % slide == 0;
+      return aligned
+          && slideDividesSize
           && proctimeTimeAttribute(windowing)
           && supportedAggregates(grouping, aggCalls, inputType);
     }

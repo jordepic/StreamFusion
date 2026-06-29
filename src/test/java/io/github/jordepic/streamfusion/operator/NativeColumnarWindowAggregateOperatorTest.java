@@ -93,6 +93,63 @@ class NativeColumnarWindowAggregateOperatorTest {
     }
   }
 
+  /**
+   * A proctime hopping window leaves several windows open at once, so the timer chains: each firing
+   * closes the earliest-ending open window and schedules the next slide boundary. A single row at
+   * proctime 1300 (slide 500, size 1000) lands in windows [500,1500) and [1000,2000), which close in
+   * order as the clock crosses 1500 then 2000.
+   */
+  @Test
+  void emitsProctimeHoppingWindowsOnChainedTimers() throws Exception {
+    NativeColumnarWindowAggregateOperator operator =
+        new NativeColumnarWindowAggregateOperator(
+            false, 1000, 500, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
+            "UTC", OUTPUT, true);
+    try (BufferAllocator allocator = new RootAllocator();
+        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+      harness.setup(new ArrowBatchSerializer());
+      harness.open();
+
+      harness.setProcessingTime(1300);
+      harness.processElement(new StreamRecord<>(batch(allocator, event(10, 42))));
+      assertEquals(List.of(), collect(harness)); // both windows still open at proctime 1300
+      harness.setProcessingTime(1500);
+      assertEquals(List.of(row(10, 500, 1500)), collect(harness));
+      harness.setProcessingTime(2000);
+      assertEquals(List.of(row(10, 1000, 2000)), collect(harness));
+    }
+  }
+
+  /**
+   * A proctime cumulative window nests several windows sharing a start, all open at once. A single row
+   * at proctime 500 (step 1000, max size 3000) lands in [0,1000), [0,2000) and [0,3000); the chained
+   * timer emits each as the clock crosses its end.
+   */
+  @Test
+  void emitsProctimeCumulativeWindowsOnChainedTimers() throws Exception {
+    NativeColumnarWindowAggregateOperator operator =
+        new NativeColumnarWindowAggregateOperator(
+            true, 3000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
+            "UTC", OUTPUT, true);
+    try (BufferAllocator allocator = new RootAllocator();
+        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+      harness.setup(new ArrowBatchSerializer());
+      harness.open();
+
+      harness.setProcessingTime(500);
+      harness.processElement(new StreamRecord<>(batch(allocator, event(10, 42))));
+      assertEquals(List.of(), collect(harness));
+      harness.setProcessingTime(1000);
+      assertEquals(List.of(row(10, 0, 1000)), collect(harness));
+      harness.setProcessingTime(2000);
+      assertEquals(List.of(row(10, 0, 2000)), collect(harness));
+      harness.setProcessingTime(3000);
+      assertEquals(List.of(row(10, 0, 3000)), collect(harness));
+    }
+  }
+
   private static RowData event(long value, long eventTimeMillis) {
     GenericRowData row = new GenericRowData(2);
     row.setField(0, value);
