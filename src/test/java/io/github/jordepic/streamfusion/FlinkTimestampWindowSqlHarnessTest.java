@@ -74,6 +74,19 @@ class FlinkTimestampWindowSqlHarnessTest {
     NativeParity.assertParity(FlinkTimestampWindowSqlHarnessTest::twoPhaseEnvironment, TUMBLE);
   }
 
+  @Test
+  void legacySessionGroupWindowMatchesHost() throws Exception {
+    // The legacy GROUP BY k, SESSION(...) syntax (StreamPhysicalGroupWindowAggregate) routed to the
+    // native session operator. Output [k, count, session_start, session_end]; the rowtime/proctime
+    // window properties Flink also appends are emitted and projected away.
+    NativeParity.assertParity(
+        FlinkTimestampWindowSqlHarnessTest::environment,
+        "SELECT k, COUNT(*) AS c, "
+            + "SESSION_START(ts, INTERVAL '10' SECOND) AS starttime, "
+            + "SESSION_END(ts, INTERVAL '10' SECOND) AS endtime "
+            + "FROM src GROUP BY k, SESSION(ts, INTERVAL '10' SECOND)");
+  }
+
   private static TableEnvironment environment() {
     return build("ONE_PHASE");
   }
