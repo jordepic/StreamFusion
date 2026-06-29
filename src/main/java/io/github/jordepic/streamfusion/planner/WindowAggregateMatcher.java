@@ -225,7 +225,7 @@ final class WindowAggregateMatcher {
    * gate differs and is checked by the callers): at most the supported grouping keys, and aggregates
    * that each read a single supported value column (or none, for COUNT(*)).
    */
-  private static boolean supportedAggregates(
+  static boolean supportedAggregates(
       int[] grouping, scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType) {
     // An empty aggregate list is allowed — a grouping-only window (GROUP BY keys + window with no
     // aggregate function) is a windowed distinct, emitting one row per (key, window).

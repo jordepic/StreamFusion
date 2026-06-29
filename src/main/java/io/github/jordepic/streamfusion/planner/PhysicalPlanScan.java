@@ -14,6 +14,7 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalE
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalGroupAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupAggregate;
+import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGroupWindowAggregate;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalIntervalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalJoin;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLimit;
@@ -792,6 +793,30 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
+    // The legacy SESSION group-window aggregate (GROUP BY k, SESSION(rowtime, INTERVAL g)) — a
+    // different operator from the windowing-TVF window aggregate, but its output layout matches the
+    // native session operator's, so it routes to the same operator.
+    if (current instanceof StreamPhysicalGroupWindowAggregate) {
+      StreamPhysicalGroupWindowAggregate agg = (StreamPhysicalGroupWindowAggregate) current;
+      if (GroupWindowSessionMatcher.matches(agg)) {
+        substitutions++;
+        int[] keyColumns = WindowAggregateMatcher.keyColumns(agg.grouping());
+        return new StreamPhysicalNativeColumnarSessionWindowAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            columnarInput(agg.getInputs().get(0), keyColumns),
+            agg.getRowType(),
+            GroupWindowSessionMatcher.gapMillis(agg),
+            GroupWindowSessionMatcher.timeColumn(agg),
+            WindowAggregateMatcher.valueColumns(agg.aggCalls()),
+            keyColumns,
+            WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType()),
+            WindowAggregateMatcher.kinds(agg.aggCalls()),
+            false, // event-time (proctime sessions are not on this path)
+            GroupWindowSessionMatcher.isLtz(agg));
+      }
+    }
+
     // The local half of a two-phase non-windowed GROUP BY: a stateless per-batch pre-aggregate that
     // emits partials for the global half to merge. Insert-only (append-only partials), so it sits
     // after the guard. Its input feeds directly (no shuffle precedes a local — the keyed exchange sits
@@ -1155,6 +1180,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           + " local-time-zone or plain TIMESTAMP rowtime, one value column whose type matches the aggregate"
           + " (bigint/int/double for SUM/AVG, also smallint/tinyint/float for MIN/MAX/COUNT),"
           + " and bigint/int/string/boolean/date keys (docs/aggregate-type-support.md)";
+    }
+    if (node instanceof StreamPhysicalGroupWindowAggregate) {
+      return GroupWindowSessionMatcher.unsupportedReason((StreamPhysicalGroupWindowAggregate) node);
     }
     return null;
   }

@@ -71,10 +71,23 @@ public abstract class NativeRowWindowOperatorCore extends NativeWindowOperatorCo
         for (int a = 0; a < aggregates; a++) {
           copyColumn(flush.getVector("result" + a), out.getVector(keyCount + a), n);
         }
-        fillLocalTimestamps(
-            (BigIntVector) flush.getVector("window_start"), out.getVector(keyCount + aggregates), n);
-        fillLocalTimestamps(
-            (BigIntVector) flush.getVector("window_end"), out.getVector(keyCount + aggregates + 1), n);
+        // Window properties follow the keys and aggregates: always window_start then window_end, and
+        // (legacy group-window only) a rowtime attribute (= window_end - 1 ms, the window's last
+        // instant) and a proctime attribute. Extra properties are present in the output schema but are
+        // projected away by the Calc above; their exact value is immaterial, so the proctime marker is
+        // filled with the window end. The TVF window aggregates carry only the two bound properties.
+        int properties = outputType.getFieldCount() - keyCount - aggregates;
+        int base = keyCount + aggregates;
+        BigIntVector starts = (BigIntVector) flush.getVector("window_start");
+        BigIntVector ends = (BigIntVector) flush.getVector("window_end");
+        fillLocalTimestamps(starts, out.getVector(base), n);
+        fillLocalTimestamps(ends, out.getVector(base + 1), n);
+        if (properties >= 3) {
+          fillLocalTimestamps(ends, out.getVector(base + 2), n, -1L); // rowtime = window_end - 1 ms
+        }
+        if (properties >= 4) {
+          fillLocalTimestamps(ends, out.getVector(base + 3), n, 0L); // proctime marker (projected away)
+        }
         out.setRowCount(n);
         output.collect(new StreamRecord<>(new ArrowBatch(out)));
       }
@@ -120,11 +133,17 @@ public abstract class NativeRowWindowOperatorCore extends NativeWindowOperatorCo
 
   /** Renders int64 epoch-millis window bounds as session-local timestamp nanos, as the host does. */
   private void fillLocalTimestamps(BigIntVector source, FieldVector target, int n) {
+    fillLocalTimestamps(source, target, n, 0L);
+  }
+
+  /** As above, offsetting the source millis first (e.g. -1 ms for a window's rowtime = end - 1). */
+  private void fillLocalTimestamps(BigIntVector source, FieldVector target, int n, long offsetMillis) {
     for (int i = 0; i < n; i++) {
       if (source.isNull(i)) {
         setTimestampNull(target, i);
       } else {
-        long localMillis = toLocal(source.get(i)).toInstant(ZoneOffset.UTC).toEpochMilli();
+        long localMillis =
+            toLocal(source.get(i) + offsetMillis).toInstant(ZoneOffset.UTC).toEpochMilli();
         setTimestampNanos(target, i, localMillis * NANOS_PER_MILLI);
       }
     }
