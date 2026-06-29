@@ -24,6 +24,7 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 | SMALLINT / TINYINT | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | FLOAT (REAL) | ✓ (custom f32) | ✓ (custom f64→f32) | ✓ | ✓ | ✓ |
 | DECIMAL | ✗ precision rules | ✗ precision rules | ✓ | ✓ | ✓ |
+| CHAR / VARCHAR | ✗ | ✗ | ✓ (byte-lexicographic) | ✓ (byte-lexicographic) | ✓ |
 
 Notes / divergences this avoids:
 - **SUM over int/smallint/tinyint** is matched with a custom wrapping accumulator

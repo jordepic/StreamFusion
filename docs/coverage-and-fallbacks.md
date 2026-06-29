@@ -162,8 +162,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   supported set (`AVG` over decimal; see `aggregate-type-support.md`); a `DISTINCT` aggregate other
   than `COUNT(DISTINCT x)` (`SUM`/`MIN`/`MAX` `DISTINCT` fall back); an approximate aggregate;
   idle-state TTL ≠ 0; an unsupported key/value column type. `SUM`/`MIN`/`MAX`/`COUNT` all admit
-  `DECIMAL` (`SUM` → `DECIMAL(38, s)`, `MIN`/`MAX` → `DECIMAL(p, s)`); `COUNT(DISTINCT x)` keeps a
-  per-key value set. A per-aggregate **`FILTER (WHERE …)`** is native — the operator folds a row into
+  `DECIMAL` (`SUM` → `DECIMAL(38, s)`, `MIN`/`MAX` → `DECIMAL(p, s)`); **`MIN`/`MAX` also admit a
+  string** (`CHAR`/`VARCHAR`), ordered byte-lexicographically — matching Flink's `BinaryStringData`
+  byte comparison (its common binary path; the materialized-Java-object path differs only for
+  supplementary-plane characters, divergences/07); `COUNT(DISTINCT x)` keeps a per-key value set. A
+  per-aggregate **`FILTER (WHERE …)`** is native — the operator folds a row into
   an aggregate only where that aggregate's filter (a boolean input column) is true.
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT;
   a value type outside bigint/int/double; a partial Flink widens past the value type (e.g. `SUM(INT)`);

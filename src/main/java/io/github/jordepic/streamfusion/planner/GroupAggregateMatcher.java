@@ -83,8 +83,14 @@ final class GroupAggregateMatcher {
           if (!isAvgType(valueType)) {
             return false;
           }
+        } else if (kind == KIND_MIN || kind == KIND_MAX) {
+          // MIN/MAX keep a value multiset; admit the running numerics, DECIMAL, and strings (ordered
+          // byte-lexicographically, matching Flink's BinaryStringData comparison).
+          if (!isRunningType(valueType) && valueType != SqlTypeName.DECIMAL && !isStringType(valueType)) {
+            return false;
+          }
         } else if (!isRunningType(valueType) && valueType != SqlTypeName.DECIMAL) {
-          return false;
+          return false; // SUM
         }
       }
     }
@@ -111,6 +117,15 @@ final class GroupAggregateMatcher {
 
   /** Native aggregate kind 7 (COUNT(DISTINCT)); matches the convention in the Rust GroupAggState. */
   private static final int KIND_COUNT_DISTINCT = 7;
+
+  /** Native MIN/MAX kinds (the Rust GroupAggState routes these to the Extremes multiset). */
+  private static final int KIND_MIN = 1;
+  private static final int KIND_MAX = 2;
+
+  /** Character string types MIN/MAX admit (compared byte-lexicographically). */
+  private static boolean isStringType(SqlTypeName type) {
+    return type == SqlTypeName.CHAR || type == SqlTypeName.VARCHAR;
+  }
 
   static int[] kinds(StreamPhysicalGroupAggregate agg) {
     Seq<AggregateCall> aggCalls = agg.aggCalls();
