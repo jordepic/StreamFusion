@@ -113,6 +113,20 @@ Acceleration is configured by JVM system properties (mirroring DataFusion Comet'
   diverges from the host only at a precision/locale edge (`UPPER`/`LOWER`, `ROUND`, transcendental
   math), for data that avoids the edge. Default off.
 
+### Deployment JVM flags
+
+Run the TaskManager JVM with Arrow's safety checks disabled (as Comet/Spark do):
+
+```
+-Darrow.enable_unsafe_memory_access=true -Darrow.enable_null_check_for_get=false
+```
+
+These turn off Arrow Java's per-accessor bounds and refcount checks. Profiling the row↔Arrow
+transpose showed roughly a third of the native-side CPU was those checks (`ArrowBuf.checkIndex` /
+`ensureAccessible` / `refCnt` on every `setSafe`); disabling them cut the `RowData→Arrow` transpose
+from ~21% to ~12% of CPU. The flags must be set at JVM start (Arrow reads them in a static
+initializer); the test/benchmark build sets them in the Surefire `argLine`.
+
 ### Determinism (the one parity caveat)
 
 Results are byte-identical to stock Flink for everything admitted, with a single
