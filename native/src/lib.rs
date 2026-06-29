@@ -1294,6 +1294,9 @@ enum RunningAgg {
     // DECIMAL(38, s) (Flink's findSumAggType). `overflow` latches once the running sum no longer
     // fits DECIMAL(38, s) (|value| >= 10^38), at which point Flink reports NULL.
     SumDecimal { sum: i128, scale: i8, overflow: bool },
+    // MIN/MAX over DECIMAL(p, s): the value lives in the Extremes multiset (this variant is never
+    // folded), so this carries only the precision/scale to report the result type DECIMAL(p, s).
+    MinMaxDecimal { precision: u8, scale: i8 },
     // FIRST_VALUE / LAST_VALUE: hold the first / most-recent non-null value seen (None until one
     // arrives → emits NULL, matching Flink, which ignores nulls in these functions).
     FirstI64(Option<i64>),
@@ -1329,6 +1332,8 @@ impl RunningAgg {
             (6, DataType::Float64) => LastF64(None),
             // SUM(DECIMAL(_, s)) — accumulate the unscaled i128 at scale s; result is DECIMAL(38, s).
             (0, DataType::Decimal128(_, s)) => SumDecimal { sum: 0, scale: *s, overflow: false },
+            // MIN/MAX(DECIMAL(p, s)) — the extreme lives in the multiset; result is DECIMAL(p, s).
+            (1 | 2, DataType::Decimal128(p, s)) => MinMaxDecimal { precision: *p, scale: *s },
             (k, other) => panic!("unsupported OVER aggregate kind {k} for value type {other:?}"),
         }
     }
@@ -1388,6 +1393,8 @@ impl RunningAgg {
             SumDecimal { sum, scale, overflow } => {
                 ScalarValue::Decimal128((!*overflow).then_some(*sum), 38, *scale)
             }
+            // Never folded — MIN/MAX state is the Extremes multiset, which emits via MinMaxKey::scalar.
+            MinMaxDecimal { precision, scale } => ScalarValue::Decimal128(None, *precision, *scale),
         }
     }
 
@@ -1400,6 +1407,7 @@ impl RunningAgg {
             SumI32(_) | MinI32(_) | MaxI32(_) | FirstI32(_) | LastI32(_) => DataType::Int32,
             SumF64(_) | MinF64(_) | MaxF64(_) | FirstF64(_) | LastF64(_) => DataType::Float64,
             SumDecimal { scale, .. } => DataType::Decimal128(38, *scale),
+            MinMaxDecimal { precision, scale } => DataType::Decimal128(*precision, *scale),
         }
     }
 
@@ -1616,6 +1624,10 @@ enum MinMaxKey {
     I64(i64),
     I32(i32),
     F64(OrdF64),
+    // A DECIMAL extreme as its unscaled i128. All values of one aggregate share a scale, so ordering
+    // the raw i128 is the decimal ordering; the precision/scale are restored from the result type on
+    // emit (the key carries only the value, since the fold path has no precision/scale).
+    Decimal128(i128),
 }
 
 impl MinMaxKey {
@@ -1624,8 +1636,7 @@ impl MinMaxKey {
             Num::I64(v) => MinMaxKey::I64(v),
             Num::I32(v) => MinMaxKey::I32(v),
             Num::F64(v) => MinMaxKey::F64(OrdF64(v)),
-            // MIN/MAX over DECIMAL is not admitted (only SUM folds an i128), so this never occurs.
-            Num::I128(_) => panic!("decimal MIN/MAX is not supported"),
+            Num::I128(v) => MinMaxKey::Decimal128(v),
         }
     }
 
@@ -1634,15 +1645,21 @@ impl MinMaxKey {
             ScalarValue::Int64(Some(v)) => MinMaxKey::I64(*v),
             ScalarValue::Int32(Some(v)) => MinMaxKey::I32(*v),
             ScalarValue::Float64(Some(v)) => MinMaxKey::F64(OrdF64(*v)),
+            ScalarValue::Decimal128(Some(v), _, _) => MinMaxKey::Decimal128(*v),
             other => panic!("unexpected MIN/MAX value scalar: {other:?}"),
         }
     }
 
-    fn scalar(&self) -> ScalarValue {
+    /// Rebuilds the scalar; a decimal extreme takes its precision/scale from `result_type`.
+    fn scalar(&self, result_type: &DataType) -> ScalarValue {
         match self {
             MinMaxKey::I64(v) => ScalarValue::Int64(Some(*v)),
             MinMaxKey::I32(v) => ScalarValue::Int32(Some(*v)),
             MinMaxKey::F64(v) => ScalarValue::Float64(Some(v.0)),
+            MinMaxKey::Decimal128(v) => match result_type {
+                DataType::Decimal128(p, s) => ScalarValue::Decimal128(Some(*v), *p, *s),
+                other => panic!("decimal MIN/MAX result type must be Decimal128, got {other:?}"),
+            },
         }
     }
 }
@@ -1705,7 +1722,7 @@ impl GroupAggState {
             },
             GroupAggState::Extremes { is_min, counts } => {
                 let extreme = if *is_min { counts.keys().next() } else { counts.keys().next_back() };
-                extreme.map_or_else(|| null_scalar(result_type), MinMaxKey::scalar)
+                extreme.map_or_else(|| null_scalar(result_type), |k| k.scalar(result_type))
             }
         }
     }
@@ -1926,7 +1943,7 @@ impl GroupAggregator {
                         non_null_columns[i].push(0);
                         for (value, count) in counts.iter() {
                             multiset_keys[i].push(key.clone());
-                            multiset_values[i].push(value.scalar());
+                            multiset_values[i].push(value.scalar(&self.result_types[i]));
                             multiset_counts[i].push(*count);
                         }
                     }

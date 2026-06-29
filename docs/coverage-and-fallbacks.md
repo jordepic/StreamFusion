@@ -44,11 +44,12 @@ These have no matcher; any query containing one falls back entirely.
 ### Feature gaps inside operators we *do* support
 (Real gaps only — Flink runs these and we don't yet. Ordering a nested value, `MAX(array)`/`ORDER BY
 array`, is **not** here: Flink rejects it too, so we're at parity.)
-- **Aggregates** — non-windowed `GROUP BY` `SUM(DECIMAL(p,s))` **is** native (i128 at scale `s` →
-  `DECIMAL(38, s)`, overflow → NULL, matching Flink); decimal `AVG`/`MIN`/`MAX`, two-phase decimal
-  `SUM`, and window-aggregate decimal `SUM`/`AVG` still fall back. `AVG` is modeled only via the
-  host's SUM/COUNT rewrite (not natively); two-phase `AVG`; window `AVG` only as a lone aggregate;
-  value types outside bigint/double/int/smallint/tinyint/float/decimal (see `aggregate-type-support.md`).
+- **Aggregates** — non-windowed `GROUP BY` `SUM`/`MIN`/`MAX`/`COUNT` over `DECIMAL` **are** native
+  (`SUM` → `DECIMAL(38, s)` with overflow → NULL; `MIN`/`MAX` → `DECIMAL(p, s)`; an i128 at scale `s`,
+  matching Flink). Decimal `AVG`, two-phase decimal `SUM`, and window-aggregate decimal `SUM`/`AVG`
+  still fall back. `AVG` is modeled only via the host's SUM/COUNT rewrite (not natively); two-phase
+  `AVG`; window `AVG` only as a lone aggregate; value types outside
+  bigint/double/int/smallint/tinyint/float/decimal (see `aggregate-type-support.md`).
 - **Two-phase (mini-batch) `GROUP BY`** — all four operators run native: a native `MiniBatchAssigner`
   emits the proc-time marker, the local is a transient in-memory bundle flushed on that marker / a
   `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
@@ -103,8 +104,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate mismatch; `AVG` (where noted);
   two-phase partials not single-field bigint/double.
 - **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, distinct, UDAF);
-  idle-state TTL ≠ 0; an unsupported key/value column type. `SUM` additionally admits `DECIMAL`
-  (→ `DECIMAL(38, s)`); `MIN`/`MAX` over `DECIMAL` are not modelled and fall back.
+  idle-state TTL ≠ 0; an unsupported key/value column type. `SUM`/`MIN`/`MAX`/`COUNT` all admit
+  `DECIMAL` (`SUM` → `DECIMAL(38, s)`, `MIN`/`MAX` → `DECIMAL(p, s)`).
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT;
   a value type outside bigint/int/double; a partial Flink widens past the value type (e.g. `SUM(INT)`);
   an unsupported grouping-key/input column type.
@@ -159,8 +160,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Key types** outside bigint/int/string/boolean/date/timestamp/decimal **(plus the nested types
   above)** for join/OVER/window/group keys.
 - **Aggregate value types** outside the parity matrix in `aggregate-type-support.md`. Non-windowed
-  `GROUP BY` `SUM` now covers `DECIMAL`; decimal `AVG`/`MIN`/`MAX` and window-aggregate decimal still
-  fall back.
+  `GROUP BY` `SUM`/`MIN`/`MAX`/`COUNT` now cover `DECIMAL`; decimal `AVG` and window-aggregate decimal
+  `SUM`/`AVG` still fall back.
 
 ### 5. Source / sink / connector
 - **Filesystem** — non-local path (`hdfs:`/`s3:`/…) for the Parquet/ORC source and Parquet sink; any

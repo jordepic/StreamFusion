@@ -56,18 +56,15 @@ final class GroupAggregateMatcher {
       if (call.getArgList().size() > 1) {
         return false;
       }
-      // SUM/MIN/MAX read a present argument as a typed running value, so it must be a running type.
-      // SUM additionally folds DECIMAL (an i128 running sum at the input scale → DECIMAL(38, s),
-      // matching Flink); MIN/MAX over decimal are not modelled yet. COUNT only reads null-ness, so it
-      // counts any column the row already admits (incl. a complex ARRAY/MAP/ROW value); COUNT(*) (no
-      // argument) is unrestricted.
+      // SUM/MIN/MAX read a present argument as a typed running value, so it must be a running type or
+      // DECIMAL: SUM folds an i128 at the input scale → DECIMAL(38, s); MIN/MAX keep the extreme as an
+      // i128 → DECIMAL(p, s) — both matching Flink. COUNT only reads null-ness, so it counts any column
+      // the row already admits (incl. a complex ARRAY/MAP/ROW value); COUNT(*) (no argument) is
+      // unrestricted.
       if (!call.getArgList().isEmpty() && kind != WindowAggregateMatcher.KIND_COUNT) {
         SqlTypeName valueType =
             inputType.getFieldList().get(call.getArgList().get(0)).getType().getSqlTypeName();
-        boolean ok =
-            isRunningType(valueType)
-                || (kind == WindowAggregateMatcher.KIND_SUM && valueType == SqlTypeName.DECIMAL);
-        if (!ok) {
+        if (!isRunningType(valueType) && valueType != SqlTypeName.DECIMAL) {
           return false;
         }
       }
