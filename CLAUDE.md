@@ -5,6 +5,14 @@ We are aiming for IDENTICAL results in stream processing jobs to flink. To start
 oriented streaming sources pop up more and more (see Fluss, for example, or open table CDC), being able to run jobs
 at massive throughput becomes more important.
 
+The one place identical results are impossible is an inherently non-deterministic function — `PROCTIME()` /
+processing time, `NOW()`/`CURRENT_TIMESTAMP`, random, and the like. Flink's own output for these is non-deterministic
+(it depends on wall-clock and execution timing), so byte-for-byte parity is not even well-defined. For these we use
+our own reasonable implementation rather than trying to mirror Flink exactly, and we do NOT gate or refuse a query
+just because it observes such a value — admit it like any other expression. We still replicate Flink wherever the
+result IS deterministic: an operator that merely *orders by* processing time (proctime dedup / OVER) must produce
+the same output as Flink, because that depends only on arrival order, not the clock value.
+
 This is an open-source project built for the community, not just for the maintainer. Design and tooling decisions
 must serve any developer who clones the repo: prefer self-contained, portable setups (e.g. a build that needs no
 machine-specific install — see the bundled-static native Kafka linking) over anything that assumes the maintainer's
