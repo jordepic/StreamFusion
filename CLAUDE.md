@@ -53,6 +53,14 @@ Builds: tests run against a debug native build for a fast iteration loop (`mvn t
 must use the release build via the `bench` Maven profile (`mvn test -Pbench ...`) — debug Rust is roughly an
 order of magnitude slower and gives misleading numbers. Never report a benchmark from a debug build.
 
+Nexmark benchmarks: the Nexmark source emits Flink `RowData` (the `nexmark` datagen connector — not a
+columnar source) and the queries sink to `blackhole` (a rowwise sink). So a native island pays a
+RowData→Arrow transpose at the source and an Arrow→RowData transpose at the sink. To steelman our
+numbers, keep both transposes in the measured path — do NOT swap in a columnar source or the native
+Parquet sink to dodge the perimeter cost. A real deployment feeds us rowwise Flink records and drains
+to a rowwise sink, so the honest benchmark is native-island-plus-both-transposes vs. stock Flink end to
+end. Confirm the plan actually has both transpose operators before trusting a Nexmark result.
+
 At a high level:
 We are ripping code out of Arroyo, which itself already uses DataFusion
 We are overriding the planning layer of Flink to use our Arroyo operators
