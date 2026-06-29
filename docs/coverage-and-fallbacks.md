@@ -218,7 +218,9 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 ### 4. Type level
 - **Scalar leaf types.** Every column (and every nested leaf) must be a type the boundary converter
   carries: tinyint/smallint/int/bigint/float/double/boolean/char/varchar/timestamp/timestamp-ltz/date/decimal.
-  Anything outside that — `TIME`, interval, raw/binary — falls back. Both gates
+  Anything outside that — `TIME`, interval, raw/binary — falls back as a **column** type (a day-time
+  `INTERVAL` *literal* inside an expression is admitted, though, so `TIMESTAMP - INTERVAL` arithmetic
+  works). Both gates
   (`FilterCalcMatcher.convertibleRow` for filter/`Calc`, `RowDataArrowConverter.supports` for the
   keyed/stateful operators) check this recursively.
 - **Nested `ARRAY`/`MAP`/`ROW`/`MULTISET` are supported** (recursively, down to supported leaves; a
