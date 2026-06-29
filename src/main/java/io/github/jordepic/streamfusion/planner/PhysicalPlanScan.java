@@ -308,18 +308,19 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
-    // An append-only streaming Top-N emits a changelog (it deletes a row when one is displaced), so
-    // it is exempt from the insert-only guard below; it requires an insert-only input (only the
-    // append-only Top-N is implemented).
+    // A streaming Top-N emits a changelog (it deletes a row when one is displaced), so it is exempt
+    // from the insert-only guard below. An insert-only input uses the append-only ranker; a changelog
+    // input uses the retracting ranker (Flink's RetractableTopNFunction), which keeps the full buffer
+    // so a deleted top-N row can be replaced by promoting rank N+1.
     if (current instanceof StreamPhysicalRank) {
       StreamPhysicalRank rank = (StreamPhysicalRank) current;
-      if (TopNMatcher.matches(rank)
-          && ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) rank.getInput())) {
+      if (TopNMatcher.matches(rank)) {
         if (!NativeConfig.operatorEnabled("topN")) {
           return noteDisabled(current, "topN");
         }
         substitutions++;
         int[] partitionColumns = TopNMatcher.partitionColumns(rank);
+        boolean retracting = !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) rank.getInput());
         // Columnar (Arrow in/out); keep the partitioned shuffle columnar where the input sits on a
         // columnar producer, else the transition pass transposes at the boundary.
         return new StreamPhysicalNativeColumnarTopN(
@@ -332,7 +333,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             TopNMatcher.sortAscending(rank),
             TopNMatcher.sortNullsFirst(rank),
             TopNMatcher.limit(rank),
-            TopNMatcher.outputRankNumber(rank));
+            TopNMatcher.outputRankNumber(rank),
+            retracting);
       }
     }
 
@@ -362,7 +364,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             LimitMatcher.sortAscending(sort),
             LimitMatcher.sortNullsFirst(sort),
             LimitMatcher.limit(sort),
-            false); // a global LIMIT never projects a rank column
+            false, // a global LIMIT never projects a rank column
+            false); // insert-only input (guarded above); the append-only ranker
       }
       // Recognized but not substituted. A sort-limit emits a changelog, so it would otherwise slip
       // past the insert-only guard below unreported; record why here so a non-accelerating query can

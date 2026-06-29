@@ -966,6 +966,8 @@ public final class Native {
    * @param limit the rank bound N
    * @param outputRankNumber whether the rank column is projected (the operator then emits the
    *     shift cascade and appends the rank); false for the plain Top-N and the global LIMIT
+   * @param retracting whether the input is a changelog (use the retracting ranker, which keeps the
+   *     full buffer to promote on delete) rather than insert-only (the append-only bounded ranker)
    */
   public static native long createTopNRanker(
       int[] partitionColumns,
@@ -973,7 +975,8 @@ public final class Native {
       int[] sortAscending,
       int[] sortNullsFirst,
       long limit,
-      boolean outputRankNumber);
+      boolean outputRankNumber,
+      boolean retracting);
 
   /** Pushes an input batch, exporting the top-N changelog (input columns plus the row kind). */
   public static native void pushTopNRanker(
@@ -993,6 +996,7 @@ public final class Native {
       int[] sortNullsFirst,
       long limit,
       boolean outputRankNumber,
+      boolean retracting,
       byte[] snapshot);
 
   /**

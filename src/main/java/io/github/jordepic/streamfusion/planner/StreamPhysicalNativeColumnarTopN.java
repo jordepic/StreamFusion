@@ -13,9 +13,11 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * Columnar form of the append-only streaming Top-N: Arrow batches in and out ({@link ColumnarInput}
- * and {@link ColumnarOutput}), substituted when the ranker's partitioned input is kept columnar
- * across the exchange. The emitted changelog carries its kind on the batch's {@code $row_kind$} column.
+ * Columnar form of the streaming Top-N: Arrow batches in and out ({@link ColumnarInput} and {@link
+ * ColumnarOutput}), substituted when the ranker's partitioned input is kept columnar across the
+ * exchange. The emitted changelog carries its kind on the batch's {@code $row_kind$} column.
+ * {@code retracting} selects the changelog-input ranker (keeps the full buffer to promote on delete)
+ * over the append-only one.
  */
 public class StreamPhysicalNativeColumnarTopN extends SingleRel
     implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
@@ -27,6 +29,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
   private final int[] sortNullsFirst;
   private final long limit;
   private final boolean outputRankNumber;
+  private final boolean retracting;
 
   public StreamPhysicalNativeColumnarTopN(
       RelOptCluster cluster,
@@ -38,7 +41,8 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
       int[] sortAscending,
       int[] sortNullsFirst,
       long limit,
-      boolean outputRankNumber) {
+      boolean outputRankNumber,
+      boolean retracting) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.partitionColumns = partitionColumns;
@@ -47,6 +51,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
     this.sortNullsFirst = sortNullsFirst;
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
+    this.retracting = retracting;
   }
 
   @Override
@@ -71,7 +76,8 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
         sortAscending,
         sortNullsFirst,
         limit,
-        outputRankNumber);
+        outputRankNumber,
+        retracting);
   }
 
   @Override
@@ -86,6 +92,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
         sortAscending,
         sortNullsFirst,
         limit,
-        outputRankNumber);
+        outputRankNumber,
+        retracting);
   }
 }

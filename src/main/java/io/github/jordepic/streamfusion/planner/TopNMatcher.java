@@ -8,13 +8,13 @@ import org.apache.flink.table.runtime.operators.rank.ConstantRankRange;
 import org.apache.flink.table.runtime.operators.rank.RankType;
 
 /**
- * Recognizes the append-only streaming Top-N the native ranker implements:
+ * Recognizes the streaming Top-N the native ranker implements:
  * {@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) <= N}, with or without the rank number
- * projected. Requires {@code ROW_NUMBER} (not RANK/DENSE_RANK), a constant rank range starting at 1
- * (no offset), and input/output column types the row/Arrow conversion supports. When the rank number
- * is projected, the ranker emits Flink's shift cascade and appends the rank column. The caller
- * additionally requires an insert-only input — only the append-only Top-N is implemented. Anything
- * else (an offset, RANK/DENSE_RANK, a retracting input) falls back.
+ * projected. Requires {@code ROW_NUMBER} (Flink rejects streaming RANK/DENSE_RANK), a constant rank
+ * range starting at 1 (no offset), and input/output column types the row/Arrow conversion supports.
+ * When the rank number is projected, the ranker emits Flink's shift cascade and appends the rank
+ * column. The caller picks the append-only ranker for an insert-only input or the retracting ranker
+ * for a changelog input. An offset (rank start > 1) falls back.
  */
 final class TopNMatcher {
 
