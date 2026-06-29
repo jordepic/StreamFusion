@@ -279,10 +279,10 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
-    // Keep-first deduplication is a rowtime-ordered rank-1 the host plans as a row-time deduplicate;
-    // it is insert-only (emits each key's first row once on the watermark), so like the append-only
-    // Top-N below it requires an insert-only input. Checked before Top-N — both are StreamPhysicalRank,
-    // but a rowtime-ordered rank is deduplication, which TopNMatcher declines.
+    // Row-time deduplication is a rowtime-ordered rank-1 the host plans as a row-time deduplicate:
+    // keep-first (ASC, insert-only, emits on the watermark) or keep-last (DESC, retracting, emits
+    // eagerly). Either way it requires an insert-only input. Checked before Top-N — both are
+    // StreamPhysicalRank, but a rowtime-ordered rank is deduplication, which TopNMatcher declines.
     if (current instanceof StreamPhysicalRank) {
       StreamPhysicalRank rank = (StreamPhysicalRank) current;
       if (DeduplicateMatcher.matches(rank)
@@ -293,14 +293,18 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         substitutions++;
         int[] partitionColumns = DeduplicateMatcher.partitionColumns(rank);
         // Columnar (Arrow in/out); the partitioned shuffle stays columnar where the input sits on a
-        // columnar producer, else the transition pass transposes at the boundary.
+        // columnar producer, else the transition pass transposes at the boundary. Keep-first is
+        // insert-only; keep-last emits a retract changelog (the native rel inherits the host rank's
+        // changelog trait, so the boundary transpose carries $row_kind$).
         return new StreamPhysicalNativeDeduplicate(
             rank.getCluster(),
             rank.getTraitSet(),
             columnarInput(rank.getInput(), partitionColumns),
             rank.getRowType(),
             partitionColumns,
-            DeduplicateMatcher.rowtimeColumn(rank));
+            DeduplicateMatcher.rowtimeColumn(rank),
+            DeduplicateMatcher.keepLast(rank),
+            DeduplicateMatcher.generateUpdateBefore(rank));
       }
     }
 

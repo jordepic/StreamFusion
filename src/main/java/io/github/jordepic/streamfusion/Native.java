@@ -517,6 +517,30 @@ public final class Native {
       int[] partitionColumns, int rtColumn, byte[] snapshot);
 
   /**
+   * Creates a keep-last (rowtime) deduplicator and returns an opaque handle. Per partition key it
+   * keeps the maximum-rowtime row and emits a retract changelog eagerly per input row: first row
+   * {@code +I}; a later row (rowtime {@code >=} stored) emits {@code -U}(previous, gated on {@code
+   * generateUpdateBefore}) then {@code +U}(new); an older row is ignored. Released with {@link
+   * #closeKeepLastDeduplicator}.
+   */
+  public static native long createKeepLastDeduplicator(
+      int[] partitionColumns, int rtColumn, boolean generateUpdateBefore);
+
+  /** Folds an input batch and returns the retract changelog it produces. */
+  public static native void pushKeepLastDeduplicator(
+      long handle, long inArrayAddress, long inSchemaAddress, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases the keep-last deduplicator and its per-key state. */
+  public static native void closeKeepLastDeduplicator(long handle);
+
+  /** Serializes the keep-last deduplicator's per-key stored rows for a checkpoint. */
+  public static native byte[] snapshotKeepLastDeduplicator(long handle);
+
+  /** Rebuilds a keep-last deduplicator from a snapshot and returns a fresh handle. */
+  public static native long restoreKeepLastDeduplicator(
+      int[] partitionColumns, int rtColumn, boolean generateUpdateBefore, byte[] snapshot);
+
+  /**
    * Creates a window-rank ranker (window Top-N / window deduplication) over the attached
    * {@code window_start}/{@code window_end} columns and returns an opaque handle. Within each window
    * and partition key it keeps the {@code limit} rows ordered by the sort columns, emitting them

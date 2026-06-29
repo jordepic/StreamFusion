@@ -3,7 +3,9 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarDeduplicateOperator;
+import io.github.jordepic.streamfusion.operator.NativeColumnarKeepLastDeduplicateOperator;
 import java.util.Collections;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.planner.delegation.PlannerBase;
@@ -28,6 +30,8 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
 
   private final int[] partitionColumns;
   private final int rowtimeColumn;
+  private final boolean keepLast;
+  private final boolean generateUpdateBefore;
 
   public NativeDeduplicateExecNode(
       ReadableConfig tableConfig,
@@ -35,7 +39,9 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
       RowType outputType,
       String description,
       int[] partitionColumns,
-      int rowtimeColumn) {
+      int rowtimeColumn,
+      boolean keepLast,
+      boolean generateUpdateBefore) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-deduplicate_1"),
@@ -45,6 +51,8 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
         description);
     this.partitionColumns = partitionColumns;
     this.rowtimeColumn = rowtimeColumn;
+    this.keepLast = keepLast;
+    this.generateUpdateBefore = generateUpdateBefore;
   }
 
   @Override
@@ -53,10 +61,15 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
+    OneInputStreamOperator<ArrowBatch, ArrowBatch> operator =
+        keepLast
+            ? new NativeColumnarKeepLastDeduplicateOperator(
+                partitionColumns, rowtimeColumn, generateUpdateBefore)
+            : new NativeColumnarDeduplicateOperator(partitionColumns, rowtimeColumn);
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarDeduplicateOperator(partitionColumns, rowtimeColumn),
+        operator,
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

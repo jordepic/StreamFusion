@@ -4443,6 +4443,133 @@ impl KeepFirstDeduplicator {
     }
 }
 
+/// Keep-last deduplication on a rowtime order — Flink's `RowTimeDeduplicateFunction` (keep-last). Per
+/// partition key it keeps the row with the **maximum** rowtime and emits a retract changelog eagerly,
+/// per input row (no watermark buffering, unlike keep-first): the first row for a key emits `+I`; a
+/// later row whose rowtime is `>=` the stored one replaces it, emitting `-U`(previous, gated on
+/// `generate_update_before`) then `+U`(new); a row with a smaller rowtime is ignored (it is older).
+/// Insert-only input (every row is a put), changelog output. The stored full row per key lives as
+/// scalars and is rebuilt with `scalars_to_array` on emit, like the changelog normalizer below.
+struct KeepLastDeduplicator {
+    partition_columns: Vec<usize>,
+    rt_column: usize,
+    generate_update_before: bool,
+    schema: Option<SchemaRef>,
+    /// Per key: the stored row's rowtime (millis) and its full row.
+    rows: HashMap<GroupKey, (i64, JoinRow)>,
+}
+
+impl KeepLastDeduplicator {
+    fn new(partition_columns: Vec<usize>, rt_column: usize, generate_update_before: bool) -> Self {
+        KeepLastDeduplicator {
+            partition_columns,
+            rt_column,
+            generate_update_before,
+            schema: None,
+            rows: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let arity = data_arity(batch);
+        self.schema = Some(data_schema(batch));
+        let key_arrays: Vec<&ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+        let rt = rt_to_millis(batch.column(self.rt_column));
+
+        let mut out_rows: Vec<JoinRow> = Vec::new();
+        let mut out_kinds: Vec<i8> = Vec::new();
+        for row in 0..batch.num_rows() {
+            let key = read_key(&key_arrays, row);
+            let rowtime = rt.value(row);
+            let current: JoinRow = data_arrays
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, row).expect("keep-last row scalar"))
+                .collect();
+            match self.rows.get(&key) {
+                None => {
+                    out_rows.push(current.clone());
+                    out_kinds.push(0); // +I — first row for the key
+                }
+                Some((stored_rt, _)) if rowtime < *stored_rt => {
+                    continue; // an older row by rowtime — keep-last ignores it
+                }
+                Some((_, prev)) => {
+                    if self.generate_update_before {
+                        out_rows.push(prev.clone());
+                        out_kinds.push(1); // -U the previous row
+                    }
+                    out_rows.push(current.clone());
+                    out_kinds.push(2); // +U the new (later) row
+                }
+            }
+            self.rows.insert(key, (rowtime, current));
+        }
+        self.emit(out_rows, out_kinds)
+    }
+
+    fn emit(&self, out_rows: Vec<JoinRow>, out_kinds: Vec<i8>) -> RecordBatch {
+        if out_rows.is_empty() {
+            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+        }
+        let schema = self.schema.as_ref().expect("schema set once a row was processed");
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
+        columns.push(Arc::new(Int8Array::from(out_kinds)));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build keep-last dedup batch")
+    }
+
+    /// Serializes the stored last-row-per-key set; the rowtime is re-derived from each row on restore.
+    fn snapshot(&self) -> Vec<u8> {
+        let Some(schema) = &self.schema else { return Vec::new() };
+        let rows: Vec<&JoinRow> = self.rows.values().map(|(_, row)| row).collect();
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        write_ipc(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("keep-last snapshot"),
+        )
+    }
+
+    fn restore(
+        partition_columns: Vec<usize>,
+        rt_column: usize,
+        generate_update_before: bool,
+        bytes: &[u8],
+    ) -> Self {
+        let mut dedup =
+            KeepLastDeduplicator::new(partition_columns, rt_column, generate_update_before);
+        for batch in read_ipc_if_present(bytes) {
+            dedup.schema = Some(batch.schema());
+            let key_arrays: Vec<&ArrayRef> =
+                dedup.partition_columns.iter().map(|&i| batch.column(i)).collect();
+            let rt = rt_to_millis(batch.column(dedup.rt_column));
+            let arity = batch.num_columns();
+            for row in 0..batch.num_rows() {
+                let key = read_key(&key_arrays, row);
+                let stored: JoinRow = (0..arity)
+                    .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("restore scalar"))
+                    .collect();
+                dedup.rows.insert(key, (rt.value(row), stored));
+            }
+        }
+        dedup
+    }
+}
+
 /// Changelog normalization (Flink's `ChangelogNormalize` / `ProcTimeDeduplicateKeepLastRowFunction`,
 /// keep-last on a changelog): turns an upsert or duplicate-bearing changelog into a regular
 /// INSERT/UPDATE_BEFORE/UPDATE_AFTER/DELETE changelog with no duplication, keyed by the unique key.
@@ -6842,6 +6969,83 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepFi
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read dedup snapshot");
     Box::into_raw(Box::new(KeepFirstDeduplicator::restore(partitions, rt_column as usize, &bytes)))
         as jlong
+}
+
+/// Creates a keep-last (rowtime) deduplicator and returns an opaque handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createKeepLastDeduplicator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    rt_column: jint,
+    generate_update_before: jboolean,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    Box::into_raw(Box::new(KeepLastDeduplicator::new(
+        partitions,
+        rt_column as usize,
+        generate_update_before != 0,
+    ))) as jlong
+}
+
+/// Folds an input batch and returns the retract changelog it produces (emitted eagerly per row).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushKeepLastDeduplicator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) {
+    let dedup = unsafe { &mut *(handle as *mut KeepLastDeduplicator) };
+    let result = dedup.push(&import_record_batch(in_array_address, in_schema_address));
+    export_record_batch(result, out_array_address, out_schema_address);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKeepLastDeduplicator<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(Box::from_raw(handle as *mut KeepLastDeduplicator));
+    }
+}
+
+/// Serializes the keep-last deduplicator's per-key stored rows for a checkpoint.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotKeepLastDeduplicator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    let dedup = unsafe { &mut *(handle as *mut KeepLastDeduplicator) };
+    env.byte_array_from_slice(&dedup.snapshot())
+        .expect("failed to allocate dedup snapshot array")
+        .into_raw()
+}
+
+/// Rebuilds a keep-last deduplicator from a snapshot and returns a fresh handle.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepLastDeduplicator<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    rt_column: jint,
+    generate_update_before: jboolean,
+    snapshot: JByteArray<'local>,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let bytes = env.convert_byte_array(&snapshot).expect("failed to read dedup snapshot");
+    Box::into_raw(Box::new(KeepLastDeduplicator::restore(
+        partitions,
+        rt_column as usize,
+        generate_update_before != 0,
+        &bytes,
+    ))) as jlong
 }
 
 /// Creates a window-rank ranker (window Top-N / window deduplication) over the attached

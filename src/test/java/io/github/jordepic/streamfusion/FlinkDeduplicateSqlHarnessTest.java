@@ -13,9 +13,9 @@ import org.apache.flink.types.Row;
 import org.junit.jupiter.api.Test;
 
 /**
- * Append-only keep-first deduplication on a rowtime order: per key the native operator keeps the
- * minimum-rowtime row and emits it once the watermark reaches it. Keep-last (descending) is a
- * retracting deduplicate and must fall back to the host.
+ * Row-time deduplication: per key the native operator keeps either the minimum-rowtime row
+ * (keep-first, {@code ORDER BY rt ASC} — insert-only, emitted on the watermark) or the
+ * maximum-rowtime row (keep-last, {@code ORDER BY rt DESC} — a retract changelog, emitted eagerly).
  */
 class FlinkDeduplicateSqlHarnessTest {
 
@@ -23,19 +23,21 @@ class FlinkDeduplicateSqlHarnessTest {
       "SELECT k, v, rt FROM ("
           + "SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt ASC) AS rn FROM src) WHERE rn = 1";
 
+  private static final String KEEP_LAST =
+      "SELECT k, v, rt FROM ("
+          + "SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt DESC) AS rn FROM src) WHERE rn = 1";
+
   @Test
   void keepFirstDeduplicationMatchesHost() throws Exception {
     NativeParity.assertParity(FlinkDeduplicateSqlHarnessTest::environment, KEEP_FIRST);
   }
 
   @Test
-  void keepLastDeduplicationFallsBack() throws Exception {
-    // ORDER BY rt DESC is a retracting (keep-last) deduplicate — not implemented; the whole query
-    // runs on the host and still matches.
-    NativeParity.assertFallback(
-        FlinkDeduplicateSqlHarnessTest::environment,
-        "SELECT k, v, rt FROM ("
-            + "SELECT *, ROW_NUMBER() OVER (PARTITION BY k ORDER BY rt DESC) AS rn FROM src) WHERE rn = 1");
+  void keepLastDeduplicationMatchesHost() throws Exception {
+    // Keep-last keeps the maximum-rowtime row per key and emits a retract changelog as a later row
+    // displaces the stored one; the collapsed result is key 1's (v=30, rt=2000) and key 2's
+    // (v=50, rt=1500).
+    NativeParity.assertChangelogParity(FlinkDeduplicateSqlHarnessTest::environment, KEEP_LAST);
   }
 
   private static TableEnvironment environment() {
