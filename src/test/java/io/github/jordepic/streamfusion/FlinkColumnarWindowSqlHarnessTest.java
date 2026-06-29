@@ -2,9 +2,14 @@ package io.github.jordepic.streamfusion;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
+import org.apache.flink.table.api.Schema;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.types.Row;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -115,6 +120,40 @@ class FlinkColumnarWindowSqlHarnessTest {
         "SELECT window_start, window_end, SUM(v) AS total "
             + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
             + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void proctimeTumbleWindowRoutesToNative() throws Exception {
+    // A proctime TUMBLE window aggregate. The window boundaries depend on wall-clock processing time,
+    // so the result is non-deterministic and cannot be byte-compared to the host (see the CLAUDE.md
+    // note); this asserts the query routes to native and runs. Correctness of the assignment/fire is
+    // covered deterministically by NativeColumnarWindowAggregateOperatorTest (a controlled clock).
+    NativeParity.assertRoutes(
+        FlinkColumnarWindowSqlHarnessTest::proctimeEnvironment,
+        "SELECT window_start, window_end, k, SUM(v) AS s "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(pt), INTERVAL '5' SECOND)) "
+            + "GROUP BY window_start, window_end, k");
+  }
+
+  private static TableEnvironment proctimeEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    DataStream<Row> source =
+        env.fromData(
+            Types.ROW_NAMED(new String[] {"k", "v"}, Types.LONG, Types.LONG),
+            Row.of(1L, 10L),
+            Row.of(2L, 20L),
+            Row.of(1L, 30L));
+    tEnv.createTemporaryView(
+        "src",
+        source,
+        Schema.newBuilder()
+            .column("k", DataTypes.BIGINT())
+            .column("v", DataTypes.BIGINT())
+            .columnByExpression("pt", "PROCTIME()")
+            .build());
+    return tEnv;
   }
 
   private static void writeInput(Path directory) throws Exception {

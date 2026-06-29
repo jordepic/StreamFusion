@@ -35,6 +35,7 @@ public class NativeColumnarWindowAggExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] keyColumns;
   private final int[] valueTypes;
   private final int[] aggregateKinds;
+  private final boolean proctime;
 
   public NativeColumnarWindowAggExecNode(
       ReadableConfig tableConfig,
@@ -48,7 +49,8 @@ public class NativeColumnarWindowAggExecNode extends ExecNodeBase<ArrowBatch>
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
-      int[] aggregateKinds) {
+      int[] aggregateKinds,
+      boolean proctime) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-window-aggregate_1"),
@@ -64,6 +66,7 @@ public class NativeColumnarWindowAggExecNode extends ExecNodeBase<ArrowBatch>
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
+    this.proctime = proctime;
   }
 
   @Override
@@ -88,7 +91,8 @@ public class NativeColumnarWindowAggExecNode extends ExecNodeBase<ArrowBatch>
             valueTypes,
             aggregateKinds,
             timeZoneId,
-            outputType),
+            outputType,
+            proctime),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);
