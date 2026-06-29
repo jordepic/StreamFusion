@@ -6854,6 +6854,21 @@ fn build_expr(
             }
             build_call(op, args)
         }
+        // A day-time INTERVAL literal (millis in the long pool), built as an Arrow IntervalDayTime so
+        // `timestamp - interval` (e.g. q7's join residual) evaluates to a timestamp. Split into
+        // days + milliseconds to keep each within i32 for multi-day intervals.
+        15 => {
+            let millis = longs[arg];
+            let days = (millis / 86_400_000) as i32;
+            let milliseconds = (millis % 86_400_000) as i32;
+            datafusion::prelude::Expr::Literal(
+                ScalarValue::IntervalDayTime(Some(arrow::datatypes::IntervalDayTime {
+                    days,
+                    milliseconds,
+                })),
+                None,
+            )
+        }
         // Approximate decimal cast: `arg` packs precision*100 + scale; the one child is the arithmetic
         // result (computed in double), cast to DECIMAL(p, s) so the output column matches the declared
         // type. Not byte-exact to Flink (opt-in via the approximate-decimal flag).
@@ -13152,6 +13167,39 @@ mod tests {
         assert_eq!(col.value(0), "1970-01-01");
         assert_eq!(col.value(1), "1970-01-02");
         assert!(col.is_null(2));
+    }
+
+    // TIMESTAMP - INTERVAL arithmetic (q7's join residual): a day-time interval literal subtracted
+    // from a timestamp yields a timestamp (millis - millis), NULL for a null input.
+    #[test]
+    fn calc_timestamp_minus_interval() {
+        let ts: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![Some(10_000), None]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            )])),
+            vec![ts],
+        )
+        .unwrap();
+        let mut calc = CalcExpression {
+            kinds: vec![6, 0, 15],   // CALL(MINUS), col ts, INTERVAL literal
+            payload: vec![1, 0, 0],  // op 1 (MINUS); col 0; longs[0]
+            child_counts: vec![2, 0, 0],
+            longs: vec![5_000], // 5 seconds
+            doubles: vec![],
+            strings: vec![],
+            projection_roots: vec![0],
+            condition_root: -1,
+            output_names: vec!["earlier".to_string()],
+            compiled: None,
+        };
+        let out = calc.evaluate(batch);
+        let col =
+            out.column(0).as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+        assert_eq!(col.value(0), 5_000); // 10s - 5s
+        assert!(col.is_null(1));
     }
 
     // The by-key split sends every row with the same key to the same partition and preserves all

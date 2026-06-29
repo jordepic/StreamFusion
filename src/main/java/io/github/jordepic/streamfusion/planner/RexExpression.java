@@ -14,6 +14,7 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexProgram;
 import org.apache.calcite.rex.RexUtil;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
 
 /**
@@ -54,6 +55,9 @@ final class RexExpression {
   // one child. Wraps a (double-computed) arithmetic result, casting it to the declared DECIMAL so the
   // output column type matches — only under the approximate-decimal flag (not byte-exact to Flink).
   private static final int KIND_CAST_DECIMAL = 14;
+  // A day-time INTERVAL literal: payload is the long-pool index of its value in milliseconds. The
+  // native side builds an Arrow IntervalDayTime, so `timestamp - interval` evaluates to a timestamp.
+  private static final int KIND_LIT_INTERVAL = 15;
 
   // Cast target type codes, mirrored on the native side.
   private static final int CAST_TINYINT = 0;
@@ -252,6 +256,18 @@ final class RexExpression {
       return true;
     }
     SqlTypeName type = literal.getType().getSqlTypeName();
+    // A day-time INTERVAL literal (SECOND/MINUTE/HOUR/DAY) — Calcite stores its value in milliseconds.
+    // Admitted so datetime arithmetic like `ts - INTERVAL '10' SECOND` (Nexmark q7) is expressible; a
+    // year-month interval (value in months) falls back.
+    if (type.getFamily() == SqlTypeFamily.INTERVAL_DAY_TIME) {
+      Long millis = literal.getValueAs(Long.class);
+      if (millis == null) {
+        return reject("null interval literal");
+      }
+      add(KIND_LIT_INTERVAL, longs.size(), 0);
+      longs.add(millis);
+      return true;
+    }
     switch (type) {
       case TINYINT:
       case SMALLINT:
