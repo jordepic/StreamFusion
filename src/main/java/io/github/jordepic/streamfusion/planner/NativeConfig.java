@@ -28,6 +28,19 @@ public final class NativeConfig {
   }
 
   /**
+   * Whether decimal-typed arithmetic ({@code +}/{@code -}/{@code *}/{@code /} with a DECIMAL result)
+   * may run natively. It is computed in double and cast to the declared {@code DECIMAL(p, s)}, so it is
+   * <em>not</em> byte-identical to Flink's decimal semantics (precision/scale derivation, HALF_UP
+   * rounding) — intended for benchmarking throughput, not correctness. Off by default ({@code
+   * streamfusion.expression.decimalArithmetic.approximate}); also enabled by the blanket
+   * {@code allowIncompatible} switch.
+   */
+  public static boolean allowsApproximateDecimal() {
+    return Boolean.getBoolean("streamfusion.expression.allowIncompatible")
+        || Boolean.getBoolean("streamfusion.expression.decimalArithmetic.approximate");
+  }
+
+  /**
    * The master switch for native acceleration ({@code streamfusion.native.enabled}, default true).
    * When false the planner substitutes nothing and the query runs entirely on the host.
    */

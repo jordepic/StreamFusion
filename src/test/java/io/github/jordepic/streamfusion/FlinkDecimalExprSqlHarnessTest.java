@@ -19,11 +19,26 @@ import org.junit.jupiter.api.Test;
 class FlinkDecimalExprSqlHarnessTest {
 
   @Test
-  void decimalArithmeticFallsBackCleanly() throws Exception {
+  void decimalArithmeticFallsBackByDefault() throws Exception {
+    // By default decimal arithmetic is not native (would not be byte-exact to Flink); it falls back.
     NativeParity.assertFallbackReasonContains(
         FlinkDecimalExprSqlHarnessTest::environment,
         "SELECT auction, 0.908 * price AS price FROM t",
-        "decimal arithmetic not yet native");
+        "decimal arithmetic not native by default");
+  }
+
+  @Test
+  void approximateDecimalRoutesUnderFlag() throws Exception {
+    // With the opt-in flag the arithmetic runs natively (computed in double, cast to the declared
+    // DECIMAL) — routes and executes without error. Not value-compared (intentionally non-exact).
+    System.setProperty("streamfusion.expression.decimalArithmetic.approximate", "true");
+    try {
+      NativeParity.assertRoutes(
+          FlinkDecimalExprSqlHarnessTest::environment,
+          "SELECT auction, 0.908 * price AS price FROM t");
+    } finally {
+      System.clearProperty("streamfusion.expression.decimalArithmetic.approximate");
+    }
   }
 
   private static TableEnvironment environment() {

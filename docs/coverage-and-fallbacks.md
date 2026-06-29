@@ -200,9 +200,12 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **CAST** — anything that isn't widening numeric (integer→wider int, integer→float/double,
   float→double); narrowing, float→int, and string casts fall back.
 - **Decimal arithmetic** — `+`/`-`/`*`/`/`/`%` whose result type is `DECIMAL` (e.g. Nexmark q1's
-  `0.908 * price`) fall back: the native engine would evaluate in float and the whole-row converter
-  reads the column back as a `DECIMAL` (a hard cast error), so it is rejected rather than run wrong.
-  Native decimal arithmetic with Flink's precision/scale derivation is a separate increment.
+  `0.908 * price`) fall back **by default**: a byte-exact native decimal (Flink's precision/scale
+  derivation + HALF_UP rounding) is not implemented. Behind the opt-in flag
+  `-Dstreamfusion.expression.decimalArithmetic.approximate=true` (or the blanket `allowIncompatible`)
+  it runs natively — computed in double and cast to the declared `DECIMAL(p, s)` so the output column
+  type matches — which is **not** byte-identical to Flink; intended for benchmarking throughput, not
+  correctness. A true byte-exact decimal arithmetic remains future work.
 - **Incompatible functions** — off by default, native only under
   `-Dstreamfusion.expression.<NAME>.allowIncompatible=true` (or the blanket flag): `UPPER`, `LOWER`,
   `EXP`, `LN`, `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `LOG10`, and `ROUND` on float/double.
