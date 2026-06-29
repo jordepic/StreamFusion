@@ -44,6 +44,24 @@ class FlinkFieldAccessSqlHarnessTest {
   }
 
   @Test
+  void joinsOnExtractedKey() throws Exception {
+    // q3/q20-shaped: a regular join whose equi-key and outputs are all fields pulled from the struct.
+    NativeParity.assertParity(
+        FlinkFieldAccessSqlHarnessTest::environment,
+        "SELECT a.auction, a.price, b.bidder FROM bidv a JOIN bidv b ON a.auction = b.auction");
+  }
+
+  @Test
+  void topNOverExtractedField() throws Exception {
+    // q19-shaped: a Top-N partitioned/ordered by extracted fields (channel repeats, so it retracts).
+    NativeParity.assertChangelogParity(
+        FlinkFieldAccessSqlHarnessTest::environment,
+        "SELECT channel, auction, price FROM (SELECT channel, auction, price, "
+            + "ROW_NUMBER() OVER (PARTITION BY channel ORDER BY price DESC) AS rn FROM bidv) "
+            + "WHERE rn <= 1");
+  }
+
+  @Test
   void fieldOfNullStructIsNull() throws Exception {
     // A row whose bid struct is NULL: every extracted field is NULL, exactly as the host computes it.
     NativeParity.assertParity(

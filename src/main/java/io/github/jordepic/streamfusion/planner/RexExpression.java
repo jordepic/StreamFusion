@@ -305,6 +305,13 @@ final class RexExpression {
     if (call.getKind() == SqlKind.REINTERPRET) {
       return emit(call.getOperands().get(0));
     }
+    // Decimal-typed arithmetic is not evaluated natively yet: the native engine would compute it in
+    // float, producing a column the whole-row converter then reads as a DECIMAL (a hard cast error).
+    // Reject so the Calc falls back cleanly rather than crash; native decimal arithmetic (with Flink's
+    // precision/scale derivation) is a separate increment.
+    if (isDecimalArithmetic(call)) {
+      return reject("decimal arithmetic not yet native: " + call.getOperator().getName());
+    }
     // PROCTIME() / PROCTIME_MATERIALIZE(): a nullary current-processing-time column.
     if (call.getOperator().getName().toUpperCase(java.util.Locale.ROOT).contains("PROCTIME")) {
       add(KIND_PROCTIME, 0, 0);
@@ -769,6 +776,20 @@ final class RexExpression {
     }
     add(KIND_CALL, op, 1);
     return emit(call.getOperands().get(0));
+  }
+
+  /** Whether {@code call} is an arithmetic operation whose result is a DECIMAL (not yet native). */
+  private static boolean isDecimalArithmetic(RexCall call) {
+    switch (call.getKind()) {
+      case PLUS:
+      case MINUS:
+      case TIMES:
+      case DIVIDE:
+      case MOD:
+        return call.getType().getSqlTypeName() == SqlTypeName.DECIMAL;
+      default:
+        return false;
+    }
   }
 
   private static int opCode(SqlKind kind) {
