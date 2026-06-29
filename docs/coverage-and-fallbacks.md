@@ -45,9 +45,13 @@ These have no matcher; any query containing one falls back entirely.
 array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Aggregates** — non-windowed `GROUP BY` `SUM`/`MIN`/`MAX`/`COUNT` over `DECIMAL` **are** native
   (`SUM` → `DECIMAL(38, s)` with overflow → NULL; `MIN`/`MAX` → `DECIMAL(p, s)`; an i128 at scale `s`,
-  matching Flink). Decimal `AVG`, two-phase decimal `SUM`, and window-aggregate decimal `SUM`/`AVG`
-  still fall back. `AVG` is modeled only via the host's SUM/COUNT rewrite (not natively); two-phase
-  `AVG`; window `AVG` only as a lone aggregate; value types outside
+  matching Flink). **`AVG` is native** for the single-phase non-windowed `GROUP BY`: a running sum
+  (widened to bigint for any integer input, double for float/double) plus the non-null count, emitting
+  `count == 0 ? NULL : sum / count` with the result cast back to the input type and **integer division
+  truncating toward zero** — a faithful port of Flink's `AvgAggFunction`, over
+  bigint/int/smallint/tinyint/float/double, retract-aware. Still falling back: **decimal `AVG`**
+  (precision/scale derivation not modelled), **two-phase `AVG`** (the local/global split — single-phase
+  only), two-phase decimal `SUM`, and window-aggregate decimal `SUM`/`AVG`; value types outside
   bigint/double/int/smallint/tinyint/float/decimal (see `aggregate-type-support.md`).
 - **Two-phase (mini-batch) `GROUP BY`** — all four operators run native: a native `MiniBatchAssigner`
   emits the proc-time marker, the local is a transient in-memory bundle flushed on that marker / a

@@ -16,10 +16,11 @@ import scala.collection.Seq;
  * Decides whether a non-windowed {@code GROUP BY} aggregate can run natively, and pulls out the
  * aggregate kinds, value columns/types, and grouping keys the operator needs.
  *
- * <p>Scope: SUM/MIN/MAX/COUNT (no AVG — its multi-field running state is not modelled yet) over
- * bigint/int/double value columns, with any grouping keys and pass-through columns the row/Arrow
- * conversion supports. The input may be append-only or a changelog; SUM/COUNT retract a running
- * value and MIN/MAX retract via a per-key value multiset, so all four work over either input.
+ * <p>Scope: SUM/MIN/MAX/COUNT over bigint/int/double value columns (SUM/MIN/MAX also decimal), plus
+ * AVG over bigint/int/smallint/tinyint/float/double (a running sum + non-null count, result cast back
+ * to the input type — decimal AVG falls back), with any grouping keys and pass-through columns the
+ * row/Arrow conversion supports. The input may be append-only or a changelog; SUM/COUNT/AVG retract a
+ * running value and MIN/MAX retract via a per-key value multiset, so all work over either input.
  */
 final class GroupAggregateMatcher {
 
@@ -50,8 +51,8 @@ final class GroupAggregateMatcher {
         return false;
       }
       int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
-      if (kind < 0 || kind == WindowAggregateMatcher.KIND_AVG) {
-        return false; // SUM/MIN/MAX/COUNT only
+      if (kind < 0) {
+        return false; // SUM/MIN/MAX/COUNT/AVG only
       }
       if (call.getArgList().size() > 1) {
         return false;
@@ -73,7 +74,14 @@ final class GroupAggregateMatcher {
       if (!call.getArgList().isEmpty() && kind != WindowAggregateMatcher.KIND_COUNT) {
         SqlTypeName valueType =
             inputType.getFieldList().get(call.getArgList().get(0)).getType().getSqlTypeName();
-        if (!isRunningType(valueType) && valueType != SqlTypeName.DECIMAL) {
+        if (kind == WindowAggregateMatcher.KIND_AVG) {
+          // AVG keeps a (sum, count) running state: sum widens to bigint/double, result casts back to
+          // the input type. Over bigint/int/smallint/tinyint/float/double only; decimal AVG (whose
+          // precision/scale derivation is not modelled) falls back.
+          if (!isAvgType(valueType)) {
+            return false;
+          }
+        } else if (!isRunningType(valueType) && valueType != SqlTypeName.DECIMAL) {
           return false;
         }
       }
@@ -85,6 +93,17 @@ final class GroupAggregateMatcher {
   private static boolean isRunningType(SqlTypeName type) {
     return type == SqlTypeName.BIGINT
         || type == SqlTypeName.INTEGER
+        || type == SqlTypeName.DOUBLE;
+  }
+
+  /** The numeric types Flink's AvgAggFunction covers (its result casts back to the input type). */
+  private static boolean isAvgType(SqlTypeName type) {
+    return type == SqlTypeName.TINYINT
+        || type == SqlTypeName.SMALLINT
+        || type == SqlTypeName.INTEGER
+        || type == SqlTypeName.BIGINT
+        || type == SqlTypeName.FLOAT
+        || type == SqlTypeName.REAL
         || type == SqlTypeName.DOUBLE;
   }
 
