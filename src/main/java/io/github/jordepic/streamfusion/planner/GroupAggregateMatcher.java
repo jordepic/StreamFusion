@@ -46,7 +46,7 @@ final class GroupAggregateMatcher {
     Seq<AggregateCall> aggCalls = agg.aggCalls();
     for (int i = 0; i < aggCalls.size(); i++) {
       AggregateCall call = aggCalls.apply(i);
-      if (call.isDistinct() || call.isApproximate() || call.filterArg >= 0) {
+      if (call.isApproximate() || call.filterArg >= 0) {
         return false;
       }
       int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
@@ -55,6 +55,15 @@ final class GroupAggregateMatcher {
       }
       if (call.getArgList().size() > 1) {
         return false;
+      }
+      // DISTINCT is native only for COUNT(DISTINCT x) over one argument — the value→multiplicity set
+      // counts distinct values (Flink's DistinctAccumulator). SUM/MIN/MAX DISTINCT fall back. The
+      // value may be any type the row already admits (read as a scalar set key).
+      if (call.isDistinct()) {
+        if (kind != WindowAggregateMatcher.KIND_COUNT || call.getArgList().isEmpty()) {
+          return false;
+        }
+        continue;
       }
       // SUM/MIN/MAX read a present argument as a typed running value, so it must be a running type or
       // DECIMAL: SUM folds an i128 at the input scale → DECIMAL(38, s); MIN/MAX keep the extreme as an
@@ -79,8 +88,21 @@ final class GroupAggregateMatcher {
         || type == SqlTypeName.DOUBLE;
   }
 
+  /** Native aggregate kind 7 (COUNT(DISTINCT)); matches the convention in the Rust GroupAggState. */
+  private static final int KIND_COUNT_DISTINCT = 7;
+
   static int[] kinds(StreamPhysicalGroupAggregate agg) {
-    return WindowAggregateMatcher.kinds(agg.aggCalls());
+    Seq<AggregateCall> aggCalls = agg.aggCalls();
+    int[] kinds = new int[aggCalls.size()];
+    for (int i = 0; i < aggCalls.size(); i++) {
+      AggregateCall call = aggCalls.apply(i);
+      int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
+      kinds[i] =
+          call.isDistinct() && kind == WindowAggregateMatcher.KIND_COUNT
+              ? KIND_COUNT_DISTINCT
+              : kind;
+    }
+    return kinds;
   }
 
   static int[] valueColumns(StreamPhysicalGroupAggregate agg) {

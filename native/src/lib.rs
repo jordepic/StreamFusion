@@ -1310,8 +1310,8 @@ enum RunningAgg {
 impl RunningAgg {
     fn new(kind: i64, value_type: &DataType) -> Self {
         use RunningAgg::*;
-        if kind == 3 {
-            return Count(0);
+        if kind == 3 || kind == 7 {
+            return Count(0); // COUNT and COUNT(DISTINCT) both report a bigint count
         }
         // kind: 0=SUM, 1=MIN, 2=MAX, 5=FIRST_VALUE, 6=LAST_VALUE (3=COUNT handled above).
         match (kind, value_type) {
@@ -1671,6 +1671,10 @@ impl MinMaxKey {
 enum GroupAggState {
     Running { agg: RunningAgg, non_null: i64 },
     Extremes { is_min: bool, counts: BTreeMap<MinMaxKey, i64> },
+    // COUNT(DISTINCT x): a value→multiplicity map (Flink's DistinctAccumulator MapView). The count is
+    // the number of live entries; a value's multiplicity tracks how many input rows carry it so a
+    // retraction removes it only when the last one is retracted. Nulls are never inserted.
+    Distinct(HashMap<ScalarValue, i64>),
 }
 
 impl GroupAggState {
@@ -1678,6 +1682,7 @@ impl GroupAggState {
         match kind {
             1 => GroupAggState::Extremes { is_min: true, counts: BTreeMap::new() }, // MIN
             2 => GroupAggState::Extremes { is_min: false, counts: BTreeMap::new() }, // MAX
+            7 => GroupAggState::Distinct(HashMap::new()), // COUNT(DISTINCT)
             _ => GroupAggState::Running { agg: RunningAgg::new(kind, value_type), non_null: 0 },
         }
     }
@@ -1691,6 +1696,7 @@ impl GroupAggState {
             GroupAggState::Extremes { counts, .. } => {
                 *counts.entry(MinMaxKey::of(value)).or_insert(0) += 1;
             }
+            GroupAggState::Distinct(_) => unreachable!("distinct folds a scalar, not a Num"),
         }
     }
 
@@ -1709,6 +1715,30 @@ impl GroupAggState {
                     }
                 }
             }
+            GroupAggState::Distinct(_) => unreachable!("distinct retracts a scalar, not a Num"),
+        }
+    }
+
+    /// Adds one occurrence of a distinct value (COUNT(DISTINCT)); a new value grows the count.
+    fn accumulate_distinct(&mut self, value: ScalarValue) {
+        match self {
+            GroupAggState::Distinct(counts) => *counts.entry(value).or_insert(0) += 1,
+            _ => unreachable!("accumulate_distinct on a non-distinct aggregate"),
+        }
+    }
+
+    /// Removes one occurrence; the value leaves the distinct set when its last occurrence is retracted.
+    fn retract_distinct(&mut self, value: ScalarValue) {
+        match self {
+            GroupAggState::Distinct(counts) => {
+                if let Some(count) = counts.get_mut(&value) {
+                    *count -= 1;
+                    if *count <= 0 {
+                        counts.remove(&value);
+                    }
+                }
+            }
+            _ => unreachable!("retract_distinct on a non-distinct aggregate"),
         }
     }
 
@@ -1724,6 +1754,8 @@ impl GroupAggState {
                 let extreme = if *is_min { counts.keys().next() } else { counts.keys().next_back() };
                 extreme.map_or_else(|| null_scalar(result_type), |k| k.scalar(result_type))
             }
+            // COUNT(DISTINCT) is the number of live distinct values (never NULL — empty is 0).
+            GroupAggState::Distinct(counts) => ScalarValue::Int64(Some(counts.len() as i64)),
         }
     }
 }
@@ -1831,6 +1863,11 @@ impl GroupAggregator {
         let key_arrays: Vec<&ArrayRef> = self.key_columns.iter().map(|&i| batch.column(i)).collect();
         self.key_types = key_types(&key_arrays);
         let row_kinds = row_kind_column(batch);
+        // Per aggregate, the value column index for a COUNT(DISTINCT) (kind 7), else None. Captured
+        // before the per-row loop so the loop body reads no `self` field while `state` is borrowed.
+        let distinct_cols: Vec<Option<usize>> = (0..num_agg)
+            .map(|i| (self.kinds[i] == 7).then_some(self.value_columns[i] as usize))
+            .collect();
 
         let mut out_keys: Vec<GroupKey> = Vec::new();
         let mut out_results: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
@@ -1862,6 +1899,21 @@ impl GroupAggregator {
                     self.state(key.clone())
                 };
                 for i in 0..num_agg {
+                    // COUNT(DISTINCT x) (kind 7) folds the value itself, not a Num — read its scalar
+                    // (skipping nulls, which DISTINCT ignores) and add/remove it from the value set.
+                    if let Some(col_idx) = distinct_cols[i] {
+                        let column = batch.column(col_idx);
+                        if !column.is_null(row) {
+                            let scalar =
+                                ScalarValue::try_from_array(column, row).expect("distinct value scalar");
+                            if retract {
+                                state.aggs[i].retract_distinct(scalar);
+                            } else {
+                                state.aggs[i].accumulate_distinct(scalar);
+                            }
+                        }
+                        continue;
+                    }
                     match &value_columns[i] {
                         // COUNT(*): the value is ignored, so any number drives the count.
                         None => {
@@ -1947,6 +1999,16 @@ impl GroupAggregator {
                             multiset_counts[i].push(*count);
                         }
                     }
+                    GroupAggState::Distinct(counts) => {
+                        // The count is recomputed from the side batch on restore (placeholder here).
+                        state_columns[i].push(null_scalar(&self.result_types[i]));
+                        non_null_columns[i].push(0);
+                        for (value, count) in counts.iter() {
+                            multiset_keys[i].push(key.clone());
+                            multiset_values[i].push(value.clone()); // the distinct value itself
+                            multiset_counts[i].push(*count);
+                        }
+                    }
                 }
             }
         }
@@ -1964,11 +2026,23 @@ impl GroupAggregator {
         let mut batches =
             vec![RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("main snapshot")];
         for i in 0..num_agg {
-            if matches!(self.kinds[i], 1 | 2) {
+            if matches!(self.kinds[i], 1 | 2 | 7) {
                 let mut f = key_fields(&self.key_types);
                 let mut c = key_columns(&multiset_keys[i], &self.key_types);
-                f.push(Field::new("value", self.result_types[i].clone(), true));
-                c.push(scalars_to_array(std::mem::take(&mut multiset_values[i]), &self.result_types[i]));
+                // MIN/MAX values take the aggregate's result type; a distinct value keeps its own type
+                // (the count's bigint result type does not describe it), inferred from the scalars.
+                let values = std::mem::take(&mut multiset_values[i]);
+                let value_array: ArrayRef = if self.kinds[i] == 7 {
+                    if values.is_empty() {
+                        new_empty_array(&DataType::Int64) // 0 rows — type is immaterial on restore
+                    } else {
+                        ScalarValue::iter_to_array(values).expect("distinct value column")
+                    }
+                } else {
+                    scalars_to_array(values, &self.result_types[i])
+                };
+                f.push(Field::new("value", value_array.data_type().clone(), true));
+                c.push(value_array);
                 f.push(Field::new("count", DataType::Int64, false));
                 c.push(Arc::new(Int64Array::from(std::mem::take(&mut multiset_counts[i]))));
                 batches.push(RecordBatch::try_new(Arc::new(Schema::new(f)), c).expect("multiset snapshot"));
@@ -2016,10 +2090,10 @@ impl GroupAggregator {
                 }
             }
         }
-        // One side batch per MIN/MAX aggregate, in aggregate order: key0.., value, count.
+        // One side batch per MIN/MAX or DISTINCT aggregate, in aggregate order: key0.., value, count.
         let mut frame = 1;
         for i in 0..num_agg {
-            if !matches!(aggregator.kinds[i], 1 | 2) {
+            if !matches!(aggregator.kinds[i], 1 | 2 | 7) {
                 continue;
             }
             let side = &batches[frame];
@@ -2031,10 +2105,14 @@ impl GroupAggregator {
             for row in 0..side.num_rows() {
                 let key = read_key(&side_keys, row);
                 let value = ScalarValue::try_from_array(values, row).expect("multiset value");
-                if let Some(GroupAggState::Extremes { counts: map, .. }) =
-                    aggregator.keys.get_mut(&key).map(|s| &mut s.aggs[i])
-                {
-                    map.insert(MinMaxKey::from_scalar(&value), counts.value(row));
+                match aggregator.keys.get_mut(&key).map(|s| &mut s.aggs[i]) {
+                    Some(GroupAggState::Extremes { counts: map, .. }) => {
+                        map.insert(MinMaxKey::from_scalar(&value), counts.value(row));
+                    }
+                    Some(GroupAggState::Distinct(map)) => {
+                        map.insert(value, counts.value(row));
+                    }
+                    _ => {}
                 }
             }
         }

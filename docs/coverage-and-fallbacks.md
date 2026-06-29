@@ -103,9 +103,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   over a local-time-zone rowtime; `HOP` slide / `CUMULATE` step doesn't divide size; key type outside
   bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate mismatch; `AVG` (where noted);
   two-phase partials not single-field bigint/double.
-- **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, distinct, UDAF);
-  idle-state TTL ≠ 0; an unsupported key/value column type. `SUM`/`MIN`/`MAX`/`COUNT` all admit
-  `DECIMAL` (`SUM` → `DECIMAL(38, s)`, `MIN`/`MAX` → `DECIMAL(p, s)`).
+- **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, UDAF); a `DISTINCT`
+  aggregate other than `COUNT(DISTINCT x)` (`SUM`/`MIN`/`MAX` `DISTINCT` fall back); idle-state TTL ≠ 0;
+  an unsupported key/value column type. `SUM`/`MIN`/`MAX`/`COUNT` all admit `DECIMAL` (`SUM` →
+  `DECIMAL(38, s)`, `MIN`/`MAX` → `DECIMAL(p, s)`); `COUNT(DISTINCT x)` keeps a per-key value set.
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT;
   a value type outside bigint/int/double; a partial Flink widens past the value type (e.g. `SUM(INT)`);
   an unsupported grouping-key/input column type.
