@@ -50,6 +50,10 @@ final class RexExpression {
   // index of the field name, with one child (the struct-typed expression). Nested access (a.b.c)
   // nests these, the child being itself a field access. Mirrors DataFusion's get_field.
   private static final int KIND_FIELD_ACCESS = 13;
+  // Approximate decimal cast: payload packs the target DECIMAL precision/scale (precision*100 + scale),
+  // one child. Wraps a (double-computed) arithmetic result, casting it to the declared DECIMAL so the
+  // output column type matches — only under the approximate-decimal flag (not byte-exact to Flink).
+  private static final int KIND_CAST_DECIMAL = 14;
 
   // Cast target type codes, mirrored on the native side.
   private static final int CAST_TINYINT = 0;
@@ -310,12 +314,21 @@ final class RexExpression {
     if (call.getKind() == SqlKind.REINTERPRET) {
       return emit(call.getOperands().get(0));
     }
-    // Decimal-typed arithmetic is not evaluated natively yet: the native engine would compute it in
-    // float, producing a column the whole-row converter then reads as a DECIMAL (a hard cast error).
-    // Reject so the Calc falls back cleanly rather than crash; native decimal arithmetic (with Flink's
-    // precision/scale derivation) is a separate increment.
+    // Decimal-typed arithmetic. Without the approximate-decimal flag it falls back: the native engine
+    // computes it in double, which is not byte-identical to Flink's decimal semantics. With the flag,
+    // emit a cast-to-DECIMAL wrapper and fall through to the plain (double) arithmetic below — the cast
+    // makes the output column the declared DECIMAL(p, s) (so the converter reads it correctly), at the
+    // cost of exactness. Intended for benchmarking throughput.
     if (isDecimalArithmetic(call)) {
-      return reject("decimal arithmetic not yet native: " + call.getOperator().getName());
+      if (!NativeConfig.allowsApproximateDecimal()) {
+        return reject(
+            "decimal arithmetic not native by default; enable approximate (non-exact) decimal with"
+                + " -Dstreamfusion.expression.decimalArithmetic.approximate=true");
+      }
+      int precision = call.getType().getPrecision();
+      int scale = call.getType().getScale();
+      add(KIND_CAST_DECIMAL, precision * 100 + scale, 1);
+      // fall through: the arithmetic op is emitted next as this cast's single child, in double.
     }
     // PROCTIME() / PROCTIME_MATERIALIZE(): a nullary current-processing-time column.
     if (call.getOperator().getName().toUpperCase(java.util.Locale.ROOT).contains("PROCTIME")) {

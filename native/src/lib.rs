@@ -6854,6 +6854,20 @@ fn build_expr(
             }
             build_call(op, args)
         }
+        // Approximate decimal cast: `arg` packs precision*100 + scale; the one child is the arithmetic
+        // result (computed in double), cast to DECIMAL(p, s) so the output column matches the declared
+        // type. Not byte-exact to Flink (opt-in via the approximate-decimal flag).
+        14 => {
+            let precision = (arg / 100) as u8;
+            let scale = (arg % 100) as i8;
+            let child = build_expr(
+                schema, kinds, payload, child_counts, longs, doubles, strings, cursor,
+            );
+            datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(child),
+                DataType::Decimal128(precision, scale),
+            ))
+        }
         // Field access: extract a named field from a ROW/struct child. `arg` indexes the field name in
         // the string pool; the one child (built next) is the struct-typed expression. get_field returns
         // NULL for a null struct, matching Flink's field access.
