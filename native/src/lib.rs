@@ -1364,6 +1364,13 @@ enum RunningAgg {
     MaxF32(Option<f32>),
     FirstF32(Option<f32>),
     LastF32(Option<f32>),
+    // AVG: a running sum plus the non-null count (the count lives in GroupAggState's `non_null`, so
+    // the variant carries only the sum and the declared result type). Matching Flink's AvgAggFunction:
+    // the sum widens to BIGINT for any integer input and DOUBLE for float/double, the result casts back
+    // to the input type, and the value is `count == 0 ? NULL : sum / count` (integer division truncates
+    // toward zero). Decimal AVG is not modelled (the matcher leaves it on the host).
+    AvgInt { sum: i64, result: DataType },
+    AvgFloat { sum: f64, result: DataType },
 }
 
 impl RunningAgg {
@@ -1404,6 +1411,14 @@ impl RunningAgg {
             (2, DataType::Float32) => MaxF32(None),
             (5, DataType::Float32) => FirstF32(None),
             (6, DataType::Float32) => LastF32(None),
+            // AVG(integer) — sum widens to BIGINT, result casts back to the input type on emit.
+            (4, DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8) => {
+                AvgInt { sum: 0, result: value_type.clone() }
+            }
+            // AVG(float/double) — sum in DOUBLE, result casts back to the input type on emit.
+            (4, DataType::Float64 | DataType::Float32) => {
+                AvgFloat { sum: 0.0, result: value_type.clone() }
+            }
             // SUM(DECIMAL(_, s)) — accumulate the unscaled i128 at scale s; result is DECIMAL(38, s).
             (0, DataType::Decimal128(_, s)) => SumDecimal { sum: 0, scale: *s, overflow: false },
             // MIN/MAX(DECIMAL(p, s)) — the extreme lives in the multiset; result is DECIMAL(p, s).
@@ -1449,6 +1464,13 @@ impl RunningAgg {
             (MaxF32(m), Num::F32(v)) => *m = Some(m.map_or(v, |x| x.max(v))),
             (FirstF32(f), Num::F32(v)) => *f = Some(f.unwrap_or(v)),
             (LastF32(l), Num::F32(v)) => *l = Some(v),
+            // AVG: sum widens to the running type; the count is tracked by GroupAggState's `non_null`.
+            (AvgInt { sum, .. }, Num::I64(v)) => *sum = sum.wrapping_add(v),
+            (AvgInt { sum, .. }, Num::I32(v)) => *sum = sum.wrapping_add(v as i64),
+            (AvgInt { sum, .. }, Num::I16(v)) => *sum = sum.wrapping_add(v as i64),
+            (AvgInt { sum, .. }, Num::I8(v)) => *sum = sum.wrapping_add(v as i64),
+            (AvgFloat { sum, .. }, Num::F64(v)) => *sum += v,
+            (AvgFloat { sum, .. }, Num::F32(v)) => *sum += v as f64,
             _ => unreachable!("OVER value type does not match aggregate state"),
         }
     }
@@ -1469,6 +1491,12 @@ impl RunningAgg {
             (SumDecimal { sum, overflow, .. }, Num::I128(v)) => {
                 accumulate_decimal(sum, overflow, v.wrapping_neg())
             }
+            (AvgInt { sum, .. }, Num::I64(v)) => *sum = sum.wrapping_sub(v),
+            (AvgInt { sum, .. }, Num::I32(v)) => *sum = sum.wrapping_sub(v as i64),
+            (AvgInt { sum, .. }, Num::I16(v)) => *sum = sum.wrapping_sub(v as i64),
+            (AvgInt { sum, .. }, Num::I8(v)) => *sum = sum.wrapping_sub(v as i64),
+            (AvgFloat { sum, .. }, Num::F64(v)) => *sum -= v,
+            (AvgFloat { sum, .. }, Num::F32(v)) => *sum -= v as f64,
             _ => unreachable!("aggregate does not support retraction"),
         }
     }
@@ -1490,6 +1518,21 @@ impl RunningAgg {
             }
             // Never folded — MIN/MAX state is the Extremes multiset, which emits via MinMaxKey::scalar.
             MinMaxDecimal { precision, scale } => ScalarValue::Decimal128(None, *precision, *scale),
+            // The checkpointed state is the raw running sum (typed by state_type, wider than result);
+            // the average itself is computed in GroupAggState::emit, where the count (non_null) lives.
+            AvgInt { sum, .. } => ScalarValue::Int64(Some(*sum)),
+            AvgFloat { sum, .. } => ScalarValue::Float64(Some(*sum)),
+        }
+    }
+
+    /// The Arrow type of the checkpointed state scalar from {@link #emit}. Equals {@link #result_type}
+    /// except for AVG, whose state is the wider running sum (BIGINT / DOUBLE) rather than the result.
+    fn state_type(&self) -> DataType {
+        use RunningAgg::*;
+        match self {
+            AvgInt { .. } => DataType::Int64,
+            AvgFloat { .. } => DataType::Float64,
+            _ => self.result_type(),
         }
     }
 
@@ -1506,6 +1549,7 @@ impl RunningAgg {
             SumF32(_) | MinF32(_) | MaxF32(_) | FirstF32(_) | LastF32(_) => DataType::Float32,
             SumDecimal { scale, .. } => DataType::Decimal128(38, *scale),
             MinMaxDecimal { precision, scale } => DataType::Decimal128(*precision, *scale),
+            AvgInt { result, .. } | AvgFloat { result, .. } => result.clone(),
         }
     }
 
@@ -1538,6 +1582,9 @@ impl RunningAgg {
                 }
                 None => *overflow = true,
             },
+            // AVG restores the running sum; the count is restored from the `non_null` column separately.
+            (AvgInt { sum, .. }, ScalarValue::Int64(Some(v))) => *sum = *v,
+            (AvgFloat { sum, .. }, ScalarValue::Float64(Some(v))) => *sum = *v,
             _ => panic!("OVER state type mismatch on restore"),
         }
     }
@@ -2096,6 +2143,12 @@ impl GroupAggState {
             GroupAggState::Running { agg, non_null } => match agg {
                 RunningAgg::Count(_) => agg.emit(),
                 _ if *non_null == 0 => null_scalar(result_type),
+                // AVG divides the running sum by the live non-null count, truncating toward zero for an
+                // integer result (Flink's div) and casting back to the input type — see AvgAggFunction.
+                RunningAgg::AvgInt { sum, result } => avg_int_scalar(*sum / *non_null, result),
+                RunningAgg::AvgFloat { sum, result } => {
+                    avg_float_scalar(*sum / *non_null as f64, result)
+                }
                 _ => agg.emit(),
             },
             GroupAggState::Extremes { is_min, counts } => {
@@ -2105,6 +2158,27 @@ impl GroupAggState {
             // COUNT(DISTINCT) is the number of live distinct values (never NULL — empty is 0).
             GroupAggState::Distinct(counts) => ScalarValue::Int64(Some(counts.len() as i64)),
         }
+    }
+}
+
+/// Casts an integer average (`sum / count`, already truncated toward zero in i64) back to the AVG
+/// input type — Flink's `cast(div(sum, count), resultType)`.
+fn avg_int_scalar(value: i64, result: &DataType) -> ScalarValue {
+    match result {
+        DataType::Int64 => ScalarValue::Int64(Some(value)),
+        DataType::Int32 => ScalarValue::Int32(Some(value as i32)),
+        DataType::Int16 => ScalarValue::Int16(Some(value as i16)),
+        DataType::Int8 => ScalarValue::Int8(Some(value as i8)),
+        other => panic!("unsupported integer AVG result type {other:?}"),
+    }
+}
+
+/// Casts a floating average back to the AVG input type (FLOAT narrows from the DOUBLE running sum).
+fn avg_float_scalar(value: f64, result: &DataType) -> ScalarValue {
+    match result {
+        DataType::Float64 => ScalarValue::Float64(Some(value)),
+        DataType::Float32 => ScalarValue::Float32(Some(value as f32)),
+        other => panic!("unsupported float AVG result type {other:?}"),
     }
 }
 
@@ -2128,6 +2202,9 @@ struct GroupAggregator {
     kinds: Vec<i64>,
     value_types: Vec<DataType>,
     result_types: Vec<DataType>,
+    // The Arrow type of each aggregate's checkpointed state scalar — equals result_types except for
+    // AVG, whose snapshot stores the wider running sum (BIGINT / DOUBLE).
+    state_types: Vec<DataType>,
     value_columns: Vec<i64>,
     key_columns: Vec<usize>,
     generate_update_before: bool,
@@ -2149,10 +2226,16 @@ impl GroupAggregator {
             .zip(&value_types)
             .map(|(&kind, vt)| RunningAgg::new(kind, vt).result_type())
             .collect();
+        let state_types = kinds
+            .iter()
+            .zip(&value_types)
+            .map(|(&kind, vt)| RunningAgg::new(kind, vt).state_type())
+            .collect();
         GroupAggregator {
             kinds,
             value_types,
             result_types,
+            state_types,
             value_columns,
             key_columns,
             generate_update_before,
@@ -2366,8 +2449,8 @@ impl GroupAggregator {
         fields.push(Field::new("records", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(records)));
         for i in 0..num_agg {
-            fields.push(Field::new(format!("state{i}"), self.result_types[i].clone(), true));
-            columns.push(scalars_to_array(std::mem::take(&mut state_columns[i]), &self.result_types[i]));
+            fields.push(Field::new(format!("state{i}"), self.state_types[i].clone(), true));
+            columns.push(scalars_to_array(std::mem::take(&mut state_columns[i]), &self.state_types[i]));
             fields.push(Field::new(format!("nonnull{i}"), DataType::Int64, false));
             columns.push(Arc::new(Int64Array::from(std::mem::take(&mut non_null_columns[i]))));
         }
@@ -11777,6 +11860,17 @@ mod tests {
         assert_eq!(row_kinds(&out), vec![0, 1, 2]); // +I, then -U/+U
         assert_eq!(values(&out, 1), vec![1, 1, 2]); // COUNT(*): 1, then 1->2
         assert_eq!(values(&out, 2), vec![10, 10, 15]); // SUM: 10, then 10->15
+    }
+
+    // AVG(bigint) keeps a running sum + non-null count and emits sum/count with integer division
+    // truncating toward zero (Flink's AvgAggFunction), retracting the prior average on each change.
+    #[test]
+    fn group_by_avg_truncates_toward_zero() {
+        let mut agg = GroupAggregator::new(vec![4], vec![0], vec![1], vec![0], true);
+        // One key, values 10 then 1 → avg 10, then 11/2 = 5 (truncated from 5.5, not rounded).
+        let out = agg.update(&group_batch(vec![1, 1], vec![10, 1]));
+        assert_eq!(row_kinds(&out), vec![0, 1, 2]); // +I, then -U/+U
+        assert_eq!(values(&out, 1), vec![10, 10, 5]);
     }
 
     // A columnar input from an insert-only producer has no `$row_kind$` column; every row is then an

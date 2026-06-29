@@ -57,12 +57,28 @@ class FlinkGroupAggregateSqlHarnessTest {
 
   @Test
   void avgMatchesHost() throws Exception {
-    // AVG in a non-windowed GROUP BY is declined natively — its multi-field running state (a retract-
-    // able sum and count) is not modelled — so the aggregate stays on the host. Under all-or-nothing
-    // the whole query runs on the host; the result still matches.
-    NativeParity.assertFallback(
+    // AVG runs natively as a (sum, count) running state: BIGINT integer division (truncating), INT
+    // also integer (cast back to INT), DOUBLE floating — each matching Flink's AvgAggFunction.
+    NativeParity.assertParity(
         FlinkGroupAggregateSqlHarnessTest::environment,
-        "SELECT k, AVG(`value`) AS a FROM src GROUP BY k");
+        "SELECT k, AVG(`value`) AS a, AVG(qty) AS aq, AVG(price) AS ap FROM src GROUP BY k");
+  }
+
+  @Test
+  void avgOverRetractingInputMatchesHost() throws Exception {
+    // The inner GROUP BY emits a changelog; the outer AVG consumes it, retracting old totals from its
+    // running sum/count and adding new ones — the average tracks the live set.
+    NativeParity.assertChangelogParity(
+        FlinkGroupAggregateSqlHarnessTest::environment,
+        "SELECT s, AVG(total) AS avg_total FROM "
+            + "(SELECT k, s, SUM(`value`) AS total FROM src GROUP BY k, s) GROUP BY s");
+  }
+
+  @Test
+  void globalAvgMatchesHost() throws Exception {
+    // No GROUP BY: a single global AVG, still a retracting changelog (+I then -U/+U per row).
+    NativeParity.assertChangelogParity(
+        FlinkGroupAggregateSqlHarnessTest::environment, "SELECT AVG(`value`) AS a FROM src");
   }
 
   @Test
