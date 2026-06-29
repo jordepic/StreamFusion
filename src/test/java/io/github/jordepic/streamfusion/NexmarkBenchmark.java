@@ -153,7 +153,36 @@ class NexmarkBenchmark {
     }
   }
 
-  private static TableEnvironment environment() {
+  /**
+   * Runs native q0 (the pass-through) in a loop for {@code -Dprofile.seconds} (default 60) so an
+   * attached sampler sees steady-state q0: source generate → RowData→Arrow transpose → native Calc →
+   * Arrow→RowData transpose → blackhole sink. Gated by {@code SF_PROFILE=true} (in addition to the
+   * class-level {@code SF_BENCHMARK}); attach async-profiler to the surefire fork while it runs.
+   */
+  @Test
+  @EnabledIfEnvironmentVariable(named = "SF_PROFILE", matches = "true")
+  void q0NativeProfileLoop() throws Exception {
+    String sinkDdl =
+        "CREATE TABLE nexmark_q0 (auction BIGINT, bidder BIGINT, price BIGINT, `dateTime`"
+            + " TIMESTAMP(3), extra STRING) WITH ('connector' = 'blackhole')";
+    String insertSql =
+        "INSERT INTO nexmark_q0 SELECT auction, bidder, price, `dateTime`, extra FROM bid";
+    long deadline = System.currentTimeMillis() + Long.getLong("profile.seconds", 60L) * 1000L;
+    long iterations = 0;
+    while (System.currentTimeMillis() < deadline) {
+      TableEnvironment tEnv = environment();
+      PhysicalPlanScan scan = NativePlanner.install(tEnv);
+      tEnv.executeSql(sinkDdl);
+      tEnv.executeSql(insertSql).await();
+      if (scan.substitutions() == 0) {
+        throw new IllegalStateException("native q0 did not engage: " + scan.fallbackReasons());
+      }
+      iterations++;
+    }
+    System.out.println("[profile] native q0 iterations completed: " + iterations);
+  }
+
+  static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
