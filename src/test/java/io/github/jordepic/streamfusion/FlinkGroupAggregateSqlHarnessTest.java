@@ -75,6 +75,15 @@ class FlinkGroupAggregateSqlHarnessTest {
   }
 
   @Test
+  void minMaxStringMatchesHost() throws Exception {
+    // MIN/MAX over a string column (Nexmark q16's max(DATE_FORMAT(...))) — byte-lexicographic order,
+    // a retracting changelog as the per-key extreme changes.
+    NativeParity.assertChangelogParity(
+        FlinkGroupAggregateSqlHarnessTest::environment,
+        "SELECT k, MIN(s) AS mn, MAX(s) AS mx FROM src GROUP BY k");
+  }
+
+  @Test
   void filteredAggregatesMatchHost() throws Exception {
     // COUNT(*)/SUM/COUNT(DISTINCT) with FILTER (WHERE …) — Nexmark q15/q17's shape: each aggregate
     // folds only the rows whose filter is true (a boolean input column the host computes). The range

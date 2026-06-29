@@ -291,6 +291,9 @@ final class WindowAggregateMatcher {
         return 5;
       case FLOAT:
         return 6;
+      case CHAR:
+      case VARCHAR:
+        return 3; // string value (MIN/MAX over a string); value_data_type maps 3 → Utf8
       case DECIMAL:
         return io.github.jordepic.streamfusion.operator.NativeWindowOperatorCore.decimalCode(
             type.getPrecision(), type.getScale());

@@ -77,7 +77,8 @@ fn value_data_type(code: i64) -> DataType {
         0 => DataType::Int64,
         1 => DataType::Float64,
         2 => DataType::Int32,
-        // 3 is reserved for string keys (never a value type); 4/5/6 are the narrow value types.
+        // 3 is a string value (MIN/MAX over a string, the Extremes multiset); 4/5/6 are narrow.
+        3 => DataType::Utf8,
         4 => DataType::Int16,
         5 => DataType::Int8,
         6 => DataType::Float32,
@@ -1338,6 +1339,9 @@ enum RunningAgg {
     // MIN/MAX over DECIMAL(p, s): the value lives in the Extremes multiset (this variant is never
     // folded), so this carries only the precision/scale to report the result type DECIMAL(p, s).
     MinMaxDecimal { precision: u8, scale: i8 },
+    // MIN/MAX over a string: likewise lives in the Extremes multiset; this only reports the result
+    // type (the converter's Utf8). Never folded.
+    MinMaxStr,
     // FIRST_VALUE / LAST_VALUE: hold the first / most-recent non-null value seen (None until one
     // arrives → emits NULL, matching Flink, which ignores nulls in these functions).
     FirstI64(Option<i64>),
@@ -1423,6 +1427,8 @@ impl RunningAgg {
             (0, DataType::Decimal128(_, s)) => SumDecimal { sum: 0, scale: *s, overflow: false },
             // MIN/MAX(DECIMAL(p, s)) — the extreme lives in the multiset; result is DECIMAL(p, s).
             (1 | 2, DataType::Decimal128(p, s)) => MinMaxDecimal { precision: *p, scale: *s },
+            // MIN/MAX(string) — the extreme lives in the multiset; result is the converter's Utf8.
+            (1 | 2, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => MinMaxStr,
             (k, other) => panic!("unsupported OVER aggregate kind {k} for value type {other:?}"),
         }
     }
@@ -1518,6 +1524,7 @@ impl RunningAgg {
             }
             // Never folded — MIN/MAX state is the Extremes multiset, which emits via MinMaxKey::scalar.
             MinMaxDecimal { precision, scale } => ScalarValue::Decimal128(None, *precision, *scale),
+            MinMaxStr => ScalarValue::Utf8(None),
             // The checkpointed state is the raw running sum (typed by state_type, wider than result);
             // the average itself is computed in GroupAggState::emit, where the count (non_null) lives.
             AvgInt { sum, .. } => ScalarValue::Int64(Some(*sum)),
@@ -1549,6 +1556,7 @@ impl RunningAgg {
             SumF32(_) | MinF32(_) | MaxF32(_) | FirstF32(_) | LastF32(_) => DataType::Float32,
             SumDecimal { scale, .. } => DataType::Decimal128(38, *scale),
             MinMaxDecimal { precision, scale } => DataType::Decimal128(*precision, *scale),
+            MinMaxStr => DataType::Utf8,
             AvgInt { result, .. } | AvgFloat { result, .. } => result.clone(),
         }
     }
@@ -2017,6 +2025,10 @@ enum MinMaxKey {
     // the raw i128 is the decimal ordering; the precision/scale are restored from the result type on
     // emit (the key carries only the value, since the fold path has no precision/scale).
     Decimal128(i128),
+    // A string extreme. Rust's String ordering is UTF-8 byte-lexicographic, matching Flink's
+    // BinaryStringData byte comparison (its common binary path) — see divergences/07 for the
+    // supplementary-plane edge where Flink's materialized-Java-object path would differ.
+    Str(String),
 }
 
 impl MinMaxKey {
@@ -2041,6 +2053,9 @@ impl MinMaxKey {
             ScalarValue::Int32(Some(v)) => MinMaxKey::I32(*v),
             ScalarValue::Float64(Some(v)) => MinMaxKey::F64(OrdF64(*v)),
             ScalarValue::Decimal128(Some(v), _, _) => MinMaxKey::Decimal128(*v),
+            ScalarValue::Utf8(Some(v))
+            | ScalarValue::LargeUtf8(Some(v))
+            | ScalarValue::Utf8View(Some(v)) => MinMaxKey::Str(v.clone()),
             other => panic!("unexpected MIN/MAX value scalar: {other:?}"),
         }
     }
@@ -2055,6 +2070,7 @@ impl MinMaxKey {
                 DataType::Decimal128(p, s) => ScalarValue::Decimal128(Some(*v), *p, *s),
                 other => panic!("decimal MIN/MAX result type must be Decimal128, got {other:?}"),
             },
+            MinMaxKey::Str(v) => ScalarValue::Utf8(Some(v.clone())),
         }
     }
 }
@@ -2111,6 +2127,33 @@ impl GroupAggState {
                 }
             }
             GroupAggState::Distinct(_) => unreachable!("distinct retracts a scalar, not a Num"),
+        }
+    }
+
+    /// Adds one occurrence of a non-numeric (string) MIN/MAX extreme, read as a scalar rather than a
+    /// Num (the Num path is numeric only). The multiset orders entries by `MinMaxKey`.
+    fn accumulate_extreme(&mut self, value: ScalarValue) {
+        match self {
+            GroupAggState::Extremes { counts, .. } => {
+                *counts.entry(MinMaxKey::from_scalar(&value)).or_insert(0) += 1;
+            }
+            _ => unreachable!("accumulate_extreme on a non-extremes aggregate"),
+        }
+    }
+
+    /// Removes one occurrence of a string MIN/MAX extreme (the changelog retraction).
+    fn retract_extreme(&mut self, value: ScalarValue) {
+        match self {
+            GroupAggState::Extremes { counts, .. } => {
+                let key = MinMaxKey::from_scalar(&value);
+                if let Some(count) = counts.get_mut(&key) {
+                    *count -= 1;
+                    if *count <= 0 {
+                        counts.remove(&key);
+                    }
+                }
+            }
+            _ => unreachable!("retract_extreme on a non-extremes aggregate"),
         }
     }
 
@@ -2313,6 +2356,22 @@ impl GroupAggregator {
         let distinct_cols: Vec<Option<usize>> = (0..num_agg)
             .map(|i| (self.kinds[i] == 7).then_some(self.value_columns[i] as usize))
             .collect();
+        // Per aggregate, a string MIN/MAX value column (kind 1/2 over Utf8) — folded as a scalar into
+        // the Extremes multiset, not through the numeric Num path.
+        let extreme_str_cols: Vec<Option<usize>> = (0..num_agg)
+            .map(|i| {
+                if matches!(self.kinds[i], 1 | 2) && self.value_columns[i] >= 0 {
+                    let col = self.value_columns[i] as usize;
+                    matches!(
+                        batch.column(col).data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                    .then_some(col)
+                } else {
+                    None
+                }
+            })
+            .collect();
         // Per aggregate, the FILTER boolean column (None = unfiltered). A row folds into aggregate i
         // only where this is TRUE — a NULL or FALSE skips it, matching SQL FILTER / Flink's filterArg.
         let filter_cols: Vec<Option<&BooleanArray>> = (0..num_agg)
@@ -2362,6 +2421,21 @@ impl GroupAggregator {
                         if filter.is_null(row) || !filter.value(row) {
                             continue;
                         }
+                    }
+                    // MIN/MAX over a string folds the value as a scalar into the Extremes multiset
+                    // (skipping nulls — MIN/MAX ignore them), ordered by MinMaxKey.
+                    if let Some(col_idx) = extreme_str_cols[i] {
+                        let column = batch.column(col_idx);
+                        if !column.is_null(row) {
+                            let scalar =
+                                ScalarValue::try_from_array(column, row).expect("extreme string scalar");
+                            if retract {
+                                state.aggs[i].retract_extreme(scalar);
+                            } else {
+                                state.aggs[i].accumulate_extreme(scalar);
+                            }
+                        }
+                        continue;
                     }
                     // COUNT(DISTINCT x) (kind 7) folds the value itself, not a Num — read its scalar
                     // (skipping nulls, which DISTINCT ignores) and add/remove it from the value set.
@@ -11931,6 +12005,31 @@ mod tests {
         // Only the TRUE row counts → +I count=1; the FALSE/NULL rows leave it unchanged (suppressed).
         assert_eq!(row_kinds(&out), vec![0]);
         assert_eq!(values(&out, 1), vec![1]);
+    }
+
+    // MIN/MAX over a string column: the Extremes multiset orders entries byte-lexicographically
+    // (Rust String Ord), retracting the prior extreme as it changes.
+    #[test]
+    fn group_by_min_max_string() {
+        let key: ArrayRef = Arc::new(Int64Array::from(vec![1, 1, 1]));
+        let s: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("banana"), Some("apple"), Some("cherry")]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key0", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, true),
+            ])),
+            vec![key, s],
+        )
+        .unwrap();
+        // MIN, MAX over the string column 1; group on column 0; value type code 3 (Utf8).
+        let mut agg = GroupAggregator::new(vec![1, 2], vec![3, 3], vec![1, 1], vec![0], true);
+        let out = agg.update(&batch);
+        let last = out.num_rows() - 1;
+        let min = out.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let max = out.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(min.value(last), "apple");
+        assert_eq!(max.value(last), "cherry");
     }
 
     // A columnar input from an insert-only producer has no `$row_kind$` column; every row is then an
