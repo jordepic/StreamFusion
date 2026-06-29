@@ -6745,6 +6745,10 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
             DataType::Utf8,
         ));
     }
+    if op == 85 {
+        // SPLIT_INDEX(str, sep, index): Flink's whole-separator split, index-th piece (see SplitIndex).
+        return datafusion::logical_expr::ScalarUDF::new_from_impl(SplitIndex::new()).call(args);
+    }
     if op == 57 {
         // POSITION(sub IN s): operands arrive [sub, s]; strpos takes (string, substring).
         let mut a = args.into_iter();
@@ -6836,6 +6840,74 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
             DataType::Utf8,
         )),
         other => panic!("unsupported expression op: {other}"),
+    }
+}
+
+/// Flink's `SPLIT_INDEX(str, separator, index)`: split `str` on the whole `separator` (preserving
+/// empty tokens) and return the 0-based `index`-th piece, or NULL when `index` is negative or past the
+/// last piece, when `str` is empty (Commons' `splitByWholeSeparatorPreserveAllTokens` yields no tokens
+/// for an empty input), or when any argument is NULL — a faithful port of `SqlFunctionUtils.splitIndex`.
+/// The JVM encoder admits this only with a non-empty literal separator, so Rust's `str::split` (also
+/// non-overlapping, left-to-right, preserving empty tokens) reproduces Commons exactly.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SplitIndex {
+    signature: datafusion::logical_expr::Signature,
+}
+
+impl SplitIndex {
+    fn new() -> Self {
+        Self {
+            signature: datafusion::logical_expr::Signature::variadic_any(
+                datafusion::logical_expr::Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl datafusion::logical_expr::ScalarUDFImpl for SplitIndex {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "split_index"
+    }
+    fn signature(&self) -> &datafusion::logical_expr::Signature {
+        &self.signature
+    }
+    fn return_type(&self, _: &[DataType]) -> datafusion::common::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(
+        &self,
+        args: datafusion::logical_expr::ScalarFunctionArgs,
+    ) -> datafusion::common::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+        let rows = args.number_rows;
+        let arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let strs = arrow::compute::cast(&arrays[0], &DataType::Utf8)?;
+        let seps = arrow::compute::cast(&arrays[1], &DataType::Utf8)?;
+        let idxs = arrow::compute::cast(&arrays[2], &DataType::Int32)?;
+        let strs = strs.as_any().downcast_ref::<StringArray>().expect("utf8 str");
+        let seps = seps.as_any().downcast_ref::<StringArray>().expect("utf8 sep");
+        let idxs = idxs.as_any().downcast_ref::<Int32Array>().expect("i32 index");
+        let mut builder = arrow::array::StringBuilder::new();
+        for row in 0..rows {
+            if strs.is_null(row) || seps.is_null(row) || idxs.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let index = idxs.value(row);
+            let str = strs.value(row);
+            if index < 0 || str.is_empty() {
+                builder.append_null();
+                continue;
+            }
+            match str.split(seps.value(row)).nth(index as usize) {
+                Some(piece) => builder.append_value(piece),
+                None => builder.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 }
 
@@ -12666,6 +12738,41 @@ mod tests {
             out.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(),
             &[99, 40, 200]
         );
+    }
+
+    // SPLIT_INDEX(url, '/', 3) over the Calc path: 0-based whole-separator split, NULL out of range /
+    // for an empty input / for a null argument (Flink's splitByWholeSeparatorPreserveAllTokens).
+    #[test]
+    fn calc_split_index_matches_flink() {
+        let url: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("http://h/a/b"),
+            Some("x"),
+            Some(""),
+            None,
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, true)])),
+            vec![url],
+        )
+        .unwrap();
+        let mut calc = CalcExpression {
+            kinds: vec![6, 0, 3, 7],    // CALL(SPLIT_INDEX), col url, lit "/", lit 3
+            payload: vec![85, 0, 0, 0], // op 85; col 0; strings[0]; longs[0]
+            child_counts: vec![3, 0, 0, 0],
+            longs: vec![3],
+            doubles: vec![],
+            strings: vec![Some("/".to_string())],
+            projection_roots: vec![0],
+            condition_root: -1,
+            output_names: vec!["dir".to_string()],
+            compiled: None,
+        };
+        let out = calc.evaluate(batch);
+        let col = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(col.value(0), "a"); // ["http:","","h","a","b"][3]
+        assert!(col.is_null(1)); // ["x"] has no index 3
+        assert!(col.is_null(2)); // empty input -> no tokens
+        assert!(col.is_null(3)); // null url
     }
 
     // The by-key split sends every row with the same key to the same partition and preserves all

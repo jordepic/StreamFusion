@@ -348,6 +348,9 @@ final class RexExpression {
       add(KIND_CALL, 57, 2);
       return emit(args.get(0)) && emit(args.get(1));
     }
+    if ("SPLIT_INDEX".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitSplitIndex(call.getOperands());
+    }
     if ("ABS".equalsIgnoreCase(call.getOperator().getName())) {
       return emitFloatUnary(call, 62);
     }
@@ -635,6 +638,33 @@ final class RexExpression {
       return reject(call.getOperator().getName() + " pad string must be a literal");
     }
     add(KIND_CALL, op, args.size());
+    for (RexNode arg : args) {
+      if (!emit(arg)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Emits {@code SPLIT_INDEX(str, sep, index)} (op 85). Admitted only when {@code sep} is a non-empty
+   * string literal: with a whole, non-empty separator the native split reproduces Flink's
+   * {@code splitByWholeSeparatorPreserveAllTokens} exactly. An empty or runtime separator (or the
+   * char-code overload) falls back.
+   */
+  private boolean emitSplitIndex(List<RexNode> args) {
+    if (args.size() != 3) {
+      return reject("SPLIT_INDEX requires 3 arguments");
+    }
+    RexNode separator = args.get(1);
+    if (!(separator instanceof RexLiteral)) {
+      return reject("SPLIT_INDEX requires a literal separator");
+    }
+    String value = ((RexLiteral) separator).getValueAs(String.class);
+    if (value == null || value.isEmpty()) {
+      return reject("SPLIT_INDEX requires a non-empty separator");
+    }
+    add(KIND_CALL, 85, 3);
     for (RexNode arg : args) {
       if (!emit(arg)) {
         return false;
