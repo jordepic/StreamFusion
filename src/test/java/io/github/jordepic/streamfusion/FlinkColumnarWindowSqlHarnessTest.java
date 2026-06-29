@@ -158,6 +158,19 @@ class FlinkColumnarWindowSqlHarnessTest {
             + "GROUP BY window_start, window_end, k");
   }
 
+  @Test
+  void proctimeSessionWindowRoutesToNative() throws Exception {
+    // A proctime SESSION window: the gap is timed on the clock and a session closes on a
+    // processing-time timer at the last element's `now + gap`. Non-deterministic boundaries (see the
+    // CLAUDE.md note) — assert it routes and runs; NativeColumnarSessionWindowAggregateOperatorTest
+    // pins the gap-merge/close correctness with a fixed clock.
+    NativeParity.assertRoutes(
+        FlinkColumnarWindowSqlHarnessTest::proctimeEnvironment,
+        "SELECT window_start, window_end, k, SUM(v) AS s "
+            + "FROM TABLE(SESSION(TABLE src PARTITION BY k, DESCRIPTOR(pt), INTERVAL '5' SECOND)) "
+            + "GROUP BY window_start, window_end, k");
+  }
+
   private static TableEnvironment proctimeEnvironment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);

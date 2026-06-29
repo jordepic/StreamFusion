@@ -760,6 +760,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         int[] valueTypes =
             WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), agg.getInput().getRowType());
         int[] kinds = WindowAggregateMatcher.kinds(agg.aggCalls());
+        boolean proctime = WindowAggregateMatcher.isProctime(agg.windowing());
         // Always columnar: the keyed shuffle stays Arrow where it sits on a columnar
         // producer, otherwise the transition pass transposes at the boundary.
         return new StreamPhysicalNativeColumnarSessionWindowAggregate(
@@ -772,7 +773,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             valueColumns,
             keyColumns,
             valueTypes,
-            kinds);
+            kinds,
+            proctime);
       }
     }
 

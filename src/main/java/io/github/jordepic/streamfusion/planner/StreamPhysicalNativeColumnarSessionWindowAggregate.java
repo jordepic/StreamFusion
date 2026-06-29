@@ -29,6 +29,7 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
   private final int[] keyColumns;
   private final int[] valueTypes;
   private final int[] aggregateKinds;
+  private final boolean proctime;
 
   public StreamPhysicalNativeColumnarSessionWindowAggregate(
       RelOptCluster cluster,
@@ -40,7 +41,8 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
-      int[] aggregateKinds) {
+      int[] aggregateKinds,
+      boolean proctime) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.gapMillis = gapMillis;
@@ -49,11 +51,12 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
+    this.proctime = proctime;
   }
 
   @Override
   public boolean requireWatermark() {
-    return true;
+    return !proctime;
   }
 
   @Override
@@ -73,7 +76,8 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
         valueColumns,
         keyColumns,
         valueTypes,
-        aggregateKinds);
+        aggregateKinds,
+        proctime);
   }
 
   @Override
@@ -88,6 +92,7 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
         valueColumns,
         keyColumns,
         valueTypes,
-        aggregateKinds);
+        aggregateKinds,
+        proctime);
   }
 }

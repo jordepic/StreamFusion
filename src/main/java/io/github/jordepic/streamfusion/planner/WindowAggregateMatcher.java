@@ -50,11 +50,14 @@ final class WindowAggregateMatcher {
       // Proctime windows fire on a processing-time timer chained at each slide boundary and assign by
       // the clock. The timer walks slide boundaries, so the slide must divide the size for every
       // window end to land on one — true for tumbling (slide == size) and the aligned hopping/
-      // cumulative cases (a non-dividing hop falls back). Single-phase only.
+      // cumulative cases (a non-dividing hop falls back). Single-phase only. Sessions are not a
+      // fixed-grid shape (aligned is false) and are handled by matchesSession instead.
+      if (!aligned) {
+        return false;
+      }
       long slide = windowSlide(windowing);
       boolean slideDividesSize = slide > 0 && windowSize(windowing) % slide == 0;
-      return aligned
-          && slideDividesSize
+      return slideDividesSize
           && proctimeTimeAttribute(windowing)
           && supportedAggregates(grouping, aggCalls, inputType);
     }
@@ -166,8 +169,15 @@ final class WindowAggregateMatcher {
       int[] grouping,
       scala.collection.Seq<AggregateCall> aggCalls,
       RelDataType inputType) {
-    return windowing.getWindow() instanceof SessionWindowSpec
-        && supportedAggregation(windowing, grouping, aggCalls, inputType);
+    if (!(windowing.getWindow() instanceof SessionWindowSpec)) {
+      return false;
+    }
+    if (windowing.isProctime()) {
+      // Proctime sessions time the gap on the clock and close on a processing-time timer registered
+      // at each element's `now + gap`; the time attribute is a local-time-zone proctime column.
+      return proctimeTimeAttribute(windowing) && supportedAggregates(grouping, aggCalls, inputType);
+    }
+    return supportedAggregation(windowing, grouping, aggCalls, inputType);
   }
 
   /**

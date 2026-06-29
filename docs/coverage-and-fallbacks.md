@@ -85,9 +85,13 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
     latest open window's end (the slide must divide the size so every window end lands on a slide
     boundary). Non-deterministic, so routing/execution are tested but the result is not byte-compared
     to the host (see the CLAUDE.md note).
-  - **Session windows, window joins, interval joins** — still fall back: not yet ported to the
-    processing-time-timer path (session needs gap-merge on the clock, the joins are two-input).
-    Non-deterministic, so lower-priority — but that is not the gate.
+  - **Session window aggregate** — native; the gap is measured on the processing-time clock and each
+    batch registers a cleanup timer at its `now + gap`, the earliest the session could close with no
+    further input. A later element extends the session (merging in the native aggregator) and
+    registers its own later timer, so a firing emits only the sessions the clock has truly left behind
+    by a full gap. Non-deterministic, so routing/execution are tested but not byte-compared.
+  - **Window joins, interval joins** — still fall back: not yet ported to the processing-time-timer
+    path (the joins are two-input). Non-deterministic, so lower-priority — but that is not the gate.
   - A proctime bounded-RANGE `OVER` frame falls back: with processing time materialized as a fixed
     per-batch timestamp, a wall-clock-interval frame has no meaningful definition.
 
@@ -123,10 +127,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Regular join** — unsupported join type; no equi key; non-null-dropping keys; non-equi residual not
   expressible; an input column type the converter can't carry.
 - **Window aggregate / local / global** — window not event-time `TUMBLE`/`HOP`/`CUMULATE` (zero offset)
-  over a local-time-zone rowtime — or, for **proctime**, anything other than a single-phase
-  `TUMBLE`/`HOP`/`CUMULATE` whose slide divides its size (proctime session and the two-phase local/
-  global are not yet on the processing-time-timer path); `HOP` slide / `CUMULATE` step doesn't divide
-  size; key type outside bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate
+  over a local-time-zone rowtime — or, for **proctime**, a single-phase `TUMBLE`/`HOP`/`CUMULATE` whose
+  slide divides its size, or a single-phase `SESSION`; anything else proctime (the two-phase local/
+  global path) is not yet on the processing-time-timer path; `HOP` slide / `CUMULATE` step doesn't
+  divide size; key type outside bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate
   mismatch; `AVG` (where noted); two-phase partials not single-field bigint/double.
 - **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, UDAF); a `DISTINCT`
   aggregate other than `COUNT(DISTINCT x)` (`SUM`/`MIN`/`MAX` `DISTINCT` fall back); idle-state TTL ≠ 0;
