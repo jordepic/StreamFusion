@@ -6,17 +6,19 @@ import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRank;
+import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.runtime.operators.rank.ConstantRankRange;
 import org.apache.flink.table.runtime.operators.rank.RankType;
 
 /**
- * Recognizes append-only keep-first deduplication: {@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY
- * rowtime ASC) = 1}. The host plans this as a {@link StreamPhysicalRank} whose sole order key is an
- * event-time attribute ascending and whose range is exactly rank 1 — distinct from a value-ordered
- * Top-N (handled by {@link TopNMatcher}). Such a rank is Flink's insert-only {@code
- * RowTimeDeduplicateKeepFirstRowFunction}: per key, emit the minimum-rowtime row once, when the
- * watermark reaches it. Keep-last (descending) is retracting and falls back; a non-time order key is
- * a Top-N, not deduplication.
+ * Recognizes row-time deduplication: {@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY rowtime …) =
+ * 1}. The host plans this as a {@link StreamPhysicalRank} whose sole order key is an event-time
+ * attribute and whose range is exactly rank 1 — distinct from a value-ordered Top-N (handled by
+ * {@link TopNMatcher}). Ascending is keep-first (Flink's insert-only {@code
+ * RowTimeDeduplicateKeepFirstRowFunction}: per key emit the minimum-rowtime row once, on the
+ * watermark); descending is keep-last (Flink's {@code RowTimeDeduplicateFunction}: per key keep the
+ * maximum-rowtime row, emitting a retract changelog eagerly). A non-time order key is a Top-N, not
+ * deduplication.
  */
 final class DeduplicateMatcher {
 
@@ -33,15 +35,24 @@ final class DeduplicateMatcher {
     if (range.getRankStart() != 1 || range.getRankEnd() != 1) {
       return false; // exactly the top row per key
     }
-    List<RelFieldCollation> collations = rank.orderKey().getFieldCollations();
-    if (collations.size() != 1 || collations.get(0).getDirection().isDescending()) {
-      return false; // keep-first is a single ascending order key (keep-last is retracting → host)
+    if (rank.orderKey().getFieldCollations().size() != 1) {
+      return false; // a single order key (the rowtime); ascending = keep-first, descending = keep-last
     }
     if (!isRowtimeOrder(rank)) {
       return false; // a non-time order key is a value Top-N, not deduplication
     }
     return RowDataArrowConverter.supports(
         FlinkTypeFactory$.MODULE$.toLogicalRowType(rank.getRowType()));
+  }
+
+  /** Keep-last (descending rowtime) vs keep-first (ascending). Keep-last emits a retract changelog. */
+  static boolean keepLast(StreamPhysicalRank rank) {
+    return rank.orderKey().getFieldCollations().get(0).getDirection().isDescending();
+  }
+
+  /** Whether the host wants UPDATE_BEFORE rows on this node's output edge (keep-last only). */
+  static boolean generateUpdateBefore(StreamPhysicalRank rank) {
+    return ChangelogPlanUtils.generateUpdateBefore(rank);
   }
 
   /** Whether the rank's sole order key is an event-time (rowtime) attribute — the dedup signal. */
@@ -64,7 +75,7 @@ final class DeduplicateMatcher {
   }
 
   static String unsupportedReason(StreamPhysicalRank rank) {
-    return "deduplication: needs ROW_NUMBER() OVER (PARTITION BY … ORDER BY rowtime ASC) = 1"
-        + " (keep-first, insert-only); keep-last/descending is retracting and stays on the host";
+    return "deduplication: needs ROW_NUMBER() OVER (PARTITION BY … ORDER BY rowtime ASC|DESC) = 1"
+        + " (keep-first or keep-last) over an insert-only input with zero idle-state TTL";
   }
 }

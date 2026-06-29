@@ -13,6 +13,14 @@ source/sink runs natively (Arrow in/out). One unsupported interior operator ther
 **whole** query back to Flink (the all-or-nothing gate below). Use `NativePlanner.explain(...)` or
 `-Dstreamfusion.logFallbackReasons=true` to see the recorded reason(s) for a given query.
 
+**What counts as a fallback.** A fallback is something **Flink executes that we don't accelerate** —
+a real gap we could close. It is *not* a fallback when Flink itself rejects the query in streaming
+(e.g. `RANK`/`DENSE_RANK` Top-N, `LEAD`/non-time/`FOLLOWING` `OVER`, non-temporal `ORDER BY`): we match
+Flink by also not running it, which is **parity**, not a gap. Nor is it a fallback when the feature
+already accelerates via another plan shape (e.g. `UNION` distinct, which the host rewrites to a
+`GROUP BY`). This file lists only real gaps; parity cases are called out as such where they'd otherwise
+look like one.
+
 ---
 
 ## (a) What we don't support
@@ -29,14 +37,13 @@ These have no matcher; any query containing one falls back entirely.
 | `GroupWindowAggregate`, `GroupWindowTableAggregate` | legacy `GROUP BY TUMBLE(...)` windowing, and proctime group windows |
 | `IncrementalGroupAggregate` | the three-phase (distinct) non-windowed `GROUP BY`. The ordinary two-phase / mini-batch `LocalGroupAggregate` + `GlobalGroupAggregate` (+ `MiniBatchAssigner`) **is** native — see the feature gaps and §2 below |
 | `GroupTableAggregate` | `TableAggregateFunction` |
-| `DropUpdateBefore`, `Values`, plain `Sort` | misc |
+| `DropUpdateBefore`, `Values` | misc (a non-temporal `Sort` is parity — Flink rejects it in streaming) |
 | `LegacyTableSourceScan`, `LegacySink` | legacy connectors |
 | `Python*` (`PythonCalc`/`PythonCorrelate`/`PythonGroupAggregate`/`PythonOverAggregate`/…) | PyFlink UDFs |
 
 ### Feature gaps inside operators we *do* support
-- **Nested types** (`ARRAY`/`MAP`/`ROW`) are carried through filters/projections, usable as GROUP BY /
-  join / dedup keys, and as a `COUNT` value column (see §4). The remaining nested-type gap is *ordering*
-  a nested value (`MAX`/`ORDER BY`/Top-N sort) — which Flink also rejects.
+(Real gaps only — Flink runs these and we don't yet. Ordering a nested value, `MAX(array)`/`ORDER BY
+array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Aggregates** — `SUM`/`AVG` over decimal; two-phase `AVG`; window `AVG` only as a lone aggregate;
   non-windowed `GROUP BY` `AVG` only via the host's SUM/COUNT rewrite (not modeled natively); value
   types outside bigint/double/int/smallint/tinyint/float (see `aggregate-type-support.md`).
@@ -48,17 +55,20 @@ These have no matcher; any query containing one falls back entirely.
   Scope: SUM/MIN/MAX/COUNT over bigint/int/double, with **no widening of the partial** — `SUM(INT)`
   (whose partial Flink widens to bigint) routes single-phase, as does `AVG`/distinct (the latter plans
   as `IncrementalGroupAggregate`). Row-time mini-batch falls back.
-- **`OVER`** — only the `RANGE UNBOUNDED PRECEDING … CURRENT ROW` frame (no `ROWS` frame, no bounded
-  frame); value column bigint/int/double only; `LAG` (model mismatch), `LEAD` (Flink-unsupported in
-  streaming).
-- **Top-N** — `ROW_NUMBER` only (Flink itself rejects streaming `RANK`/`DENSE_RANK`); rank range must
-  start at 1 (no `OFFSET`); insert-only input (no retracting Top-N).
-- **Deduplication** — keep-first (`ORDER BY rowtime ASC`) only; keep-last falls back.
+- **`OVER`** — only the unbounded `RANGE … CURRENT ROW` frame over one ascending rowtime, all
+  aggregates over one shared bigint/int/double value column. Real gaps: bounded frames (`ROWS`
+  unbounded/`n PRECEDING`, bounded-`RANGE` time interval), more than one window group, independent
+  value columns, wider value types, and proctime ordering. (`FOLLOWING` frames, non-time/descending
+  order, and `LAG`/`LEAD` are parity — Flink rejects them in streaming.)
+- **Top-N** — rank range must start at 1 (no `OFFSET`); insert-only input only (no retracting Top-N).
+  (`RANK`/`DENSE_RANK` are parity — Flink rejects them in streaming.)
+- **Deduplication** — rowtime keep-first (`ORDER BY rowtime ASC`, insert-only) and keep-last (`DESC`,
+  retracting) are both native; proctime deduplication falls back.
 - **Joins** — proctime interval/window joins fall back; a residual non-equi predicate must be
   expressible by the native expression engine.
 - **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
   (see below); CDC only Debezium/OGG JSON.
-- **Proctime** variants of essentially every event-time operator (sort, dedup, window agg, joins).
+- **Proctime** variants of essentially every event-time operator (dedup, window agg, joins, `OVER`).
 
 ---
 
@@ -78,9 +88,10 @@ These have no matcher; any query containing one falls back entirely.
   `groupAggregate` switch. `kafkaSource` defaults to *false*.
 
 ### 2. Per-operator matcher declines (exact conditions)
-- **OVER** — more than one window group; frame ≠ `UNBOUNDED PRECEDING…CURRENT ROW`; order key not
-  exactly one ascending rowtime; aggregates not all over one shared bigint/int/double value column;
-  `PARTITION BY` key outside bigint/int/string/boolean/date/timestamp/decimal.
+- **OVER** — more than one window group; a bounded frame (`ROWS`, or bounded-`RANGE`); proctime
+  ordering; aggregates not all over one shared bigint/int/double value column; `PARTITION BY` key
+  outside bigint/int/string/boolean/date/timestamp/decimal. (Non-time/descending order, `FOLLOWING`
+  frames, and `LAG`/`LEAD` never reach us — Flink rejects them in streaming.)
 - **Interval join** — not INNER/LEFT/RIGHT/FULL; no equi key; non-null-dropping (non-INNER) keys;
   equi-key type outside the supported set; non-equi residual not expressible; proctime bounds.
 - **Window join** — same key/type/non-equi conditions; both sides must carry an event-time
@@ -99,14 +110,18 @@ These have no matcher; any query containing one falls back entirely.
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT; a partial
   column outside bigint/int/double; an unsupported grouping-key/output column type. (Both halves must
   match for the query to accelerate — one staying on the host drags the whole query back via the gate.)
-- **Top-N / LIMIT** — not `ROW_NUMBER`; rank range not a constant starting at 1 (an `OFFSET`); a row
-  type the converter can't carry; (`LIMIT`) missing `FETCH`, or an `OFFSET`.
-- **Deduplicate** — not rowtime-`ASC` rank-1 keep-first.
-- **Window Top-N / window dedup** — not `ROW_NUMBER` over a windowing-TVF; rank not starting at 1.
+- **Top-N / LIMIT** — rank range not a constant starting at 1 (an `OFFSET`); a retracting input (no
+  retracting Top-N); a row type the converter can't carry; (`LIMIT`) missing `FETCH`, or an `OFFSET`.
+  (`RANK`/`DENSE_RANK` never reach us — Flink rejects them in streaming.)
+- **Deduplicate** — not a rowtime rank-1 (keep-first `ASC` or keep-last `DESC` are both native);
+  proctime deduplication falls back.
+- **Window Top-N / window dedup** — rank not starting at 1 (an `OFFSET`).
 - **Windowing TVF** — not event-time `TUMBLE`/`HOP`/`CUMULATE` (zero offset) over a local-time-zone
   rowtime.
-- **Event-time sort** — more than one order key, descending, or a non-timestamp order key.
-- **Union** — not `UNION ALL`; row type the converter can't carry.
+- **Event-time sort** — a secondary order key beyond the leading ascending rowtime. (A descending or
+  non-time leading key is a non-temporal `Sort`, which Flink rejects in streaming — parity.)
+- **Union** — a row type the converter can't carry. (`UNION` distinct is not a fallback — the host
+  rewrites it to a `GROUP BY`, which routes through the aggregate path.)
 - **Expand** — any project cell that isn't a column ref, a NULL literal, or the integer expand id.
 - **ChangelogNormalize** — a pushed filter condition; the source-reuse variant; a row type the
   converter can't carry.
