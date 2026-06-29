@@ -27,6 +27,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] sortNullsFirst;
   private final long limit;
   private final boolean outputRankNumber;
+  private final boolean retracting;
 
   public NativeColumnarTopNExecNode(
       ReadableConfig tableConfig,
@@ -38,7 +39,8 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
       int[] sortAscending,
       int[] sortNullsFirst,
       long limit,
-      boolean outputRankNumber) {
+      boolean outputRankNumber,
+      boolean retracting) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-top-n_1"),
@@ -52,6 +54,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
     this.sortNullsFirst = sortNullsFirst;
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
+    this.retracting = retracting;
   }
 
   @Override
@@ -64,7 +67,13 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
         input,
         createTransformationMeta(TRANSFORMATION, config),
         new NativeColumnarTopNOperator(
-            partitionColumns, sortIndices, sortAscending, sortNullsFirst, limit, outputRankNumber),
+            partitionColumns,
+            sortIndices,
+            sortAscending,
+            sortNullsFirst,
+            limit,
+            outputRankNumber,
+            retracting),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

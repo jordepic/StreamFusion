@@ -4282,6 +4282,227 @@ impl TopNRanker {
     }
 }
 
+/// Retracting streaming Top-N — Flink's `RetractableTopNFunction`: a `ROW_NUMBER() OVER (PARTITION BY
+/// … ORDER BY …) <= N` over a **changelog** input (e.g. a Top-N of a GROUP BY result). Unlike the
+/// append-only ranker it keeps the **full** sorted buffer per key (never truncated to N), so when a
+/// top-N row is retracted the row that was at rank N+1 can be promoted into the top-N.
+///
+/// Each input row accumulates (`+I`/`+U`) by inserting into the sorted buffer or retracts (`-U`/`-D`)
+/// by removing the first full-row-equal match. The emitted changelog is then the **diff of the top-N
+/// before vs after** the mutation: with the rank number projected, compared by rank position (a
+/// changed occupant → `-U`(old)/`+U`(new), a newly-occupied rank → `+I`, a vacated rank → `-D`);
+/// without it, compared as a row multiset (rows that left → `-D`, rows that entered → `+I`). This
+/// single diff covers insert and retract and collapses to the same materialized result as Flink's
+/// per-case cascade.
+struct RetractableTopNRanker {
+    partition_columns: Vec<usize>,
+    sort_columns: Vec<SortColumn>,
+    limit: i64,
+    output_rank_number: bool,
+    schema: Option<SchemaRef>,
+    groups: HashMap<GroupKey, Vec<JoinRow>>,
+}
+
+impl RetractableTopNRanker {
+    fn new(
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        output_rank_number: bool,
+    ) -> Self {
+        RetractableTopNRanker {
+            partition_columns,
+            sort_columns,
+            limit,
+            output_rank_number,
+            schema: None,
+            groups: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
+        let arity = data_arity(batch);
+        self.schema = Some(data_schema(batch));
+        let partition_arrays: Vec<&ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+        let row_kinds = row_kind_column(batch);
+        let limit = self.limit as usize;
+
+        let mut out_rows: Vec<JoinRow> = Vec::new();
+        let mut out_kinds: Vec<i8> = Vec::new();
+        let mut out_ranks: Vec<i64> = Vec::new();
+
+        for row in 0..batch.num_rows() {
+            let key = read_key(&partition_arrays, row);
+            let full: JoinRow = data_arrays
+                .iter()
+                .map(|a| ScalarValue::try_from_array(a, row).expect("retract top-n row scalar"))
+                .collect();
+            // +I(0)/+U(2) accumulate; -U(1)/-D(3) retract.
+            let retract = matches!(row_kinds.map(|k| k.value(row)).unwrap_or(0), 1 | 3);
+            let sort = &self.sort_columns;
+            let buffer = self.groups.entry(key).or_default();
+            let old_top: Vec<JoinRow> = buffer[..limit.min(buffer.len())].to_vec();
+            if retract {
+                if let Some(pos) = buffer.iter().position(|r| *r == full) {
+                    buffer.remove(pos);
+                }
+            } else {
+                let pos = buffer
+                    .partition_point(|r| compare_rows(r, &full, sort) != std::cmp::Ordering::Greater);
+                buffer.insert(pos, full.clone());
+            }
+            let new_top: Vec<JoinRow> = buffer[..limit.min(buffer.len())].to_vec();
+            self.diff(&old_top, &new_top, &mut out_rows, &mut out_kinds, &mut out_ranks);
+        }
+        self.emit(out_rows, out_kinds, out_ranks)
+    }
+
+    /// Appends the changelog transitioning the top-N from `old_top` to `new_top` (see the struct doc).
+    fn diff(
+        &self,
+        old_top: &[JoinRow],
+        new_top: &[JoinRow],
+        out_rows: &mut Vec<JoinRow>,
+        out_kinds: &mut Vec<i8>,
+        out_ranks: &mut Vec<i64>,
+    ) {
+        if self.output_rank_number {
+            for i in 0..old_top.len().max(new_top.len()) {
+                match (old_top.get(i), new_top.get(i)) {
+                    (Some(o), Some(n)) if o != n => {
+                        out_rows.push(o.clone());
+                        out_kinds.push(1); // -U the old occupant of this rank
+                        out_ranks.push(i as i64 + 1);
+                        out_rows.push(n.clone());
+                        out_kinds.push(2); // +U the new occupant
+                        out_ranks.push(i as i64 + 1);
+                    }
+                    (Some(_), Some(_)) => {} // rank unchanged
+                    (Some(o), None) => {
+                        out_rows.push(o.clone());
+                        out_kinds.push(3); // -D a rank that lost its occupant
+                        out_ranks.push(i as i64 + 1);
+                    }
+                    (None, Some(n)) => {
+                        out_rows.push(n.clone());
+                        out_kinds.push(0); // +I a newly-occupied rank
+                        out_ranks.push(i as i64 + 1);
+                    }
+                    (None, None) => {}
+                }
+            }
+        } else {
+            // No rank column — only membership matters; diff the two row multisets.
+            let mut old_counts: HashMap<&JoinRow, i32> = HashMap::new();
+            for r in old_top {
+                *old_counts.entry(r).or_insert(0) += 1;
+            }
+            for r in new_top {
+                match old_counts.get_mut(r) {
+                    Some(c) if *c > 0 => *c -= 1, // still present — no change
+                    _ => {
+                        out_rows.push(r.clone());
+                        out_kinds.push(0); // +I a row that entered the top-N
+                    }
+                }
+            }
+            for (r, count) in old_counts {
+                for _ in 0..count {
+                    out_rows.push(r.clone());
+                    out_kinds.push(3); // -D a row that left the top-N
+                }
+            }
+        }
+    }
+
+    fn emit(&self, out_rows: Vec<JoinRow>, out_kinds: Vec<i8>, out_ranks: Vec<i64>) -> RecordBatch {
+        if out_rows.is_empty() {
+            return RecordBatch::new_empty(Arc::new(Schema::empty()));
+        }
+        let schema = self.schema.as_ref().expect("schema set once a row was processed");
+        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        if self.output_rank_number {
+            fields.push(Field::new("w0$o0", DataType::Int64, false));
+            columns.push(Arc::new(Int64Array::from(out_ranks)));
+        }
+        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
+        columns.push(Arc::new(Int8Array::from(out_kinds)));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build retract top-n changelog batch")
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let Some(schema) = &self.schema else { return Vec::new() };
+        let rows: Vec<&JoinRow> = self.groups.values().flatten().collect();
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let columns: Vec<ArrayRef> = (0..fields.len())
+            .map(|j| {
+                scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
+            })
+            .collect();
+        write_ipc(
+            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("retract top-n snapshot"),
+        )
+    }
+
+    fn restore(
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        output_rank_number: bool,
+        bytes: &[u8],
+    ) -> Self {
+        let mut ranker =
+            RetractableTopNRanker::new(partition_columns, sort_columns, limit, output_rank_number);
+        for batch in read_ipc_if_present(bytes) {
+            ranker.schema = Some(batch.schema());
+            let partition_arrays: Vec<&ArrayRef> =
+                ranker.partition_columns.iter().map(|&i| batch.column(i)).collect();
+            for row in 0..batch.num_rows() {
+                let key = read_key(&partition_arrays, row);
+                let full: JoinRow = (0..batch.num_columns())
+                    .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("retract top-n scalar"))
+                    .collect();
+                ranker.groups.entry(key).or_default().push(full); // stored in buffer (sorted) order
+            }
+        }
+        ranker
+    }
+}
+
+/// The Top-N handle the JVM holds: append-only (insert-only input, bounded buffer) or retracting
+/// (changelog input, full buffer). Both push a batch and return a changelog, snapshot, and restore.
+enum TopNHandle {
+    Append(TopNRanker),
+    Retract(RetractableTopNRanker),
+}
+
+impl TopNHandle {
+    fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
+        match self {
+            TopNHandle::Append(r) => r.push(batch),
+            TopNHandle::Retract(r) => r.push(batch),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        match self {
+            TopNHandle::Append(r) => r.snapshot(),
+            TopNHandle::Retract(r) => r.snapshot(),
+        }
+    }
+}
+
 /// Append-only keep-first deduplication on a rowtime order — Flink's
 /// `RowTimeDeduplicateKeepFirstRowFunction`. Per partition key it keeps the row with the minimum
 /// rowtime and emits it exactly once, when a watermark reaches that rowtime; every later row for the
@@ -8970,10 +9191,16 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRan
     sort_nulls_first: JIntArray<'local>,
     limit: jlong,
     output_rank_number: jboolean,
+    retracting: jboolean,
 ) -> jlong {
     let partitions = read_columns(&env, &partition_columns);
     let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
-    Box::into_raw(Box::new(TopNRanker::new(partitions, sort, limit, output_rank_number != 0))) as jlong
+    let handle = if retracting != 0 {
+        TopNHandle::Retract(RetractableTopNRanker::new(partitions, sort, limit, output_rank_number != 0))
+    } else {
+        TopNHandle::Append(TopNRanker::new(partitions, sort, limit, output_rank_number != 0))
+    };
+    Box::into_raw(Box::new(handle)) as jlong
 }
 
 /// Folds an input batch into the per-partition top-N and exports the changelog it produces (the
@@ -8988,19 +9215,19 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pushTopNRanke
     out_array_address: jlong,
     out_schema_address: jlong,
 ) {
-    let ranker = unsafe { &mut *(handle as *mut TopNRanker) };
+    let ranker = unsafe { &mut *(handle as *mut TopNHandle) };
     let result = ranker.push(&import_record_batch(in_array_address, in_schema_address));
     export_record_batch(result, out_array_address, out_schema_address);
 }
 
-/// Serializes the ranker's bounded per-partition buffers for a checkpoint.
+/// Serializes the ranker's per-partition buffers for a checkpoint.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTopNRanker<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) -> jbyteArray {
-    let ranker = unsafe { &mut *(handle as *mut TopNRanker) };
+    let ranker = unsafe { &mut *(handle as *mut TopNHandle) };
     env.byte_array_from_slice(&ranker.snapshot())
         .expect("failed to allocate top-n snapshot array")
         .into_raw()
@@ -9017,13 +9244,24 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
     sort_nulls_first: JIntArray<'local>,
     limit: jlong,
     output_rank_number: jboolean,
+    retracting: jboolean,
     snapshot: JByteArray<'local>,
 ) -> jlong {
     let partitions = read_columns(&env, &partition_columns);
     let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read top-n snapshot");
-    Box::into_raw(Box::new(TopNRanker::restore(partitions, sort, limit, output_rank_number != 0, &bytes)))
-        as jlong
+    let handle = if retracting != 0 {
+        TopNHandle::Retract(RetractableTopNRanker::restore(
+            partitions,
+            sort,
+            limit,
+            output_rank_number != 0,
+            &bytes,
+        ))
+    } else {
+        TopNHandle::Append(TopNRanker::restore(partitions, sort, limit, output_rank_number != 0, &bytes))
+    };
+    Box::into_raw(Box::new(handle)) as jlong
 }
 
 /// Releases a Top-N ranker handle.
@@ -9034,7 +9272,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTopNRank
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut TopNRanker));
+        drop(Box::from_raw(handle as *mut TopNHandle));
     }
 }
 
