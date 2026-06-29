@@ -75,15 +75,18 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   expressible by the native expression engine.
 - **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
   (see below); CDC only Debezium/OGG JSON.
-- **Proctime** windows and joins fall back because they are **not yet implemented** — they close
-  windows / evict join state on a wall-clock processing-time timer, a mechanism we don't have (every
-  native operator today flushes on a watermark instead). Their output is also non-deterministic, which
-  makes them harder to test and so lower-priority, but that is not the gate — see the CLAUDE.md note,
-  we are fine using our own implementation for non-deterministic functions. Proctime **deduplication**
-  and **`OVER`** (running / bounded-ROWS) are native: they emit eagerly in arrival order, no
-  wall-clock timer needed. A proctime bounded-RANGE OVER frame falls back because, with processing
-  time materialized as a fixed per-batch timestamp, a wall-clock-interval frame has no meaningful
-  definition — the running and ROWS frames already cover the well-defined proctime cases.
+- **Proctime** support, by operator:
+  - **Deduplication** and **`OVER`** (running / bounded-ROWS) — native; they emit eagerly in arrival
+    order, no wall-clock timer needed.
+  - **`TUMBLE` window aggregate** — native; it assigns each row to the window of the operator's
+    current processing-time clock and fires on a processing-time timer (the timer infrastructure that
+    wall-clock windows need). Non-deterministic, so routing/execution are tested but the result is not
+    byte-compared to the host (see the CLAUDE.md note).
+  - **`HOP`/`CUMULATE`/session windows, window joins, interval joins** — still fall back: not yet
+    ported to the processing-time-timer path (`HOP`/`CUMULATE` have overlapping open windows, the
+    joins are two-input). Non-deterministic, so lower-priority — but that is not the gate.
+  - A proctime bounded-RANGE `OVER` frame falls back: with processing time materialized as a fixed
+    per-batch timestamp, a wall-clock-interval frame has no meaningful definition.
 
 ---
 
@@ -117,9 +120,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Regular join** — unsupported join type; no equi key; non-null-dropping keys; non-equi residual not
   expressible; an input column type the converter can't carry.
 - **Window aggregate / local / global** — window not event-time `TUMBLE`/`HOP`/`CUMULATE` (zero offset)
-  over a local-time-zone rowtime; `HOP` slide / `CUMULATE` step doesn't divide size; key type outside
-  bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate mismatch; `AVG` (where noted);
-  two-phase partials not single-field bigint/double.
+  over a local-time-zone rowtime — or, for **proctime**, anything other than a single-phase `TUMBLE`
+  (proctime `HOP`/`CUMULATE`/local/global are not yet on the processing-time-timer path); `HOP` slide /
+  `CUMULATE` step doesn't divide size; key type outside bigint/int/string/boolean/date/timestamp/decimal;
+  value type/aggregate mismatch; `AVG` (where noted); two-phase partials not single-field bigint/double.
 - **GROUP BY (non-windowed)** — any aggregate other than SUM/MIN/MAX/COUNT (`AVG`, UDAF); a `DISTINCT`
   aggregate other than `COUNT(DISTINCT x)` (`SUM`/`MIN`/`MAX` `DISTINCT` fall back); idle-state TTL ≠ 0;
   an unsupported key/value column type. `SUM`/`MIN`/`MAX`/`COUNT` all admit `DECIMAL` (`SUM` →

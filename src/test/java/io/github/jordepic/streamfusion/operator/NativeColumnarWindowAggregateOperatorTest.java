@@ -45,7 +45,7 @@ class NativeColumnarWindowAggregateOperatorTest {
     NativeColumnarWindowAggregateOperator operator =
         new NativeColumnarWindowAggregateOperator(
             false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-            "UTC", OUTPUT);
+            "UTC", OUTPUT, false);
     try (BufferAllocator allocator = new RootAllocator();
         OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
             new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
@@ -59,6 +59,37 @@ class NativeColumnarWindowAggregateOperatorTest {
       harness.processElement(new StreamRecord<>(batch(allocator, event(4, 1500), event(5, 2500))));
       harness.processWatermark(new Watermark(3000));
       assertEquals(List.of(row(7, 1000, 2000), row(5, 2000, 3000)), collect(harness));
+    }
+  }
+
+  /**
+   * Proctime windows ignore the row time column and assign by the operator's processing-time clock,
+   * firing on a processing-time timer. Driving the clock with {@code setProcessingTime} makes this
+   * deterministic (proctime is non-deterministic in a real run — see the CLAUDE.md note). The event
+   * times below are deliberately scattered to show they are ignored: assignment is by the clock.
+   */
+  @Test
+  void emitsProctimeWindowsOnTimer() throws Exception {
+    NativeColumnarWindowAggregateOperator operator =
+        new NativeColumnarWindowAggregateOperator(
+            false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
+            "UTC", OUTPUT, true);
+    try (BufferAllocator allocator = new RootAllocator();
+        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+      harness.setup(new ArrowBatchSerializer());
+      harness.open();
+
+      harness.setProcessingTime(500);
+      harness.processElement(new StreamRecord<>(batch(allocator, event(1, 7000), event(2, 0), event(3, 9000))));
+      assertEquals(List.of(), collect(harness)); // window [0,1000) still open at proctime 500
+      harness.setProcessingTime(1000); // fires the window-end timer
+      assertEquals(List.of(row(6, 0, 1000)), collect(harness));
+
+      harness.setProcessingTime(1500);
+      harness.processElement(new StreamRecord<>(batch(allocator, event(4, 100), event(5, 8000))));
+      harness.setProcessingTime(2000);
+      assertEquals(List.of(row(9, 1000, 2000)), collect(harness));
     }
   }
 

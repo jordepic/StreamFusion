@@ -46,7 +46,25 @@ final class WindowAggregateMatcher {
     } else {
       aligned = false;
     }
+    if (windowing.isProctime()) {
+      // Proctime windows fire on a processing-time timer and assign by the clock. Only single-phase
+      // TUMBLE is supported so far (one open window at a time keeps the timer model simple).
+      return spec instanceof TumblingWindowSpec
+          && proctimeTimeAttribute(windowing)
+          && supportedAggregates(grouping, aggCalls, inputType);
+    }
     return aligned && supportedAggregation(windowing, grouping, aggCalls, inputType);
+  }
+
+  /** Whether the window orders by processing time (fired by a clock timer rather than a watermark). */
+  static boolean isProctime(WindowingStrategy windowing) {
+    return windowing.isProctime();
+  }
+
+  private static boolean proctimeTimeAttribute(WindowingStrategy windowing) {
+    return windowing instanceof TimeAttributeWindowingStrategy
+        && windowing.getTimeAttributeType().getTypeRoot()
+            == LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE;
   }
 
   static boolean isCumulative(WindowingStrategy windowing) {
@@ -165,6 +183,16 @@ final class WindowAggregateMatcher {
         != LogicalTypeRoot.TIMESTAMP_WITH_LOCAL_TIME_ZONE) {
       return false;
     }
+    return supportedAggregates(grouping, aggCalls, inputType);
+  }
+
+  /**
+   * The grouping-key and aggregate terms shared by event-time and proctime windows (the time-attribute
+   * gate differs and is checked by the callers): at most the supported grouping keys, and aggregates
+   * that each read a single supported value column (or none, for COUNT(*)).
+   */
+  private static boolean supportedAggregates(
+      int[] grouping, scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType) {
     if (aggCalls.isEmpty() || !supportedKeys(grouping, inputType)) {
       return false;
     }

@@ -281,6 +281,27 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
    */
   protected final void updateColumnar(
       VectorSchemaRoot in, int timeColumn, int[] valueColumns, int[] keyColumns, int[] keyTypes) {
+    updateColumnarInternal(in, timeColumn, 0L, valueColumns, keyColumns, keyTypes);
+  }
+
+  /**
+   * Proctime variant of {@link #updateColumnar}: every row's window-assignment time is the operator's
+   * current processing time {@code nowMillis} (read once per batch by the caller), not a row column —
+   * matching Flink's processing-time window assigner, which uses the clock rather than a row value.
+   */
+  protected final void updateColumnarProctime(
+      VectorSchemaRoot in, long nowMillis, int[] valueColumns, int[] keyColumns, int[] keyTypes) {
+    updateColumnarInternal(in, -1, nowMillis, valueColumns, keyColumns, keyTypes);
+  }
+
+  private void updateColumnarInternal(
+      VectorSchemaRoot in,
+      int timeColumn,
+      long proctimeMillis,
+      int[] valueColumns,
+      int[] keyColumns,
+      int[] keyTypes) {
+    boolean proctime = timeColumn < 0;
     int rows = in.getRowCount();
     BigIntVector ts = new BigIntVector("ts", allocator);
     FieldVector[] values = new FieldVector[valueColumns.length];
@@ -297,12 +318,12 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
       keys[j] = newKeyVector("key" + j, keyTypes[j]);
       vectors.add(keys[j]);
     }
-    TimeStampNanoVector srcTs = (TimeStampNanoVector) in.getVector(timeColumn);
+    TimeStampNanoVector srcTs = proctime ? null : (TimeStampNanoVector) in.getVector(timeColumn);
     try (VectorSchemaRoot root = new VectorSchemaRoot(vectors);
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
       for (int i = 0; i < rows; i++) {
-        ts.setSafe(i, srcTs.get(i) / 1_000_000L);
+        ts.setSafe(i, proctime ? proctimeMillis : srcTs.get(i) / 1_000_000L);
         for (int a = 0; a < valueColumns.length; a++) {
           if (valueColumns[a] < 0) {
             ((BigIntVector) values[a]).setSafe(i, 1L); // COUNT(*): a non-null constant counts rows
