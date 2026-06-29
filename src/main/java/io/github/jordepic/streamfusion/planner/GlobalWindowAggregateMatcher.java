@@ -52,9 +52,8 @@ final class GlobalWindowAggregateMatcher {
     }
     int[] grouping = aggregate.grouping();
     RelDataType inputType = aggregate.getInput().getRowType();
-    if (aggregate.aggCalls().isEmpty()) {
-      return "global window aggregate: needs at least one aggregate";
-    }
+    // An empty aggregate list is allowed: the global half of a grouping-only window (windowed
+    // distinct) merges only slice ends and emits one row per (key, window).
     for (int column : grouping) {
       if (!WindowAggregateMatcher.supportedGroupingKeyType(
           inputType.getFieldList().get(column).getType().getSqlTypeName())) {

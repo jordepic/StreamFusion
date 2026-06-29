@@ -42,6 +42,32 @@ class FlinkTimestampWindowSqlHarnessTest {
   }
 
   @Test
+  void zeroAggregateWindowedDistinctMatchesHost() throws Exception {
+    // GROUP BY key + window with NO aggregate function — a windowed distinct, one row per (k, window).
+    NativeParity.assertParity(
+        FlinkTimestampWindowSqlHarnessTest::twoPhaseEnvironment,
+        "SELECT k, window_start FROM "
+            + "TABLE(TUMBLE(TABLE src, DESCRIPTOR(ts), INTERVAL '10' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
+  void windowJoinOfWindowedDistinctsMatchesHost() throws Exception {
+    // Nexmark q8 shape: a window join of two zero-aggregate windowed distincts on key + window, over
+    // a plain TIMESTAMP rowtime.
+    NativeParity.assertParity(
+        FlinkTimestampWindowSqlHarnessTest::twoPhaseEnvironment,
+        "SELECT a.k, a.window_start FROM "
+            + "(SELECT k, window_start, window_end FROM "
+            + "  TABLE(TUMBLE(TABLE src, DESCRIPTOR(ts), INTERVAL '10' SECOND)) "
+            + "  GROUP BY k, window_start, window_end) a "
+            + "JOIN (SELECT k, window_start, window_end FROM "
+            + "  TABLE(TUMBLE(TABLE src, DESCRIPTOR(ts), INTERVAL '10' SECOND)) "
+            + "  GROUP BY k, window_start, window_end) b "
+            + "ON a.k = b.k AND a.window_start = b.window_start AND a.window_end = b.window_end");
+  }
+
+  @Test
   void twoPhaseTumbleOverPlainTimestampMatchesHost() throws Exception {
     // Two-phase (local pre-aggregate + global merge): the global renders the window bounds, so its
     // UTC render for a plain TIMESTAMP must match the host too.

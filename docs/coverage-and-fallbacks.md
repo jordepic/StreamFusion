@@ -159,7 +159,9 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   slide divides its size, or a single-phase `SESSION`; anything else proctime (the two-phase local/
   global path) is not yet on the processing-time-timer path; `HOP` slide / `CUMULATE` step doesn't
   divide size; key type outside bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate
-  mismatch; `AVG` (where noted); two-phase partials not single-field bigint/double.
+  mismatch; `AVG` (where noted); two-phase partials not single-field bigint/double. A **zero-aggregate**
+  grouping-only window (`GROUP BY key + window`, no aggregate function) is a windowed distinct and **is**
+  supported (single- and two-phase), emitting one row per (key, window).
 - **GROUP BY (non-windowed)** — a UDAF, or `AVG`/`SUM`/`MIN`/`MAX` over a value type outside its
   supported set (`AVG` over decimal; see `aggregate-type-support.md`); a `DISTINCT` aggregate other
   than `COUNT(DISTINCT x)` (`SUM`/`MIN`/`MAX` `DISTINCT` fall back); an approximate aggregate;

@@ -227,7 +227,9 @@ final class WindowAggregateMatcher {
    */
   private static boolean supportedAggregates(
       int[] grouping, scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType) {
-    if (aggCalls.isEmpty() || !supportedKeys(grouping, inputType)) {
+    // An empty aggregate list is allowed — a grouping-only window (GROUP BY keys + window with no
+    // aggregate function) is a windowed distinct, emitting one row per (key, window).
+    if (!supportedKeys(grouping, inputType)) {
       return false;
     }
 
