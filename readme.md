@@ -203,6 +203,39 @@ that last transpose. It can be disabled meanwhile with
 work: keep Arrow across adjacent native operators so the transpose is paid once at the edges, not per
 operator ([divergences/08](divergences/08-columnar-flow-transitions.md)).
 
+### Nexmark q0–q4 (steelmanned: rowwise source + blackhole sink)
+
+The first five Nexmark queries over the wide event row (the `nexmark` datagen shape — `event_type`
+plus nested `person`/`auction`/`bid` structs), 2 M events, single slot — run with
+`SF_BENCHMARK=true mvn test -Pbench -Dtest=NexmarkBenchmark`. The source is a **rowwise** `DataStream`
+and the sink is `blackhole` (also rowwise), exactly as the published Nexmark plan, so a native island
+pays a `RowData → Arrow` transpose at the source **and** an `Arrow → RowData` transpose at the sink.
+We keep both transposes in the measured path on purpose — a real deployment feeds us rowwise records
+and drains to a rowwise sink, so this is the honest end-to-end number, not the favorable
+columnar-source/columnar-sink case above. q1 runs under the approximate-decimal flag.
+
+| Query | Shape | Flink | Native | Native vs. Flink |
+|---|---|---|---|---|
+| q2 | filter `WHERE MOD(auction, 123) = 0` | 1.18 M ev/s | 0.82 M ev/s | **0.69×** |
+| q0 | pass-through projection of `bid` fields | 0.96 M ev/s | 0.58 M ev/s | **0.61×** |
+| q1 | `0.908 * price` (approximate decimal) | 1.03 M ev/s | 0.62 M ev/s | **0.60×** |
+| q4 | interval join → `MAX` per auction → `AVG` per category | 0.66 M ev/s | 0.36 M ev/s | **0.55×** |
+| q3 | regular (updating) join `auction ⋈ person` on seller | 0.99 M ev/s | 0.42 M ev/s | **0.42×** |
+
+**All five are below 1×, and that is the expected steelman result.** These queries land squarely in
+the regimes the End-to-end table above already shows losing from a row source: q0/q1/q2 are cheap
+stateless projection/filter work (cf. filter at 0.75×) where a single light expression cannot earn
+back the `RowData → Arrow → RowData` round-trip the rowwise perimeter forces; q3 is a regular
+(non-windowed) join and q4 chains an interval join into two changelog `GROUP BY`s (cf. non-windowed
+`GROUP BY` at 0.67×), and the changelog retract stream plus the per-row key read compound with the
+perimeter transposes. The interval join alone reaches 1.71× (above), but downstream of it q4's two
+updating aggregates and the host sink dominate. The lever is the same as everywhere else: these win
+only when the flow stays Arrow end to end — a columnar source and a native (Parquet) sink remove both
+transposes, and keeping adjacent native operators columnar removes the interior ones
+([divergences/08](divergences/08-columnar-flow-transitions.md)). Against the published Nexmark suite as
+written — rowwise in, discard out — we are currently **slower than stock Flink on q0–q4**; this is the
+gap to close, recorded honestly rather than benchmarked around.
+
 _Apple M1 Max; numbers are comparable only within a machine._
 
 ## Related work
