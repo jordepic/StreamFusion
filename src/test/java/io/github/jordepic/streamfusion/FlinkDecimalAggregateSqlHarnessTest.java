@@ -30,6 +30,17 @@ class FlinkDecimalAggregateSqlHarnessTest {
     NativeParity.assertParity(() -> readEnvironment(input), "SELECT SUM(d) AS s FROM t");
   }
 
+  @Test
+  void decimalMinMaxCountMatchesHost() throws Exception {
+    // MIN/MAX keep the extreme as an i128 and report DECIMAL(p, s) (the input type, preserved);
+    // COUNT over a decimal counts non-null rows. SUM is DECIMAL(38, s).
+    Path input = Files.createTempDirectory("dec-minmax-in");
+    writeInput(input);
+    NativeParity.assertParity(
+        () -> readEnvironment(input),
+        "SELECT k, MIN(d) AS mn, MAX(d) AS mx, COUNT(d) AS c, SUM(d) AS s FROM t GROUP BY k");
+  }
+
   private static void writeInput(Path directory) throws Exception {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
