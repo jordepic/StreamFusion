@@ -60,9 +60,6 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   unbounded/`n PRECEDING`, bounded-`RANGE` time interval), more than one window group, independent
   value columns, wider value types, and proctime ordering. (`FOLLOWING` frames, non-time/descending
   order, and `LAG`/`LEAD` are parity — Flink rejects them in streaming.)
-- **Top-N** — rank range must start at 1 (no `OFFSET`). Both insert-only input (append-only ranker)
-  and changelog input (retracting ranker — keeps the full buffer to promote on delete) are native.
-  (`RANK`/`DENSE_RANK` are parity — Flink rejects them in streaming.)
 - **Deduplication** — rowtime keep-first (`ORDER BY rowtime ASC`, insert-only) and keep-last (`DESC`,
   retracting) are both native; proctime deduplication falls back.
 - **Joins** — proctime interval/window joins fall back; a residual non-equi predicate must be
@@ -111,10 +108,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT; a partial
   column outside bigint/int/double; an unsupported grouping-key/output column type. (Both halves must
   match for the query to accelerate — one staying on the host drags the whole query back via the gate.)
-- **Top-N** — rank range not a constant starting at 1 (an `OFFSET`); a row type the converter can't
-  carry. (A changelog input is fine now — it uses the retracting ranker. `RANK`/`DENSE_RANK` never
-  reach us — Flink rejects them in streaming.)
-- **LIMIT** — missing `FETCH`, an `OFFSET`, or a retracting input (only the append-only ranker).
+- **Top-N** — a non-constant (variable) rank range; a row type the converter can't carry. (Insert-only
+  and changelog input, an `OFFSET`, and a projected rank number are all handled. `RANK`/`DENSE_RANK`
+  never reach us — Flink rejects them in streaming.)
+- **LIMIT** — missing `FETCH`, or a retracting input (`OFFSET` is handled — it uses the retracting
+  ranker over the insert-only input).
 - **Deduplicate** — not a rowtime rank-1 (keep-first `ASC` or keep-last `DESC` are both native);
   proctime deduplication falls back.
 - **Window Top-N / window dedup** — rank not starting at 1 (an `OFFSET`).

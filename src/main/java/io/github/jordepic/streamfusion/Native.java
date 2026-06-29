@@ -974,6 +974,7 @@ public final class Native {
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
+      long offset,
       long limit,
       boolean outputRankNumber,
       boolean retracting);
@@ -994,6 +995,7 @@ public final class Native {
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
+      long offset,
       long limit,
       boolean outputRankNumber,
       boolean retracting,

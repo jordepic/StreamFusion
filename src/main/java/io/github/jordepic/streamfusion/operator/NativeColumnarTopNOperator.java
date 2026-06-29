@@ -29,6 +29,7 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
   private final int[] sortIndices;
   private final int[] sortAscending;
   private final int[] sortNullsFirst;
+  private final long offset;
   private final long limit;
   private final boolean outputRankNumber;
   private final boolean retracting;
@@ -43,6 +44,7 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
+      long offset,
       long limit,
       boolean outputRankNumber,
       boolean retracting) {
@@ -50,6 +52,7 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
     this.sortIndices = sortIndices;
     this.sortAscending = sortAscending;
     this.sortNullsFirst = sortNullsFirst;
+    this.offset = offset;
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
     this.retracting = retracting;
@@ -76,6 +79,7 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
                 sortIndices,
                 sortAscending,
                 sortNullsFirst,
+                offset,
                 limit,
                 outputRankNumber,
                 retracting)
@@ -84,6 +88,7 @@ public class NativeColumnarTopNOperator extends AbstractStreamOperator<ArrowBatc
                 sortIndices,
                 sortAscending,
                 sortNullsFirst,
+                offset,
                 limit,
                 outputRankNumber,
                 retracting,

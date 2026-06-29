@@ -54,12 +54,11 @@ class FlinkLimitSqlHarnessTest {
   }
 
   @Test
-  void offsetFallsBack() throws Exception {
-    // An OFFSET (rank start > 1) is not supported, so the whole query stays on the host.
-    NativeParity.assertFallbackReasonContains(
-        FlinkLimitSqlHarnessTest::environment,
-        "SELECT k, v FROM src ORDER BY v LIMIT 2 OFFSET 1",
-        "limit: an OFFSET is not supported");
+  void sortLimitWithOffsetMatchesHost() throws Exception {
+    // OFFSET 1 LIMIT 2 → the rank window [2, 3]; routed through the retracting ranker. The collapsed
+    // result is the 2nd and 3rd smallest v globally (v=3 and v=4).
+    NativeParity.assertChangelogParity(
+        FlinkLimitSqlHarnessTest::environment, "SELECT k, v FROM src ORDER BY v LIMIT 2 OFFSET 1");
   }
 
   @Test

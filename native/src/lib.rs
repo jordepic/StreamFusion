@@ -4297,6 +4297,9 @@ impl TopNRanker {
 struct RetractableTopNRanker {
     partition_columns: Vec<usize>,
     sort_columns: Vec<SortColumn>,
+    /// Rank window: output ranks `[offset+1, limit]` (1-based), i.e. buffer indices `[offset, limit)`.
+    /// `offset = rankStart - 1` (0 for the common no-`OFFSET` case); `limit = rankEnd`.
+    offset: i64,
     limit: i64,
     output_rank_number: bool,
     schema: Option<SchemaRef>,
@@ -4307,12 +4310,14 @@ impl RetractableTopNRanker {
     fn new(
         partition_columns: Vec<usize>,
         sort_columns: Vec<SortColumn>,
+        offset: i64,
         limit: i64,
         output_rank_number: bool,
     ) -> Self {
         RetractableTopNRanker {
             partition_columns,
             sort_columns,
+            offset,
             limit,
             output_rank_number,
             schema: None,
@@ -4327,7 +4332,8 @@ impl RetractableTopNRanker {
             self.partition_columns.iter().map(|&i| batch.column(i)).collect();
         let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
         let row_kinds = row_kind_column(batch);
-        let limit = self.limit as usize;
+        // Output window: buffer indices [offset, limit) = ranks [offset+1, limit], clamped to len.
+        let (offset, limit) = (self.offset as usize, self.limit as usize);
 
         let mut out_rows: Vec<JoinRow> = Vec::new();
         let mut out_kinds: Vec<i8> = Vec::new();
@@ -4343,7 +4349,8 @@ impl RetractableTopNRanker {
             let retract = matches!(row_kinds.map(|k| k.value(row)).unwrap_or(0), 1 | 3);
             let sort = &self.sort_columns;
             let buffer = self.groups.entry(key).or_default();
-            let old_top: Vec<JoinRow> = buffer[..limit.min(buffer.len())].to_vec();
+            let old_top: Vec<JoinRow> =
+                buffer[offset.min(buffer.len())..limit.min(buffer.len())].to_vec();
             if retract {
                 if let Some(pos) = buffer.iter().position(|r| *r == full) {
                     buffer.remove(pos);
@@ -4353,7 +4360,8 @@ impl RetractableTopNRanker {
                     .partition_point(|r| compare_rows(r, &full, sort) != std::cmp::Ordering::Greater);
                 buffer.insert(pos, full.clone());
             }
-            let new_top: Vec<JoinRow> = buffer[..limit.min(buffer.len())].to_vec();
+            let new_top: Vec<JoinRow> =
+                buffer[offset.min(buffer.len())..limit.min(buffer.len())].to_vec();
             self.diff(&old_top, &new_top, &mut out_rows, &mut out_kinds, &mut out_ranks);
         }
         self.emit(out_rows, out_kinds, out_ranks)
@@ -4370,25 +4378,26 @@ impl RetractableTopNRanker {
     ) {
         if self.output_rank_number {
             for i in 0..old_top.len().max(new_top.len()) {
+                let rank = self.offset + i as i64 + 1; // window position i is rank offset+i+1
                 match (old_top.get(i), new_top.get(i)) {
                     (Some(o), Some(n)) if o != n => {
                         out_rows.push(o.clone());
                         out_kinds.push(1); // -U the old occupant of this rank
-                        out_ranks.push(i as i64 + 1);
+                        out_ranks.push(rank);
                         out_rows.push(n.clone());
                         out_kinds.push(2); // +U the new occupant
-                        out_ranks.push(i as i64 + 1);
+                        out_ranks.push(rank);
                     }
                     (Some(_), Some(_)) => {} // rank unchanged
                     (Some(o), None) => {
                         out_rows.push(o.clone());
                         out_kinds.push(3); // -D a rank that lost its occupant
-                        out_ranks.push(i as i64 + 1);
+                        out_ranks.push(rank);
                     }
                     (None, Some(n)) => {
                         out_rows.push(n.clone());
                         out_kinds.push(0); // +I a newly-occupied rank
-                        out_ranks.push(i as i64 + 1);
+                        out_ranks.push(rank);
                     }
                     (None, None) => {}
                 }
@@ -4458,12 +4467,13 @@ impl RetractableTopNRanker {
     fn restore(
         partition_columns: Vec<usize>,
         sort_columns: Vec<SortColumn>,
+        offset: i64,
         limit: i64,
         output_rank_number: bool,
         bytes: &[u8],
     ) -> Self {
         let mut ranker =
-            RetractableTopNRanker::new(partition_columns, sort_columns, limit, output_rank_number);
+            RetractableTopNRanker::new(partition_columns, sort_columns, offset, limit, output_rank_number);
         for batch in read_ipc_if_present(bytes) {
             ranker.schema = Some(batch.schema());
             let partition_arrays: Vec<&ArrayRef> =
@@ -9189,6 +9199,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRan
     sort_indices: JIntArray<'local>,
     sort_ascending: JIntArray<'local>,
     sort_nulls_first: JIntArray<'local>,
+    offset: jlong,
     limit: jlong,
     output_rank_number: jboolean,
     retracting: jboolean,
@@ -9196,8 +9207,15 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRan
     let partitions = read_columns(&env, &partition_columns);
     let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
     let handle = if retracting != 0 {
-        TopNHandle::Retract(RetractableTopNRanker::new(partitions, sort, limit, output_rank_number != 0))
+        TopNHandle::Retract(RetractableTopNRanker::new(
+            partitions,
+            sort,
+            offset,
+            limit,
+            output_rank_number != 0,
+        ))
     } else {
+        // The append-only ranker is the no-OFFSET path (offset always 0).
         TopNHandle::Append(TopNRanker::new(partitions, sort, limit, output_rank_number != 0))
     };
     Box::into_raw(Box::new(handle)) as jlong
@@ -9242,6 +9260,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
     sort_indices: JIntArray<'local>,
     sort_ascending: JIntArray<'local>,
     sort_nulls_first: JIntArray<'local>,
+    offset: jlong,
     limit: jlong,
     output_rank_number: jboolean,
     retracting: jboolean,
@@ -9254,6 +9273,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
         TopNHandle::Retract(RetractableTopNRanker::restore(
             partitions,
             sort,
+            offset,
             limit,
             output_rank_number != 0,
             &bytes,

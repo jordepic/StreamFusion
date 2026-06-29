@@ -9,12 +9,12 @@ import org.apache.flink.table.runtime.operators.rank.RankType;
 
 /**
  * Recognizes the streaming Top-N the native ranker implements:
- * {@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) <= N}, with or without the rank number
- * projected. Requires {@code ROW_NUMBER} (Flink rejects streaming RANK/DENSE_RANK), a constant rank
- * range starting at 1 (no offset), and input/output column types the row/Arrow conversion supports.
- * When the rank number is projected, the ranker emits Flink's shift cascade and appends the rank
- * column. The caller picks the append-only ranker for an insert-only input or the retracting ranker
- * for a changelog input. An offset (rank start > 1) falls back.
+ * {@code ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) BETWEEN rankStart AND rankEnd}, with or
+ * without the rank number projected. Requires {@code ROW_NUMBER} (Flink rejects streaming
+ * RANK/DENSE_RANK), a constant rank range, and input/output column types the row/Arrow conversion
+ * supports. The caller picks the ranker: the append-only one for an insert-only, no-offset query, or
+ * the retracting one (full buffer, rank window {@code [offset+1, rankEnd]}) for a changelog input or
+ * an {@code OFFSET} (rank start > 1).
  */
 final class TopNMatcher {
 
@@ -26,10 +26,6 @@ final class TopNMatcher {
     }
     if (!(rank.rankRange() instanceof ConstantRankRange)) {
       return false;
-    }
-    ConstantRankRange range = (ConstantRankRange) rank.rankRange();
-    if (range.getRankStart() != 1) {
-      return false; // an offset (rank start > 1) is not supported
     }
     if (DeduplicateMatcher.isRowtimeOrder(rank)) {
       return false; // a rowtime-ordered rank is deduplication (DeduplicateMatcher), not a value Top-N
@@ -44,8 +40,14 @@ final class TopNMatcher {
     return rank.partitionKey().toArray();
   }
 
+  /** The rank window upper bound (rankEnd): the operator emits ranks {@code [offset+1, limit]}. */
   static long limit(StreamPhysicalRank rank) {
     return ((ConstantRankRange) rank.rankRange()).getRankEnd();
+  }
+
+  /** The 0-based offset (rankStart - 1); > 0 for an {@code OFFSET} (range not starting at rank 1). */
+  static long offset(StreamPhysicalRank rank) {
+    return ((ConstantRankRange) rank.rankRange()).getRankStart() - 1;
   }
 
   static boolean outputRankNumber(StreamPhysicalRank rank) {

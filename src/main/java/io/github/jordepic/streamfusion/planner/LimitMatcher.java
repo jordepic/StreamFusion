@@ -16,19 +16,17 @@ import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
  * which never enters — so it is insert-only), while {@code SORT LIMIT} carries the order keys and
  * emits a changelog as the top set changes.
  *
- * <p>Matched only when there is no {@code OFFSET} (rank start 1 — an offset is not yet supported), a
- * {@code FETCH} is present (streaming requires it), and the row type the row/Arrow conversion carries.
- * The caller additionally requires an insert-only input — only the append-only ranker is implemented
- * (a retracting input makes the host pick its retract strategy, which we do not reproduce).
+ * <p>Matched when a {@code FETCH} is present (streaming requires it) and the row type the row/Arrow
+ * conversion carries. The rank window is {@code [offset+1, offset+fetch]}; an {@code OFFSET} routes
+ * through the retracting ranker (which keeps the full buffer), a no-offset limit through the
+ * append-only one. The caller additionally requires an insert-only input — a retracting input makes
+ * the host pick its retract strategy, which we do not reproduce.
  */
 final class LimitMatcher {
 
   private LimitMatcher() {}
 
   static boolean matches(Sort sort) {
-    if (sort.offset != null && RexLiteral.intValue(sort.offset) != 0) {
-      return false; // an OFFSET (rank start > 1) is not supported
-    }
     if (sort.fetch == null) {
       return false; // a streaming FETCH/LIMIT must bound the output (Flink rejects an unbounded one)
     }
@@ -36,8 +34,14 @@ final class LimitMatcher {
         FlinkTypeFactory$.MODULE$.toLogicalRowType(sort.getRowType()));
   }
 
+  /** The 0-based offset (the {@code OFFSET} count, 0 if absent). */
+  static long offset(Sort sort) {
+    return sort.offset == null ? 0 : RexLiteral.intValue(sort.offset);
+  }
+
+  /** The rank window upper bound (rankEnd) = offset + fetch; the operator emits {@code [offset+1, end]}. */
   static long limit(Sort sort) {
-    return RexLiteral.intValue(sort.fetch);
+    return offset(sort) + RexLiteral.intValue(sort.fetch);
   }
 
   static int[] sortIndices(Sort sort) {
@@ -68,9 +72,6 @@ final class LimitMatcher {
   }
 
   static String unsupportedReason(Sort sort) {
-    if (sort.offset != null && RexLiteral.intValue(sort.offset) != 0) {
-      return "limit: an OFFSET is not supported";
-    }
     if (sort.fetch == null) {
       return "limit: a FETCH/LIMIT count is required on a streaming query";
     }

@@ -25,6 +25,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] sortIndices;
   private final int[] sortAscending;
   private final int[] sortNullsFirst;
+  private final long offset;
   private final long limit;
   private final boolean outputRankNumber;
   private final boolean retracting;
@@ -38,6 +39,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
+      long offset,
       long limit,
       boolean outputRankNumber,
       boolean retracting) {
@@ -52,6 +54,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
     this.sortIndices = sortIndices;
     this.sortAscending = sortAscending;
     this.sortNullsFirst = sortNullsFirst;
+    this.offset = offset;
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
     this.retracting = retracting;
@@ -71,6 +74,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
             sortIndices,
             sortAscending,
             sortNullsFirst,
+            offset,
             limit,
             outputRankNumber,
             retracting),

@@ -320,7 +320,11 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         }
         substitutions++;
         int[] partitionColumns = TopNMatcher.partitionColumns(rank);
-        boolean retracting = !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) rank.getInput());
+        long offset = TopNMatcher.offset(rank);
+        // A changelog input or an OFFSET routes to the retracting ranker (full buffer + rank window);
+        // the append-only bounded ranker handles only the insert-only, no-offset case.
+        boolean retracting =
+            offset > 0 || !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) rank.getInput());
         // Columnar (Arrow in/out); keep the partitioned shuffle columnar where the input sits on a
         // columnar producer, else the transition pass transposes at the boundary.
         return new StreamPhysicalNativeColumnarTopN(
@@ -332,6 +336,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             TopNMatcher.sortIndices(rank),
             TopNMatcher.sortAscending(rank),
             TopNMatcher.sortNullsFirst(rank),
+            offset,
             TopNMatcher.limit(rank),
             TopNMatcher.outputRankNumber(rank),
             retracting);
@@ -354,6 +359,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
         }
         substitutions++;
         int[] partitionColumns = new int[0]; // global limit — a single gather, no partition
+        long offset = LimitMatcher.offset(sort);
         return new StreamPhysicalNativeColumnarTopN(
             sort.getCluster(),
             sort.getTraitSet(),
@@ -363,9 +369,10 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             LimitMatcher.sortIndices(sort),
             LimitMatcher.sortAscending(sort),
             LimitMatcher.sortNullsFirst(sort),
+            offset,
             LimitMatcher.limit(sort),
             false, // a global LIMIT never projects a rank column
-            false); // insert-only input (guarded above); the append-only ranker
+            offset > 0); // an OFFSET uses the retracting ranker; no-offset the append-only one
       }
       // Recognized but not substituted. A sort-limit emits a changelog, so it would otherwise slip
       // past the insert-only guard below unreported; record why here so a non-accelerating query can

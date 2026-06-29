@@ -27,6 +27,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
   private final int[] sortIndices;
   private final int[] sortAscending;
   private final int[] sortNullsFirst;
+  private final long offset;
   private final long limit;
   private final boolean outputRankNumber;
   private final boolean retracting;
@@ -40,6 +41,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
+      long offset,
       long limit,
       boolean outputRankNumber,
       boolean retracting) {
@@ -49,6 +51,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
     this.sortIndices = sortIndices;
     this.sortAscending = sortAscending;
     this.sortNullsFirst = sortNullsFirst;
+    this.offset = offset;
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
     this.retracting = retracting;
@@ -75,6 +78,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
         sortIndices,
         sortAscending,
         sortNullsFirst,
+        offset,
         limit,
         outputRankNumber,
         retracting);
@@ -91,6 +95,7 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
         sortIndices,
         sortAscending,
         sortNullsFirst,
+        offset,
         limit,
         outputRankNumber,
         retracting);

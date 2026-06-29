@@ -52,6 +52,24 @@ class FlinkTopNSqlHarnessTest {
             + "FROM src) WHERE rn <= 2");
   }
 
+  @Test
+  void topNWithOffsetMatchesHost() throws Exception {
+    // An OFFSET (rank range [2, 3]) routes through the retracting ranker's rank window; the collapsed
+    // result is ranks 2-3 per key (k=1 has them; k=2 has only rank 2).
+    NativeParity.assertChangelogParity(
+        FlinkTopNSqlHarnessTest::environment,
+        "SELECT k, v FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn "
+            + "FROM src) WHERE rn BETWEEN 2 AND 3");
+  }
+
+  @Test
+  void topNWithOffsetAndRankNumberMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkTopNSqlHarnessTest::environment,
+        "SELECT k, v, rn FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn "
+            + "FROM src) WHERE rn BETWEEN 2 AND 3");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
