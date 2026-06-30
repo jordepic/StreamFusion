@@ -24,6 +24,9 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
     implements StreamPhysicalRel, ColumnarOutput {
 
   private final RelDataType outputRowType;
+  // The full record schema as written, kept when the output is pruned: JSON ignores it, but Avro needs
+  // it as the writer schema (its datums are schema-less) and resolves the pruned output as the reader.
+  private final RelDataType writerRowType;
   private final Map<String, String> options;
 
   public StreamPhysicalNativeKafkaDecode(
@@ -31,8 +34,18 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
       RelTraitSet traitSet,
       RelDataType outputRowType,
       Map<String, String> options) {
+    this(cluster, traitSet, outputRowType, outputRowType, options);
+  }
+
+  private StreamPhysicalNativeKafkaDecode(
+      RelOptCluster cluster,
+      RelTraitSet traitSet,
+      RelDataType outputRowType,
+      RelDataType writerRowType,
+      Map<String, String> options) {
     super(cluster, traitSet);
     this.outputRowType = outputRowType;
+    this.writerRowType = writerRowType;
     this.options = options;
   }
 
@@ -40,9 +53,14 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
     return options;
   }
 
-  /** A copy decoding only {@code rowType}'s columns/fields — set by the planner's projection pushdown. */
-  StreamPhysicalNativeKafkaDecode withRowType(RelDataType rowType) {
-    return new StreamPhysicalNativeKafkaDecode(getCluster(), getTraitSet(), rowType, options);
+  /**
+   * A copy that decodes only {@code projected}'s columns/fields (the planner's projection pushdown),
+   * while remembering this decode's current type as the full writer schema (Avro resolution reads the
+   * full record but builds only the projected fields; JSON just decodes the narrowed schema).
+   */
+  StreamPhysicalNativeKafkaDecode withProjection(RelDataType projected) {
+    return new StreamPhysicalNativeKafkaDecode(
+        getCluster(), getTraitSet(), projected, outputRowType, options);
   }
 
   @Override
@@ -57,7 +75,8 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
 
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
-    return new StreamPhysicalNativeKafkaDecode(getCluster(), traitSet, outputRowType, options);
+    return new StreamPhysicalNativeKafkaDecode(
+        getCluster(), traitSet, outputRowType, writerRowType, options);
   }
 
   @Override
@@ -72,6 +91,7 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
     return new NativeKafkaDecodeExecNode(
         ShortcutUtils.unwrapTableConfig(this),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
+        FlinkTypeFactory$.MODULE$.toLogicalRowType(writerRowType),
         getRelDetailedDescription(),
         options);
   }

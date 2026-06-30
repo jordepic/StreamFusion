@@ -9359,11 +9359,13 @@ enum MessageDecoder {
     Json(JsonDecoder),
     Csv(CsvDecoder),
     Raw(RawDecoder),
-    /// Confluent-framed Avro: each message is `0x00` + 4-byte BE schema id + datum, resolved by id.
-    Avro(arrow_avro::schema::SchemaStore),
-    /// Bare Avro (Flink's `avro`): each message is just the datum, decoded against the one reader schema
-    /// registered at synthetic id 0 — we prepend the 5-byte id-0 header so the framed decoder applies.
-    BareAvro(arrow_avro::schema::SchemaStore),
+    /// Confluent-framed Avro: each message is `0x00` + 4-byte BE schema id + datum, resolved by id. The
+    /// optional reader schema projects the writer's record to a subset of fields (Avro resolution).
+    Avro(arrow_avro::schema::SchemaStore, Option<arrow_avro::schema::AvroSchema>),
+    /// Bare Avro (Flink's `avro`): each message is just the datum, decoded against the one writer schema
+    /// registered at synthetic id 0 — we prepend the 5-byte id-0 header so the framed decoder applies. An
+    /// optional reader schema projects it to a subset (the query's columns/fields) via Avro resolution.
+    BareAvro(arrow_avro::schema::SchemaStore, Option<arrow_avro::schema::AvroSchema>),
     Protobuf(ProtobufDecoder),
     /// CDC changelog JSON (Debezium/OGG): envelope → physical rows + `$row_kind$`, fanning out updates.
     Cdc(CdcJsonDecoder),
@@ -9375,10 +9377,23 @@ impl MessageDecoder {
     /// 1 = Confluent-Avro
     /// (`avro_schema` registered at `schema_id`); 4 = bare Avro (`avro_schema` as the reader schema,
     /// registered at synthetic id 0). (Protobuf is built via `createProtobufDecoder`, not here.)
-    fn new(format: i32, output_schema: SchemaRef, avro_schema: &str, schema_id: i32) -> MessageDecoder {
+    fn new(
+        format: i32,
+        output_schema: SchemaRef,
+        avro_schema: &str,
+        reader_avro_schema: &str,
+        schema_id: i32,
+    ) -> MessageDecoder {
+        // A non-empty reader schema projects the writer record to a subset of fields (Avro resolution),
+        // set when the planner pushes the query's projection into the decode.
+        let reader = if reader_avro_schema.is_empty() {
+            None
+        } else {
+            Some(arrow_avro::schema::AvroSchema::new(reader_avro_schema.to_string()))
+        };
         match format {
-            1 => MessageDecoder::Avro(avro_store(avro_schema, schema_id as u32)),
-            4 => MessageDecoder::BareAvro(avro_store(avro_schema, 0)),
+            1 => MessageDecoder::Avro(avro_store(avro_schema, schema_id as u32), reader),
+            4 => MessageDecoder::BareAvro(avro_store(avro_schema, 0), reader),
             2 => MessageDecoder::Csv(CsvDecoder::new(output_schema)),
             3 => MessageDecoder::Raw(RawDecoder::new(output_schema)),
             6 => MessageDecoder::Cdc(CdcJsonDecoder::new(output_schema, CdcDialect::Debezium)),
@@ -9394,8 +9409,8 @@ impl MessageDecoder {
             MessageDecoder::Json(decoder) => decoder.decode(body),
             MessageDecoder::Csv(decoder) => decoder.decode(body),
             MessageDecoder::Raw(decoder) => decoder.decode(body),
-            MessageDecoder::Avro(store) => decode_avro_body(store, body, false),
-            MessageDecoder::BareAvro(store) => decode_avro_body(store, body, true),
+            MessageDecoder::Avro(store, reader) => decode_avro_body(store, reader, body, false),
+            MessageDecoder::BareAvro(store, reader) => decode_avro_body(store, reader, body, true),
             MessageDecoder::Protobuf(decoder) => decoder.decode(body),
             MessageDecoder::Cdc(decoder) => decoder.decode(body),
         }
@@ -9424,6 +9439,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder
     schema_array_address: jlong,
     schema_address: jlong,
     avro_schema: JString<'local>,
+    reader_avro_schema: JString<'local>,
     schema_id: jint,
 ) -> jlong {
     // Avro (1, 4) derives its own schema from the writer schema, so those callers pass 0/0 for the
@@ -9434,7 +9450,16 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder
         import_record_batch(schema_array_address, schema_address).schema()
     };
     let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
-    Box::into_raw(Box::new(MessageDecoder::new(format, schema, &avro_schema, schema_id))) as jlong
+    // Empty unless the planner pushed a projection into an Avro decode: the narrowed reader schema.
+    let reader_avro_schema: String =
+        env.get_string(&reader_avro_schema).map(Into::into).unwrap_or_default();
+    Box::into_raw(Box::new(MessageDecoder::new(
+        format,
+        schema,
+        &avro_schema,
+        &reader_avro_schema,
+        schema_id,
+    ))) as jlong
 }
 
 /// Creates a protobuf message decoder (Flink's `protobuf` format: bare message bytes, no framing) and
@@ -9548,16 +9573,22 @@ struct Decoded {
 /// skipped. Used by `MessageDecoder` for both Avro variants.
 fn decode_avro_body(
     store: &arrow_avro::schema::SchemaStore,
+    reader: &Option<arrow_avro::schema::AvroSchema>,
     body: &RecordBatch,
     bare: bool,
 ) -> RecordBatch {
     use arrow::array::{Array, BinaryArray};
     let column = body.column(0).as_any().downcast_ref::<BinaryArray>().expect("binary body");
-    let mut decoder = arrow_avro::reader::ReaderBuilder::new()
+    let mut builder = arrow_avro::reader::ReaderBuilder::new()
         .with_writer_schema_store(store.clone())
-        .with_batch_size(column.len().max(1))
-        .build_decoder()
-        .expect("failed to build avro decoder");
+        .with_batch_size(column.len().max(1));
+    // With a reader schema, Avro resolution decodes the full writer datum but materializes only the
+    // reader's (subset of) fields — projection pushed into the decode. Writer fields the reader omits
+    // are parsed and discarded, never built into Arrow.
+    if let Some(reader_schema) = reader {
+        builder = builder.with_reader_schema(reader_schema.clone());
+    }
+    let mut decoder = builder.build_decoder().expect("failed to build avro decoder");
     let mut framed = Vec::new();
     for i in 0..column.len() {
         if !column.is_valid(i) {
@@ -9649,7 +9680,7 @@ impl KafkaSplitReader {
         let decode_thread = std::thread::spawn(move || {
             // The same format-dispatched decoder the shallow path uses; built here so its state never
             // crosses threads. Only who produces the body batch (rdkafka vs Flink) differs.
-            let decoder = MessageDecoder::new(format, output_schema, &avro_schema, schema_id);
+            let decoder = MessageDecoder::new(format, output_schema, &avro_schema, "", schema_id);
             while let Ok(work) = raw_rx.recv() {
                 let decoded = Decoded {
                     topic: work.topic,
@@ -10103,7 +10134,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let queue = unsafe { rdsys::rd_kafka_queue_get_consumer(consumer.client().native_ptr()) };
 
     // The same decoder the pipelined path builds, just driven inline.
-    let decoder = MessageDecoder::new(format, schema, &avro_schema, schema_id);
+    let decoder = MessageDecoder::new(format, schema, &avro_schema, "", schema_id);
     let body_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)]));
 
     let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); 65536];
@@ -11502,7 +11533,7 @@ mod tests {
     #[test]
     fn csv_decode_emits_one_row_per_record() {
         let body = bodies(vec![Some(b"1,a,1.5"), Some(b"2,b,2.5")]);
-        let out = MessageDecoder::new(2, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(2, json_schema(), "", "", 0).decode(&body);
         assert_eq!(out.num_rows(), 2);
         let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(id.values(), &[1, 2]);
@@ -11518,7 +11549,7 @@ mod tests {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, true)]));
         let body = bodies(vec![Some(b"hello"), Some(b"world")]);
-        let out = MessageDecoder::new(3, schema, "", 0).decode(&body);
+        let out = MessageDecoder::new(3, schema, "", "", 0).decode(&body);
         assert_eq!(out.num_rows(), 2);
         let col = out.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
         assert_eq!((col.value(0), col.value(1)), ("hello", "world"));
@@ -11558,7 +11589,7 @@ mod tests {
         let m1 = datum(2, "b", 2.5);
         let body = bodies(vec![Some(m0.as_slice()), Some(m1.as_slice())]);
 
-        let out = MessageDecoder::new(4, Arc::new(Schema::empty()), reader_schema, 0).decode(&body);
+        let out = MessageDecoder::new(4, Arc::new(Schema::empty()), reader_schema, "", 0).decode(&body);
 
         assert_eq!(out.num_rows(), 2);
         let id = out.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
@@ -11579,7 +11610,7 @@ mod tests {
         let delete = br#"{"before":{"id":3,"name":"c","score":4.5},"after":null,"op":"d"}"#;
         let body = bodies(vec![Some(insert.as_slice()), Some(update), Some(delete)]);
 
-        let out = MessageDecoder::new(6, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(6, json_schema(), "", "", 0).decode(&body);
 
         // 1 (insert) + 2 (update) + 1 (delete) physical rows.
         assert_eq!(out.num_rows(), 4);
@@ -11605,7 +11636,7 @@ mod tests {
         let insert = br#"{"before":null,"after":{"id":1,"name":"a","score":1.5},"op":"r"}"#;
         let body = bodies(vec![None, Some(insert.as_slice())]);
 
-        let out = MessageDecoder::new(6, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(6, json_schema(), "", "", 0).decode(&body);
 
         assert_eq!(out.num_rows(), 1);
         let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -11621,7 +11652,7 @@ mod tests {
     #[should_panic(expected = "unknown CDC operation")]
     fn cdc_unknown_op_fails() {
         let unknown = br#"{"before":null,"after":{"id":9,"name":"z","score":9.5},"op":"x"}"#;
-        MessageDecoder::new(6, json_schema(), "", 0).decode(&bodies(vec![Some(unknown.as_slice())]));
+        MessageDecoder::new(6, json_schema(), "", "", 0).decode(&bodies(vec![Some(unknown.as_slice())]));
     }
 
     // A null "before" on an update fails (Flink's REPLICA_IDENTITY error), not a silent drop.
@@ -11629,7 +11660,7 @@ mod tests {
     #[should_panic(expected = "null \"before\"")]
     fn cdc_debezium_null_before_update_fails() {
         let update = br#"{"before":null,"after":{"id":2,"name":"b","score":2.5},"op":"u"}"#;
-        MessageDecoder::new(6, json_schema(), "", 0).decode(&bodies(vec![Some(update.as_slice())]));
+        MessageDecoder::new(6, json_schema(), "", "", 0).decode(&bodies(vec![Some(update.as_slice())]));
     }
 
     // OGG JSON (format 7): same nested before/after layout as Debezium, but the op field is `op_type`
@@ -11642,7 +11673,7 @@ mod tests {
         let delete = br#"{"before":{"id":3,"name":"c","score":4.5},"after":null,"op_type":"D"}"#;
         let body = bodies(vec![Some(insert.as_slice()), Some(update), Some(delete)]);
 
-        let out = MessageDecoder::new(7, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(7, json_schema(), "", "", 0).decode(&body);
 
         assert_eq!(out.num_rows(), 4); // insert + (update→2) + delete
         let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -11662,7 +11693,7 @@ mod tests {
         let delete = br#"{"data":{"id":3,"name":"c","score":3.5},"type":"delete"}"#;
         let body = bodies(vec![Some(insert.as_slice()), Some(update), Some(delete)]);
 
-        let out = MessageDecoder::new(8, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(8, json_schema(), "", "", 0).decode(&body);
 
         assert_eq!(out.num_rows(), 4);
         let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -11690,7 +11721,7 @@ mod tests {
         let ddl = br#"{"data":null,"type":"CREATE"}"#;
         let body = bodies(vec![Some(insert.as_slice()), Some(update), Some(ddl)]);
 
-        let out = MessageDecoder::new(9, json_schema(), "", 0).decode(&body);
+        let out = MessageDecoder::new(9, json_schema(), "", "", 0).decode(&body);
 
         // 2 inserts + (update → UB + UA); CREATE dropped.
         assert_eq!(out.num_rows(), 4);

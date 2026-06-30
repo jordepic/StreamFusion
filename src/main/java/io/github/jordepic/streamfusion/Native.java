@@ -704,10 +704,17 @@ public final class Native {
    * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the target schema
    * @param schemaAddress address of the matching exported {@code ArrowSchema}
    * @param avroSchema writer-schema JSON for Avro (ignored for JSON; pass "")
+   * @param readerAvroSchema reader-schema JSON projecting the Avro writer record to a subset of fields
+   *     via Avro resolution (the query's columns); pass "" for no projection / non-Avro
    * @param schemaId Confluent schema id the Avro writer schema is registered under (ignored for JSON)
    */
   public static native long createDecoder(
-      int format, long schemaArrayAddress, long schemaAddress, String avroSchema, int schemaId);
+      int format,
+      long schemaArrayAddress,
+      long schemaAddress,
+      String avroSchema,
+      String readerAvroSchema,
+      int schemaId);
 
   /**
    * Creates a protobuf message decoder (Flink's {@code protobuf} format: bare message bytes, no
