@@ -5859,8 +5859,12 @@ struct KeepLastDeduplicator {
     /// Keep-first (insert-only, first row wins) vs keep-last (retract changelog, latest row wins).
     keep_first: bool,
     schema: Option<SchemaRef>,
-    /// Per key: the stored row's rowtime (millis, 0 in proctime) and its full row.
-    rows: HashMap<GroupKey, (i64, JoinRow)>,
+    /// arrow-row encoders (partition key, value-encoded full row), built once from the first batch.
+    partition_converter: Option<RowConverter>,
+    payload_converter: Option<RowConverter>,
+    /// Per key: the stored row's rowtime (millis, 0 in proctime) and its full row as arrow-row bytes —
+    /// no per-cell `ScalarValue`, so storing/replacing a row moves one byte buffer (cf. the Top-N).
+    rows: HashMap<OwnedRow, (i64, OwnedRow)>,
 }
 
 impl KeepLastDeduplicator {
@@ -5878,76 +5882,102 @@ impl KeepLastDeduplicator {
             rowtime_ordered,
             keep_first,
             schema: None,
+            partition_converter: None,
+            payload_converter: None,
             rows: HashMap::new(),
         }
+    }
+
+    /// Builds the partition-key and full-row arrow-row converters from a batch's column types, once.
+    fn ensure_converters(&mut self, batch: &RecordBatch, arity: usize) {
+        if self.payload_converter.is_some() {
+            return;
+        }
+        self.payload_converter = Some(
+            RowConverter::new(
+                (0..arity).map(|i| SortField::new(batch.column(i).data_type().clone())).collect(),
+            )
+            .expect("dedup payload converter"),
+        );
+        self.partition_converter = Some(
+            RowConverter::new(
+                self.partition_columns
+                    .iter()
+                    .map(|&i| SortField::new(batch.column(i).data_type().clone()))
+                    .collect(),
+            )
+            .expect("dedup partition converter"),
+        );
     }
 
     fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
         let arity = data_arity(batch);
         self.schema = Some(data_schema(batch));
-        let key_arrays: Vec<&ArrayRef> =
-            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
-        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+        self.ensure_converters(batch, arity);
+        let partition_arrays: Vec<ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i).clone()).collect();
+        let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
+        let parts =
+            self.partition_converter.as_ref().unwrap().convert_columns(&partition_arrays).expect("encode dedup key");
+        let payloads =
+            self.payload_converter.as_ref().unwrap().convert_columns(&data_arrays).expect("encode dedup payload");
         // The rowtime is read only for a rowtime order; proctime dedup uses arrival order.
         let rt = self.rowtime_ordered.then(|| rt_to_millis(batch.column(self.rt_column)));
 
-        let mut out_rows: Vec<JoinRow> = Vec::new();
+        let keep_first = self.keep_first;
+        let rowtime_ordered = self.rowtime_ordered;
+        let generate_update_before = self.generate_update_before;
+        let rows = &mut self.rows;
+        let mut out_rows: Vec<OwnedRow> = Vec::new();
         let mut out_kinds: Vec<i8> = Vec::new();
         for row in 0..batch.num_rows() {
-            let key = read_key(&key_arrays, row);
+            let key = parts.row(row).owned();
             // keep-first: the first row per key wins, later rows are dropped (insert-only).
-            if self.keep_first {
-                if self.rows.contains_key(&key) {
+            if keep_first {
+                if rows.contains_key(&key) {
                     continue;
                 }
-                let current: JoinRow = data_arrays
-                    .iter()
-                    .map(|a| ScalarValue::try_from_array(a, row).expect("keep-first row scalar"))
-                    .collect();
-                out_rows.push(current.clone());
+                let payload = payloads.row(row).owned();
+                out_rows.push(payload.clone());
                 out_kinds.push(0); // +I — first row for the key
-                self.rows.insert(key, (0, current));
+                rows.insert(key, (0, payload));
                 continue;
             }
             let rowtime = rt.as_ref().map_or(0, |rt| rt.value(row));
-            let current: JoinRow = data_arrays
-                .iter()
-                .map(|a| ScalarValue::try_from_array(a, row).expect("keep-last row scalar"))
-                .collect();
-            match self.rows.get(&key) {
+            let payload = payloads.row(row).owned();
+            match rows.get(&key) {
                 None => {
-                    out_rows.push(current.clone());
+                    out_rows.push(payload.clone());
                     out_kinds.push(0); // +I — first row for the key
                 }
                 // A rowtime order ignores an older (smaller-rowtime) row; proctime always replaces.
-                Some((stored_rt, _)) if self.rowtime_ordered && rowtime < *stored_rt => {
+                Some((stored_rt, _)) if rowtime_ordered && rowtime < *stored_rt => {
                     continue;
                 }
                 Some((_, prev)) => {
-                    if self.generate_update_before {
+                    if generate_update_before {
                         out_rows.push(prev.clone());
                         out_kinds.push(1); // -U the previous row
                     }
-                    out_rows.push(current.clone());
+                    out_rows.push(payload.clone());
                     out_kinds.push(2); // +U the new (later) row
                 }
             }
-            self.rows.insert(key, (rowtime, current));
+            rows.insert(key, (rowtime, payload));
         }
         self.emit(out_rows, out_kinds)
     }
 
-    fn emit(&self, out_rows: Vec<JoinRow>, out_kinds: Vec<i8>) -> RecordBatch {
+    fn emit(&self, out_rows: Vec<OwnedRow>, out_kinds: Vec<i8>) -> RecordBatch {
         if out_rows.is_empty() {
             return RecordBatch::new_empty(Arc::new(Schema::empty()));
         }
         let schema = self.schema.as_ref().expect("schema set once a row was processed");
+        let conv = self.payload_converter.as_ref().expect("converter set");
+        // One vectorized row->columnar pass rebuilds every data column (cf. the per-cell scalar build).
+        let mut columns: Vec<ArrayRef> =
+            conv.convert_rows(out_rows.iter().map(|r| r.row())).expect("decode dedup payloads");
         let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        let mut columns: Vec<ArrayRef> = (0..fields.len())
-            .map(|j| {
-                scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
-            })
-            .collect();
         // Keep-first is insert-only (every emitted row is a +I), so it carries no $row_kind$ column;
         // keep-last emits a changelog and tags each row's kind.
         if !self.keep_first {
@@ -5961,19 +5991,13 @@ impl KeepLastDeduplicator {
     /// Serializes the stored last-row-per-key set; the rowtime is re-derived from each row on restore.
     fn snapshot(&self) -> Vec<u8> {
         let Some(schema) = &self.schema else { return Vec::new() };
-        let rows: Vec<&JoinRow> = self.rows.values().map(|(_, row)| row).collect();
+        let Some(conv) = &self.payload_converter else { return Vec::new() };
+        let rows: Vec<Row> = self.rows.values().map(|(_, row)| row.row()).collect();
         if rows.is_empty() {
             return Vec::new();
         }
-        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        let columns: Vec<ArrayRef> = (0..fields.len())
-            .map(|j| {
-                scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
-            })
-            .collect();
-        write_ipc(
-            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("keep-last snapshot"),
-        )
+        let columns = conv.convert_rows(rows).expect("decode dedup snapshot payloads");
+        write_ipc(&RecordBatch::try_new(schema.clone(), columns).expect("keep-last snapshot"))
     }
 
     fn restore(
@@ -5992,18 +6016,24 @@ impl KeepLastDeduplicator {
             keep_first,
         );
         for batch in read_ipc_if_present(bytes) {
+            let arity = batch.num_columns();
             dedup.schema = Some(batch.schema());
-            let key_arrays: Vec<&ArrayRef> =
-                dedup.partition_columns.iter().map(|&i| batch.column(i)).collect();
+            dedup.ensure_converters(&batch, arity);
             // The stored rowtime matters only to the rowtime keep-last comparison; proctime stores 0.
             let rt = rowtime_ordered.then(|| rt_to_millis(batch.column(dedup.rt_column)));
-            let arity = batch.num_columns();
+            let partition_arrays: Vec<ArrayRef> =
+                dedup.partition_columns.iter().map(|&i| batch.column(i).clone()).collect();
+            let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
+            let parts =
+                dedup.partition_converter.as_ref().unwrap().convert_columns(&partition_arrays).expect("encode key");
+            let payloads =
+                dedup.payload_converter.as_ref().unwrap().convert_columns(&data_arrays).expect("encode payload");
+            let rows = &mut dedup.rows;
             for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
-                let stored: JoinRow = (0..arity)
-                    .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("restore scalar"))
-                    .collect();
-                dedup.rows.insert(key, (rt.as_ref().map_or(0, |rt| rt.value(row)), stored));
+                rows.insert(
+                    parts.row(row).owned(),
+                    (rt.as_ref().map_or(0, |rt| rt.value(row)), payloads.row(row).owned()),
+                );
             }
         }
         dedup
