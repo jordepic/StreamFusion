@@ -37,6 +37,7 @@ import org.testcontainers.utility.DockerImageName;
 class NativeKafkaSourceSqlHarnessTest {
 
   private static final String TOPIC = "native-source-sql-it";
+  private static final String PROTO_TOPIC = "native-source-proto-it";
   private static final int MESSAGES = 2_000;
 
   @Test
@@ -70,6 +71,75 @@ class NativeKafkaSourceSqlHarnessTest {
       }
     } finally {
       System.clearProperty("streamfusion.operator.kafkaSource.enabled");
+    }
+  }
+
+  @Test
+  void nativeKafkaProtobufSourceReadsTopicThroughSql() throws Exception {
+    // Protobuf is the path only reachable from the native source after this change (the in-Rust decoder
+    // is built from the descriptor on the decode thread): produce bare protobuf messages and confirm the
+    // native source decodes every one to the right value, not just that it routed.
+    System.setProperty("streamfusion.operator.kafkaSource.enabled", "true");
+    try (KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
+      kafka.start();
+      String brokers = kafka.getBootstrapServers();
+      produceProtobuf(brokers, MESSAGES);
+
+      StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+      env.setParallelism(1);
+      StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+      // The source decodes the full descriptor (no projection pushed into it yet), so the table must
+      // declare every Scalars field in descriptor order; the query then projects i64/text after decode.
+      tEnv.executeSql(
+          "CREATE TABLE p (i32 INT, i64 BIGINT, flag BOOLEAN, f32 FLOAT, f64 DOUBLE, text STRING,"
+              + " si32 INT, si64 BIGINT) WITH ('connector' = 'kafka', 'topic' = '"
+              + PROTO_TOPIC
+              + "', 'properties.bootstrap.servers' = '"
+              + brokers
+              + "', 'properties.group.id' = 'native-source-proto-it',"
+              + " 'scan.startup.mode' = 'earliest-offset', 'format' = 'protobuf',"
+              + " 'protobuf.message-class-name' = 'io.github.jordepic.streamfusion.proto.Scalars')");
+      PhysicalPlanScan scan = NativePlanner.install(tEnv);
+
+      Set<Long> ids = new HashSet<>();
+      try (CloseableIterator<Row> iterator = tEnv.executeSql("SELECT i64, text FROM p").collect()) {
+        while (ids.size() < MESSAGES && iterator.hasNext()) {
+          Row row = iterator.next();
+          long id = (Long) row.getField("i64");
+          assertEquals("row-" + (id - 1), row.getField("text"), "wrong text for i64 " + id);
+          ids.add(id);
+        }
+      }
+
+      assertTrue(scan.substitutions() >= 1, "protobuf Kafka source did not route to native");
+      assertEquals(MESSAGES, ids.size(), "expected every produced message exactly once");
+      for (long i = 1; i <= MESSAGES; i++) {
+        assertTrue(ids.contains(i), "missing i64 " + i);
+      }
+    } finally {
+      System.clearProperty("streamfusion.operator.kafkaSource.enabled");
+    }
+  }
+
+  private static void produceProtobuf(String brokers, int messages) {
+    Properties props = new Properties();
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
+    props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+    props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
+    props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1 << 20);
+    try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props)) {
+      for (int i = 0; i < messages; i++) {
+        byte[] value =
+            io.github.jordepic.streamfusion.proto.Scalars.newBuilder()
+                .setI64(i + 1L)
+                .setText("row-" + i)
+                .build()
+                .toByteArray();
+        producer.send(new ProducerRecord<>(PROTO_TOPIC, 0, null, value));
+      }
+      producer.flush();
     }
   }
 

@@ -286,7 +286,10 @@ class NativeKafkaSourceBenchmark {
             format,
             ROW_TYPE,
             avroSchema,
+            "",
             schemaId,
+            null,
+            "",
             BATCH,
             pollTimeout);
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

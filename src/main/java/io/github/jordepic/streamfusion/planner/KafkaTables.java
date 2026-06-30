@@ -14,6 +14,7 @@ import org.apache.flink.connector.kafka.source.enumerator.initializer.NoStopping
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscriber;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
+import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
@@ -30,9 +31,16 @@ final class KafkaTables {
   private KafkaTables() {}
 
   private static final String PROPERTIES_PREFIX = "properties.";
-  // Native batch cap per poll (Java's max.poll.records has no librdkafka analog) and poll timeout.
+  // Native batch cap per poll (Java's max.poll.records has no librdkafka analog) and poll timeout. The
+  // timeout is the most a drained poll blocks before returning empty; at a bounded source's tail the
+  // reader does a couple of empty polls before concluding the split is finished, so a large timeout adds
+  // dead seconds there (a 1s timeout dominated a 200k-row bounded run). Keep it short — a steady stream
+  // with prefetch rarely waits on it (the queue is non-empty), so it only bounds tail latency.
   private static final int MAX_RECORDS = 8192;
-  private static final long POLL_TIMEOUT_MILLIS = 1000;
+  private static final long POLL_TIMEOUT_MILLIS = 100;
+  // MessageDecoder format codes the native source decodes in Rust (the codes decodeFormatCode emits).
+  private static final int BARE_AVRO = 4;
+  private static final int PROTOBUF = 5;
 
   /** Whether the native Kafka source can faithfully run this scan's table. */
   static boolean isNativeKafka(org.apache.calcite.rel.RelNode node) {
@@ -48,28 +56,31 @@ final class KafkaTables {
     return supports(options);
   }
 
-  /** The shared gate, also used by {@code build} to assume a translatable, supported table. */
+  /** The shared gate, also used by {@code build} to assume a translatable, supported table. The native
+   * source decodes in Rust the same insert-only value formats the shallow decode path does — JSON (0),
+   * bare Avro (4), and protobuf (5) — over the consume/topic/offset prerequisites in {@link
+   * #decodeCommon}, plus a librdkafka-translatable consumer config (the native source owns the consume,
+   * so its config must render to librdkafka). */
   private static boolean supports(Map<String, String> options) {
-    if (options == null || !"kafka".equals(options.get("connector"))) {
+    if (!decodeCommon(options)) {
       return false;
     }
-    String format = options.getOrDefault("value.format", options.get("format"));
-    if (!"json".equals(format) || options.containsKey("key.format")) {
-      return false; // only a JSON value is decoded natively
-    }
-    if (options.get("topic") == null) {
-      return false; // topic-pattern not supported natively yet
-    }
-    if (mapStartupMode(options) == null || !boundedModeSupported(options)) {
-      return false; // e.g. specific-offsets startup, or an unsupported bounded mode
-    }
-    if (options.get(PROPERTIES_PREFIX + "bootstrap.servers") == null) {
-      return false;
+    int code = decodeFormatCode(options);
+    if (code == PROTOBUF) {
+      String messageClass = options.get("protobuf.message-class-name");
+      if (messageClass == null || !ProtobufDescriptors.isSupportedMessage(messageClass)) {
+        return false;
+      }
+    } else if (code != 0 && code != BARE_AVRO) {
+      return false; // JSON / bare Avro / protobuf only — CSV/raw/Confluent-Avro/CDC stay on the decode path
     }
     return KafkaConfigTranslator.translate(consumerProperties(options)).isTranslated();
   }
 
-  /** Builds the native source for a table {@link #isNativeKafka} accepted. */
+  /** Builds the native source for a table {@link #isNativeKafka} accepted. The decode runs in Rust, so
+   * the format-specific schema inputs match the shallow decode path: bare Avro derives its writer schema
+   * from the row type (the same converter Flink's own {@code avro} format uses), protobuf carries the
+   * reflectively-extracted descriptor + message name, JSON decodes against the exported output schema. */
   static NativeKafkaSource build(Map<String, String> options, RowType outputType) {
     Properties props = consumerProperties(options);
     Map<String, String> librdkafka =
@@ -87,6 +98,17 @@ final class KafkaTables {
     }
     List<String> topics = Arrays.asList(options.get("topic").split(";"));
     boolean bounded = "latest-offset".equals(options.get("scan.bounded.mode"));
+    int format = decodeFormatCode(options);
+    // Bare Avro decodes against its writer schema (datums are schema-less): derive it from the row type,
+    // forced non-null so the row is a record, not a ["null", record] union — matching Flink's `avro`.
+    String avroSchema =
+        format == BARE_AVRO ? AvroSchemaConverter.convertToSchema(outputType.copy(false)).toString() : "";
+    // Protobuf decodes against the generated message class's descriptor, extracted by reflection (no
+    // compile-time protobuf-java dependency — the class + runtime come from the Flink distribution).
+    String messageClass = options.get("protobuf.message-class-name");
+    byte[] protoDescriptor =
+        format == PROTOBUF ? ProtobufDescriptors.descriptorSet(messageClass) : null;
+    String protoMessageName = format == PROTOBUF ? ProtobufDescriptors.messageName(messageClass) : "";
     return new NativeKafkaSource(
         KafkaSubscriber.getTopicListSubscriber(topics),
         mapStartupMode(options),
@@ -95,10 +117,13 @@ final class KafkaTables {
         props,
         keys,
         values,
-        0, // JSON (the only SQL format wired natively today)
+        format,
         outputType,
-        "",
+        avroSchema,
+        "", // reader schema: no projection pushed into the source yet (the full record is decoded)
         0,
+        protoDescriptor,
+        protoMessageName,
         MAX_RECORDS,
         POLL_TIMEOUT_MILLIS);
   }

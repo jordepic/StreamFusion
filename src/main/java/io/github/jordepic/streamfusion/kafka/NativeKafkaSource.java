@@ -50,7 +50,10 @@ public final class NativeKafkaSource
   private final int format;
   private final RowType outputType;
   private final String avroSchema;
+  private final String readerAvroSchema;
   private final int schemaId;
+  private final byte[] protoDescriptor;
+  private final String protoMessageName;
   private final int maxRecords;
   private final long pollTimeoutMillis;
 
@@ -65,7 +68,10 @@ public final class NativeKafkaSource
       int format,
       RowType outputType,
       String avroSchema,
+      String readerAvroSchema,
       int schemaId,
+      byte[] protoDescriptor,
+      String protoMessageName,
       int maxRecords,
       long pollTimeoutMillis) {
     this.subscriber = subscriber;
@@ -83,7 +89,10 @@ public final class NativeKafkaSource
     this.format = format;
     this.outputType = outputType;
     this.avroSchema = avroSchema;
+    this.readerAvroSchema = readerAvroSchema;
     this.schemaId = schemaId;
+    this.protoDescriptor = protoDescriptor;
+    this.protoMessageName = protoMessageName;
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
   }
@@ -103,7 +112,10 @@ public final class NativeKafkaSource
                 format,
                 outputType,
                 avroSchema,
+                readerAvroSchema,
                 schemaId,
+                protoDescriptor,
+                protoMessageName,
                 maxRecords,
                 pollTimeoutMillis);
     return new NativeKafkaSourceReader(
