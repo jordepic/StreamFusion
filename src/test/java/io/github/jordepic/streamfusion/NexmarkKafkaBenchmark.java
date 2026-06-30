@@ -2,13 +2,23 @@ package io.github.jordepic.streamfusion;
 
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.EncoderFactory;
+import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
+import org.apache.flink.table.types.logical.RowType;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -54,11 +64,12 @@ class NexmarkKafkaBenchmark {
   @Test
   @EnabledIfEnvironmentVariable(named = "SF_PROFILE", matches = "true")
   void q0NativeProfileLoop() throws Exception {
+    String format = System.getProperty("profile.format", "json");
     try (KafkaContainer kafka =
         new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
       kafka.start();
       String brokers = kafka.getBootstrapServers();
-      produce(brokers, "nexmark");
+      produce(brokers, "nexmark", format);
       String sinkDdl =
           "CREATE TABLE sink (auction BIGINT, bidder BIGINT, price BIGINT, `dateTime` BIGINT,"
               + " extra STRING) WITH ('connector' = 'blackhole')";
@@ -68,23 +79,33 @@ class NexmarkKafkaBenchmark {
       long deadline = System.currentTimeMillis() + Long.getLong("profile.seconds", 60L) * 1000L;
       long iterations = 0;
       while (System.currentTimeMillis() < deadline) {
-        runOnce(brokers, true, sinkDdl, insertSql);
+        runOnce(brokers, format, true, sinkDdl, insertSql);
         iterations++;
       }
-      System.out.println("[profile] native Kafka/JSON q0 iterations: " + iterations);
+      System.out.println("[profile] native Kafka/" + format + " q0 iterations: " + iterations);
     }
   }
 
   @Test
   void nexmarkKafkaJson() throws Exception {
+    runFormat("json");
+  }
+
+  @Test
+  void nexmarkKafkaAvro() throws Exception {
+    runFormat("avro");
+  }
+
+  private void runFormat(String format) throws Exception {
     try (KafkaContainer kafka =
         new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
       kafka.start();
       String brokers = kafka.getBootstrapServers();
-      produce(brokers, "nexmark");
+      produce(brokers, "nexmark", format);
 
       compare(
           brokers,
+          format,
           "q0 pass-through (project bid fields)",
           false,
           "CREATE TABLE sink (auction BIGINT, bidder BIGINT, price BIGINT, `dateTime` BIGINT,"
@@ -93,6 +114,7 @@ class NexmarkKafkaBenchmark {
               + " FROM src WHERE event_type = 2");
       compare(
           brokers,
+          format,
           "q1 currency conversion (0.908 * price)",
           true,
           "CREATE TABLE sink (auction BIGINT, bidder BIGINT, price DECIMAL(23, 3), `dateTime` BIGINT,"
@@ -101,6 +123,7 @@ class NexmarkKafkaBenchmark {
               + " bid.extra FROM src WHERE event_type = 2");
       compare(
           brokers,
+          format,
           "q2 filter (MOD(auction, 123) = 0)",
           false,
           "CREATE TABLE sink (auction BIGINT, price BIGINT) WITH ('connector' = 'blackhole')",
@@ -110,11 +133,18 @@ class NexmarkKafkaBenchmark {
   }
 
   private static void compare(
-      String brokers, String label, boolean approximateDecimal, String sinkDdl, String insertSql)
+      String brokers,
+      String format,
+      String label,
+      boolean approximateDecimal,
+      String sinkDdl,
+      String insertSql)
       throws Exception {
-    double flink = bestOf(brokers, false, approximateDecimal, sinkDdl, insertSql);
-    double nativeRun = bestOf(brokers, true, approximateDecimal, sinkDdl, insertSql);
-    System.out.printf("%n[benchmark] Kafka/JSON %s over %,d events (best of %d)%n", label, ROWS, RUNS);
+    double flink = bestOf(brokers, format, false, approximateDecimal, sinkDdl, insertSql);
+    double nativeRun = bestOf(brokers, format, true, approximateDecimal, sinkDdl, insertSql);
+    System.out.printf(
+        "%n[benchmark] Kafka/%s %s over %,d events (best of %d)%n",
+        format.toUpperCase(java.util.Locale.ROOT), label, ROWS, RUNS);
     System.out.printf("[benchmark]   Flink : %6.3f s  (%,.0f events/s)%n", flink, ROWS / flink);
     System.out.printf(
         "[benchmark]   Native: %6.3f s  (%,.0f events/s)  %.2fx vs Flink%n",
@@ -122,7 +152,12 @@ class NexmarkKafkaBenchmark {
   }
 
   private static double bestOf(
-      String brokers, boolean useNative, boolean approximateDecimal, String sinkDdl, String insertSql)
+      String brokers,
+      String format,
+      boolean useNative,
+      boolean approximateDecimal,
+      String sinkDdl,
+      String insertSql)
       throws Exception {
     String property = "streamfusion.expression.decimalArithmetic.approximate";
     String previous = System.getProperty(property);
@@ -132,7 +167,7 @@ class NexmarkKafkaBenchmark {
     try {
       double best = Double.MAX_VALUE;
       for (int run = 0; run < WARMUP + RUNS; run++) {
-        double seconds = runOnce(brokers, useNative, sinkDdl, insertSql);
+        double seconds = runOnce(brokers, format, useNative, sinkDdl, insertSql);
         if (run >= WARMUP) {
           best = Math.min(best, seconds);
         }
@@ -148,7 +183,8 @@ class NexmarkKafkaBenchmark {
   }
 
   private static double runOnce(
-      String brokers, boolean useNative, String sinkDdl, String insertSql) throws Exception {
+      String brokers, String format, boolean useNative, String sinkDdl, String insertSql)
+      throws Exception {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     env.getConfig().enableObjectReuse();
@@ -159,7 +195,9 @@ class NexmarkKafkaBenchmark {
             + ") WITH ('connector' = 'kafka', 'topic' = 'nexmark', 'properties.bootstrap.servers' = '"
             + brokers
             + "', 'properties.group.id' = 'nexmark', 'scan.startup.mode' = 'earliest-offset',"
-            + " 'scan.bounded.mode' = 'latest-offset', 'format' = 'json')");
+            + " 'scan.bounded.mode' = 'latest-offset', 'format' = '"
+            + format
+            + "')");
     PhysicalPlanScan scan = useNative ? NativePlanner.install(tEnv) : null;
     tEnv.executeSql(sinkDdl);
     long start = System.nanoTime();
@@ -172,17 +210,29 @@ class NexmarkKafkaBenchmark {
     return seconds;
   }
 
-  private static void produce(String brokers, String topic) {
+  private static void produce(String brokers, String topic, String format) throws Exception {
     Properties props = new Properties();
     props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
     props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
     props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
     props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
     props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1 << 20);
+    boolean avro = "avro".equals(format);
+    Schema schema = avro ? AvroSchemaConverter.convertToSchema(nexmarkRowType().copy(false)) : null;
+    GenericDatumWriter<GenericRecord> writer = avro ? new GenericDatumWriter<>(schema) : null;
     try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props)) {
-      List<ProducerRecord<byte[], byte[]>> batch = new ArrayList<>();
       for (long i = 0; i < ROWS; i++) {
-        producer.send(new ProducerRecord<>(topic, 0, null, event(i).getBytes(StandardCharsets.UTF_8)));
+        byte[] value;
+        if (avro) {
+          ByteArrayOutputStream out = new ByteArrayOutputStream();
+          BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
+          writer.write(avroEvent(i, schema), encoder);
+          encoder.flush();
+          value = out.toByteArray();
+        } else {
+          value = event(i).getBytes(StandardCharsets.UTF_8);
+        }
+        producer.send(new ProducerRecord<>(topic, 0, null, value));
       }
       producer.flush();
     }
@@ -215,5 +265,108 @@ class NexmarkKafkaBenchmark {
             + "\"price\":%d,\"channel\":\"ch-%d\",\"url\":\"https://n.test/%d\",\"dateTime\":%d,"
             + "\"extra\":\"x\"},\"dateTime\":%d}",
         auctionId, pos, (i % 1000) + 1, pos % 8, auctionId, ts, ts);
+  }
+
+  /** The same wide event as an Avro {@link GenericRecord}, inactive structs left null. */
+  private static GenericRecord avroEvent(long i, Schema schema) {
+    long block = i / BLOCK;
+    int pos = (int) (i % BLOCK);
+    long ts = block * 1000L + pos * 10L;
+    GenericRecord row = new GenericData.Record(schema);
+    row.put("event_type", pos == 0 ? 0 : pos <= 3 ? 1 : 2);
+    row.put("dateTime", ts);
+    if (pos == 0) {
+      GenericRecord person = new GenericData.Record(branch(schema, "person"));
+      person.put("id", block);
+      person.put("name", "p-" + block);
+      person.put("emailAddress", "e-" + block);
+      person.put("creditCard", "1234");
+      person.put("city", "c-" + (block % 1000));
+      person.put("state", STATES[(int) (block % STATES.length)]);
+      person.put("dateTime", ts);
+      person.put("extra", "x");
+      row.put("person", person);
+    } else if (pos <= 3) {
+      long auctionId = block * 3 + (pos - 1);
+      GenericRecord auction = new GenericData.Record(branch(schema, "auction"));
+      auction.put("id", auctionId);
+      auction.put("itemName", "i-" + auctionId);
+      auction.put("description", "d-" + auctionId);
+      auction.put("initialBid", 10L);
+      auction.put("reserve", 50L);
+      auction.put("dateTime", ts);
+      auction.put("expires", ts + 20000);
+      auction.put("seller", block);
+      auction.put("category", block % 100);
+      auction.put("extra", "x");
+      row.put("auction", auction);
+    } else {
+      long auctionId = block * 3 + (pos % 3);
+      GenericRecord bid = new GenericData.Record(branch(schema, "bid"));
+      bid.put("auction", auctionId);
+      bid.put("bidder", (long) pos);
+      bid.put("price", (i % 1000) + 1);
+      bid.put("channel", "ch-" + (pos % 8));
+      bid.put("url", "https://n.test/" + auctionId);
+      bid.put("dateTime", ts);
+      bid.put("extra", "x");
+      row.put("bid", bid);
+    }
+    return row;
+  }
+
+  /** The record branch of a nullable (null-union) struct field's Avro schema. */
+  private static Schema branch(Schema schema, String field) {
+    Schema fieldSchema = schema.getField(field).schema();
+    if (fieldSchema.getType() == Schema.Type.RECORD) {
+      return fieldSchema;
+    }
+    return fieldSchema.getTypes().stream()
+        .filter(s -> s.getType() == Schema.Type.RECORD)
+        .findFirst()
+        .orElseThrow();
+  }
+
+  /** The wide event row type, mirroring {@link #SCHEMA}, for deriving the Avro schema. */
+  private static RowType nexmarkRowType() {
+    return (RowType)
+        DataTypes.ROW(
+                DataTypes.FIELD("event_type", DataTypes.INT()),
+                DataTypes.FIELD(
+                    "person",
+                    DataTypes.ROW(
+                        DataTypes.FIELD("id", DataTypes.BIGINT()),
+                        DataTypes.FIELD("name", DataTypes.STRING()),
+                        DataTypes.FIELD("emailAddress", DataTypes.STRING()),
+                        DataTypes.FIELD("creditCard", DataTypes.STRING()),
+                        DataTypes.FIELD("city", DataTypes.STRING()),
+                        DataTypes.FIELD("state", DataTypes.STRING()),
+                        DataTypes.FIELD("dateTime", DataTypes.BIGINT()),
+                        DataTypes.FIELD("extra", DataTypes.STRING()))),
+                DataTypes.FIELD(
+                    "auction",
+                    DataTypes.ROW(
+                        DataTypes.FIELD("id", DataTypes.BIGINT()),
+                        DataTypes.FIELD("itemName", DataTypes.STRING()),
+                        DataTypes.FIELD("description", DataTypes.STRING()),
+                        DataTypes.FIELD("initialBid", DataTypes.BIGINT()),
+                        DataTypes.FIELD("reserve", DataTypes.BIGINT()),
+                        DataTypes.FIELD("dateTime", DataTypes.BIGINT()),
+                        DataTypes.FIELD("expires", DataTypes.BIGINT()),
+                        DataTypes.FIELD("seller", DataTypes.BIGINT()),
+                        DataTypes.FIELD("category", DataTypes.BIGINT()),
+                        DataTypes.FIELD("extra", DataTypes.STRING()))),
+                DataTypes.FIELD(
+                    "bid",
+                    DataTypes.ROW(
+                        DataTypes.FIELD("auction", DataTypes.BIGINT()),
+                        DataTypes.FIELD("bidder", DataTypes.BIGINT()),
+                        DataTypes.FIELD("price", DataTypes.BIGINT()),
+                        DataTypes.FIELD("channel", DataTypes.STRING()),
+                        DataTypes.FIELD("url", DataTypes.STRING()),
+                        DataTypes.FIELD("dateTime", DataTypes.BIGINT()),
+                        DataTypes.FIELD("extra", DataTypes.STRING()))),
+                DataTypes.FIELD("dateTime", DataTypes.BIGINT()))
+            .getLogicalType();
   }
 }

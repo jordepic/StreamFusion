@@ -110,13 +110,14 @@ final class KafkaTables {
 
   /**
    * Whether this table's decoder honors a pruned output schema — decoding only the columns and nested
-   * sub-fields the schema names. JSON ({@code arrow-json} builds only the schema's fields) and bare Avro
-   * (its reader schema is derived from the output type, and Avro resolution projects to it) do; the
-   * positional/scalar formats (CSV/raw) and the not-yet-verified ones do not, so they decode in full.
+   * sub-fields the schema names. Only JSON: {@code arrow-json} is schema-driven and self-describing, so
+   * a narrowed schema simply skips the other keys. Bare Avro cannot — its datums are schema-less, so the
+   * decode schema <em>is</em> the writer schema; pruning it mis-parses the bytes. Projecting Avro needs
+   * the full writer schema plus a narrowed reader schema (Avro resolution), which the decode path does
+   * not yet carry. CSV/raw are positional/scalar. Those decode in full.
    */
   static boolean decodeHonorsProjection(Map<String, String> options) {
-    int code = decodeFormatCode(options);
-    return code == 0 || code == 4; // JSON, bare Avro
+    return decodeFormatCode(options) == 0; // JSON only
   }
 
   /** The {@code MessageDecoder} format code for this table's value format, or -1 if not decodable here. */

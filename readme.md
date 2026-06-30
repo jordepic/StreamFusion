@@ -253,30 +253,35 @@ runtime is fast (q3 at 2.72 M ev/s). The changelog retract stream (up to ~2× th
 per-row key read dominate; closing this is the columnar-changelog work
 ([divergences/08](divergences/08-columnar-flow-transitions.md)), not a perimeter-transpose problem.
 
-### Nexmark q0–q2 from a Kafka JSON source (native decode)
+### Nexmark q0–q2 from a Kafka source (native decode)
 
-The same projection pushdown applies to the Kafka decode path — the native decoder is itself a (Rust)
-bytes→Arrow transpose, so a `SELECT bid.auction, …` over a `'format'='json'` table decodes only the
-read columns/fields rather than the whole record (Flink does **not** push projection into the Kafka
-scan, so its `json` format decodes everything). Run with `SF_BENCHMARK=true mvn test -Pbench
--Dtest=NexmarkKafkaBenchmark` (Testcontainers Kafka). 2 M events, native decode vs Flink's `json`:
+The native decoder is itself a (Rust) bytes→Arrow transpose. Flink does **not** push projection into
+the Kafka scan, so its format decodes the whole record; for JSON we push the query's projection into
+the decode so it builds only the read columns/fields. Run with `SF_BENCHMARK=true mvn test -Pbench
+-Dtest=NexmarkKafkaBenchmark` (Testcontainers Kafka). 2 M events, native decode vs Flink's own format:
 
-| Query | Flink | Native | Native vs. Flink |
-|---|---|---|---|
-| q2 filter | 0.78 M ev/s | 0.81 M ev/s | **1.03×** |
-| q1 currency | 0.77 M ev/s | 0.72 M ev/s | **0.94×** |
-| q0 pass-through | 0.77 M ev/s | 0.69 M ev/s | **0.90×** |
+| Query | JSON (Flink → Native) | Avro (Flink → Native) |
+|---|---|---|
+| q0 pass-through | 0.77 → 0.69 M ev/s — **0.90×** | 0.81 → 0.95 M ev/s — **1.18×** |
+| q1 currency | 0.77 → 0.72 M ev/s — **0.94×** | 0.83 → 0.88 M ev/s — **1.06×** |
+| q2 filter | 0.78 → 0.81 M ev/s — **1.03×** | 0.84 → 1.00 M ev/s — **1.18×** |
 
-**At parity, not the win the generator path shows — and the profile says why.** Sampling the native
-job (`SF_PROFILE=true … -Dtest=NexmarkKafkaBenchmark#q0NativeProfileLoop`) attributes its CPU as: ~45%
-Kafka socket I/O + thread-sync, ~19% `arrow-json` tape tokenize (parses the *whole* document), ~12% JIT,
-~10% memcpy, and only **~5% building the Arrow arrays — the one part projection pushdown reduces**. So
-pruning's ceiling on this workload is ~5%, and the dominant I/O+sync cost is *shared* with the Flink run
-(both use Flink's `KafkaSource`), which pins the ratio near 1×. This is the opposite of the generator
-source, where the JVM transpose reads every field's value and pruning that away doubled throughput. The
-bigger lever for Kafka throughput would be the I/O path (a native consumer bypassing Flink's
-`KafkaSource`), not decode pruning. (Binary formats — Avro positional, Protobuf tag-length — tokenize
-less and may shift this balance; not yet measured.)
+**JSON is ~parity; Avro is a 1.06–1.18× win — and the profiles say why** (sample with `SF_PROFILE=true …
+#q0NativeProfileLoop`, `-Dprofile.format=json|avro`). Both share a large Kafka-I/O + thread-sync cost
+(~38–45%) with the Flink run, plus JIT noise from the harness's short jobs. The decode itself differs:
+
+- **JSON is tokenize-bound** — ~19% `arrow-json` tape parse of the *whole* document, and only **~5%
+  building the Arrow arrays** (the part projection pushdown reduces). So pruning's ceiling is ~5%, and
+  Flink's mature JSON deserializer edges out the native path + its handoffs → parity.
+- **Avro is build/copy-bound** — ~27% `memmove` + ~15% decode, of which **`append_null` for the mostly-
+  null `person`/`auction` union branches is ~15% alone**. `arrow-avro` already beats Flink's Avro
+  deserializer decoding the full record, and that `append_null`/copy cost is exactly what a reader-
+  schema prune would remove — so Avro pruning has a real ~15%+ ceiling (unlike JSON's ~5%).
+
+Avro projection isn't wired yet: bare-Avro datums are schema-less, so pruning needs a full *writer*
+schema plus a narrowed *reader* schema (Avro resolution), not just a narrowed output type — a bigger
+change than JSON's, but one the profile justifies. The other shared lever for both formats is the I/O
+path (a native consumer bypassing Flink's `KafkaSource`).
 
 _Apple M1 Max; numbers are comparable only within a machine._
 
