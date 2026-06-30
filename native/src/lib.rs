@@ -4387,8 +4387,8 @@ struct UpdatingJoiner {
     left_schema: SchemaRef,
     right_schema: SchemaRef,
     predicate: Option<JoinPredicate>,
-    left_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
-    right_state: HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+    left_state: ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
+    right_state: ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
 }
 
 impl UpdatingJoiner {
@@ -4407,8 +4407,8 @@ impl UpdatingJoiner {
             left_schema,
             right_schema,
             predicate,
-            left_state: HashMap::new(),
-            right_state: HashMap::new(),
+            left_state: ahash::HashMap::default(),
+            right_state: ahash::HashMap::default(),
         }
     }
 
@@ -4466,7 +4466,7 @@ impl UpdatingJoiner {
     /// null in the equi-key matches nothing (Flink's null-filtering equi semantics), so an empty key
     /// match means "no associated rows".
     fn associated(
-        other_state: &HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        other_state: &ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
         key: &GroupKey,
     ) -> Vec<OuterRecord> {
         if key.iter().any(ScalarValue::is_null) {
@@ -4486,7 +4486,7 @@ impl UpdatingJoiner {
     /// `state.addRecord(record, num_assoc)` — bumps appear-times and (re)sets the degree, as Flink's
     /// no-unique-key `OuterJoinRecordStateView.addRecord`.
     fn add_record(
-        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        state: &mut ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
         key: &GroupKey,
         row: &JoinRow,
         num_assoc: i32,
@@ -4503,7 +4503,7 @@ impl UpdatingJoiner {
 
     /// `state.updateNumOfAssociations(record, num_assoc)` — sets the degree of an existing row.
     fn update_num_assoc(
-        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        state: &mut ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
         key: &GroupKey,
         row: &JoinRow,
         num_assoc: i32,
@@ -4517,7 +4517,7 @@ impl UpdatingJoiner {
 
     /// `state.retractRecord(record)` — drops one appear-time, removing the row (and emptied key) at 0.
     fn retract_record(
-        state: &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>>,
+        state: &mut ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>>,
         key: &GroupKey,
         row: &JoinRow,
     ) {
@@ -4571,8 +4571,19 @@ impl UpdatingJoiner {
         let mut fields: Vec<Field> = (0..types.len())
             .map(|j| Field::new(format!("c{j}"), types[j].clone(), true))
             .collect();
-        let mut columns: Vec<ArrayRef> = (0..types.len())
-            .map(|j| scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), &types[j]))
+        // Transpose the emitted rows into columns by moving each scalar exactly once (no per-cell
+        // clone): the changelog rows are consumed here, so drain them column-wise.
+        let mut col_scalars: Vec<Vec<ScalarValue>> =
+            types.iter().map(|_| Vec::with_capacity(out_rows.len())).collect();
+        for row in out_rows {
+            for (j, scalar) in row.into_iter().enumerate() {
+                col_scalars[j].push(scalar);
+            }
+        }
+        let mut columns: Vec<ArrayRef> = col_scalars
+            .into_iter()
+            .enumerate()
+            .map(|(j, scalars)| scalars_to_array(scalars, &types[j]))
             .collect();
         fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
         columns.push(Arc::new(Int8Array::from(out_kinds)));
@@ -4691,12 +4702,12 @@ impl UpdatingJoiner {
     }
 
     /// The state map for the arriving (input) side.
-    fn input_state(&mut self, is_left: bool) -> &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>> {
+    fn input_state(&mut self, is_left: bool) -> &mut ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>> {
         if is_left { &mut self.left_state } else { &mut self.right_state }
     }
 
     /// The state map for the side opposite the arriving one.
-    fn other_state(&mut self, is_left: bool) -> &mut HashMap<GroupKey, HashMap<JoinRow, RowMeta>> {
+    fn other_state(&mut self, is_left: bool) -> &mut ahash::HashMap<GroupKey, ahash::HashMap<JoinRow, RowMeta>> {
         if is_left { &mut self.right_state } else { &mut self.left_state }
     }
 
