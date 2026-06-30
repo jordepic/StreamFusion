@@ -34,6 +34,10 @@ arrow-avro = "58"
 # 58, so we carry the source with that one-line bump rather than a fork/git dep. Self-contained: any
 # clone builds it. See native/vendor/ptars/Cargo.toml for provenance.
 prost-reflect = "0.16"
+# Manipulate the FileDescriptorSet to prune it to the read fields (projection pushdown into the decode):
+# match prost-reflect 0.16's prost (0.14) so the encoded set is interchangeable.
+prost = "0.14"
+prost-types = "0.14"
 ptars = { path = "vendor/ptars" }
 datafusion = "53.1.0"
 # Native Kafka consumer, behind the `kafka` feature so the normal build pulls in no Kafka code at all.

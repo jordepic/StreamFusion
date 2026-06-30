@@ -724,8 +724,12 @@ public final class Native {
    * @param descriptor an encoded protobuf {@code FileDescriptorSet} the JVM serialized off the
    *     generated message class (the message's {@code .proto} file + its transitive dependencies)
    * @param messageName the fully-qualified message type to decode each body as
+   * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the projected output
+   *     schema, used to prune the descriptor to the read fields; 0 for no projection (decode in full)
+   * @param schemaAddress address of the matching exported {@code ArrowSchema}, or 0
    */
-  public static native long createProtobufDecoder(byte[] descriptor, String messageName);
+  public static native long createProtobufDecoder(
+      byte[] descriptor, String messageName, long schemaArrayAddress, long schemaAddress);
 
   /** Decodes one binary-column body batch into a typed batch, exported into the output C structs. */
   public static native void decodeInto(
