@@ -6977,6 +6977,22 @@ fn build_call(op: i64, args: Vec<datafusion::prelude::Expr>) -> datafusion::prel
         // DATE_FORMAT(ts, fmt): fmt is the already-translated chrono pattern (see DateFormat).
         return datafusion::logical_expr::ScalarUDF::new_from_impl(DateFormat::new()).call(args);
     }
+    if op == 87 {
+        // TO_TIMESTAMP_LTZ(millis, 3): the single operand is epoch millis (the Java side admits only
+        // the precision-3 form). Casting Int64 -> Timestamp(ms) reads the int as millis-since-epoch
+        // (the right instant); the second cast rescales to the nanosecond/no-tz unit ArrowConversion
+        // pins every TIMESTAMP/TIMESTAMP_LTZ column to.
+        let mut a = args.into_iter();
+        let millis = a.next().expect("to_timestamp_ltz operand");
+        let as_ms = datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(millis),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        ));
+        return datafusion::prelude::Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(as_ms),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ));
+    }
     if op == 57 {
         // POSITION(sub IN s): operands arrive [sub, s]; strpos takes (string, substring).
         let mut a = args.into_iter();

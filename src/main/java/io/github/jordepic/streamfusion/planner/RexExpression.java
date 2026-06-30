@@ -403,6 +403,9 @@ final class RexExpression {
     if ("DATE_FORMAT".equalsIgnoreCase(call.getOperator().getName())) {
       return emitDateFormat(call.getOperands());
     }
+    if ("TO_TIMESTAMP_LTZ".equalsIgnoreCase(call.getOperator().getName())) {
+      return emitToTimestampLtz(call.getOperands());
+    }
     if ("ABS".equalsIgnoreCase(call.getOperator().getName())) {
       return emitFloatUnary(call, 62);
     }
@@ -735,6 +738,27 @@ final class RexExpression {
       }
     }
     return true;
+  }
+
+  /**
+   * Emits {@code TO_TIMESTAMP_LTZ(epoch, precision)} (op 87). Admitted only for the millisecond form
+   * ({@code precision} literal 3) over an integer epoch — the only shape the native side reads (epoch
+   * millis → the nanosecond/no-tz timestamp ArrowConversion pins every timestamp column to). Any other
+   * precision (seconds, micros) or a non-literal precision falls back.
+   */
+  private boolean emitToTimestampLtz(List<RexNode> args) {
+    if (args.size() != 2) {
+      return reject("TO_TIMESTAMP_LTZ requires 2 arguments");
+    }
+    if (!(args.get(1) instanceof RexLiteral)) {
+      return reject("TO_TIMESTAMP_LTZ requires a literal precision");
+    }
+    Object precision = ((RexLiteral) args.get(1)).getValueAs(Integer.class);
+    if (!Integer.valueOf(3).equals(precision)) {
+      return reject("TO_TIMESTAMP_LTZ: only millisecond precision (3) is supported");
+    }
+    add(KIND_CALL, 87, 1);
+    return emit(args.get(0));
   }
 
   /**
