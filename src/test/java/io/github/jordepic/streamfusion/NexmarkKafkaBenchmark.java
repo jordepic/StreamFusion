@@ -2,6 +2,10 @@ package io.github.jordepic.streamfusion;
 
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import io.github.jordepic.streamfusion.proto.NexmarkAuction;
+import io.github.jordepic.streamfusion.proto.NexmarkBid;
+import io.github.jordepic.streamfusion.proto.NexmarkEvent;
+import io.github.jordepic.streamfusion.proto.NexmarkPerson;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -94,6 +98,11 @@ class NexmarkKafkaBenchmark {
   @Test
   void nexmarkKafkaAvro() throws Exception {
     runFormat("avro");
+  }
+
+  @Test
+  void nexmarkKafkaProtobuf() throws Exception {
+    runFormat("protobuf");
   }
 
   private void runFormat(String format) throws Exception {
@@ -197,7 +206,11 @@ class NexmarkKafkaBenchmark {
             + "', 'properties.group.id' = 'nexmark', 'scan.startup.mode' = 'earliest-offset',"
             + " 'scan.bounded.mode' = 'latest-offset', 'format' = '"
             + format
-            + "')");
+            + "'"
+            + ("protobuf".equals(format)
+                ? ", 'protobuf.message-class-name' = 'io.github.jordepic.streamfusion.proto.NexmarkEvent'"
+                : "")
+            + ")");
     PhysicalPlanScan scan = useNative ? NativePlanner.install(tEnv) : null;
     tEnv.executeSql(sinkDdl);
     long start = System.nanoTime();
@@ -218,12 +231,15 @@ class NexmarkKafkaBenchmark {
     props.put(ProducerConfig.LINGER_MS_CONFIG, 50);
     props.put(ProducerConfig.BATCH_SIZE_CONFIG, 1 << 20);
     boolean avro = "avro".equals(format);
+    boolean protobuf = "protobuf".equals(format);
     Schema schema = avro ? AvroSchemaConverter.convertToSchema(nexmarkRowType().copy(false)) : null;
     GenericDatumWriter<GenericRecord> writer = avro ? new GenericDatumWriter<>(schema) : null;
     try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(props)) {
       for (long i = 0; i < ROWS; i++) {
         byte[] value;
-        if (avro) {
+        if (protobuf) {
+          value = protobufEvent(i).toByteArray();
+        } else if (avro) {
           ByteArrayOutputStream out = new ByteArrayOutputStream();
           BinaryEncoder encoder = EncoderFactory.get().binaryEncoder(out, null);
           writer.write(avroEvent(i, schema), encoder);
@@ -265,6 +281,57 @@ class NexmarkKafkaBenchmark {
             + "\"price\":%d,\"channel\":\"ch-%d\",\"url\":\"https://n.test/%d\",\"dateTime\":%d,"
             + "\"extra\":\"x\"},\"dateTime\":%d}",
         auctionId, pos, (i % 1000) + 1, pos % 8, auctionId, ts, ts);
+  }
+
+  /** The same wide event as a protobuf {@link NexmarkEvent}; the inactive nested messages stay unset. */
+  private static NexmarkEvent protobufEvent(long i) {
+    long block = i / BLOCK;
+    int pos = (int) (i % BLOCK);
+    long ts = block * 1000L + pos * 10L;
+    NexmarkEvent.Builder row = NexmarkEvent.newBuilder().setDateTime(ts);
+    if (pos == 0) {
+      return row.setEventType(0)
+          .setPerson(
+              NexmarkPerson.newBuilder()
+                  .setId(block)
+                  .setName("p-" + block)
+                  .setEmailAddress("e-" + block)
+                  .setCreditCard("1234")
+                  .setCity("c-" + (block % 1000))
+                  .setState(STATES[(int) (block % STATES.length)])
+                  .setDateTime(ts)
+                  .setExtra("x"))
+          .build();
+    }
+    if (pos <= 3) {
+      long auctionId = block * 3 + (pos - 1);
+      return row.setEventType(1)
+          .setAuction(
+              NexmarkAuction.newBuilder()
+                  .setId(auctionId)
+                  .setItemName("i-" + auctionId)
+                  .setDescription("d-" + auctionId)
+                  .setInitialBid(10)
+                  .setReserve(50)
+                  .setDateTime(ts)
+                  .setExpires(ts + 20000)
+                  .setSeller(block)
+                  .setCategory(block % 100)
+                  .setExtra("x"))
+          .build();
+    }
+    long auctionId = block * 3 + (pos % 3);
+    return row.setEventType(2)
+        .setBid(
+            NexmarkBid.newBuilder()
+                .setAuction(auctionId)
+                .setBidder(pos)
+                .setPrice((i % 1000) + 1)
+                .setChannel("ch-" + (pos % 8))
+                .setUrl("https://n.test/" + auctionId)
+                .setDateTime(ts)
+                .setExtra("x"))
+        .build();
   }
 
   /** The same wide event as an Avro {@link GenericRecord}, inactive structs left null. */
