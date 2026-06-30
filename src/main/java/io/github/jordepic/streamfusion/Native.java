@@ -810,11 +810,15 @@ public final class Native {
    *
    * @param configKeys translated librdkafka config keys (from {@code KafkaConfigTranslator})
    * @param configValues values index-aligned with {@code configKeys}, applied verbatim
-   * @param format decoder: 0 = JSON (against the schema C structs), 1 = Confluent Avro
+   * @param format decoder: 0 = JSON (against the schema C structs), 1 = Confluent Avro, 4 = bare Avro,
+   *     5 = protobuf — the same codes the shallow decode path uses
    * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the decoder's schema
    * @param schemaAddress address of the matching exported {@code ArrowSchema}
-   * @param avroSchema writer-schema JSON for Avro (ignored for JSON; pass "")
+   * @param avroSchema writer-schema JSON for Avro (ignored for JSON/protobuf; pass "")
+   * @param readerAvroSchema narrowed reader-schema JSON for a projected bare-Avro decode (else "")
    * @param schemaId Confluent schema id the Avro writer schema is registered under (ignored for JSON)
+   * @param descriptor encoded protobuf {@code FileDescriptorSet} for format 5 (else {@code null})
+   * @param messageName fully-qualified protobuf message type for format 5 (else "")
    */
   public static native long openKafkaConsumer(
       String[] configKeys,
@@ -823,7 +827,10 @@ public final class Native {
       long schemaArrayAddress,
       long schemaAddress,
       String avroSchema,
-      int schemaId);
+      String readerAvroSchema,
+      int schemaId,
+      byte[] descriptor,
+      String messageName);
 
   /**
    * Adds splits to the reader and re-assigns the consumer: each new partition seeks to its start

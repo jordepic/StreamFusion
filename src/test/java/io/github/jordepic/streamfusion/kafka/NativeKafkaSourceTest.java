@@ -125,7 +125,7 @@ class NativeKafkaSourceTest {
         Data.exportVectorSchemaRoot(allocator, template, dictionaries, array, schema);
         long handle =
             Native.openKafkaConsumer(
-                keys, values, 0, array.memoryAddress(), schema.memoryAddress(), "", 0);
+                keys, values, 0, array.memoryAddress(), schema.memoryAddress(), "", "", 0, null, "");
         Native.assignKafkaSplits(handle, new String[] {TOPIC}, new long[] {0}, new long[] {startOffset});
         return handle;
       }

@@ -52,13 +52,16 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
       int format,
       RowType outputType,
       String avroSchema,
+      String readerAvroSchema,
       int schemaId,
+      byte[] protoDescriptor,
+      String protoMessageName,
       int maxRecords,
       long pollTimeoutMillis) {
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
     // Export an empty batch of the decoder's output schema so the native side can build the JSON
-    // decoder (Avro derives its own schema); the consumer is created here, partitions assigned later.
+    // decoder (Avro/protobuf derive their own schema); the consumer is created here, partitions later.
     try (VectorSchemaRoot template = RowDataArrowConverter.write(List.of(), outputType, allocator);
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
@@ -71,7 +74,10 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
               array.memoryAddress(),
               schema.memoryAddress(),
               avroSchema == null ? "" : avroSchema,
-              schemaId);
+              readerAvroSchema == null ? "" : readerAvroSchema,
+              schemaId,
+              protoDescriptor,
+              protoMessageName == null ? "" : protoMessageName);
     }
   }
 

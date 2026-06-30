@@ -9767,15 +9767,21 @@ impl Drop for KafkaSplitReader {
 
 #[cfg(feature = "kafka")]
 impl KafkaSplitReader {
-    /// `format` selects the decoder: JSON (0) decodes against `output_schema`; Avro (1) builds a
-    /// Confluent schema store mapping `schema_id` → `avro_schema` (the writer schema JSON). The decoder
-    /// is built and owned by the background decode thread.
+    /// `format` selects the decoder, the same dispatch the shallow decode path uses: JSON (0) decodes
+    /// against `output_schema`; bare Avro (4) / Confluent Avro (1) build a schema store mapping
+    /// `schema_id` → `avro_schema` (the writer schema JSON), optionally projecting to `reader_avro_schema`
+    /// (the narrowed output) via Avro resolution; protobuf (5) decodes against `proto_descriptor` (an
+    /// encoded `FileDescriptorSet`) / `proto_message_name`. The decoder is built and owned by the
+    /// background decode thread, so its state never crosses threads.
     fn open(
         config: &[(String, String)],
         format: i32,
         output_schema: SchemaRef,
         avro_schema: &str,
+        reader_avro_schema: &str,
         schema_id: i32,
+        proto_descriptor: Vec<u8>,
+        proto_message_name: String,
     ) -> KafkaSplitReader {
         use rdkafka::config::ClientConfig;
 
@@ -9794,10 +9800,17 @@ impl KafkaSplitReader {
         let (raw_tx, raw_rx) = std::sync::mpsc::channel::<RawWork>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Decoded>();
         let avro_schema = avro_schema.to_string();
+        let reader_avro_schema = reader_avro_schema.to_string();
         let decode_thread = std::thread::spawn(move || {
             // The same format-dispatched decoder the shallow path uses; built here so its state never
-            // crosses threads. Only who produces the body batch (rdkafka vs Flink) differs.
-            let decoder = MessageDecoder::new(format, output_schema, &avro_schema, "", schema_id);
+            // crosses threads. Only who produces the body batch (rdkafka vs Flink) differs. Protobuf
+            // is built straight from the descriptor (not in MessageDecoder::new, like the shallow path's
+            // createProtobufDecoder); every other format dispatches through MessageDecoder::new.
+            let decoder = if format == 5 {
+                MessageDecoder::Protobuf(ProtobufDecoder::new(&proto_descriptor, &proto_message_name))
+            } else {
+                MessageDecoder::new(format, output_schema, &avro_schema, &reader_avro_schema, schema_id)
+            };
             while let Ok(work) = raw_rx.recv() {
                 let decoded = Decoded {
                     topic: work.topic,
@@ -9963,9 +9976,10 @@ impl KafkaSplitReader {
 
 /// Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
 /// `closeKafkaConsumer`. `configKeys`/`configValues` are the translated librdkafka config (applied
-/// verbatim). `format` is 0 for JSON (decoded against the schema in the C structs) or 1 for Confluent
-/// Avro (decoded against `avroSchema` registered at `schemaId`). Splits are added later via
-/// `assignKafkaSplits` as the enumerator assigns them.
+/// verbatim). `format` selects the decoder (the same codes the shallow decode path uses): 0 JSON
+/// (decoded against the schema in the C structs), 1 Confluent / 4 bare Avro (decoded against
+/// `avroSchema` registered at `schemaId`, optionally projected to `readerAvroSchema`), 5 protobuf
+/// (decoded against `descriptor`/`messageName`). Splits are added later via `assignKafkaSplits`.
 #[cfg(feature = "kafka")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaConsumer<'local>(
@@ -9977,7 +9991,10 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaCons
     schema_array_address: jlong,
     schema_address: jlong,
     avro_schema: JString<'local>,
+    reader_avro_schema: JString<'local>,
     schema_id: jint,
+    descriptor: JByteArray<'local>,
+    message_name: JString<'local>,
 ) -> jlong {
     let keys = read_string_array(&mut env, &config_keys);
     let values = read_string_array(&mut env, &config_values);
@@ -9985,8 +10002,24 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaCons
     let schema = import_record_batch(schema_array_address, schema_address).schema();
     let avro_schema: String =
         env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
-    let reader =
-        KafkaSplitReader::open(&config, format, schema, &avro_schema, schema_id);
+    // Empty unless the planner pushed a projection into a bare-Avro decode (the narrowed reader schema).
+    let reader_avro_schema: String =
+        env.get_string(&reader_avro_schema).map(Into::into).unwrap_or_default();
+    // The protobuf FileDescriptorSet + message name; empty for non-protobuf formats (JByteArray is null).
+    let proto_descriptor: Vec<u8> =
+        if descriptor.is_null() { Vec::new() } else { env.convert_byte_array(&descriptor).unwrap_or_default() };
+    let proto_message_name: String =
+        env.get_string(&message_name).map(Into::into).unwrap_or_default();
+    let reader = KafkaSplitReader::open(
+        &config,
+        format,
+        schema,
+        &avro_schema,
+        &reader_avro_schema,
+        schema_id,
+        proto_descriptor,
+        proto_message_name,
+    );
     Box::into_raw(Box::new(reader)) as jlong
 }
 
@@ -10112,7 +10145,8 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let schema = import_record_batch(schema_array_address, schema_address).schema();
     let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
 
-    let mut reader = KafkaSplitReader::open(&config, format, schema, &avro_schema, schema_id);
+    let mut reader =
+        KafkaSplitReader::open(&config, format, schema, &avro_schema, "", schema_id, Vec::new(), String::new());
     reader.assign_splits(&[topic], &[0], &[-2]); // partition 0, earliest
 
     let timeout = std::time::Duration::from_millis(250);
