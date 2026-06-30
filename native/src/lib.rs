@@ -2255,8 +2255,31 @@ struct GroupAggregator {
     filter_columns: Vec<i64>,
     key_columns: Vec<usize>,
     generate_update_before: bool,
-    keys: ahash::HashMap<GroupKey, GroupKeyState>,
+    // The group map is keyed by the arrow-row memcomparable encoding of the key columns, not a
+    // `Vec<ScalarValue>`: a native-vs-Flink differential on q17 showed the scalar key's hash/alloc/drop
+    // (ScalarValue::hash, per-row Vec churn) was the dominant cost native paid and Flink (byte keys)
+    // did not. `key_converter` encodes the key columns per batch and decodes them back for the output.
+    keys: ahash::HashMap<OwnedRow, GroupKeyState>,
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
+}
+
+/// An arrow-row codec over a set of key columns (memcomparable; used to key group/distinct state by
+/// bytes instead of `Vec<ScalarValue>`).
+fn key_row_converter(arrays: &[&ArrayRef]) -> RowConverter {
+    RowConverter::new(arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())
+        .expect("group key converter")
+}
+
+/// Decodes memcomparable group-key byte rows back to their key columns (inverse of `key_row_converter`).
+/// With no rows (or no converter yet) it yields one empty, correctly-typed array per key column.
+fn decode_keys(conv: Option<&RowConverter>, keys: &[OwnedRow], key_types: &[DataType]) -> Vec<ArrayRef> {
+    match conv {
+        Some(c) if !keys.is_empty() => {
+            c.convert_rows(keys.iter().map(|k| k.row())).expect("decode group keys")
+        }
+        _ => key_types.iter().map(new_empty_array).collect(),
+    }
 }
 
 impl GroupAggregator {
@@ -2288,6 +2311,7 @@ impl GroupAggregator {
             key_columns,
             generate_update_before,
             keys: ahash::HashMap::default(),
+            key_converter: None,
             key_types: Vec::new(),
             filter_columns,
         }
@@ -2303,7 +2327,7 @@ impl GroupAggregator {
     }
 
     /// The per-key state, created (empty) on first touch.
-    fn state(&mut self, key: GroupKey) -> &mut GroupKeyState {
+    fn state(&mut self, key: OwnedRow) -> &mut GroupKeyState {
         let (kinds, value_types) = (&self.kinds, &self.value_types);
         self.keys.entry(key).or_insert_with(|| GroupKeyState {
             aggs: kinds.iter().zip(value_types).map(|(&kind, vt)| GroupAggState::new(kind, vt)).collect(),
@@ -2312,7 +2336,7 @@ impl GroupAggregator {
     }
 
     /// A key's current output tuple (each aggregate reports NULL while it has no live input).
-    fn output_values(&self, key: &GroupKey) -> Vec<ScalarValue> {
+    fn output_values(&self, key: &OwnedRow) -> Vec<ScalarValue> {
         let state = self.keys.get(key).expect("key present");
         state.aggs.iter().zip(&self.result_types).map(|(agg, rt)| agg.emit(rt)).collect()
     }
@@ -2351,6 +2375,14 @@ impl GroupAggregator {
             .collect();
         let key_arrays: Vec<&ArrayRef> = self.key_columns.iter().map(|&i| batch.column(i)).collect();
         self.key_types = key_types(&key_arrays);
+        if self.key_converter.is_none() {
+            self.key_converter = Some(key_row_converter(&key_arrays));
+        }
+        // Encode all key columns to memcomparable byte rows in one pass; the per-row group key is then
+        // a byte slice, not a freshly allocated Vec<ScalarValue>.
+        let key_owned: Vec<ArrayRef> = key_arrays.iter().map(|a| (*a).clone()).collect();
+        let keys_encoded =
+            self.key_converter.as_ref().unwrap().convert_columns(&key_owned).expect("encode group keys");
         let row_kinds = row_kind_column(batch);
         // Per aggregate, the value column index for a COUNT(DISTINCT) (kind 7), else None. Captured
         // before the per-row loop so the loop body reads no `self` field while `state` is borrowed.
@@ -2387,10 +2419,10 @@ impl GroupAggregator {
             })
             .collect();
 
-        let mut out_keys: Vec<GroupKey> = Vec::new();
+        let mut out_keys: Vec<OwnedRow> = Vec::new();
         let mut out_results: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut out_kinds: Vec<i8> = Vec::new();
-        let mut push = |kind: i8, key: &GroupKey, values: &[ScalarValue]| {
+        let mut push = |kind: i8, key: &OwnedRow, values: &[ScalarValue]| {
             out_keys.push(key.clone());
             for (i, v) in values.iter().enumerate() {
                 out_results[i].push(v.clone());
@@ -2399,7 +2431,7 @@ impl GroupAggregator {
         };
 
         for row in 0..n {
-            let key = read_key(&key_arrays, row);
+            let key = keys_encoded.row(row).owned();
             // RowKind: 0 +I, 1 -U, 2 +U, 3 -D (absent column ⇒ INSERT). UB/delete retract; I/UA add.
             let kind = row_kinds.map_or(0, |kinds| kinds.value(row));
             let retract = kind == 1 || kind == 3;
@@ -2497,7 +2529,7 @@ impl GroupAggregator {
         drop(push);
 
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&out_keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &out_keys, &self.key_types);
         for (i, rt) in self.result_types.iter().enumerate() {
             fields.push(Field::new(format!("result{i}"), rt.clone(), true));
             columns.push(scalars_to_array(std::mem::take(&mut out_results[i]), rt));
@@ -2513,11 +2545,11 @@ impl GroupAggregator {
     /// batch per MIN/MAX aggregate carries its `[key0.., value, count]` multiset rows.
     fn snapshot(&mut self) -> Vec<u8> {
         let num_agg = self.kinds.len();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<OwnedRow> = Vec::new();
         let mut records: Vec<i64> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut non_null_columns: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
-        let mut multiset_keys: Vec<Vec<GroupKey>> = vec![Vec::new(); num_agg];
+        let mut multiset_keys: Vec<Vec<OwnedRow>> = vec![Vec::new(); num_agg];
         let mut multiset_values: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut multiset_counts: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
         for (key, state) in self.keys.iter() {
@@ -2553,7 +2585,7 @@ impl GroupAggregator {
         }
 
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         fields.push(Field::new("records", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(records)));
         for i in 0..num_agg {
@@ -2567,7 +2599,7 @@ impl GroupAggregator {
         for i in 0..num_agg {
             if matches!(self.kinds[i], 1 | 2 | 7) {
                 let mut f = key_fields(&self.key_types);
-                let mut c = key_columns(&multiset_keys[i], &self.key_types);
+                let mut c = decode_keys(self.key_converter.as_ref(), &multiset_keys[i], &self.key_types);
                 // MIN/MAX values take the aggregate's result type; a distinct value keeps its own type
                 // (the count's bigint result type does not describe it), inferred from the scalars.
                 let values = std::mem::take(&mut multiset_values[i]);
@@ -2610,9 +2642,13 @@ impl GroupAggregator {
         let arity = main.num_columns() - 1 - 2 * num_agg;
         let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| main.column(j)).collect();
         aggregator.key_types = key_types(&key_arrays);
+        aggregator.key_converter = Some(key_row_converter(&key_arrays));
+        let key_owned: Vec<ArrayRef> = key_arrays.iter().map(|a| (*a).clone()).collect();
+        let keys_encoded =
+            aggregator.key_converter.as_ref().unwrap().convert_columns(&key_owned).expect("encode restored keys");
         let records = column_i64(main, "records");
         for row in 0..main.num_rows() {
-            let key = read_key(&key_arrays, row);
+            let key = keys_encoded.row(row).owned();
             let state = aggregator.state(key);
             state.records = records.value(row);
             for i in 0..num_agg {
@@ -2639,10 +2675,17 @@ impl GroupAggregator {
             frame += 1;
             let side_arity = side.num_columns() - 2;
             let side_keys: Vec<&ArrayRef> = (0..side_arity).map(|j| side.column(j)).collect();
+            let side_key_owned: Vec<ArrayRef> = side_keys.iter().map(|a| (*a).clone()).collect();
+            let side_keys_enc = aggregator
+                .key_converter
+                .as_ref()
+                .expect("key converter set by the main batch")
+                .convert_columns(&side_key_owned)
+                .expect("encode multiset keys");
             let values = side.column(side_arity);
             let counts = column_i64(side, "count");
             for row in 0..side.num_rows() {
-                let key = read_key(&side_keys, row);
+                let key = side_keys_enc.row(row).owned();
                 let value = ScalarValue::try_from_array(values, row).expect("multiset value");
                 match aggregator.keys.get_mut(&key).map(|s| &mut s.aggs[i]) {
                     Some(GroupAggState::Extremes { counts: map, .. }) => {
