@@ -42,3 +42,48 @@ message Complex {
   map<string, int64> tags = 3;
   Row nested = 4;
 }
+
+// The wide Nexmark event (person/auction/bid mix) as protobuf — for the Kafka decode benchmark. Only
+// the active event's nested message is set; the others are unset (proto3) and decode to a null ROW.
+// `dateTime`/`expires` are int64 epoch millis (the decode cost is a long; avoids timestamp-format noise).
+message NexmarkPerson {
+  int64 id = 1;
+  string name = 2;
+  string emailAddress = 3;
+  string creditCard = 4;
+  string city = 5;
+  string state = 6;
+  int64 dateTime = 7;
+  string extra = 8;
+}
+
+message NexmarkAuction {
+  int64 id = 1;
+  string itemName = 2;
+  string description = 3;
+  int64 initialBid = 4;
+  int64 reserve = 5;
+  int64 dateTime = 6;
+  int64 expires = 7;
+  int64 seller = 8;
+  int64 category = 9;
+  string extra = 10;
+}
+
+message NexmarkBid {
+  int64 auction = 1;
+  int64 bidder = 2;
+  int64 price = 3;
+  string channel = 4;
+  string url = 5;
+  int64 dateTime = 6;
+  string extra = 7;
+}
+
+message NexmarkEvent {
+  int32 event_type = 1;
+  NexmarkPerson person = 2;
+  NexmarkAuction auction = 3;
+  NexmarkBid bid = 4;
+  int64 dateTime = 5;
+}
