@@ -447,7 +447,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return new StreamPhysicalNativeCalc(
               calc.getCluster(),
               calc.getTraitSet(),
-              decode.withRowType(pruned.inputType),
+              decode.withProjection(pruned.inputType),
               calc.getRowType(),
               encoded.remapInputs(pruned.remap));
         }

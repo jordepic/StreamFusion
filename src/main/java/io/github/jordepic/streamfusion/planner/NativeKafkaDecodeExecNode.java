@@ -41,10 +41,15 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
   private static final int PROTOBUF = 5;
 
   private final RowType outputType;
+  private final RowType writerType;
   private final Map<String, String> options;
 
   public NativeKafkaDecodeExecNode(
-      ReadableConfig tableConfig, RowType outputType, String description, Map<String, String> options) {
+      ReadableConfig tableConfig,
+      RowType outputType,
+      RowType writerType,
+      String description,
+      Map<String, String> options) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-kafka-decode_1"),
@@ -53,6 +58,7 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.outputType = outputType;
+    this.writerType = writerType;
     this.options = options;
   }
 
@@ -68,12 +74,19 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
             SOURCE_TRANSFORMATION,
             PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO);
     int format = KafkaTables.decodeFormatCode(options);
-    // Bare Avro decodes against a reader schema, not the exported target schema: derive it from the
-    // table's RowType with the same converter Flink's own `avro` format uses, so the decode matches. The
+    // Bare Avro decodes against the writer schema (its datums are schema-less): derive it from the full
+    // writer RowType with the same converter Flink's own `avro` format uses, so the decode matches. The
     // row is forced non-null first (a record, never a `["null", record]` union — which both Flink's own
-    // format and the Arrow reader treat as a record, the row itself never being null).
+    // format and the Arrow reader treat as a record, the row itself never being null). When the output
+    // is a pruned subset of the writer, also pass a reader schema (the narrowed output) so Avro
+    // resolution materializes only the read fields.
+    boolean pruned = !writerType.equals(outputType);
     String avroSchema =
         format == BARE_AVRO
+            ? AvroSchemaConverter.convertToSchema(writerType.copy(false)).toString()
+            : "";
+    String readerAvroSchema =
+        format == BARE_AVRO && pruned
             ? AvroSchemaConverter.convertToSchema(outputType.copy(false)).toString()
             : "";
     // Protobuf decodes against the descriptor of the generated message class the table names — extracted
@@ -88,7 +101,14 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
             DECODE_TRANSFORMATION,
             ArrowBatchTypeInformation.INSTANCE,
             new NativeBytesDecodeOperator(
-                outputType, BATCH_SIZE, format, avroSchema, 0, protoDescriptor, protoMessageName));
+                outputType,
+                BATCH_SIZE,
+                format,
+                avroSchema,
+                readerAvroSchema,
+                0,
+                protoDescriptor,
+                protoMessageName));
     return decoded.getTransformation();
   }
 }

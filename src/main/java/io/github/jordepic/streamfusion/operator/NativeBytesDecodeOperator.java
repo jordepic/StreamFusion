@@ -38,6 +38,7 @@ public class NativeBytesDecodeOperator extends AbstractStreamOperator<ArrowBatch
   private final int batchSize;
   private final int format;
   private final String avroSchema;
+  private final String readerAvroSchema;
   private final int schemaId;
   private final byte[] protoDescriptor;
   private final String protoMessageName;
@@ -52,6 +53,7 @@ public class NativeBytesDecodeOperator extends AbstractStreamOperator<ArrowBatch
       int batchSize,
       int format,
       String avroSchema,
+      String readerAvroSchema,
       int schemaId,
       byte[] protoDescriptor,
       String protoMessageName) {
@@ -59,6 +61,7 @@ public class NativeBytesDecodeOperator extends AbstractStreamOperator<ArrowBatch
     this.batchSize = batchSize;
     this.format = format;
     this.avroSchema = avroSchema;
+    this.readerAvroSchema = readerAvroSchema;
     this.schemaId = schemaId;
     this.protoDescriptor = protoDescriptor;
     this.protoMessageName = protoMessageName;
@@ -79,13 +82,13 @@ public class NativeBytesDecodeOperator extends AbstractStreamOperator<ArrowBatch
       return Native.createProtobufDecoder(protoDescriptor, protoMessageName);
     }
     if (format == 1 || format == 4) {
-      return Native.createDecoder(format, 0L, 0L, avroSchema, schemaId);
+      return Native.createDecoder(format, 0L, 0L, avroSchema, readerAvroSchema, schemaId);
     }
     try (VectorSchemaRoot template = RowDataArrowConverter.write(List.of(), outputType, allocator);
         ArrowArray array = ArrowArray.allocateNew(allocator);
         ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, template, NativeAllocator.DICTIONARIES, array, schema);
-      return Native.createDecoder(format, array.memoryAddress(), schema.memoryAddress(), "", 0);
+      return Native.createDecoder(format, array.memoryAddress(), schema.memoryAddress(), "", "", 0);
     }
   }
 

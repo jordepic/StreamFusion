@@ -83,6 +83,68 @@ class NativeAvroDecodeSqlHarnessTest {
     }
   }
 
+  @Test
+  void nestedProjectionPrunesDecodedColumns() throws Exception {
+    // A wide record read through a strict subset: the planner pushes the projection into the decode,
+    // which decodes the full writer datum but materializes only event_type + the two bid sub-fields via
+    // a narrowed reader schema (Avro resolution). Must still match Flink's full-record decode + calc.
+    try (KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
+      kafka.start();
+      String brokers = kafka.getBootstrapServers();
+      String columns =
+          "event_type INT, person ROW<id BIGINT, name STRING, email STRING, city STRING>,"
+              + " bid ROW<auction BIGINT, bidder BIGINT, price BIGINT, channel STRING, url STRING>";
+      RowType wide =
+          (RowType)
+              DataTypes.ROW(
+                      DataTypes.FIELD("event_type", DataTypes.INT()),
+                      DataTypes.FIELD(
+                          "person",
+                          DataTypes.ROW(
+                              DataTypes.FIELD("id", DataTypes.BIGINT()),
+                              DataTypes.FIELD("name", DataTypes.STRING()),
+                              DataTypes.FIELD("email", DataTypes.STRING()),
+                              DataTypes.FIELD("city", DataTypes.STRING()))),
+                      DataTypes.FIELD(
+                          "bid",
+                          DataTypes.ROW(
+                              DataTypes.FIELD("auction", DataTypes.BIGINT()),
+                              DataTypes.FIELD("bidder", DataTypes.BIGINT()),
+                              DataTypes.FIELD("price", DataTypes.BIGINT()),
+                              DataTypes.FIELD("channel", DataTypes.STRING()),
+                              DataTypes.FIELD("url", DataTypes.STRING()))))
+                  .getLogicalType();
+      produce(brokers, "avro-wide", wide, NativeAvroDecodeSqlHarnessTest::wideRecord);
+      NativeParity.assertParity(
+          environment(brokers, "avro-wide", columns),
+          "SELECT bid.auction, bid.price FROM t WHERE event_type = 2");
+    }
+  }
+
+  private static void wideRecord(GenericRecord record, int i, Schema schema) {
+    int eventType = i % 2 == 0 ? 0 : 2;
+    record.put("event_type", eventType);
+    if (eventType == 0) {
+      GenericRecord person = new GenericData.Record(recordBranch(schema.getField("person").schema()));
+      person.put("id", (long) i);
+      person.put("name", "n-" + i);
+      person.put("email", "e-" + i);
+      person.put("city", "c-" + i);
+      record.put("person", person);
+      record.put("bid", null);
+    } else {
+      GenericRecord bid = new GenericData.Record(recordBranch(schema.getField("bid").schema()));
+      bid.put("auction", (long) i);
+      bid.put("bidder", (long) (i + 1));
+      bid.put("price", (long) (i * 10));
+      bid.put("channel", "ch-" + i);
+      bid.put("url", "u-" + i);
+      record.put("person", null);
+      record.put("bid", bid);
+    }
+  }
+
   private static void flatRecord(GenericRecord record, int i, Schema schema) {
     record.put("id", (long) i);
     record.put("name", "row-" + i);
