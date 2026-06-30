@@ -67,6 +67,34 @@ class NativeJsonDecodeSqlHarnessTest {
     }
   }
 
+  @Test
+  void nestedProjectionPrunesDecodedColumns() throws Exception {
+    // A wide record read through a strict subset: the planner prunes the decode to event_type + the two
+    // bid sub-fields, so arrow-json never materializes person or bid.channel/url. Must still match Flink.
+    try (KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
+      kafka.start();
+      String brokers = kafka.getBootstrapServers();
+      List<String> wide = new ArrayList<>(MESSAGES);
+      for (int i = 0; i < MESSAGES; i++) {
+        wide.add(
+            String.format(
+                "{\"event_type\":%d,\"person\":{\"id\":%d,\"name\":\"p-%d\",\"email\":\"e-%d\","
+                    + "\"city\":\"c-%d\"},\"bid\":{\"auction\":%d,\"bidder\":%d,\"price\":%d,"
+                    + "\"channel\":\"ch-%d\",\"url\":\"u-%d\"}}",
+                i % 3, i, i, i, i, i, i + 1, (i % 1000) + 1, i % 8, i));
+      }
+      produce(brokers, "json-wide", wide);
+      NativeParity.assertParity(
+          environment(
+              brokers,
+              "json-wide",
+              "event_type INT, person ROW<id BIGINT, name STRING, email STRING, city STRING>,"
+                  + " bid ROW<auction BIGINT, bidder BIGINT, price BIGINT, channel STRING, url STRING>"),
+          "SELECT bid.auction, bid.price FROM t WHERE event_type = 2");
+    }
+  }
+
   private static Supplier<TableEnvironment> environment(String brokers, String topic, String columns) {
     return () -> {
       StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();

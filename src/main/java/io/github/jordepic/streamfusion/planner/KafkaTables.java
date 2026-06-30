@@ -108,6 +108,17 @@ final class KafkaTables {
   // CDC changelog formats (Debezium/OGG) route via isCdcDecode, gated to the cases reproduced identically
   // to Flink. Avro/protobuf decoders exist but aren't wired into this planner path yet — see ticket 32.
 
+  /**
+   * Whether this table's decoder honors a pruned output schema — decoding only the columns and nested
+   * sub-fields the schema names. JSON ({@code arrow-json} builds only the schema's fields) and bare Avro
+   * (its reader schema is derived from the output type, and Avro resolution projects to it) do; the
+   * positional/scalar formats (CSV/raw) and the not-yet-verified ones do not, so they decode in full.
+   */
+  static boolean decodeHonorsProjection(Map<String, String> options) {
+    int code = decodeFormatCode(options);
+    return code == 0 || code == 4; // JSON, bare Avro
+  }
+
   /** The {@code MessageDecoder} format code for this table's value format, or -1 if not decodable here. */
   static int decodeFormatCode(Map<String, String> options) {
     String format = options.getOrDefault("value.format", options.get("format"));
