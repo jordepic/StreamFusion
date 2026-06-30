@@ -4527,15 +4527,21 @@ impl UpdatingJoiner {
         // here (the uncommon path — only joins with a residual non-equi condition, e.g. q7).
         let input_scalars =
             decode_row(if is_left { &self.left_payload } else { &self.right_payload }, full, if is_left { lcols } else { rcols });
-        let pairs: Vec<JoinRow> = associated
-            .iter()
-            .map(|other| {
+        // Decode all associated other-side rows in ONE vectorized pass — a per-row convert_rows here
+        // was a measured regression on q7, whose price-equi predicate join builds large associated sets.
+        let other_conv = if is_left { &self.right_payload } else { &self.left_payload };
+        let other_ncols = if is_left { rcols } else { lcols };
+        let other_cols =
+            other_conv.convert_rows(associated.iter().map(|o| o.record.row())).expect("decode associated rows");
+        let pairs: Vec<JoinRow> = (0..associated.len())
+            .map(|r| {
+                let other: Vec<ScalarValue> = (0..other_ncols)
+                    .map(|j| ScalarValue::try_from_array(&other_cols[j], r).expect("associated scalar"))
+                    .collect();
                 if is_left {
-                    let r = decode_row(&self.right_payload, &other.record, rcols);
-                    input_scalars.iter().chain(&r).cloned().collect()
+                    input_scalars.iter().chain(&other).cloned().collect()
                 } else {
-                    let l = decode_row(&self.left_payload, &other.record, lcols);
-                    l.iter().chain(&input_scalars).cloned().collect()
+                    other.iter().chain(&input_scalars).cloned().collect()
                 }
             })
             .collect();
