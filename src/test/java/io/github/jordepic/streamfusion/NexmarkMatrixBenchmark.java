@@ -350,6 +350,30 @@ class NexmarkMatrixBenchmark {
     System.out.println(out);
   }
 
+  /**
+   * Runs one query (default q19, override with {@code -Dprofile.query}) natively on the generator in a
+   * loop for {@code -Dprofile.seconds} (default 60), so an attached sampler sees steady-state of the
+   * changelog operator that query is bound by — no Kafka, no decode, just transpose → native island.
+   * Gated by {@code SF_PROFILE=true} on top of {@code SF_BENCHMARK}; attach async-profiler to the fork.
+   */
+  @Test
+  @EnabledIfEnvironmentVariable(named = "SF_PROFILE", matches = "true")
+  void generatorNativeProfileLoop() throws Exception {
+    String label = System.getProperty("profile.query", "q19");
+    Query q =
+        Arrays.stream(ALL_QUERIES)
+            .filter(x -> x.label.equals(label))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("unknown profile.query: " + label));
+    long deadline = System.currentTimeMillis() + Long.getLong("profile.seconds", 60L) * 1000L;
+    long iterations = 0;
+    while (System.currentTimeMillis() < deadline) {
+      withDecimal(q, true, () -> runGeneratorOnce(q, true));
+      iterations++;
+    }
+    System.out.println("[profile] native " + label + " iterations: " + iterations);
+  }
+
   private static Query[] selectQueries() {
     String subset = System.getenv("SF_MATRIX_QUERIES");
     if (subset == null) {
