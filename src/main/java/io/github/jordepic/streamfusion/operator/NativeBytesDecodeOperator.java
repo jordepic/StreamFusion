@@ -79,7 +79,15 @@ public class NativeBytesDecodeOperator extends AbstractStreamOperator<ArrowBatch
    * exported target schema; JSON/CSV/raw decode against {@code outputType}. */
   private long createDecoder() {
     if (format == PROTOBUF) {
-      return Native.createProtobufDecoder(protoDescriptor, protoMessageName);
+      // Export the (possibly projection-narrowed) output schema so the native side prunes the
+      // descriptor to the read fields; pruning to the full schema is a no-op.
+      try (VectorSchemaRoot template = RowDataArrowConverter.write(List.of(), outputType, allocator);
+          ArrowArray array = ArrowArray.allocateNew(allocator);
+          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportVectorSchemaRoot(allocator, template, NativeAllocator.DICTIONARIES, array, schema);
+        return Native.createProtobufDecoder(
+            protoDescriptor, protoMessageName, array.memoryAddress(), schema.memoryAddress());
+      }
     }
     if (format == 1 || format == 4) {
       return Native.createDecoder(format, 0L, 0L, avroSchema, readerAvroSchema, schemaId);

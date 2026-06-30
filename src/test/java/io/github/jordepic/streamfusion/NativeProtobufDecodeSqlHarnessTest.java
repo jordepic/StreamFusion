@@ -84,6 +84,26 @@ class NativeProtobufDecodeSqlHarnessTest {
     }
   }
 
+  @Test
+  void nestedProjectionPrunesDecodedColumns() throws Exception {
+    // Read one nested field of a wider message: the planner prunes the protobuf descriptor to id +
+    // nested.score, so ptars builds only those columns and skips nested.id/name on the wire. Must still
+    // match Flink's full decode + calc.
+    try (KafkaContainer kafka =
+        new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
+      kafka.start();
+      String brokers = kafka.getBootstrapServers();
+      produce(brokers, "pb-prune", nestedMessages());
+      NativeParity.assertParity(
+          environment(
+              brokers,
+              "pb-prune",
+              "id BIGINT, nested ROW<id BIGINT, name STRING, score DOUBLE>",
+              PKG + ".WithNested"),
+          "SELECT nested.score FROM t WHERE id > 5");
+    }
+  }
+
   private static List<byte[]> scalarMessages() {
     List<byte[]> values = new ArrayList<>(MESSAGES);
     for (int i = 0; i < MESSAGES; i++) {

@@ -8894,6 +8894,113 @@ struct ProtobufDecoder {
     config: ptars::PtarsConfig,
 }
 
+/// Prunes a `FileDescriptorSet` so the root message — and, recursively, the nested message types its
+/// kept fields reference — declare only the fields named in `schema` (the query's projected columns).
+/// ptars builds one column per descriptor field and skips wire tags it has no field for, so decoding
+/// against the pruned descriptor materializes only the read fields straight from the bytes; the unread
+/// ones are skipped on the wire. Fields are matched to the schema by name (Flink maps a proto field to
+/// the like-named column). An identity schema (the full row type) prunes nothing.
+fn prune_descriptor_set(bytes: &[u8], root_message: &str, schema: &Schema) -> Vec<u8> {
+    use prost::Message as _;
+    use prost_types::FileDescriptorSet;
+    let mut set = FileDescriptorSet::decode(bytes).expect("decode FileDescriptorSet");
+
+    // Walk the schema (which drives what to keep) building, per message full-name, the set of field
+    // names to retain; descend into a nested message via the proto field's type_name when the schema
+    // field is a Struct. Read-only over `set` here.
+    let mut keep: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut work: Vec<(String, arrow::datatypes::Fields)> =
+        vec![(root_message.trim_start_matches('.').to_string(), schema.fields().clone())];
+    while let Some((name, fields)) = work.pop() {
+        let names: std::collections::HashSet<String> =
+            fields.iter().map(|f| f.name().clone()).collect();
+        if let Some(descriptor) = find_message(&set, &name) {
+            for field in fields.iter() {
+                if let DataType::Struct(sub) = field.data_type() {
+                    if let Some(proto_field) =
+                        descriptor.field.iter().find(|pf| pf.name() == field.name())
+                    {
+                        if !proto_field.type_name().is_empty() {
+                            work.push((
+                                proto_field.type_name().trim_start_matches('.').to_string(),
+                                sub.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        keep.insert(name, names);
+    }
+
+    for file in &mut set.file {
+        let package = file.package().to_string();
+        for message in &mut file.message_type {
+            prune_message(message, &qualify(&package, message.name()), &keep);
+        }
+    }
+    set.encode_to_vec()
+}
+
+/// Retains only `keep`-listed fields of `message` (and recurses into nested message definitions); a
+/// message absent from `keep` is left whole (it is unreferenced after the root is pruned).
+fn prune_message(
+    message: &mut prost_types::DescriptorProto,
+    full_name: &str,
+    keep: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) {
+    if let Some(fields) = keep.get(full_name) {
+        message.field.retain(|f| fields.contains(f.name()));
+    }
+    for nested in &mut message.nested_type {
+        let nested_name = qualify(full_name, nested.name());
+        prune_message(nested, &nested_name, keep);
+    }
+}
+
+/// Finds a message by its fully-qualified name (package + nesting), searching top-level and nested types.
+fn find_message<'a>(
+    set: &'a prost_types::FileDescriptorSet,
+    full_name: &str,
+) -> Option<&'a prost_types::DescriptorProto> {
+    for file in &set.file {
+        let package = file.package();
+        for message in &file.message_type {
+            if let Some(found) = find_message_in(message, &qualify(package, message.name()), full_name)
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn find_message_in<'a>(
+    message: &'a prost_types::DescriptorProto,
+    message_full_name: &str,
+    target: &str,
+) -> Option<&'a prost_types::DescriptorProto> {
+    if message_full_name == target {
+        return Some(message);
+    }
+    for nested in &message.nested_type {
+        let nested_name = qualify(message_full_name, nested.name());
+        if let Some(found) = find_message_in(nested, &nested_name, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn qualify(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
 impl ProtobufDecoder {
     /// `descriptor_set` is an encoded protobuf `FileDescriptorSet` (the message's file + its transitive
     /// dependencies); `message_name` is the fully-qualified message type to decode each body as.
@@ -9474,9 +9581,19 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createProtobu
     _class: JClass<'local>,
     descriptor: JByteArray<'local>,
     message_name: JString<'local>,
+    schema_array_address: jlong,
+    schema_address: jlong,
 ) -> jlong {
     let descriptor = env.convert_byte_array(&descriptor).expect("failed to read proto descriptor");
     let message_name: String = env.get_string(&message_name).expect("failed to read message name").into();
+    // When the planner pushed a projection into the decode, it exports the narrowed output schema (0/0
+    // otherwise): prune the descriptor to those fields so ptars builds only the read columns.
+    let descriptor = if schema_array_address != 0 {
+        let schema = import_record_batch(schema_array_address, schema_address).schema();
+        prune_descriptor_set(&descriptor, &message_name, &schema)
+    } else {
+        descriptor
+    };
     let decoder = MessageDecoder::Protobuf(ProtobufDecoder::new(&descriptor, &message_name));
     Box::into_raw(Box::new(decoder)) as jlong
 }

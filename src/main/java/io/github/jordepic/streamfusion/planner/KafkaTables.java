@@ -111,13 +111,15 @@ final class KafkaTables {
   /**
    * Whether this table's decoder honors a pruned output schema — decoding only the columns and nested
    * sub-fields the schema names. JSON ({@code arrow-json} is schema-driven and self-describing, so a
-   * narrowed schema skips the other keys) and bare Avro (the decode carries the full writer schema and
-   * resolves the narrowed output as the reader schema) do. CSV/raw are positional/scalar, and Confluent
-   * Avro's writer schema comes from the registry by id; those decode in full.
+   * narrowed schema skips the other keys), bare Avro (the decode carries the full writer schema and
+   * resolves the narrowed output as the reader schema), and protobuf (the descriptor is pruned to the
+   * read fields; ptars builds a column per descriptor field and skips unmatched wire tags) do. CSV/raw
+   * are positional/scalar, and Confluent Avro's writer schema comes from the registry by id; those
+   * decode in full.
    */
   static boolean decodeHonorsProjection(Map<String, String> options) {
     int code = decodeFormatCode(options);
-    return code == 0 || code == 4; // JSON, bare Avro
+    return code == 0 || code == 4 || code == 5; // JSON, bare Avro, protobuf
   }
 
   /** The {@code MessageDecoder} format code for this table's value format, or -1 if not decodable here. */

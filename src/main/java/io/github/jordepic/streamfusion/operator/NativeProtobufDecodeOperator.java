@@ -48,7 +48,7 @@ public class NativeProtobufDecodeOperator extends AbstractStreamOperator<ArrowBa
     super.open();
     allocator = NativeAllocator.SHARED;
     dictionaries = NativeAllocator.DICTIONARIES;
-    handle = Native.createProtobufDecoder(descriptorSet, messageName);
+    handle = Native.createProtobufDecoder(descriptorSet, messageName, 0L, 0L);
   }
 
   @Override
