@@ -437,9 +437,23 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       // and remap the calc's top-level column references to the compacted positions. The transpose
       // then converts only the read fields of each wide source row to Arrow. (A columnar producer is
       // left alone — its batch is already built; nested access stays by name, so it needs no remap.)
-      CalcProjectionPruner.Pruned pruned =
-          emitsColumnar(input) ? null : CalcProjectionPruner.compute(calc);
-      if (pruned != null) {
+      CalcProjectionPruner.Pruned pruned = CalcProjectionPruner.compute(calc);
+      if (pruned != null && input instanceof StreamPhysicalNativeKafkaDecode) {
+        // The native decode is itself a (Rust) row→Arrow transpose: pushing the projection into it
+        // makes the decoder build only the read columns/fields straight from the bytes, so a wide
+        // record's unread fields are never decoded. Only for decoders that honor a pruned schema.
+        StreamPhysicalNativeKafkaDecode decode = (StreamPhysicalNativeKafkaDecode) input;
+        if (KafkaTables.decodeHonorsProjection(decode.options())) {
+          return new StreamPhysicalNativeCalc(
+              calc.getCluster(),
+              calc.getTraitSet(),
+              decode.withRowType(pruned.inputType),
+              calc.getRowType(),
+              encoded.remapInputs(pruned.remap));
+        }
+      }
+      if (pruned != null && !emitsColumnar(input)) {
+        // A rowwise input is about to be transposed: prune that entry transpose to the read fields.
         boolean carryRowKind =
             input instanceof StreamPhysicalRel
                 && !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) input);

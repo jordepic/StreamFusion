@@ -36,6 +36,15 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
     this.options = options;
   }
 
+  Map<String, String> options() {
+    return options;
+  }
+
+  /** A copy decoding only {@code rowType}'s columns/fields — set by the planner's projection pushdown. */
+  StreamPhysicalNativeKafkaDecode withRowType(RelDataType rowType) {
+    return new StreamPhysicalNativeKafkaDecode(getCluster(), getTraitSet(), rowType, options);
+  }
+
   @Override
   public boolean requireWatermark() {
     return false;
