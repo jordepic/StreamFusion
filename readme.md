@@ -369,12 +369,28 @@ _Apple M1 Max; numbers are comparable only within a machine._
 
 ### Nexmark — the full accelerating set, every source
 
-Beyond q0–q4, StreamFusion runs **all of the runnable Nexmark queries** natively end-to-end (the explain
-diagnostic `NexmarkExplainTest` enumerates them) — including q14, whose decimal, `count_char` UDF, and
-`EXTRACT(HOUR …)` all run natively now. The one caveat: q21 (`REGEXP_EXTRACT`) needs the
-`allowIncompatible` flag, gated because Rust's regex engine diverges from Java's on advanced features (as
-Comet gates regex). q6 (Flink SQL cannot consume the retractions its `OVER` needs), q13 (a
-temporal-table/lookup join, async-gated) and q23 (a query-file parse quirk) are outside the runnable set.
+Beyond q0–q4, StreamFusion runs **every runnable Nexmark query** natively end-to-end, with no fallback
+and no flags (the explain diagnostic `NexmarkExplainTest` enumerates them) — including q14 (decimal +
+`count_char` UDF + `EXTRACT(HOUR …)`), q21, and q23:
+
+- **q21** (`CASE` + `REGEXP_EXTRACT` over `lower(channel)`) is fully native by default. `REGEXP_EXTRACT`
+  and `UPPER`/`LOWER` — whose Rust regex / case folding can diverge from Java's — route through the
+  host's own implementation (`SqlFunctionUtils.regexpExtract`, `BinaryStringData.toUpperCase/toLowerCase`)
+  via the same columnar JVM upcall the UDFs use, so they are byte-identical while the rest of the `Calc`
+  stays native. The pure-native Rust paths remain the faster opt-in behind `allowIncompatible`.
+- **q23** is a multi-way inner equi-join, which the native updating join accelerates
+  (`FlinkMultiwayJoinSqlHarnessTest`). Its `q23.sql` does not plan in this Flink build only because it
+  references the reserved identifier `dateTime` bare; the quoted form (as the DDL declares it) parses and
+  accelerates identically.
+
+Two queries stay outside the runnable set for reasons that are not StreamFusion's to fix. **q6**
+(`AVG(…) OVER (ROWS BETWEEN 10 PRECEDING …)` over a retracting Top-1) cannot run in Flink SQL at all —
+its `OVER` window can't consume the retractions the winning-bid Top-N emits — so there is no host plan to
+mirror and no host output to verify against; StreamFusion accelerates Flink's plan, it does not invent
+semantics Flink lacks. **q13** is a processing-time temporal/lookup join (`FOR SYSTEM_TIME AS OF`) to a
+bounded side input — an async external-I/O operator, outside the columnar-streaming island (the same
+reason a Kafka source's I/O is Flink's, not the native engine's). Both are tracked in
+[.claude/todos/39-nexmark-q6-q13-exclusions.md](.claude/todos/39-nexmark-q6-q13-exclusions.md).
 
 **Non-builtin UDFs** run natively too: a Flink `ScalarFunction` the expression engine can't implement
 itself is invoked by a native→JVM columnar upcall (datafusion-comet's `JvmScalarUdfExpr` pattern) — the
@@ -421,9 +437,9 @@ queries, so within-one-run speedups understate native; per-query isolation is th
 | q3 | updating join `auction ⋈ person` | 0.66× |
 | q9 | interval join → `ROW_NUMBER` (≤ 1) | 0.41× |
 
-(q5 and q21 also run natively end-to-end — q5 on the window-attached re-aggregate + windows-only join,
-q21 under `allowIncompatible` — verified byte-exact against Flink by their harness tests, but not yet
-wired into this throughput table.)
+(q5, q21, and q23 also run natively end-to-end — q5 on the window-attached re-aggregate + windows-only
+join, q21 on the JVM-upcall `REGEXP_EXTRACT`/`LOWER`, q23 as a three-input join — verified byte-exact
+against Flink by their harness tests, but not yet wired into this throughput table.)
 
 **Ten of eighteen beat stock Flink, and the rest are far above where row-at-a-time state once put them.**
 Projection/filter/scalar (q0/q1/q2/q22), the windowed and group/`DISTINCT` aggregates (q11/q12/q15/q17),
