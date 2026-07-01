@@ -1,8 +1,12 @@
 # Native decode-to-Arrow at the ingestion edge (skip RowData on source formats)
 
-**Status:** in progress — JSON decode kernel landed (Phase 0); ORC + Parquet file sources landed via
-DataFusion's file scan + the framework's split handoff (Phase 1). Streaming decode operator (Phase 2)
-next.
+**Status:** core DONE — trimmed to the tail. File sources (Parquet + ORC) land via DataFusion's file
+scan + the framework's split handoff; the streaming decode operator (`NativeBytesDecodeOperator`) is
+built, wired (`NativeKafkaDecodeExecNode`, routed by `KafkaTables`), and parity-tested for JSON,
+Confluent/bare Avro, CSV, protobuf, and Debezium/OGG CDC. **Remaining tail only:** (a) a **time-based
+flush** for an unbounded stream that stays below the batch size (latency); (b) **Maxwell/Canal**
+exact-parity auto-routing (decoded, but parity-gated to fallback today); (c) **CSV/JSON *file*** sources
+(the lower-priority file formats — Avro OCF was dropped, arrow-avro can't read Flink's top-level-union).
 **Source:** every record we ingest from Kafka (or any non-Parquet source) is decoded on the
 JVM `bytes → GenericRecord/JsonNode/… → RowData` and only *then* transposed to Arrow by our
 source-edge `StreamPhysicalRowDataToArrow`. That row materialization is the single highest-traffic
@@ -110,9 +114,10 @@ Legend: ✅ ready (decoder exists, version-compatible) · ⚙️ ready decoder +
 **Decoder status (2026-06-26): JSON, CSV, raw, bare-Avro, Confluent-Avro, and Protobuf decoders are all
 BUILT and unit-tested** in `MessageDecoder` (native/src/lib.rs). `createDecoder(format, …)` codes:
 **0 = JSON, 1 = Confluent-Avro, 2 = CSV, 3 = raw, 4 = bare Avro**; Protobuf via `createProtobufDecoder`.
-Remaining: CDC family (Phase 3), and the planner rule that auto-routes a SQL `format=…` table to a
-native decode operator (Phase 2, unbuilt for *every* format — the operators exist + are tested but
-aren't planner-wired yet).
+The CDC family (Debezium/OGG/Maxwell/Canal) is also built, and the planner rule that auto-routes a SQL
+`format=…` table to the native decode operator is wired (`KafkaTables` → `NativeKafkaDecodeExecNode`)
+for JSON, Confluent/bare Avro, CSV, protobuf, and Debezium/OGG. See the Status line for the residual
+tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
 
 ### JSON — ✅ built (format 0)
 - Flink: `~/data/flink/flink-formats/flink-json/src/main/java/org/apache/flink/formats/json/JsonRowDataDeserializationSchema.java`
@@ -244,7 +249,7 @@ aren't planner-wired yet).
   fields by `op`, plus the `$row_kind$` Int8 column. RisingWave sidesteps this by being accessor/row-
   oriented at parse; our batch decode does struct-column surgery + gather.
 
-### Protobuf — ✅ decoder built (via `ptars`), JVM wiring remains
+### Protobuf — ✅ decoder built (via `ptars`) and JVM-wired + routed
 - **Flink's wire format = BARE protobuf bytes, NOT Confluent (confirmed in source, 2026-06-26).**
   `PbRowDataDeserializationSchema.deserialize(byte[])` → `ProtoToRowConverter` → `parseFrom(byte[])` on
   the **whole** message: no magic byte, no schema id, no message-index varints. The descriptor comes
@@ -282,9 +287,10 @@ aren't planner-wired yet).
     RowType via `PbToRowTypeUtil`. Reconcile edge cases (enum repr — set `EnumRepr` to match Flink;
     64-bit ints; timestamps/well-known; `oneof`) and either align via `PtarsConfig` or cast/rename to the
     declared schema. Add a parity test (decode via both, compare) before shipping.
-  - **JVM wiring not done:** serialize the descriptor off the generated message class to a
-    `FileDescriptorSet` at plan/open time, gate `protobuf` in `KafkaTables`/the decode operator, pass
-    `message-class-name`. End-to-end SQL test pending.
+  - **JVM wiring DONE:** `ProtobufDescriptors` serializes the descriptor off the generated message
+    class to a `FileDescriptorSet`, `KafkaTables` gates+routes `protobuf` via `NativeKafkaDecodeExecNode`,
+    and `NativeProtobufDecodeSqlHarnessTest` covers it end to end. Remaining representation
+    reconciliations (enum/unsigned/bytes/defaults) are tracked in ticket 34.
   - ptars also goes the **other way** (`record_batch_to_array`/`MessageEncoder`) — free protobuf *sink*
     encoding when we need it.
 

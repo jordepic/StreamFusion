@@ -12,12 +12,12 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalI
 import org.apache.flink.table.runtime.operators.join.FlinkJoinType;
 
 /**
- * Recognizes the event-time INNER interval joins the native operator implements:
- * {@code a JOIN b ON a.k = b.k AND a.rt BETWEEN b.rt + lower AND b.rt + upper}. Requires an INNER
- * join, an event-time interval, one or more equi-join keys all of supported types
- * (bigint/int/string/boolean/date/timestamp/decimal), null-filtering keys (INNER semantics), and no residual non-equi predicate —
- * the whole interval condition must live in the window bounds. Anything else (outer joins, proctime,
- * an extra filter, an unsupported key type) falls back to the host.
+ * Recognizes the event-time interval joins the native operator implements:
+ * {@code a JOIN b ON a.k = b.k AND a.rt BETWEEN b.rt + lower AND b.rt + upper}. Requires an
+ * INNER/LEFT/RIGHT/FULL join, an event-time interval, one or more equi-join keys all of supported types
+ * (bigint/int/string/boolean/date/timestamp/decimal), and null-filtering keys; a residual non-equi
+ * predicate beyond the interval bounds is admitted when it is natively expressible (else it falls back).
+ * Anything else (proctime, semi/anti, an inexpressible predicate, an unsupported key type) falls back.
  */
 final class IntervalJoinMatcher {
 

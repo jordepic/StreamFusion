@@ -24,5 +24,6 @@ decode/scan, like the Parquet/ORC file sources) rather than through `RowData`.
   the point of the exercise; if it still has to go through `RowData`, note that and measure anyway.
 - Report alongside the generator + Kafka rungs in the same table.
 
-Relates to: ticket 30 (Nexmark benchmark), ticket 32 (native decode to Arrow at ingest), ticket 24
-(columnar endpoints beyond local Parquet), ticket 34 (columnar sinks / nested boundary types).
+Relates to: the Nexmark matrix (a fourth source rung; see roadmap "Where we are"), ticket 32 (native
+decode to Arrow at ingest), ticket 24 (columnar endpoints beyond local Parquet), ticket 34 (columnar
+sinks / nested boundary types).
