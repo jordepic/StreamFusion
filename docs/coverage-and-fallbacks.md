@@ -1,12 +1,13 @@
 # Coverage and fallbacks
 
 What StreamFusion does **not** accelerate, and **every** condition that makes a query (or part of one)
-fall back to stock Flink. The [Compatibility Chart](../readme.md#compatibility-chart) is the source of
-truth for what *is* accelerated and under what terms; this is its complement — the boundaries.
+fall back to stock Flink. This file is the **source of truth for coverage**: everything not excluded
+here runs natively. The [readme](../readme.md) gives the high-level picture of what *is* accelerated;
+this is the precise complement — the boundaries.
 
 > Keep this current. When an operator, type, expression, or connector gains or loses support, update
-> this file in the same commit (alongside the readme chart). It is meant to always answer "why didn't
-> my query accelerate?" precisely.
+> this file in the same commit. It is meant to always answer "why didn't my query accelerate?"
+> precisely.
 
 A query accelerates only if it forms **one fully-columnar island**: every operator but a rowwise
 source/sink runs natively (Arrow in/out). One unsupported interior operator therefore drags the
