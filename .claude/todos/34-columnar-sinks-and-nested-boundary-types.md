@@ -1,7 +1,9 @@
 # Columnar sinks + nested types across the native↔host boundary
 
-**Status:** open — **nested-type transpose DONE** (direction 2 below); columnar sinks (direction 1) and
-the protobuf representation reconciliations remain.
+**Status:** open — **nested-type transpose DONE** (direction 2 below), and the **Parquet columnar sink
+ships** (`NativeParquetSinkOperator`, consumes `ArrowBatch` with no transpose). What remains: columnar
+sinks *beyond Parquet* (no ORC sink / columnar collect yet) and the protobuf representation
+reconciliations (`enum` int-vs-name, unsigned/`fixed` ints, `bytes` parity, proto3 missing-field defaults).
 
 ## Done (2026-06-26)
 - The row↔Arrow transpose now carries every logical type, including `ROW`/`ARRAY`/`MAP`/`VARBINARY`. We

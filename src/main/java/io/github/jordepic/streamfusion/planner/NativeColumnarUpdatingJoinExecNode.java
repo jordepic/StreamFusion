@@ -16,7 +16,10 @@ import org.apache.flink.table.planner.plan.nodes.exec.stream.StreamExecNode;
 import org.apache.flink.table.planner.plan.nodes.exec.utils.ExecNodeUtil;
 import org.apache.flink.table.types.logical.RowType;
 
-/** Wraps the columnar regular (updating) INNER join operator into the plan; Arrow batches in and out. */
+/**
+ * Wraps the columnar regular (updating) join operator into the plan; Arrow batches in and out.
+ * INNER/LEFT/RIGHT/FULL/SEMI/ANTI, with an optional residual non-equi predicate.
+ */
 public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
     implements StreamExecNode<ArrowBatch> {
 

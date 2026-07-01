@@ -23,14 +23,16 @@ here when the ticket is deleted.
   manager, not just the planner's JVM — no plan-time global registry.
 - **Operators, native + identical to Flink:** filter/`WHERE` (via the native expression engine),
   tumbling / hopping / session / cumulative window aggregates (one- and two-phase), event-time
-  `OVER` aggregation, event-time INNER interval and window joins, Parquet sink (exactly-once),
+  `OVER` aggregation, event-time interval and window joins (INNER/LEFT/RIGHT/FULL + residual
+  non-equi, outer null-pads at watermark eviction), Parquet sink (exactly-once),
   and Parquet + ORC sources. The sources read through DataFusion's file scan (like comet) with the
   framework's file source owning enumeration/split-assignment/checkpointing — splittable at
   row-group/stripe granularity, projection pushed into the decode. Compatibility chart in `readme.md`
   is the source of truth.
 - **Changelog / retract — done.** `RowKind` crosses the boundary as a four-way byte column
   (divergences/13), and three operators both emit and consume a retract changelog: the non-windowed
-  `GROUP BY` aggregate (SUM/COUNT/MIN/MAX retract), the regular (updating) INNER equi-join, and
+  `GROUP BY` aggregate (SUM/COUNT/MIN/MAX retract), the regular (updating) equi-join
+  (INNER/LEFT/RIGHT/FULL/SEMI/ANTI + a residual non-equi predicate), and
   append-only streaming Top-N (`ROW_NUMBER`), which the global `FETCH`/`LIMIT` reuses — `ORDER BY …
   LIMIT n` (`SortLimit`) and plain `LIMIT n` (`Limit`) both lower to a global no-partition
   ROW_NUMBER rank, so they run on the same native Top-N operator with an empty partition key (no new
@@ -90,6 +92,17 @@ here when the ticket is deleted.
   lifted both Parquet paths; the row-major + pre-sized transpose build lifted the row-source ops (a
   native row decoder was investigated and rejected — ticket 28). Only the lone stateless filter stays
   below 1× (its `RowData → Arrow → RowData` round-trip); leave it on the host via the per-operator flag.
+- **Native decode-to-Arrow at ingest — done.** File sources (Parquet + ORC) read through DataFusion's
+  file scan with the framework owning enumeration/splits/checkpointing, splittable at row-group/stripe
+  granularity with projection pushdown; and a streaming decode operator (`NativeBytesDecodeOperator`)
+  decodes Kafka bytes → Arrow for JSON, Confluent/bare Avro, CSV, protobuf, and Debezium/OGG CDC
+  envelopes (→ our `$row_kind$` changelog). The residual tail lives in ticket 32 (a time-based flush for
+  sub-batch unbounded streams; Maxwell/Canal auto-routing; CSV/JSON *file* sources).
+- **Nexmark matrix vs Flink — running.** The full q0–q22 suite (q6 excluded, ticket 39) runs
+  native-substituted vs stock Flink across four source rungs (generator, Kafka JSON/Avro/Protobuf);
+  per-query routed-fraction/fallback reasons via `NexmarkExplainTest`, throughput matrix in the readme.
+  It is the standing prioritization + regression gate; the coverage/perf gaps it surfaces feed the
+  backlog below.
 
 ## Next, roughly in order
 1. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
@@ -99,19 +112,6 @@ here when the ticket is deleted.
 2. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators, session
    `update` one-row `take` batching. (The `RowData → Arrow` transpose was made row-major + pre-sized,
    ~25% faster; a native decoder was investigated and rejected on benchmark grounds — ticket 28.)
-3. **Nexmark benchmark vs Flink** (ticket 30): run the standard q0–q22 Flink SQL suite native-
-   substituted vs stock Flink (release), per-query routed-fraction + fallback reasons + throughput
-   ratio. Use it as the prioritization engine for both coverage (which queries fall back, and why)
-   and perf (which route but trail Flink) — re-run as a regression/impact gate after each change.
-4. **Native decode-to-Arrow at ingest** (ticket 32): skip the per-record `RowData` materialization on
-   source formats, two source kinds handled differently. **File sources — done for ORC + Parquet:**
-   read through DataFusion's file scan with the framework's file source owning enumeration/splits/
-   checkpointing, splittable at row-group/stripe granularity, projection pushed down (Avro OCF dropped —
-   arrow-avro can't read Flink's top-level-union output; CSV/JSON files remain, lower priority).
-   **Streaming/Kafka (next):** keep Flink's connector, pay one off-heap copy into a native decode
-   operator (arrow-json/csv/avro share one push API; CDC envelopes → our `$row_kind$` changelog;
-   protobuf via prost-reflect). JSON decode kernel landed (~5.3 Melem/s). Removing the Kafka copy
-   entirely is the fully-native source (ticket 33).
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting** (ticket 05): native execution memory is not accounted against Flink's
@@ -150,14 +150,8 @@ here when the ticket is deleted.
   (likely Fluss's PK-table KV) with a local working-set cache — decoupling state size from worker RAM
   and enabling incremental checkpoints + lazy rescale (Flink 2.0 ForSt / RisingWave Hummock direction).
   The operators' state is already arrow-row bytes, so the stored format is mostly in place.
-- **Join breadth** (ticket 35): **DONE.** The regular updating join does INNER/LEFT/RIGHT/FULL/SEMI/ANTI +
-  a residual non-equi predicate (per-row match-degree, RisingWave's degree table = Flink's
-  `numOfAssociations`); the interval and window joins do INNER/LEFT/RIGHT/FULL + a residual non-equi
-  predicate (folded into the DataFusion join filter, Arroyo's pattern), with outer null-pads emitted at
-  watermark eviction via per-row match tracking. Semi/anti don't arise as time-bounded joins. All
-  parity-tested.
-- **Columnar sinks + nested boundary types** (ticket 34): the row↔Arrow transpose carries only
-  scalar/temporal columns, so native operators that produce a nested `ROW`/`ARRAY`/`MAP` column can't
-  hand it to a rowwise sink — complex protobuf/Avro/JSON messages therefore fall back today. The end
-  state is custom columnar sinks (no transpose for columnar workflows); the bridge fix is nested-type
-  support in the transpose. Lifts the flat-scalar gate on protobuf decode.
+- **Columnar sinks + remaining boundary types** (ticket 34): the nested-type transpose is **done** —
+  the row↔Arrow converter carries `ROW`/`ARRAY`/`MAP`/`VARBINARY`, so nested protobuf/Avro/JSON now
+  route. What remains: a custom columnar sink beyond Parquet (no ORC sink / columnar collect yet), and
+  the protobuf representation reconciliations still gated (`enum` int-vs-name, unsigned/`fixed` ints,
+  `bytes` parity, proto3 missing-field defaults).

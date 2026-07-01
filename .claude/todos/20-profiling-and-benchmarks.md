@@ -1,9 +1,11 @@
 # Profiling + benchmark layer (measure as we build)
 
-**Status:** in progress — Criterion harness landed (item 1 started); native timing
-hook, harness timing, and the remaining benches still open. First numbers in
-[docs/benchmarks.md](../../docs/benchmarks.md) already surfaced the per-row key cost
-in the tumbling aggregator (~100× slower per element than the filter).
+**Status:** mostly done — trimmed to the tail. The Criterion micro-bench harness (item 1) and the
+end-to-end native-vs-Flink throughput bench (item 3) both shipped, with results in
+[docs/benchmarks.md](../../docs/benchmarks.md) and the readme (and the Nexmark matrix layered on top).
+**Remaining:** the feature-flagged native timing/counter hook (item 2, not built), plus two-phase
+local/global micro-benches. First numbers already surfaced the per-row key cost in the tumbling
+aggregator (~100× slower per element than the filter) — feeds the operator-perf backlog.
 **Source:** every acceleration claim should be measured, not asserted (the README
 already contrasts us with closed engines on exactly this point). We need a standing
 way to benchmark each operator and catch hot-path regressions as we code.
@@ -15,12 +17,12 @@ scale — we need numbers: per-operator throughput (rows/s) and allocations, nat
 vs. Flink fallback, tracked over time so a regression is visible.
 
 ## What to build
-1. **Native micro-benchmarks** (Criterion, in `native/benches/`). ✅ STARTED —
-   harness in `native/benches/operators.rs` with `filter/gt_literal`,
-   `tumbling/sum_update_flush`, and `tumbling/sum_keyed_update_flush`, run via
-   `cargo bench`, documented in [docs/benchmarks.md](../../docs/benchmarks.md) and the
-   readme. Remaining: session and two-phase local/global benches, and committing a
-   results table from a quiet machine.
+1. **Native micro-benchmarks** (Criterion, in `native/benches/`). ✅ DONE —
+   `native/benches/operators.rs` covers `filter/gt_literal`, `tumbling/{sum_update_flush,
+   sum_keyed_update_flush}`, `session/sum_keyed_update_flush`, `over/{running_sum_keyed,
+   row_number_keyed}`, `interval_join/equi_key_push`, and `window_join/equi_key_flush`, run via
+   `cargo bench`, with a committed results table in [docs/benchmarks.md](../../docs/benchmarks.md) and
+   the readme. Remaining: two-phase local/global benches.
 2. **A lightweight native timing/counter hook** behind a feature flag — per-operator
    batch count, row count, and wall time, dumpable on close — so we can profile a
    real job without a full tracing dependency. Keep it zero-cost when the flag is off.

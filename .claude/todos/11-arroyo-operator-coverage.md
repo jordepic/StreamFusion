@@ -33,10 +33,11 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       (SUM/MIN/MAX/COUNT/AVG, UNBOUNDED PRECEDING) and ROW_NUMBER/RANK/DENSE_RANK,
       incremental per-key state (divergences/11). Remaining: FIRST_VALUE/LAST_VALUE,
       LAG/LEAD, NTILE, bounded frames, and proctime.
-- [x] Interval/temporal join (`join_with_expiration.rs`) — event-time INNER equi-join
+- [x] Interval/temporal join (`join_with_expiration.rs`) — event-time equi-join
       with an interval on the rowtimes; buffer + delegate the match to a DataFusion
-      hash join, own watermark eviction (divergences/12). Remaining: outer/semi/anti,
-      proctime, and a residual non-equi predicate.
+      hash join, own watermark eviction (divergences/12). INNER/LEFT/RIGHT/FULL with
+      outer null-pads at watermark eviction, plus a residual non-equi predicate.
+      Remaining: proctime. (Semi/anti are regular joins, not time-bounded.)
 - [~] Instant join (`instant_join.rs`) — its main use, a windowed equi-join, is covered
       by our window join (INNER, on shared window bounds, divergences/12) via a hash
       join rather than a direct port. The general per-instant primitive is not ported.
@@ -45,10 +46,11 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       `GroupAggFunction`). SUM/COUNT/MIN/MAX (AVG via the host's SUM/COUNT rewrite) over
       bigint/int/double; SUM/COUNT retract a running value, MIN/MAX a per-key value
       multiset (Arroyo's batch state). Any converter-supported keys, global aggregation.
-- [x] Regular (non-windowed) join — INNER updating equi-join, emits *and* consumes a
+- [x] Regular (non-windowed) join — updating equi-join, emits *and* consumes a
       changelog. Per-side keyed multiset probed incrementally (native, not DataFusion
-      delegation — divergences/14); INNER only, equi-key, null keys dropped. Remaining:
-      outer/semi/anti, residual non-equi predicate.
+      delegation — divergences/14). INNER/LEFT/RIGHT/FULL/SEMI/ANTI, equi-key, null keys
+      dropped, plus a residual non-equi predicate (per-row match-degree, RisingWave's
+      degree table). Done — no remaining tail.
 - [x] Streaming Top-N (`ROW_NUMBER`) — append-only, rank ≤ N, rank number not projected;
       per-partition bounded buffer emitting the insert/delete changelog (divergences/14).
       Remaining: rank-number output (rank-shift updates), `RANK`/`DENSE_RANK`, an offset,
