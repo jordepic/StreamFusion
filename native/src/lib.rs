@@ -7082,9 +7082,23 @@ fn build_expr(
                 None,
             )
         }
-        // Approximate decimal cast: `arg` packs precision*100 + scale; the one child is the arithmetic
-        // result (computed in double), cast to DECIMAL(p, s) so the output column matches the declared
-        // type. Not byte-exact to Flink (opt-in via the approximate-decimal flag).
+        // An exact DECIMAL literal, encoded "unscaled|precision|scale" in the string pool. Built as a
+        // Decimal128 scalar so decimal arithmetic (q1's `0.908 * price`) stays exact.
+        16 => {
+            let encoded = strings[arg].as_deref().expect("decimal literal");
+            let mut parts = encoded.split('|');
+            let unscaled: i128 = parts.next().expect("unscaled").parse().expect("i128 unscaled");
+            let precision: u8 = parts.next().expect("precision").parse().expect("u8 precision");
+            let scale: i8 = parts.next().expect("scale").parse().expect("i8 scale");
+            datafusion::prelude::Expr::Literal(
+                ScalarValue::Decimal128(Some(unscaled), precision, scale),
+                None,
+            )
+        }
+        // Decimal cast: `arg` packs precision*100 + scale; the one child is cast to DECIMAL(p, s). Arrow
+        // rescales Decimal128 with HALF_UP rounding (matching Flink), so from an exact source (decimal or
+        // integer) the result is byte-exact; from a float/double source it is approximate (flag-gated on
+        // the JVM side) since the binary value is already inexact.
         14 => {
             let precision = (arg / 100) as u8;
             let scale = (arg % 100) as i8;
@@ -13695,9 +13709,6 @@ mod tests {
         assert!(col.is_null(2));
     }
 
-    // REGEXP_EXTRACT(url, '(&|^)channel_id=([^&]*)', 2) over the Calc path — q21's channel_id
-    // extraction: the group-2 capture of the first match, NULL when there is no match or the input is
-    // null. Mirrors Flink's SqlFunctionUtils.regexpExtract (first find(), group(index), null on miss).
     #[test]
     fn calc_regexp_extract_matches_flink() {
         let url: ArrayRef = Arc::new(StringArray::from(vec![
