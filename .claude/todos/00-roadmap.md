@@ -120,6 +120,9 @@ here when the ticket is deleted.
   allocator across all operators, as comet does) — accounting is the pool's job, not the allocator's.
 - **Mailbox threading** (ticket 01): native execution should integrate with the task mailbox
   (non-blocking), not block the task thread.
+- **Memory profiling + leak detection** (ticket 41): introspect the native allocator/pool (metrics +
+  close-time leak assertions in tests), a documented native heap-profiling workflow, and a soak test —
+  the verification counterpart to ticket 05.
 
 ## Breadth / longer horizon
 - **Arroyo operator coverage tracker** (ticket 11): what remains is async UDF (ticket 01) plus operator
