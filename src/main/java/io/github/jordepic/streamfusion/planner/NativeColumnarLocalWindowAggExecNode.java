@@ -69,23 +69,26 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
     String timeZoneId = planner.getTableConfig().getLocalTimeZone().getId();
-    return ExecNodeUtil.createOneInputTransformation(
-        input,
-        createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarLocalWindowAggregateOperator(
-            sliceMillis,
-            sliceMillis,
-            timeColumn,
-            windowStartColumn,
-            windowEndColumn,
-            valueColumns,
-            keyColumns,
-            NativeWindowOperatorCore.keyTypes((RowType) getOutputType(), keyColumns.length),
-            valueTypes,
-            aggregateKinds,
-            timeZoneId),
-        ArrowBatchTypeInformation.INSTANCE,
-        input.getParallelism(),
-        false);
+    Transformation<ArrowBatch> transformation =
+        ExecNodeUtil.createOneInputTransformation(
+            input,
+            createTransformationMeta(TRANSFORMATION, config),
+            new NativeColumnarLocalWindowAggregateOperator(
+                sliceMillis,
+                sliceMillis,
+                timeColumn,
+                windowStartColumn,
+                windowEndColumn,
+                valueColumns,
+                keyColumns,
+                NativeWindowOperatorCore.keyTypes((RowType) getOutputType(), keyColumns.length),
+                valueTypes,
+                aggregateKinds,
+                timeZoneId),
+            ArrowBatchTypeInformation.INSTANCE,
+            input.getParallelism(),
+            false);
+    NativeManagedMemory.declareOperatorWeight(transformation);
+    return transformation;
   }
 }

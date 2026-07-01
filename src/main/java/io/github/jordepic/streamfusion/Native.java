@@ -380,9 +380,15 @@ public final class Native {
    *     5=tinyint, 6=float), positionally matching {@code aggregateKinds} so each aggregate reads its
    *     own value column
    * @param aggregateKinds one code per aggregate: 0=SUM, 1=MIN, 2=MAX, 3=COUNT, 4=AVG
+   * @param memoryBudgetBytes managed-memory budget bounding the open-window state (negative for
+   *     unaccounted); exceeding it throws {@link NativeMemoryLimitException} from the violating call
    */
   public static native long createTumblingAggregator(
-      long windowMillis, long slideMillis, int[] valueTypes, int[] aggregateKinds);
+      long windowMillis,
+      long slideMillis,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      long memoryBudgetBytes);
 
   /**
    * Folds a batch (columns {@code ts} and {@code value}) into the aggregator's open windows.
@@ -434,9 +440,16 @@ public final class Native {
    * @param valueTypes value-column type per aggregate (see {@link #createTumblingAggregator})
    * @param aggregateKinds aggregate codes (see {@link #createTumblingAggregator})
    * @param snapshot bytes produced by {@link #snapshotTumblingAggregator(long)}
+   * @param memoryBudgetBytes managed-memory budget (see {@link #createTumblingAggregator}); the
+   *     restored state is accounted immediately, so a snapshot that no longer fits fails here
    */
   public static native long restoreTumblingAggregator(
-      long windowMillis, long slideMillis, int[] valueTypes, int[] aggregateKinds, byte[] snapshot);
+      long windowMillis,
+      long slideMillis,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      byte[] snapshot,
+      long memoryBudgetBytes);
 
   /**
    * Creates a columnar event-time OVER aggregator (RANGE between unbounded preceding and current
@@ -1233,13 +1246,23 @@ public final class Native {
    * @param stepMillis the step between successive cumulative window ends
    * @param valueTypes value-column type per aggregate (see {@link #createTumblingAggregator})
    * @param aggregateKinds one code per aggregate: 0=SUM, 1=MIN, 2=MAX, 3=COUNT, 4=AVG
+   * @param memoryBudgetBytes managed-memory budget (see {@link #createTumblingAggregator})
    */
   public static native long createCumulativeAggregator(
-      long maxSizeMillis, long stepMillis, int[] valueTypes, int[] aggregateKinds);
+      long maxSizeMillis,
+      long stepMillis,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      long memoryBudgetBytes);
 
   /** Rebuilds a cumulative-window aggregator from a snapshot and returns a fresh handle. */
   public static native long restoreCumulativeAggregator(
-      long maxSizeMillis, long stepMillis, int[] valueTypes, int[] aggregateKinds, byte[] snapshot);
+      long maxSizeMillis,
+      long stepMillis,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      byte[] snapshot,
+      long memoryBudgetBytes);
 
   /**
    * Creates a stateful session-window aggregator and returns an opaque handle, released with {@link

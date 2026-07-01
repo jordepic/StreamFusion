@@ -62,4 +62,26 @@ public final class NativeConfig {
     return Boolean.parseBoolean(
         System.getProperty("streamfusion.operator." + operator + ".enabled", defaultEnabled));
   }
+
+  /**
+   * The master switch for managed-memory accounting ({@code streamfusion.memory.accounting.enabled},
+   * default true). When on, a native stateful operator's transformation declares an operator-scope
+   * managed-memory weight; the operator reserves the resulting budget from Flink's memory manager and
+   * the native side bounds its state by it, failing with a clear budget message instead of a
+   * container OOM. When off, no weight is declared and the native side runs unaccounted.
+   */
+  public static boolean memoryAccountingEnabled() {
+    return Boolean.parseBoolean(
+        System.getProperty("streamfusion.memory.accounting.enabled", "true"));
+  }
+
+  /**
+   * The operator-scope managed-memory weight, in mebibytes, a native stateful operator declares
+   * ({@code streamfusion.memory.operator-weight-mb}, default 64). Flink splits the slot's
+   * managed-memory OPERATOR share across declaring operators proportionally to these weights, so the
+   * absolute value only matters relative to other declaring operators in the same slot.
+   */
+  public static int operatorMemoryWeightMb() {
+    return Integer.getInteger("streamfusion.memory.operator-weight-mb", 64);
+  }
 }
