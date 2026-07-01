@@ -113,6 +113,15 @@ Acceleration is configured by JVM system properties (mirroring DataFusion Comet'
   edge. For `UPPER`/`LOWER`/`REGEXP_EXTRACT` (already native by default via a byte-exact JVM upcall) it
   switches to the faster pure-Rust path; for `ROUND` on float/double and transcendental math (which
   otherwise fall back, having no cheap byte-exact path) it enables the native path at all. Default off.
+- **Managed-memory accounting** — `-Dstreamfusion.memory.accounting.enabled=false` turns off native
+  state accounting (default on). When on, a native stateful operator declares an operator-scope
+  managed-memory weight (`-Dstreamfusion.memory.operator-weight-mb`, default 64), reserves the
+  resulting share of the slot's managed memory from Flink's `MemoryManager` for its lifetime, and the
+  native side bounds its state by that budget — state growth past it fails the task with a
+  `NativeMemoryLimitException` naming the remedy instead of an unattributed container OOM
+  ([divergences/16](divergences/16-upfront-managed-memory-reservation.md)). Shipped for the
+  aligned-window aggregate family so far; the rollout to the remaining stateful operators is tracked
+  in the todos.
 
 ### Deployment JVM flags
 

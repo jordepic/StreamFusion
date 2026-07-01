@@ -121,6 +121,7 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   protected transient BufferAllocator allocator;
   protected transient CDataDictionaryProvider dictionaries;
   protected transient long handle;
+  private transient ManagedMemoryBudget memoryBudget;
 
   protected NativeWindowOperatorCore(
       String stateName,
@@ -150,13 +151,22 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
 
   /** Creates a fresh native aggregator handle. */
   protected long createHandle() {
-    return Native.createTumblingAggregator(windowMillis, slideMillis, valueTypes, aggregateKinds);
+    return Native.createTumblingAggregator(
+        windowMillis, slideMillis, valueTypes, aggregateKinds, memoryBudgetBytes());
   }
 
   /** Restores a native aggregator handle from a checkpoint snapshot. */
   protected long restoreHandle(byte[] snapshot) {
     return Native.restoreTumblingAggregator(
-        windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot);
+        windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes());
+  }
+
+  /**
+   * The managed-memory budget bounding the native state (see {@link ManagedMemoryBudget}), for this
+   * class's handle creation and any subclass override's.
+   */
+  protected final long memoryBudgetBytes() {
+    return memoryBudget == null ? ManagedMemoryBudget.UNBOUNDED : memoryBudget.bytes();
   }
 
   /** Folds an exported batch into the native aggregator. */
@@ -192,6 +202,7 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
     for (byte[] entry : windowState.get()) {
       snapshot = entry;
     }
+    memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle = snapshot == null ? createHandle() : restoreHandle(snapshot);
   }
 
@@ -223,6 +234,10 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
     if (handle != 0) {
       closeHandle();
       handle = 0;
+    }
+    if (memoryBudget != null) {
+      memoryBudget.close();
+      memoryBudget = null;
     }
     super.close();
   }

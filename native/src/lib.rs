@@ -9,7 +9,10 @@ use arrow::row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use datafusion::catalog::memory::MemorySourceConfig;
-use datafusion::common::{DFSchema, JoinSide, JoinType, NullEquality};
+use datafusion::common::{DFSchema, DataFusionError, JoinSide, JoinType, NullEquality};
+use datafusion::execution::memory_pool::{
+    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+};
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
 use datafusion::functions_aggregate::sum::sum_udaf;
@@ -46,6 +49,16 @@ fn capture_jvm(env: &JNIEnv) {
             let _ = JVM.set(vm);
         }
     }
+}
+
+/// Raises the managed-memory-limit exception on the calling JVM thread; the native call returns
+/// immediately after, so the task fails with the budget message instead of the container OOM-killing
+/// the process.
+fn throw_memory_limit(env: &mut JNIEnv, message: &str) {
+    let _ = env.throw_new(
+        "io/github/jordepic/streamfusion/NativeMemoryLimitException",
+        message,
+    );
 }
 
 fn import_record_batch(array_address: jlong, schema_address: jlong) -> RecordBatch {
@@ -953,6 +966,28 @@ struct TumblingAggregator {
     // The highest watermark flushed so far; a row whose window ends at or before it is late (its
     // window already closed) and is dropped, matching the host's per-row late-data handling.
     current_watermark: i64,
+    // Managed-memory accounting: the estimated heap footprint of the open windows, tracked
+    // incrementally (per touched group, not by rescanning all state) and resized against the
+    // reservation after every state change. `None` when the host gave no budget — the accounting
+    // branch then costs one predicted-false test per group.
+    memory: Option<MemoryReservation>,
+    state_bytes: usize,
+}
+
+/// Estimated heap footprint of one (window, key) group entry beyond its key and accumulators: the
+/// hash-map entry and the accumulator `Vec`'s spine. An estimate, as DataFusion's own operators
+/// estimate — accounting bounds state honestly without bit-exact malloc introspection.
+const GROUP_ENTRY_OVERHEAD: usize = 64;
+
+/// Estimated heap footprint of a composite group key (the map-entry overhead is counted once in
+/// [`GROUP_ENTRY_OVERHEAD`]).
+fn group_key_bytes(key: &GroupKey) -> usize {
+    key.iter().map(ScalarValue::size).sum::<usize>() + GROUP_ENTRY_OVERHEAD
+}
+
+/// Estimated heap footprint of one group's accumulators.
+fn accumulators_bytes(accumulators: &[Box<dyn Accumulator>]) -> usize {
+    accumulators.iter().map(|a| a.size()).sum()
 }
 
 impl TumblingAggregator {
@@ -971,6 +1006,69 @@ impl TumblingAggregator {
             windows: BTreeMap::new(),
             key_types: Vec::new(),
             current_watermark: i64::MIN,
+            memory: None,
+            state_bytes: 0,
+        }
+    }
+
+    /// Bounds this aggregator's state by a managed-memory budget the host reserved for the operator
+    /// (a negative budget means unaccounted). Registers a reservation against a pool of that size and
+    /// accounts any state already present (the restore path), so a restored snapshot that no longer
+    /// fits fails here rather than as a container OOM.
+    fn with_memory_budget(self, budget_bytes: i64) -> Result<Self, DataFusionError> {
+        if budget_bytes < 0 {
+            return Ok(self);
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(budget_bytes as usize));
+        self.with_memory_pool(&pool)
+    }
+
+    /// [`with_memory_budget`](Self::with_memory_budget) against a caller-owned pool (shared in tests
+    /// to observe the pool's balance from outside).
+    fn with_memory_pool(mut self, pool: &Arc<dyn MemoryPool>) -> Result<Self, DataFusionError> {
+        self.memory = Some(MemoryConsumer::new("window-aggregate").register(pool));
+        self.state_bytes = self.computed_state_bytes();
+        self.account()?;
+        Ok(self)
+    }
+
+    /// The full-scan footprint of the open windows — the ground truth the incremental
+    /// `state_bytes` tracks. Used once when a budget attaches to restored state (and by tests to
+    /// assert the incremental tracking does not drift).
+    fn computed_state_bytes(&self) -> usize {
+        self.windows
+            .values()
+            .map(|window| {
+                window
+                    .keys
+                    .iter()
+                    .map(|(key, accumulators)| group_key_bytes(key) + accumulators_bytes(accumulators))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Resizes the reservation to the tracked footprint. A denial is the budget-exceeded signal —
+    /// surfaced as a clear failure the host can report, instead of the container OOM-killing the
+    /// process (this operator has no runtime spill to fall back to).
+    fn account(&mut self) -> Result<(), DataFusionError> {
+        let Some(reservation) = &mut self.memory else {
+            return Ok(());
+        };
+        reservation.try_resize(self.state_bytes).map_err(|e| {
+            DataFusionError::ResourcesExhausted(format!(
+                "native window state exceeded the operator's managed-memory budget; raise \
+                 taskmanager.memory.managed.size or the operator's managed-memory weight ({e})"
+            ))
+        })
+    }
+
+    /// Removes a dropped group's footprint from the tracked state size (a flush closing its window).
+    fn forget_group_bytes(&mut self, key: &GroupKey, accumulators: &[Box<dyn Accumulator>]) {
+        if self.memory.is_some() {
+            self.state_bytes = self
+                .state_bytes
+                .saturating_sub(group_key_bytes(key) + accumulators_bytes(accumulators));
         }
     }
 
@@ -1000,7 +1098,7 @@ impl TumblingAggregator {
         self.windows.keys().copied().take_while(|end| *end <= watermark).collect()
     }
 
-    fn update(&mut self, batch: &RecordBatch) {
+    fn update(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         let ts = column_i64(batch, "ts");
         // One value column per aggregate (value0, value1, …), so aggregates can read different
         // columns. Sliced by type-agnostic take, so each accumulator sees its column's own type.
@@ -1030,7 +1128,7 @@ impl TumblingAggregator {
                 grouped.entry((start, end, owned)).or_default().push(row as u32);
             }
         }
-        self.accumulate_grouped(grouped, &values);
+        self.accumulate_grouped(grouped, &values)
     }
 
     /// Window-attached local half: each row already carries its window as `window_start`/`window_end`
@@ -1038,7 +1136,7 @@ impl TumblingAggregator {
     /// (Nexmark q5's hot-items MAX over per-auction counts). Unlike `update`, there is no rowtime to
     /// slice: the row folds into exactly the one window it names (dropping rows whose window the
     /// watermark has already closed). `flush_partial` then emits the partials keyed by window end.
-    fn update_attached(&mut self, batch: &RecordBatch) {
+    fn update_attached(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         let starts = column_i64(batch, "window_start");
         let ends = column_i64(batch, "window_end");
         let values: Vec<&ArrayRef> = (0..self.aggregates.len())
@@ -1057,24 +1155,40 @@ impl TumblingAggregator {
             let key = read_key(&key_arrays, row);
             grouped.entry((starts.value(row), ends.value(row), key)).or_default().push(row as u32);
         }
-        self.accumulate_grouped(grouped, &values);
+        self.accumulate_grouped(grouped, &values)
     }
 
     /// Folds the grouped row positions into their (window, key) accumulators. The value columns are
-    /// sliced by type-agnostic `take`, so each accumulator sees its column's own type.
+    /// sliced by type-agnostic `take`, so each accumulator sees its column's own type. When a memory
+    /// budget is set, each touched group's footprint change is folded into the tracked state size —
+    /// measuring only touched groups keeps accounting O(batch), not O(open state).
     fn accumulate_grouped(
         &mut self,
         grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>>,
         values: &[&ArrayRef],
-    ) {
+    ) -> Result<(), DataFusionError> {
+        let track = self.memory.is_some();
         for ((start, end, key), rows) in grouped {
             let indices = UInt32Array::from(rows);
             let columns: Vec<ArrayRef> =
                 values.iter().map(|v| take(v, &indices, None).expect("failed to take values")).collect();
-            for (i, accumulator) in self.accumulators(start, end, key).iter_mut().enumerate() {
+            let mut delta = 0isize;
+            if track {
+                delta = match self.windows.get(&end).and_then(|w| w.keys.get(&key)) {
+                    Some(accumulators) => -(accumulators_bytes(accumulators) as isize),
+                    None => group_key_bytes(&key) as isize,
+                };
+            }
+            let accumulators = self.accumulators(start, end, key);
+            for (i, accumulator) in accumulators.iter_mut().enumerate() {
                 accumulator.update_batch(std::slice::from_ref(&columns[i])).expect("failed to update");
             }
+            if track {
+                delta += accumulators_bytes(accumulators) as isize;
+                self.state_bytes = self.state_bytes.saturating_add_signed(delta);
+            }
         }
+        self.account()
     }
 
     /// Finalizes and removes closed windows, emitting
@@ -1095,6 +1209,7 @@ impl TumblingAggregator {
                 window.keys.into_iter().collect();
             group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             for (key, mut accumulators) in group {
+                self.forget_group_bytes(&key, &accumulators);
                 keys.push(key);
                 starts.push(start);
                 ends.push(end);
@@ -1103,6 +1218,7 @@ impl TumblingAggregator {
                 }
             }
         }
+        self.account().expect("shrinking a reservation cannot fail");
 
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&keys, &self.key_types);
@@ -1132,6 +1248,7 @@ impl TumblingAggregator {
                 window.keys.into_iter().collect();
             group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             for (key, mut accumulators) in group {
+                self.forget_group_bytes(&key, &accumulators);
                 keys.push(key);
                 slice_ends.push(end);
                 for (i, accumulator) in accumulators.iter_mut().enumerate() {
@@ -1140,6 +1257,7 @@ impl TumblingAggregator {
                 }
             }
         }
+        self.account().expect("shrinking a reservation cannot fail");
 
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&keys, &self.key_types);
@@ -1156,7 +1274,7 @@ impl TumblingAggregator {
 
     /// Global half of two-phase aggregation: merges incoming partials
     /// `[key, partial0..partialN-1, slice_end]` into the window each slice belongs to.
-    fn update_partial(&mut self, batch: &RecordBatch) {
+    fn update_partial(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         let n = self.aggregates.len();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
@@ -1166,19 +1284,31 @@ impl TumblingAggregator {
         let partials: Vec<&ArrayRef> =
             (0..n).map(|i| batch.column_by_name(&format!("partial{i}")).expect("partial")).collect();
 
+        let track = self.memory.is_some();
         for row in 0..batch.num_rows() {
             let slice_end = slice_ends.value(row);
             let key = read_key(&key_arrays, row);
             for (start, end) in self.partial_windows(slice_end) {
-                for (i, accumulator) in
-                    self.accumulators(start, end, key.clone()).iter_mut().enumerate()
-                {
+                let mut delta = 0isize;
+                if track {
+                    delta = match self.windows.get(&end).and_then(|w| w.keys.get(&key)) {
+                        Some(accumulators) => -(accumulators_bytes(accumulators) as isize),
+                        None => group_key_bytes(&key) as isize,
+                    };
+                }
+                let accumulators = self.accumulators(start, end, key.clone());
+                for (i, accumulator) in accumulators.iter_mut().enumerate() {
                     accumulator
                         .merge_batch(&[partials[i].slice(row, 1)])
                         .expect("failed to merge partial");
                 }
+                if track {
+                    delta += accumulators_bytes(accumulators) as isize;
+                    self.state_bytes = self.state_bytes.saturating_add_signed(delta);
+                }
             }
         }
+        self.account()
     }
 
     /// The `(start, end)` windows a slice ending at `slice_end` belongs to in the global merge.
@@ -8881,22 +9011,35 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_tumblingSum<'
 /// owns native state that lives across calls; the JVM must release it with the matching close.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTumblingAggregator<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     window_millis: jlong,
     slide_millis: jlong,
     value_types: JIntArray<'local>,
     aggregate_kinds: JIntArray<'local>,
+    memory_budget_bytes: jlong,
 ) -> jlong {
     let kinds = read_int_array(&env, &aggregate_kinds);
     let value_types = read_int_array(&env, &value_types);
-    Box::into_raw(Box::new(TumblingAggregator::new(
-        window_millis,
-        slide_millis,
-        false,
-        value_types,
-        kinds,
-    ))) as jlong
+    let aggregator =
+        TumblingAggregator::new(window_millis, slide_millis, false, value_types, kinds)
+            .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
+}
+
+/// Boxes a built aggregator into an opaque handle, or raises the memory-limit exception and returns
+/// a null handle when its budget was already exceeded (a restore larger than the budget).
+fn boxed_or_throw(
+    env: &mut JNIEnv,
+    aggregator: Result<TumblingAggregator, DataFusionError>,
+) -> jlong {
+    match aggregator {
+        Ok(aggregator) => Box::into_raw(Box::new(aggregator)) as jlong,
+        Err(e) => {
+            throw_memory_limit(env, &e.to_string());
+            0
+        }
+    }
 }
 
 /// Creates a stateful cumulative-window aggregator (nested windows of `step` up to `max_size`) and
@@ -8904,22 +9047,19 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTumblin
 /// flush, snapshot, close) with the tumbling handle; only the window assignment differs.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createCumulativeAggregator<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     max_size_millis: jlong,
     step_millis: jlong,
     value_types: JIntArray<'local>,
     aggregate_kinds: JIntArray<'local>,
+    memory_budget_bytes: jlong,
 ) -> jlong {
     let kinds = read_int_array(&env, &aggregate_kinds);
     let value_types = read_int_array(&env, &value_types);
-    Box::into_raw(Box::new(TumblingAggregator::new(
-        max_size_millis,
-        step_millis,
-        true,
-        value_types,
-        kinds,
-    ))) as jlong
+    let aggregator = TumblingAggregator::new(max_size_millis, step_millis, true, value_types, kinds)
+        .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
 }
 
 /// Reads a JVM int[] (aggregate kinds or per-aggregate value-type codes) into a Vec.
@@ -8967,15 +9107,22 @@ fn read_strings(env: &mut JNIEnv, values: &JObjectArray) -> Vec<Option<String>> 
 /// emitted later when a watermark closes windows.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateTumblingAggregator<'local>(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     in_array_address: jlong,
     in_schema_address: jlong,
 ) {
     let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    aggregator.update(&batch);
+    // The batch must drop before a throw: its release callback upcalls into the JVM (the C Data
+    // producer side), which cannot run with this thread's exception pending.
+    let result = {
+        let batch = import_record_batch(in_array_address, in_schema_address);
+        aggregator.update(&batch)
+    };
+    if let Err(e) = result {
+        throw_memory_limit(&mut env, &e.to_string());
+    }
 }
 
 /// Window-attached local half: folds a batch whose rows carry explicit `window_start`/`window_end`
@@ -8984,15 +9131,21 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateTumblin
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateAttachedTumblingAggregator<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     in_array_address: jlong,
     in_schema_address: jlong,
 ) {
     let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    aggregator.update_attached(&batch);
+    // See updateTumblingAggregator: the batch's JVM release upcall must precede any throw.
+    let result = {
+        let batch = import_record_batch(in_array_address, in_schema_address);
+        aggregator.update_attached(&batch)
+    };
+    if let Err(e) = result {
+        throw_memory_limit(&mut env, &e.to_string());
+    }
 }
 
 /// Emits the windows the given watermark has closed as a batch and drops them from state.
@@ -9015,15 +9168,21 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushTumbling
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updatePartialTumblingAggregator<
     'local,
 >(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     in_array_address: jlong,
     in_schema_address: jlong,
 ) {
     let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    aggregator.update_partial(&batch);
+    // See updateTumblingAggregator: the batch's JVM release upcall must precede any throw.
+    let result = {
+        let batch = import_record_batch(in_array_address, in_schema_address);
+        aggregator.update_partial(&batch)
+    };
+    if let Err(e) = result {
+        throw_memory_limit(&mut env, &e.to_string());
+    }
 }
 
 /// Local two-phase half: emits the partial state of the windows the watermark has closed.
@@ -9071,49 +9230,43 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTumbl
 /// Rebuilds an aggregator from a snapshot taken by a prior run and returns a fresh handle.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTumblingAggregator<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     window_millis: jlong,
     slide_millis: jlong,
     value_types: JIntArray<'local>,
     aggregate_kinds: JIntArray<'local>,
     snapshot: JByteArray<'local>,
+    memory_budget_bytes: jlong,
 ) -> jlong {
     let kinds = read_int_array(&env, &aggregate_kinds);
     let value_types = read_int_array(&env, &value_types);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read snapshot");
-    Box::into_raw(Box::new(TumblingAggregator::restore(
-        window_millis,
-        slide_millis,
-        false,
-        value_types,
-        kinds,
-        &bytes,
-    ))) as jlong
+    let aggregator =
+        TumblingAggregator::restore(window_millis, slide_millis, false, value_types, kinds, &bytes)
+            .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
 }
 
 /// Rebuilds a cumulative-window aggregator from a snapshot taken by a prior run.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreCumulativeAggregator<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     max_size_millis: jlong,
     step_millis: jlong,
     value_types: JIntArray<'local>,
     aggregate_kinds: JIntArray<'local>,
     snapshot: JByteArray<'local>,
+    memory_budget_bytes: jlong,
 ) -> jlong {
     let kinds = read_int_array(&env, &aggregate_kinds);
     let value_types = read_int_array(&env, &value_types);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read snapshot");
-    Box::into_raw(Box::new(TumblingAggregator::restore(
-        max_size_millis,
-        step_millis,
-        true,
-        value_types,
-        kinds,
-        &bytes,
-    ))) as jlong
+    let aggregator =
+        TumblingAggregator::restore(max_size_millis, step_millis, true, value_types, kinds, &bytes)
+            .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
 }
 
 /// Reads a JVM int[] of column indices into a Vec.
@@ -12230,8 +12383,24 @@ pub mod bench {
             Tumbling(TumblingAggregator::new(window_millis, window_millis, false, value_types, kinds))
         }
 
+        /// The accounted variant: state is tracked against `budget_bytes`, measuring the
+        /// memory-accounting overhead against `new`.
+        pub fn with_budget(
+            window_millis: i64,
+            value_type: i64,
+            kinds: Vec<i64>,
+            budget_bytes: i64,
+        ) -> Self {
+            let value_types = vec![value_type; kinds.len()];
+            Tumbling(
+                TumblingAggregator::new(window_millis, window_millis, false, value_types, kinds)
+                    .with_memory_budget(budget_bytes)
+                    .expect("empty state fits any budget"),
+            )
+        }
+
         pub fn update(&mut self, batch: &RecordBatch) {
-            self.0.update(batch);
+            self.0.update(batch).expect("budget exceeded");
         }
 
         pub fn flush(&mut self, watermark: i64) -> RecordBatch {
@@ -12949,7 +13118,7 @@ mod tests {
             ],
         )
         .unwrap();
-        agg.update_partial(&partial);
+        agg.update_partial(&partial).unwrap();
         let out = agg.flush(3000);
         // Nested windows share the bucket start 0; each accumulates the slices up to its end:
         // (0,1000]=10, (0,2000]=10+20=30, (0,3000]=10+20+30=60.
@@ -12980,11 +13149,79 @@ mod tests {
             ],
         )
         .unwrap();
-        agg.update_attached(&batch);
+        agg.update_attached(&batch).unwrap();
         let out = agg.flush_partial(20000);
         // Output columns: [partial0, slice_end]. Windows emitted in ascending end order.
         assert_eq!(values(&out, 1), vec![10000, 12000]); // slice_end == the named window ends
         assert_eq!(values(&out, 0), vec![8, 7]); // (0,10000] sums 3+5, (2000,12000] sums 7
+    }
+
+    // A `[ts, value0, key0]` batch (bigint value and key) for the memory-accounting tests.
+    fn keyed_window_batch(ts_millis: i64, keys: Vec<i64>) -> RecordBatch {
+        let n = keys.len();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, false),
+                Field::new("value0", DataType::Int64, true),
+                Field::new("key0", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![ts_millis; n])),
+                Arc::new(Int64Array::from(vec![1i64; n])),
+                Arc::new(Int64Array::from(keys)),
+            ],
+        )
+        .unwrap()
+    }
+
+    // Open-window state grows the pool reservation, tracks the full-scan footprint exactly, and
+    // returns to zero when the windows close — the release-on-close half of memory accounting.
+    #[test]
+    fn window_state_reserves_and_releases_memory() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let mut agg = TumblingAggregator::new(1000, 1000, false, vec![0], vec![0])
+            .with_memory_pool(&pool)
+            .unwrap();
+        agg.update(&keyed_window_batch(0, (0..50).collect())).unwrap();
+        agg.update(&keyed_window_batch(1500, (0..20).collect())).unwrap();
+        assert!(pool.reserved() > 0);
+        assert_eq!(agg.state_bytes, agg.computed_state_bytes()); // incremental tracking must not drift
+        let both_windows = pool.reserved();
+
+        agg.flush(1000); // closes the first window only
+        assert_eq!(agg.state_bytes, agg.computed_state_bytes());
+        assert!(pool.reserved() > 0 && pool.reserved() < both_windows);
+
+        agg.flush(2000); // closes the rest
+        assert_eq!(pool.reserved(), 0);
+        drop(agg);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    // Exceeding the budget is a clear, attributable failure — not a container OOM.
+    #[test]
+    fn window_state_over_budget_fails_clearly() {
+        let mut agg = TumblingAggregator::new(1000, 1000, false, vec![0], vec![0])
+            .with_memory_budget(256)
+            .unwrap();
+        let err = agg.update(&keyed_window_batch(0, (0..100).collect())).unwrap_err();
+        assert!(err.to_string().contains("managed-memory budget"), "{err}");
+    }
+
+    // A restored snapshot is accounted the moment the budget attaches, so state that no longer fits
+    // fails at restore rather than silently exceeding the budget.
+    #[test]
+    fn restored_state_is_accounted_against_budget() {
+        let mut agg = TumblingAggregator::new(1000, 1000, false, vec![0], vec![0]);
+        agg.update(&keyed_window_batch(0, (0..100).collect())).unwrap();
+        let snapshot = agg.snapshot();
+        let restored = TumblingAggregator::restore(1000, 1000, false, vec![0], vec![0], &snapshot);
+        assert!(restored.with_memory_budget(256).is_err());
+
+        let restored = TumblingAggregator::restore(1000, 1000, false, vec![0], vec![0], &snapshot);
+        let fits = restored.with_memory_budget(1 << 20).unwrap();
+        assert_eq!(fits.state_bytes, fits.computed_state_bytes());
+        assert!(fits.state_bytes > 0);
     }
 
     // A `[key0, value0, $row_kind$]` changelog batch (key/value bigint) for the GROUP BY tests;
@@ -14403,4 +14640,5 @@ mod tests {
         assert_eq!(values(&first, 0), vec![1, 3]);
     }
 }
+
 

@@ -77,7 +77,8 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
   @Override
   protected long createHandle() {
     return cumulative
-        ? Native.createCumulativeAggregator(windowMillis, slideMillis, valueTypes, aggregateKinds)
+        ? Native.createCumulativeAggregator(
+            windowMillis, slideMillis, valueTypes, aggregateKinds, memoryBudgetBytes())
         : super.createHandle();
   }
 
@@ -85,7 +86,7 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
   protected long restoreHandle(byte[] snapshot) {
     return cumulative
         ? Native.restoreCumulativeAggregator(
-            windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot)
+            windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes())
         : super.restoreHandle(snapshot);
   }
 

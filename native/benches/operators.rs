@@ -100,6 +100,18 @@ fn bench_tumbling_keyed(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+    // The same keyed path with managed-memory accounting on: the delta is the per-touched-group
+    // footprint tracking the operator pays when the host hands it a memory budget.
+    group.bench_function("sum_keyed_update_flush_accounted", |b| {
+        b.iter_batched(
+            || Tumbling::with_budget(window_millis, 0, vec![0], 1 << 30),
+            |mut aggregator| {
+                aggregator.update(black_box(&batch));
+                black_box(aggregator.flush(i64::MAX));
+            },
+            BatchSize::SmallInput,
+        )
+    });
     group.finish();
 }
 

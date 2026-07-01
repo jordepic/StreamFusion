@@ -1,6 +1,8 @@
 package io.github.jordepic.streamfusion;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -16,12 +18,14 @@ import org.junit.jupiter.api.Test;
 
 class StatefulTumblingTest {
 
+  private static final long UNBOUNDED = -1;
+
   @Test
   void accumulatesWindowsAcrossBatchesAndEmitsOnWatermark() {
     try (BufferAllocator allocator = new RootAllocator();
         CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
 
-      long handle = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}); // SUM
+      long handle = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}, UNBOUNDED); // SUM
       try {
         // First batch lands rows in windows 0 and 1000.
         update(allocator, provider, handle, new long[] {0, 500, 1000}, new long[] {1, 2, 3});
@@ -47,7 +51,7 @@ class StatefulTumblingTest {
         CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
 
       // Integer average; its partial state is (sum, count), exercising multi-field checkpoint.
-      long handle = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {4});
+      long handle = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {4}, UNBOUNDED);
       byte[] snapshot;
       try {
         update(allocator, provider, handle, new long[] {0, 500}, new long[] {1, 2});
@@ -56,7 +60,7 @@ class StatefulTumblingTest {
         Native.closeTumblingAggregator(handle);
       }
 
-      long restored = Native.restoreTumblingAggregator(1000, 1000, new int[] {0}, new int[] {4}, snapshot);
+      long restored = Native.restoreTumblingAggregator(1000, 1000, new int[] {0}, new int[] {4}, snapshot, UNBOUNDED);
       try {
         // Same window gets another value: sum 1+2+6=9 over count 3 -> integer avg 3.
         update(allocator, provider, restored, new long[] {700}, new long[] {6});
@@ -72,8 +76,8 @@ class StatefulTumblingTest {
     try (BufferAllocator allocator = new RootAllocator();
         CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
 
-      long local = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}); // SUM
-      long global = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0});
+      long local = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}, UNBOUNDED); // SUM
+      long global = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}, UNBOUNDED);
       try {
         // Local pre-aggregates raw values into per-window partials.
         update(allocator, provider, local, new long[] {0, 500, 1500}, new long[] {1, 2, 3});
@@ -101,6 +105,32 @@ class StatefulTumblingTest {
       } finally {
         Native.closeTumblingAggregator(local);
         Native.closeTumblingAggregator(global);
+      }
+    }
+  }
+
+  // Exceeding the operator's managed-memory budget must surface as the dedicated exception across
+  // the JNI boundary (which the task fails with), not a silent overrun the container OOM-kills.
+  @Test
+  void exceedingMemoryBudgetThrowsAcrossJni() {
+    try (BufferAllocator allocator = new RootAllocator();
+        CDataDictionaryProvider provider = new CDataDictionaryProvider()) {
+
+      long handle = Native.createTumblingAggregator(1000, 1000, new int[] {0}, new int[] {0}, 64);
+      try {
+        long[] timestamps = new long[256];
+        long[] values = new long[256];
+        for (int i = 0; i < timestamps.length; i++) {
+          timestamps[i] = i * 1000L; // one window per row, so state outgrows the 64-byte budget
+          values[i] = i;
+        }
+        NativeMemoryLimitException e =
+            assertThrows(
+                NativeMemoryLimitException.class,
+                () -> update(allocator, provider, handle, timestamps, values));
+        assertTrue(e.getMessage().contains("managed-memory budget"), e.getMessage());
+      } finally {
+        Native.closeTumblingAggregator(handle);
       }
     }
   }

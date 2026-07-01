@@ -71,20 +71,23 @@ public class NativeColumnarGlobalWindowAggExecNode extends ExecNodeBase<ArrowBat
     String timeZoneId =
         timestampLtz ? planner.getTableConfig().getLocalTimeZone().getId() : "UTC";
     RowType outputType = (RowType) getOutputType();
-    return ExecNodeUtil.createOneInputTransformation(
-        input,
-        createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarGlobalWindowAggregateOperator(
-            windowMillis,
-            slideMillis,
-            cumulative,
-            NativeWindowOperatorCore.keyTypes(outputType, keyColumns.length),
-            valueTypes,
-            aggregateKinds,
-            timeZoneId,
-            outputType),
-        ArrowBatchTypeInformation.INSTANCE,
-        input.getParallelism(),
-        false);
+    Transformation<ArrowBatch> transformation =
+        ExecNodeUtil.createOneInputTransformation(
+            input,
+            createTransformationMeta(TRANSFORMATION, config),
+            new NativeColumnarGlobalWindowAggregateOperator(
+                windowMillis,
+                slideMillis,
+                cumulative,
+                NativeWindowOperatorCore.keyTypes(outputType, keyColumns.length),
+                valueTypes,
+                aggregateKinds,
+                timeZoneId,
+                outputType),
+            ArrowBatchTypeInformation.INSTANCE,
+            input.getParallelism(),
+            false);
+    NativeManagedMemory.declareOperatorWeight(transformation);
+    return transformation;
   }
 }

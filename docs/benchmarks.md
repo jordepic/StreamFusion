@@ -29,6 +29,9 @@ Current benches:
   iteration.
 - `tumbling/sum_keyed_update_flush` — the same, grouped by a bigint key (64 distinct
   values), so it exercises the per-row grouping-key path the unkeyed bench does not.
+  The `_accounted` variant attaches a managed-memory budget, measuring the per-touched-group
+  footprint tracking an operator pays when the host hands it one (default off in the plain bench,
+  so the unaccounted number is the like-for-like baseline).
 - `session/sum_keyed_update_flush` — a session `SUM` grouped by key (gap merge).
 - `over/running_sum_keyed`, `over/row_number_keyed` — the columnar `OVER` push+flush, for a
   running `SUM` (DataFusion accumulator per row) and `ROW_NUMBER` (per-key counter).
@@ -46,6 +49,7 @@ Numbers are only comparable within a machine; record the host (CPU) alongside.
 | `filter/gt_literal` | 4096 | 2.56 µs | ~1.60 Gelem/s | compiled predicate, ~50% selectivity |
 | `tumbling/sum_update_flush` | 4096 | 106 µs | ~38.6 Melem/s | 16 windows, no key |
 | `tumbling/sum_keyed_update_flush` | 4096 | 252 µs | ~16.3 Melem/s | 16 windows, 64 bigint keys |
+| `tumbling/sum_keyed_update_flush_accounted` | 4096 | 260 µs | ~15.8 Melem/s | same, managed-memory budget attached (~2% overhead) |
 | `interval_join/equi_key_push` | 4096 | 100 µs | ~41 Melem/s | INNER, 1:1, equi-key + interval filter |
 | `window_join/equi_key_flush` | 4096 | 175 µs | ~23 Melem/s | INNER, 1:1, equi-key + window bounds |
 | `over/running_sum_keyed` | 4096 | 0.60 ms | ~6.8 Melem/s | running aggregate, specialized fold, 64 keys |
