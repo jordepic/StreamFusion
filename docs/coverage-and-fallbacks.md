@@ -82,13 +82,17 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   residual non-equi predicate beyond the temporal condition (e.g. `… AND o.amount < r.rate`) is applied
   natively, like the other joins. Real gap: none — a **processing-time** temporal table join is parity
   (Flink itself rejects it — FLINK-19830), as is the legacy proctime temporal *function* join.
-- **Lookup join** (`FOR SYSTEM_TIME AS OF probe.proctime`, the dimension-table join, Nexmark q13) — the
-  **synchronous** form is native for INNER and LEFT: the probe batch stays Arrow and each row calls the
-  connector's real synchronous `LookupFunction` (byte-identical to Flink's `LookupJoinRunner`;
-  `NativeLookupJoinOperator`). This is not vectorizable compute — it is a per-row JVM upcall into the
-  host connector — but it keeps the island unbroken. Still falls back: the **async** lookup path (needs
-  the operator mailbox), an **upsert-materialized** (keyed-state) lookup, a **calc/filter on the temporal
-  table**, and any **residual or pre-filter** condition; ticket 40 tracks these follow-ups.
+- **Lookup join** (`FOR SYSTEM_TIME AS OF probe.proctime`, the dimension-table join, Nexmark q13) —
+  native for INNER and LEFT against **both synchronous and async** connectors. The probe batch stays
+  Arrow; a sync connector's real `LookupFunction` is called per row (`NativeLookupJoinOperator`,
+  byte-identical to Flink's `LookupJoinRunner`), an async connector's real `asyncLookup` is fired for
+  each distinct key in the batch **concurrently** and awaited on the task thread before emitting
+  (`NativeAsyncLookupJoinOperator` — Arroyo/RisingWave's within-batch model, no operator mailbox needed
+  since nothing is in flight across a batch; see ticket 40 / ticket 01). This is not vectorizable
+  compute — it is a JVM upcall into the host connector — but it keeps the island unbroken, and the async
+  path overlaps a batch's I/O. Still falls back: an **upsert-materialized** (keyed-state) lookup, a
+  **calc/filter on the temporal table**, and any **residual or pre-filter** condition; ticket 40 tracks
+  these follow-ups.
 - **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
   (see below); CDC only Debezium/OGG JSON.
 - **Proctime** support, by operator:
@@ -156,10 +160,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   equi-key type outside the supported set; a residual non-equi predicate beyond the `FOR SYSTEM_TIME`
   condition that the native engine can't express; a processing-time temporal join (parity — Flink
   rejects it for a versioned table).
-- **Lookup join** — an async lookup (needs the operator mailbox); an upsert-materialized (keyed-state)
-  lookup; a projection/filter on the temporal table; a residual (non-equi) or pre-filter condition; not
-  INNER/LEFT; a temporal table that isn't a non-legacy `TableSourceTable`; a non-field-reference
-  (constant/computed) lookup key. (The synchronous processing-time form is otherwise native — §(a).)
+- **Lookup join** — an upsert-materialized (keyed-state) lookup; a projection/filter on the temporal
+  table; a residual (non-equi) or pre-filter condition; not INNER/LEFT; a temporal table that isn't a
+  non-legacy `TableSourceTable`; a non-field-reference (constant/computed) lookup key. (Both the sync
+  and async processing-time forms are otherwise native — §(a).)
 - **Regular join** — unsupported join type; no equi key; non-null-dropping keys; non-equi residual not
   expressible; an input column type the converter can't carry.
 - **Window aggregate / local / global** — window not event-time `TUMBLE`/`HOP`/`CUMULATE` (zero offset)

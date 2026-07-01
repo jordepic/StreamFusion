@@ -14,13 +14,28 @@ as Flink's `LookupJoinRunner` does), so the result is byte-identical. INNER + LE
 lookup keys, no calc/residual. Wiring: `LookupJoinMatcher` → `StreamPhysicalNativeLookupJoin` →
 `NativeLookupJoinExecNode` → operator; verified by `FlinkLookupJoinSqlHarnessTest`.
 
+## Async connectors — DONE (2026-07-01)
+
+An `AsyncLookupFunctionProvider` connector (`isAsyncEnabled`) now routes to
+`NativeAsyncLookupJoinOperator`. Rather than Flink's `AsyncWaitOperator` (cross-batch in-flight queue +
+mailbox + snapshot/replay of in-flight rows), it uses the **within-batch concurrent** model that Arroyo's
+`lookup_join` and RisingWave's `temporal_join` both use: per probe `ArrowBatch` it fires the connector's
+real `asyncLookup` (from `getLookupFunction(..., async=true, ...)`) for each **distinct** key
+concurrently, `CompletableFuture.allOf(...).join()`s on the task thread, then assembles the joined batch.
+Because all the I/O begins and ends inside one `processElement`, **nothing is in flight across a batch
+boundary** — a checkpoint barrier (itself a task-thread action) only runs between batches, so there is no
+in-flight state to snapshot and **no mailbox is needed**, exactly as for the sync operator. The win over
+sync is that a batch's lookups overlap (≈ one round-trip instead of N). Distinct-key dedup is safe: dim
+state is fixed within a batch, so it can only differ from Flink's per-row calls when the dim mutates
+mid-batch, where Flink's own concurrent lookups already race. Byte-identical, verified by
+`FlinkAsyncLookupJoinSqlHarnessTest` (INNER, LEFT, duplicate keys). See [ticket 01](01-mailbox-threading.md)
+for why within-batch beats the `AsyncWaitOperator` port here.
+
+The remaining `AsyncWaitOperator` port (cross-batch I/O overlap) is only worth building if per-lookup
+latency is so high that blocking on a single batch stalls checkpoints unacceptably — not the case today.
+
 ## Follow-ups (each currently falls back with a named reason)
 
-- **Async lookups + the mailbox.** An `AsyncLookupFunctionProvider` connector (`isAsyncEnabled`) needs
-  the operator **mailbox** (`MailboxExecutor`): fire `asyncLookup` returning a `CompletableFuture`, and
-  enqueue result-handling mails to emit on the task thread in order (Flink's `AsyncWaitOperator` /
-  `TableKeyedAsyncWaitOperator` pattern). This is where the "you may need the mailbox" note lands — v1
-  is sync so it doesn't; async does. Keep ordering + watermark semantics.
 - **Calc on the temporal table.** `calcOnTemporalTable` (projection/filter on dim rows before the join)
   — evaluate it natively via the existing expression engine over the dim columns, or in the JVM bridge.
 - **Residual (non-equi) join condition.** `finalRemainingCondition` / `finalPreFilterCondition` —

@@ -28,6 +28,7 @@ public class StreamPhysicalNativeLookupJoin extends SingleRel
   private final int[] orderedDimKeys;
   private final int[] probeKeyIndices;
   private final int joinType;
+  private final boolean async;
 
   public StreamPhysicalNativeLookupJoin(
       RelOptCluster cluster,
@@ -37,13 +38,15 @@ public class StreamPhysicalNativeLookupJoin extends SingleRel
       RelOptTable temporalTable,
       int[] orderedDimKeys,
       int[] probeKeyIndices,
-      int joinType) {
+      int joinType,
+      boolean async) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.temporalTable = temporalTable;
     this.orderedDimKeys = orderedDimKeys;
     this.probeKeyIndices = probeKeyIndices;
     this.joinType = joinType;
+    this.async = async;
   }
 
   @Override
@@ -66,7 +69,8 @@ public class StreamPhysicalNativeLookupJoin extends SingleRel
         temporalTable,
         orderedDimKeys,
         probeKeyIndices,
-        joinType);
+        joinType,
+        async);
   }
 
   @Override
@@ -81,6 +85,7 @@ public class StreamPhysicalNativeLookupJoin extends SingleRel
         FlinkTypeFactory$.MODULE$.toLogicalRowType(temporalTable.getRowType()),
         orderedDimKeys,
         probeKeyIndices,
-        joinType);
+        joinType,
+        async);
   }
 }

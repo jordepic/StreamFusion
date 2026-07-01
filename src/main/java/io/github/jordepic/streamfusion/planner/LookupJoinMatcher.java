@@ -16,12 +16,13 @@ import org.apache.flink.table.planner.plan.utils.FunctionCallUtil;
  * lookup itself calls the connector's real synchronous {@code LookupFunction} per row (like a UDF
  * upcall), so the result is byte-identical to Flink's {@code LookupJoinRunner}.
  *
- * <p>Admitted only for the shape the operator implements: a <b>synchronous</b> lookup against a
- * non-legacy {@link TableSourceTable}, INNER or LEFT join, every lookup key a field reference into the
- * probe (constants and computed keys are pushed to an upstream Calc by the planner, so this is the
- * normal case), no projection/filter on the temporal table, no residual (non-equi) or pre-filter
- * condition, and no upsert materialization. Async lookups (which need the operator mailbox) and the
- * calc/residual variants fall back to the host — see ticket 40.
+ * <p>Admitted for the shape the operators implement: a lookup against a non-legacy {@link
+ * TableSourceTable}, INNER or LEFT join, every lookup key a field reference into the probe (constants
+ * and computed keys are pushed to an upstream Calc by the planner, so this is the normal case), no
+ * projection/filter on the temporal table, no residual (non-equi) or pre-filter condition, and no
+ * upsert materialization. Both synchronous ({@code NativeLookupJoinOperator}) and asynchronous
+ * ({@code NativeAsyncLookupJoinOperator}) connectors are supported; {@link #isAsync} tells the exec
+ * node which function to build. The calc/residual variants fall back to the host — see ticket 40.
  */
 final class LookupJoinMatcher {
 
@@ -35,9 +36,6 @@ final class LookupJoinMatcher {
   }
 
   static String unsupportedReason(StreamPhysicalLookupJoin join) {
-    if (join.isAsyncEnabled()) {
-      return "lookup join: async lookup not supported (needs the operator mailbox)";
-    }
     if (join.upsertMaterialize()) {
       return "lookup join: upsert-materialized (keyed-state) lookup not supported";
     }
@@ -83,6 +81,11 @@ final class LookupJoinMatcher {
       probeIndices[i] = ((FunctionCallUtil.FieldRef) keys.get(dimKeys[i])).index;
     }
     return probeIndices;
+  }
+
+  /** Whether the connector offers an async lookup function (the planner's chosen path). */
+  static boolean isAsync(StreamPhysicalLookupJoin join) {
+    return join.isAsyncEnabled();
   }
 
   static int joinTypeCode(StreamPhysicalLookupJoin join) {

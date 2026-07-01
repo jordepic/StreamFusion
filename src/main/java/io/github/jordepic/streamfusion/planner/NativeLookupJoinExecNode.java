@@ -2,6 +2,7 @@ package io.github.jordepic.streamfusion.planner;
 
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
+import io.github.jordepic.streamfusion.operator.NativeAsyncLookupJoinOperator;
 import io.github.jordepic.streamfusion.operator.NativeLookupJoinOperator;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -9,6 +10,8 @@ import java.util.List;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.table.functions.AsyncLookupFunction;
 import org.apache.flink.table.functions.LookupFunction;
 import org.apache.flink.table.functions.UserDefinedFunction;
 import org.apache.flink.table.planner.delegation.PlannerBase;
@@ -24,9 +27,11 @@ import org.apache.flink.table.runtime.operators.join.lookup.ResultRetryStrategy;
 import org.apache.flink.table.types.logical.RowType;
 
 /**
- * Wraps the native lookup-join operator into the plan. Builds the connector's synchronous {@link
- * LookupFunction} the same way Flink's own lookup join does ({@link LookupJoinUtil#getLookupFunction})
- * and hands it to the operator, which calls it per probe row while the batches stay Arrow.
+ * Wraps the native lookup-join operator into the plan. Builds the connector's lookup function the same
+ * way Flink's own lookup join does ({@link LookupJoinUtil#getLookupFunction}) and hands it to the
+ * operator while the batches stay Arrow. When the connector offers an async function the planner picks
+ * it ({@code async}), so this builds the {@link AsyncLookupFunction} and the async operator; otherwise
+ * the synchronous {@link LookupFunction} and the sync operator.
  */
 public class NativeLookupJoinExecNode extends ExecNodeBase<ArrowBatch>
     implements StreamExecNode<ArrowBatch>, SingleTransformationTranslator<ArrowBatch> {
@@ -39,6 +44,7 @@ public class NativeLookupJoinExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] orderedDimKeys;
   private final int[] probeKeyIndices;
   private final int joinType;
+  private final boolean async;
 
   public NativeLookupJoinExecNode(
       ReadableConfig tableConfig,
@@ -50,7 +56,8 @@ public class NativeLookupJoinExecNode extends ExecNodeBase<ArrowBatch>
       RowType dimType,
       int[] orderedDimKeys,
       int[] probeKeyIndices,
-      int joinType) {
+      int joinType,
+      boolean async) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-lookup-join_1"),
@@ -64,6 +71,7 @@ public class NativeLookupJoinExecNode extends ExecNodeBase<ArrowBatch>
     this.orderedDimKeys = orderedDimKeys;
     this.probeKeyIndices = probeKeyIndices;
     this.joinType = joinType;
+    this.async = async;
   }
 
   @Override
@@ -83,26 +91,43 @@ public class NativeLookupJoinExecNode extends ExecNodeBase<ArrowBatch>
             temporalTable,
             keys,
             classLoader,
-            false,
+            async,
             ResultRetryStrategy.NO_RETRY_STRATEGY,
             false);
-    if (!(function instanceof LookupFunction)) {
-      throw new IllegalStateException(
-          "expected a synchronous LookupFunction but got " + function.getClass().getName());
-    }
 
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeLookupJoinOperator(
-            (LookupFunction) function,
-            probeType,
-            dimType,
-            (RowType) getOutputType(),
-            probeKeyIndices,
-            joinType),
+        createOperator(function),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);
+  }
+
+  private OneInputStreamOperator<ArrowBatch, ArrowBatch> createOperator(UserDefinedFunction function) {
+    if (async) {
+      if (!(function instanceof AsyncLookupFunction)) {
+        throw new IllegalStateException(
+            "expected an AsyncLookupFunction but got " + function.getClass().getName());
+      }
+      return new NativeAsyncLookupJoinOperator(
+          (AsyncLookupFunction) function,
+          probeType,
+          dimType,
+          (RowType) getOutputType(),
+          probeKeyIndices,
+          joinType);
+    }
+    if (!(function instanceof LookupFunction)) {
+      throw new IllegalStateException(
+          "expected a synchronous LookupFunction but got " + function.getClass().getName());
+    }
+    return new NativeLookupJoinOperator(
+        (LookupFunction) function,
+        probeType,
+        dimType,
+        (RowType) getOutputType(),
+        probeKeyIndices,
+        joinType);
   }
 }
