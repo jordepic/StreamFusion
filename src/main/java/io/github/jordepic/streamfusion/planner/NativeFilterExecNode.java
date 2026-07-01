@@ -3,6 +3,7 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeFilterOperator;
+import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.Collections;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
@@ -29,6 +30,7 @@ public class NativeFilterExecNode extends ExecNodeBase<ArrowBatch>
   private final long[] longs;
   private final double[] doubles;
   private final String[] strings;
+  private final NativeUdf.Binding udfBinding;
 
   public NativeFilterExecNode(
       ReadableConfig tableConfig,
@@ -41,7 +43,8 @@ public class NativeFilterExecNode extends ExecNodeBase<ArrowBatch>
       int[] childCounts,
       long[] longs,
       double[] doubles,
-      String[] strings) {
+      String[] strings,
+      NativeUdf.Binding udfBinding) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-filter_1"),
@@ -56,6 +59,7 @@ public class NativeFilterExecNode extends ExecNodeBase<ArrowBatch>
     this.longs = longs;
     this.doubles = doubles;
     this.strings = strings;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -67,7 +71,8 @@ public class NativeFilterExecNode extends ExecNodeBase<ArrowBatch>
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeFilterOperator(projection, kinds, payload, childCounts, longs, doubles, strings),
+        new NativeFilterOperator(
+            projection, kinds, payload, childCounts, longs, doubles, strings, udfBinding),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

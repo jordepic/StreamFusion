@@ -114,6 +114,7 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
         ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      predicate.bind();
       handle =
           snapshot == null
               ? Native.createWindowJoiner(
@@ -129,7 +130,7 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings)
               : Native.restoreWindowJoiner(
@@ -145,7 +146,7 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
                   snapshot);
@@ -271,6 +272,7 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
       Native.closeWindowJoiner(handle);
       handle = 0;
     }
+    predicate.unbind();
     super.close();
   }
 }

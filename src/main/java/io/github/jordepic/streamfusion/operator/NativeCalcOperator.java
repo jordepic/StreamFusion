@@ -30,6 +30,7 @@ public class NativeCalcOperator extends AbstractStreamOperator<ArrowBatch>
   private final int[] projectionRoots;
   private final int conditionRoot;
   private final String[] outputNames;
+  private final NativeUdf.Binding udfBinding;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
@@ -44,7 +45,8 @@ public class NativeCalcOperator extends AbstractStreamOperator<ArrowBatch>
       String[] strings,
       int[] projectionRoots,
       int conditionRoot,
-      String[] outputNames) {
+      String[] outputNames,
+      NativeUdf.Binding udfBinding) {
     this.kinds = kinds;
     this.payload = payload;
     this.childCounts = childCounts;
@@ -54,6 +56,7 @@ public class NativeCalcOperator extends AbstractStreamOperator<ArrowBatch>
     this.projectionRoots = projectionRoots;
     this.conditionRoot = conditionRoot;
     this.outputNames = outputNames;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -61,10 +64,13 @@ public class NativeCalcOperator extends AbstractStreamOperator<ArrowBatch>
     super.open();
     allocator = NativeAllocator.SHARED;
     dictionaries = NativeAllocator.DICTIONARIES;
+    // Register any UDFs this Calc references into this JVM's registry (empty on a task manager) and
+    // patch their ids into the encoded pool before compiling — so distributed tasks resolve them.
+    long[] boundLongs = udfBinding.bind(longs);
     calc =
         Native.createCalcExpression(
-            kinds, payload, childCounts, longs, doubles, strings, projectionRoots, conditionRoot,
-            outputNames);
+            kinds, payload, childCounts, boundLongs, doubles, strings, projectionRoots,
+            conditionRoot, outputNames);
   }
 
   @Override
@@ -73,6 +79,7 @@ public class NativeCalcOperator extends AbstractStreamOperator<ArrowBatch>
       Native.closeCalcExpression(calc);
       calc = 0;
     }
+    udfBinding.unbind();
     super.close();
   }
 

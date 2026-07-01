@@ -48,6 +48,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
   private final long[] predLongs;
   private final double[] predDoubles;
   private final String[] predStrings;
+  private final NativeUdf.Binding predBinding;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
@@ -65,7 +66,8 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
       int[] predChildCounts,
       long[] predLongs,
       double[] predDoubles,
-      String[] predStrings) {
+      String[] predStrings,
+      NativeUdf.Binding predBinding) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.joinType = joinType;
@@ -77,6 +79,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
     this.predLongs = predLongs;
     this.predDoubles = predDoubles;
     this.predStrings = predStrings;
+    this.predBinding = predBinding;
   }
 
   @Override
@@ -101,6 +104,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
         ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      long[] boundPredLongs = predBinding.bind(predLongs);
       handle =
           snapshot == null
               ? Native.createUpdatingJoiner(
@@ -112,7 +116,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
                   predKinds,
                   predPayload,
                   predChildCounts,
-                  predLongs,
+                  boundPredLongs,
                   predDoubles,
                   predStrings)
               : Native.restoreUpdatingJoiner(
@@ -124,7 +128,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
                   predKinds,
                   predPayload,
                   predChildCounts,
-                  predLongs,
+                  boundPredLongs,
                   predDoubles,
                   predStrings,
                   snapshot);
@@ -191,6 +195,7 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
       Native.closeUpdatingJoiner(handle);
       handle = 0;
     }
+    predBinding.unbind();
     super.close();
   }
 }

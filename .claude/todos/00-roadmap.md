@@ -14,6 +14,13 @@ here when the ticket is deleted.
   kernel) and `CHAR`/`VARCHAR`→`VARCHAR` passthrough; precision/locale-divergent ops (`ROUND`/transcendental,
   pure-Rust case/regex) are opt-in behind `allowIncompatible`. Remaining tail (parity-gated, minor):
   number↔string `CAST`, narrowing-`VARCHAR`/cast-to-`CHAR(n)`, byte-exact decimal `/`/`%`, obscure funcs.
+- **JVM-upcall UDFs — done, distributed-safe.** A function the native engine can't evaluate itself runs
+  via a native→JVM columnar Arrow upcall (`NativeUdf`/`JvmUdf`, one JNI crossing per batch, byte-identical
+  to Flink): non-builtin Flink `ScalarFunction`s (q14) and the host-exact builtins `REGEXP_EXTRACT` /
+  `UPPER` / `LOWER` (q21, native by default; the faster pure-Rust regex/case paths stay opt-in behind
+  `allowIncompatible`). The function is carried into the operator as a serializable descriptor and
+  registered on the JVM that runs it at `open()` (freed at `close()`), so it works on a distributed task
+  manager, not just the planner's JVM — no plan-time global registry.
 - **Operators, native + identical to Flink:** filter/`WHERE` (via the native expression engine),
   tumbling / hopping / session / cumulative window aggregates (one- and two-phase), event-time
   `OVER` aggregation, event-time INNER interval and window joins, Parquet sink (exactly-once),
@@ -115,8 +122,8 @@ here when the ticket is deleted.
   (non-blocking), not block the task thread.
 
 ## Breadth / longer horizon
-- **Arroyo operator coverage tracker** (ticket 11): what remains is async-gated (lookup join, async
-  UDF — ticket 01) plus operator feature tails (rank-number / `RANK` / retracting-input Top-N, OVER
+- **Arroyo operator coverage tracker** (ticket 11): what remains is async UDF (ticket 01) plus operator
+  feature tails (rank-number / `RANK` / retracting-input Top-N, OVER
   frames / `FIRST_VALUE`/`LAST_VALUE`, proctime variants). (Two-phase cumulative windows, event-time
   joins incl. outer/semi/anti, the non-windowed GROUP BY aggregate, the regular updating join,
   append-only Top-N, keep-first deduplication, window Top-N / window deduplication, and event-time
@@ -128,19 +135,13 @@ here when the ticket is deleted.
   fourth source in the Nexmark matrix; its columnar format may let the native island ingest Arrow with
   little/no row transpose — the perimeter transpose is a visible share of the remaining stateful-query
   cost, so Fluss is the source most likely to show the engine's largest end-to-end margin.
-- **Serialize native UDFs for distributed execution** (ticket 38): non-builtin Flink `ScalarFunction`s
-  now run natively via a native→JVM columnar Arrow upcall (`NativeUdf`/`JvmUdf`), but the function lives in
-  a process-global plan-time registry — local/embedded/benchmark JVM only. Distributed task managers need
-  the function serialized into the operator (thread it through the `Calc` rel/exec/operator, register at
-  `open()`, deregister at `close()`). The same upcall now also carries `REGEXP_EXTRACT` and `UPPER`/`LOWER`
-  by default (host-exact regex/case folding), so q21 accelerates with no flag; these builtins hit the same
-  distributed-registry limitation until ticket 38 lands.
-- **Native lookup join** (ticket 40): **v1 DONE.** `NativeLookupJoinOperator` accelerates a synchronous
-  processing-time lookup join (Nexmark q13) — Arrow probe batches stay in the island while each row calls
-  the connector's real `LookupFunction` (byte-identical to Flink's `LookupJoinRunner`); INNER + LEFT,
-  field-ref keys, no calc/residual. Follow-ups in ticket 40: async lookups (needs the operator mailbox),
-  calc-on-temporal-table + residual condition, constant keys, columnar/preload assembly, distributed
-  serialization.
+- **Native lookup join** (ticket 40): **sync + async DONE.** `NativeLookupJoinOperator` (sync) and
+  `NativeAsyncLookupJoinOperator` (async) accelerate a processing-time lookup join (Nexmark q13) — Arrow
+  probe batches stay in the island while the connector's real `LookupFunction`/`asyncLookup` runs
+  (byte-identical to Flink); INNER + LEFT, field-ref keys, no calc/residual. Async fires a batch's
+  distinct-key lookups concurrently and awaits them on the task thread (Arroyo/RisingWave within-batch
+  model — no operator mailbox). Follow-ups in ticket 40: calc-on-temporal-table + residual condition,
+  constant keys, columnar/preload assembly, distributed serialization.
 - **Nexmark q6 — documented exclusion** (ticket 39): the one query Flink 2.2.1 itself can't run (invalid
   as written; wrapped, Flink rejects the bounded `OVER` over the Top-N's non-time-attribute `dateTime` —
   FLINK-19059, the retraction limit the nexmark README cites, is fixed in 2.1.0, so that barrier is gone,

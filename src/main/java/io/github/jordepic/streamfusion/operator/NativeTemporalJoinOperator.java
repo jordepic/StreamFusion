@@ -97,6 +97,7 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
         ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      predicate.bind();
       handle =
           snapshot == null
               ? Native.createTemporalJoiner(
@@ -110,7 +111,7 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings)
               : Native.restoreTemporalJoiner(
@@ -124,7 +125,7 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
                   snapshot);
@@ -205,6 +206,7 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
       Native.closeTemporalJoiner(handle);
       handle = 0;
     }
+    predicate.unbind();
     super.close();
   }
 }

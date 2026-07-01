@@ -40,7 +40,8 @@ class NativeFilterOperatorTest {
             new int[] {2, 0, 0},
             new long[] {20},
             new double[] {},
-            new String[] {});
+            new String[] {},
+            NativeUdf.Binding.EMPTY);
     List<RowData> output = new ArrayList<>();
     try (BufferAllocator allocator = new RootAllocator();
         OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =

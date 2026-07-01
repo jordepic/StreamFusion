@@ -422,7 +422,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           condition.childCounts(),
           condition.longs(),
           condition.doubles(),
-          condition.strings());
+          condition.strings(),
+          condition.udfBinding());
     }
 
     if (current instanceof StreamPhysicalCalc && CalcMatcher.matches((Calc) current)) {
@@ -552,7 +553,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             condition.childCounts(),
             condition.longs(),
             condition.doubles(),
-            condition.strings());
+            condition.strings(),
+            condition.udfBinding());
       }
     }
 

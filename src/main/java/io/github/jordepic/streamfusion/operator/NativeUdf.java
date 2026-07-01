@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
+import java.io.Serializable;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,9 +33,12 @@ import org.apache.flink.table.functions.ScalarFunction;
  * out, one JNI crossing per batch — no per-row boundary) and hands the result column back. Because it
  * runs the same JVM {@code eval} Flink would, the result is byte-identical by construction.
  *
- * <p>The registry is process-global and populated at plan time, so this covers execution that shares the
- * planner's JVM (the local/embedded and benchmark path). Distributed task managers would need the
- * function serialized into the operator instead — a separate step, not wired here.
+ * <p>The registry is process-global but populated at operator {@code open()}, not at plan time: the
+ * planner encodes a {@link Descriptor} per UDF (the {@code Serializable} {@link ScalarFunction} or a
+ * builtin's class + method) into the operator's {@link Binding}, and {@code open()} registers it into
+ * <em>this</em> JVM's registry, obtaining a task-local id that patches the encoded call. This works on a
+ * distributed task manager (a different JVM from the planner) as well as the local/benchmark path, and
+ * {@code close()} unregisters, so the registry doesn't leak across a task's lifetime.
  */
 public final class NativeUdf {
 
@@ -92,6 +96,131 @@ public final class NativeUdf {
     int id = NEXT_ID.getAndIncrement();
     REGISTRY.put(id, new Registered(null, staticMethod, argTypes, returnType));
     return id;
+  }
+
+  /** Removes a registration, freeing its id — called when an operator carrying it closes. */
+  public static void unregister(int id) {
+    REGISTRY.remove(id);
+  }
+
+  /**
+   * A serializable description of a UDF to register, carried into the operator so a task manager (a
+   * different JVM from the planner) can populate its own registry at {@code open()} — the fix for
+   * distributed execution (the plan-time registry only exists in the planner JVM). Holds the Flink
+   * {@link ScalarFunction} (which is {@code Serializable}) or, for a builtin, its declaring class; the
+   * {@code eval}/static method is re-resolved from the (serializable) name + parameter types on the
+   * task, since {@link Method} itself is not serializable.
+   */
+  public static final class Descriptor implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final ScalarFunction function; // null => a builtin static method
+    private final Class<?> methodClass; // builtin: the declaring class (null for a user function)
+    private final String methodName;
+    private final Class<?>[] paramTypes;
+    private final int[] argTypes;
+    private final int returnType;
+
+    private Descriptor(
+        ScalarFunction function,
+        Class<?> methodClass,
+        String methodName,
+        Class<?>[] paramTypes,
+        int[] argTypes,
+        int returnType) {
+      this.function = function;
+      this.methodClass = methodClass;
+      this.methodName = methodName;
+      this.paramTypes = paramTypes;
+      this.argTypes = argTypes;
+      this.returnType = returnType;
+    }
+
+    /** A user {@link ScalarFunction}, invoked via the given {@code eval} overload. */
+    public static Descriptor forFunction(
+        ScalarFunction function, Method eval, int[] argTypes, int returnType) {
+      return new Descriptor(
+          function, null, eval.getName(), eval.getParameterTypes(), argTypes, returnType);
+    }
+
+    /** A builtin backed by a {@code static} method (e.g. {@code UPPER}, {@code REGEXP_EXTRACT}). */
+    public static Descriptor forBuiltin(Method staticMethod, int[] argTypes, int returnType) {
+      return new Descriptor(
+          null,
+          staticMethod.getDeclaringClass(),
+          staticMethod.getName(),
+          staticMethod.getParameterTypes(),
+          argTypes,
+          returnType);
+    }
+
+    /** Resolves the method on this JVM and registers it, returning the task-local runtime id. */
+    int registerLocally() {
+      Class<?> owner = function != null ? function.getClass() : methodClass;
+      Method method;
+      try {
+        method = owner.getMethod(methodName, paramTypes);
+      } catch (NoSuchMethodException e) {
+        throw new IllegalStateException(
+            "cannot resolve UDF method " + methodName + " on " + owner.getName(), e);
+      }
+      return function != null
+          ? register(function, method, argTypes, returnType)
+          : registerBuiltin(method, argTypes, returnType);
+    }
+  }
+
+  /**
+   * The UDF registrations an encoded expression needs, carried alongside its {@code longs} pool from
+   * the planner into the operator. At operator {@code open()} {@link #bind} registers each descriptor
+   * into this JVM's registry (obtaining task-local ids) and rewrites the id slots of the encoded
+   * {@code longs} — which the planner filled with a descriptor's <em>local index</em> — to those ids,
+   * so the compiled {@code JvmUdf} nodes call the right registration on this task. {@link #unbind} at
+   * {@code close()} frees them.
+   */
+  public static final class Binding implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    public static final Binding EMPTY = new Binding(new Descriptor[0], new int[0]);
+
+    private final Descriptor[] descriptors; // indexed by local index
+    private final int[] idSlots; // positions in the longs pool holding a local index
+    private transient int[] runtimeIds;
+
+    public Binding(Descriptor[] descriptors, int[] idSlots) {
+      this.descriptors = descriptors;
+      this.idSlots = idSlots;
+    }
+
+    /**
+     * Registers the carried UDFs on this JVM and returns {@code longs} with each id slot patched from
+     * its local index to the task-local runtime id (a copy, leaving the encoded array pristine so a
+     * re-open rebinds correctly). Returns {@code longs} unchanged when there are no UDFs.
+     */
+    public long[] bind(long[] longs) {
+      runtimeIds = new int[descriptors.length];
+      for (int i = 0; i < descriptors.length; i++) {
+        runtimeIds[i] = descriptors[i].registerLocally();
+      }
+      if (idSlots.length == 0) {
+        return longs;
+      }
+      long[] patched = longs.clone();
+      for (int slot : idSlots) {
+        patched[slot] = runtimeIds[(int) longs[slot]];
+      }
+      return patched;
+    }
+
+    /** Frees the registrations obtained by {@link #bind}. */
+    public void unbind() {
+      if (runtimeIds != null) {
+        for (int id : runtimeIds) {
+          unregister(id);
+        }
+        runtimeIds = null;
+      }
+    }
   }
 
   /**

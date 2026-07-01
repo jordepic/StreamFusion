@@ -48,7 +48,8 @@ latency is so high that blocking on a single batch stalls checkpoints unacceptab
   dim side) and probe fully columnar — zero per-batch JVM crossing in steady state. Otherwise keep the
   per-row `LookupFunction` call but assemble the output columnar (take probe cols by index + matched dim
   cols) instead of row copies.
-- **Distributed execution.** Like the UDF bridge (ticket 38), the operator holds a `LookupFunction`
-  built at plan time in the planner JVM — fine for local/embedded/benchmark. For distributed task
-  managers, carry the serializable `TemporalTableSourceSpec` into the operator and build the function at
-  `open()` (what Flink's own exec node does).
+- **Distributed execution.** Like the native UDF bridge (which carries a serializable descriptor and
+  registers at `open()`), the operator holds a `LookupFunction` built at plan time in the planner JVM —
+  fine for local/embedded/benchmark. For distributed task managers, carry the serializable
+  `TemporalTableSourceSpec` into the operator and build the function at `open()` (what Flink's own exec
+  node does).

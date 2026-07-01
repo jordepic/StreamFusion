@@ -31,6 +31,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
   private final long[] longs;
   private final double[] doubles;
   private final String[] strings;
+  private final NativeUdf.Binding udfBinding;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
@@ -43,7 +44,8 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
       int[] childCounts,
       long[] longs,
       double[] doubles,
-      String[] strings) {
+      String[] strings,
+      NativeUdf.Binding udfBinding) {
     this.projection = projection;
     this.kinds = kinds;
     this.payload = payload;
@@ -51,6 +53,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
     this.longs = longs;
     this.doubles = doubles;
     this.strings = strings;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -58,7 +61,11 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
     super.open();
     allocator = NativeAllocator.SHARED;
     dictionaries = NativeAllocator.DICTIONARIES;
-    predicate = Native.createFilterExpression(kinds, payload, childCounts, longs, doubles, strings);
+    // Register any UDFs the condition references into this JVM's registry and patch their ids before
+    // compiling — so a task manager (empty registry) resolves them, not just the planner JVM.
+    long[] boundLongs = udfBinding.bind(longs);
+    predicate =
+        Native.createFilterExpression(kinds, payload, childCounts, boundLongs, doubles, strings);
   }
 
   @Override
@@ -67,6 +74,7 @@ public class NativeFilterOperator extends AbstractStreamOperator<ArrowBatch>
       Native.closeFilterExpression(predicate);
       predicate = 0;
     }
+    udfBinding.unbind();
     super.close();
   }
 

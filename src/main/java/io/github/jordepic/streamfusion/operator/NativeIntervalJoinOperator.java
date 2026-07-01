@@ -108,6 +108,7 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
         ArrowSchema rightSchema = ArrowSchema.allocateNew(alloc)) {
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(leftType), dicts, leftSchema);
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
+      predicate.bind();
       handle =
           snapshot == null
               ? Native.createIntervalJoiner(
@@ -123,7 +124,7 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings)
               : Native.restoreIntervalJoiner(
@@ -139,7 +140,7 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.kinds,
                   predicate.payload,
                   predicate.childCounts,
-                  predicate.longs,
+                  predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
                   snapshot);
@@ -267,6 +268,7 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
       Native.closeIntervalJoiner(handle);
       handle = 0;
     }
+    predicate.unbind();
     super.close();
   }
 }
