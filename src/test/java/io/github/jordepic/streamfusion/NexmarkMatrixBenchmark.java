@@ -24,8 +24,10 @@ import org.testcontainers.utility.DockerImageName;
  * per query, each a speedup over the Flink baseline for that same source.
  *
  * <p>The query set is the accelerating subset reported by {@link NexmarkExplainTest}: q0–q4, q7–q12,
- * q15–q20, q22 (q1/q14-style decimal needs the approximate-decimal flag; q14's non-builtin UDF, q5/q6's
- * unsupported window shape, q13's temporal join, q21's REGEXP_EXTRACT and q23's parse all keep them out).
+ * q15–q20, q22 (q1's decimal is now exact and native by default — no flag). q5 (window-attached
+ * re-aggregate + windows-only join) and q21 (REGEXP_EXTRACT, under allowIncompatible) also accelerate and
+ * are covered by their own harness tests but are not yet wired into this throughput matrix; q14's
+ * non-builtin UDF, q6/q13's temporal/OVER-retraction shapes, and q23's parse keep them out.
  * Each query runs over the same logical {@code person}/{@code auction}/{@code bid} views the published
  * Nexmark SQL uses, off a watermarked event-time {@code dateTime}; the only thing that changes between
  * cells is how those rows are produced and transposed into the columnar island. The perimeter transposes
@@ -102,7 +104,7 @@ class NexmarkMatrixBenchmark {
         "INSERT INTO sink SELECT auction, bidder, price, `dateTime`, extra FROM bid"),
     new Query(
         "q1",
-        true,
+        false, // 0.908 * price is exact and native by default now — no approximate-decimal flag
         null,
         "CREATE TABLE sink (auction BIGINT, bidder BIGINT, price DECIMAL(23, 3), `dateTime` %TS%,"
             + " extra STRING) WITH ('connector' = 'blackhole')",

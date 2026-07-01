@@ -56,11 +56,11 @@ class NexmarkBenchmark {
 
   @Test
   void q1CurrencyConversion() throws Exception {
-    // 0.908 * price is DECIMAL arithmetic; routes only with the approximate-decimal flag (off by
-    // default). Computed in double then cast to DECIMAL(23,3) — for throughput, not byte-exactness.
+    // 0.908 * price is DECIMAL arithmetic; it runs natively and byte-exactly by default (Decimal128
+    // multiply + HALF_UP cast to DECIMAL(23,3), matching Flink) — no approximate-decimal flag needed.
     compare(
         "q1 currency conversion (0.908 * price)",
-        true,
+        false,
         "CREATE TABLE nexmark_q1 (auction BIGINT, bidder BIGINT, price DECIMAL(23, 3), `dateTime`"
             + " TIMESTAMP(3), extra STRING) WITH ('connector' = 'blackhole')",
         "INSERT INTO nexmark_q1 SELECT auction, bidder, 0.908 * price AS price, `dateTime`, extra"

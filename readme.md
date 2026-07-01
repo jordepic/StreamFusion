@@ -227,12 +227,14 @@ pays a `RowData → Arrow` transpose at the source **and** an `Arrow → RowData
 We keep both transposes in the measured path on purpose — a real deployment feeds us rowwise records
 and drains to a rowwise sink, so this is the honest end-to-end number, not the favorable
 columnar-source/columnar-sink case above. Object reuse is enabled (a standard tuned-prod setting) for
-both engines; q1 runs under the approximate-decimal flag.
+both engines. q1's decimal arithmetic is now exact and native by default (Decimal128 multiply + a
+HALF_UP cast to DECIMAL(23,3), matching Flink — no approximate-decimal flag); the exact path measures a
+touch below the earlier approximate one (the extra i128 multiply + rounding cast), ~1.1× on a fresh JVM.
 
 | Query | Shape | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
 | q2 | filter `WHERE MOD(auction, 123) = 0` | 1.60 M ev/s | 2.57 M ev/s | **1.61×** |
-| q1 | `0.908 * price` (approximate decimal) | 1.55 M ev/s | 2.05 M ev/s | **1.32×** |
+| q1 | `0.908 * price` (exact decimal) | 1.93 M ev/s | 2.14 M ev/s | **1.11×** |
 | q0 | pass-through projection of `bid` fields | 1.58 M ev/s | 1.91 M ev/s | **1.21×** |
 | q4 | interval join → `MAX` per auction → `AVG` per category | 0.86 M ev/s | 0.59 M ev/s | **0.69×** |
 | q3 | regular (updating) join `auction ⋈ person` on seller | 1.97 M ev/s | 1.30 M ev/s | **0.66×** |
@@ -367,12 +369,17 @@ _Apple M1 Max; numbers are comparable only within a machine._
 
 ### Nexmark — the full accelerating set, every source
 
-Beyond q0–q4, StreamFusion runs **18 of the 22 Nexmark queries** natively end-to-end (the explain
-diagnostic `NexmarkExplainTest` enumerates them; q5/q6/q13/q14/q21/q23 fall back — an unsupported window
-shape, a temporal-table join, a non-builtin UDF, `REGEXP_EXTRACT`, a parse error). `NexmarkMatrixBenchmark`
-runs each one over **every source it can be fed by** — the rowwise generator and Kafka json/avro/protobuf
-across the four-rung ladder — all vs stock Flink, same steelmanned perimeter (rowwise source + `blackhole`
-sink, object reuse on both engines, q1 under the approximate-decimal flag). 1 M events.
+Beyond q0–q4, StreamFusion runs **20 of the 22 Nexmark queries** natively end-to-end (the explain
+diagnostic `NexmarkExplainTest` enumerates them). Only two of the runnable queries still fall back: q14
+(a non-builtin `count_char` UDF — its decimal arithmetic now runs natively) and, without the
+`allowIncompatible` flag, q21 (`REGEXP_EXTRACT`, gated because Rust's regex engine diverges from Java's on
+advanced features, as Comet gates regex). q6 (Flink SQL cannot consume the retractions its `OVER` needs),
+q13 (a temporal-table/lookup join, async-gated) and q23 (a query-file parse quirk) are outside the
+runnable set. `NexmarkMatrixBenchmark` runs each query over **every source it can be fed by** — the
+rowwise generator and Kafka json/avro/protobuf across the four-rung ladder — all vs stock Flink, same
+steelmanned perimeter (rowwise source + `blackhole` sink, object reuse on both engines). q1's decimal
+arithmetic is exact and native by default; q5 (Hot Items) runs on a window-attached window aggregate
+re-aggregating per window plus a windows-only window join. 1 M events.
 
 `SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features kafka"
 -Dtest=NexmarkMatrixBenchmark` (Testcontainers Kafka; native source needs the `kafka` feature).
@@ -394,7 +401,7 @@ queries, so within-one-run speedups understate native; per-query isolation is th
 | q12 | proctime tumble `COUNT` per bidder | **1.72×** |
 | q2 | filter `WHERE MOD(auction, 123) = 0` | **1.61×** |
 | q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.34×** |
-| q1 | `0.908 * price` (approximate decimal) | **1.32×** |
+| q1 | `0.908 * price` (exact decimal) | **1.11×** |
 | q0 | pass-through projection of `bid` | **1.21×** |
 | q15 | multi-`DISTINCT` `COUNT`s per day | **1.17×** |
 | q17 | group agg + `AVG`/`MIN`/`MAX`/`SUM` | **1.15×** |
@@ -408,6 +415,10 @@ queries, so within-one-run speedups understate native; per-query isolation is th
 | q4 | interval join → `MAX` → `AVG` | 0.69× |
 | q3 | updating join `auction ⋈ person` | 0.66× |
 | q9 | interval join → `ROW_NUMBER` (≤ 1) | 0.41× |
+
+(q5 and q21 also run natively end-to-end — q5 on the window-attached re-aggregate + windows-only join,
+q21 under `allowIncompatible` — verified byte-exact against Flink by their harness tests, but not yet
+wired into this throughput table.)
 
 **Ten of eighteen beat stock Flink, and the rest are far above where row-at-a-time state once put them.**
 Projection/filter/scalar (q0/q1/q2/q22), the windowed and group/`DISTINCT` aggregates (q11/q12/q15/q17),
