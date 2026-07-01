@@ -4805,8 +4805,17 @@ impl UpdatingJoiner {
                     }
                 }
             }
+            // INNER never reuses key/full past this point (matches already gathered; candidate inputs
+            // are decoded from `payloads` by index), so move them into the state — an accumulate insert
+            // that avoids add_record's re-clone of both the key and the row (2 allocs/row on the state,
+            // the SYS_ALLOC a differential profile flagged vs Flink's reused BinaryRowData).
             if kind == 0 || kind == 2 {
-                Self::add_record(input_state, &key, &full, -1);
+                input_state
+                    .entry(key)
+                    .or_default()
+                    .entry(full)
+                    .and_modify(|m| m.count += 1)
+                    .or_insert(RowMeta { count: 1, num_assoc: -1 });
             } else {
                 Self::retract_record(input_state, &key, &full);
             }
