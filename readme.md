@@ -431,7 +431,7 @@ so these **understate** native for the aggregate/dedup queries (fresh-JVM-per-qu
 ones — q15/q17/q18 — back above 1.0×); it is the conservative read._
 
 **Generator** (the transpose floor — no I/O, no decode), native vs Flink, all 23 accelerated queries
-sorted by speedup:
+sorted by speedup (q21 appears twice — its parity default and its opt-in fast path, see † below):
 
 | Query | Shape | Native vs. Flink |
 |---|---|---|
@@ -454,7 +454,8 @@ sorted by speedup:
 | q19 | `ROW_NUMBER` topN (≤ 10) | 0.91× |
 | q3 | updating join `auction ⋈ person` | 0.83× |
 | q18 | `ROW_NUMBER` dedup (≤ 1) | 0.82× |
-| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` (JVM upcall) | 0.79× |
+| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.76× |
+| q21 † | …same, pure-native Rust regex/case (opt-in, non-parity) | **1.57×** |
 | q20 | updating join (`category = 10`) | 0.75× |
 | q16 | multi-`DISTINCT` per channel/day | 0.75× |
 | q8 | tumble windowed-distinct ⋈ join | 0.71× |
@@ -479,9 +480,17 @@ What still trails 1× is **not one hotspot** but three distinct residues: q8 is 
 join with only a ~9% native island — the cheap operator can't earn back the `RowData↔Arrow` round-trip);
 q16's multi-`DISTINCT` accumulator still churns `ScalarValue` (byte-encoding it is a group-aggregator
 rewrite); and q20/q3 are wide updating joins whose remaining cost is the per-row state store that Flink
-pools — the next lever is a free-list allocator for the keyed-multiset buffers. q21 pays the per-batch JVM
-regex/case upcall (native regex is exact-but-opt-in) — inherent row-oriented work these operators keep
-native to avoid breaking the columnar island, not a state-churn cost.
+pools — the next lever is a free-list allocator for the keyed-multiset buffers.
+
+**† q21 is reported on both paths.** By default its `REGEXP_EXTRACT` and `LOWER` run through a
+byte-identical **JVM upcall** (the host's own `SqlFunctionUtils.regexpExtract` /
+`BinaryStringData.toLowerCase`, one JNI crossing per batch) — that is the **0.76×** row, the price of
+staying exactly Flink-equal on functions whose Rust regex / case-folding can diverge at a locale/regex
+edge. Flipping `-Dstreamfusion.expression.allowIncompatible=true` runs them on the **pure-native Rust**
+regex/case path, which is **1.57×** — a 2× swing over the parity path, and the honest cost of the
+guarantee. The default is parity; the fast path is opt-in and documented in
+[divergences/07](divergences/07-expression-encoding-and-compile-once.md). Both are measured against the
+same Flink baseline in a single `NexmarkMatrixBenchmark` run (a query may carry a `nativeVariant`).
 
 **Kafka**, best rung per format (native speedup vs that format's own Flink baseline; rung in parens —
 `jvm` = JVM transpose, `decode` = Rust decode / JVM poll, `source` = full native rdkafka source). The
