@@ -33,15 +33,12 @@ arrow-avro = "58"
 # protobuf wire format STRAIGHT into Arrow columnar arrays (no per-row DynamicMessage), driven by a
 # runtime `MessageDescriptor` — exactly Flink's dynamic model. prost-reflect (pinned to ptars' 0.16)
 # builds that descriptor from a FileDescriptorSet the JVM serializes off the message class.
-# ptars is VENDORED in-tree (native/vendor/ptars) — crates.io ptars is pinned to arrow 57 and we need
-# 58, so we carry the source with that one-line bump rather than a fork/git dep. Self-contained: any
-# clone builds it. See native/vendor/ptars/Cargo.toml for provenance.
 prost-reflect = "0.16"
 # Manipulate the FileDescriptorSet to prune it to the read fields (projection pushdown into the decode):
 # match prost-reflect 0.16's prost (0.14) so the encoded set is interchangeable.
 prost = "0.14"
 prost-types = "0.14"
-ptars = { path = "vendor/ptars" }
+ptars = "0.0.18"
 datafusion = "53.1.0"
 # Native Kafka consumer, behind the `kafka` feature so the normal build pulls in no Kafka code at all.
 # rdkafka-sys builds and statically links its bundled librdkafka (mklove build, needs only a C
@@ -61,6 +58,13 @@ ahash = "0.8"
 # whole-topic benchmark consumer.
 kafka = ["dep:rdkafka"]
 kafka-bench = ["kafka"]
+
+# The engine is one large crate; the default parallel codegen-unit split severs cross-unit inlining
+# at arbitrary points, so hot operator loops were measured swinging ~50% from unrelated code
+# additions elsewhere in the crate. One codegen unit trades release-build time (tests build debug,
+# unaffected) for stable, faster code — and benchmark numbers that reflect the change under test.
+[profile.release]
+codegen-units = 1
 
 [dev-dependencies]
 criterion = "0.5"

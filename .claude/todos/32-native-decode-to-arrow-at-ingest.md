@@ -277,12 +277,9 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
   `Native.createProtobufDecoder` declared; Rust unit test green (`protobuf_decode_emits_one_row_per_
   message`); full `cargo test` (41) + `mvn test` (242) green.
 - **Caveats / remaining:**
-  - **ptars is VENDORED in-tree** at `native/vendor/ptars` (path dep `ptars = { path = "vendor/ptars" }`),
-    Apache-2.0, from upstream `0x26res/ptars` v0.0.17+8 (4adf0b5) with **one local patch: arrow 57.1→58**
-    to match our arrow (compiles clean). Vendored rather than a git/crates.io dep because crates.io ptars
-    is pinned to arrow 57 — keeping the source in-tree makes the repo **self-contained and OSS-portable**
-    (any clone builds it, no fork to track). prost-reflect pinned to ptars' **0.16**. Re-sync from
-    upstream when they ship an arrow-58 release.
+  - **ptars is a crates.io dep** (`ptars = "0.0.18"`), Apache-2.0, `0x26res/ptars`. The arrow-58 bump
+    we'd carried as an in-tree vendor patch was upstreamed (#243) and released as v0.0.18, so the fork is
+    gone — the plain crate now matches our arrow. prost-reflect pinned to ptars' **0.16**.
   - **Schema parity vs Flink:** ptars *derives* the Arrow schema from the descriptor; Flink derives the
     RowType via `PbToRowTypeUtil`. Reconcile edge cases (enum repr — set `EnumRepr` to match Flink;
     64-bit ints; timestamps/well-known; `oneof`) and either align via `PtarsConfig` or cast/rename to the
