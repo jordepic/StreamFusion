@@ -25,6 +25,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
 
   private final long sliceMillis;
   private final int timeColumn;
+  private final int windowStartColumn;
+  private final int windowEndColumn;
   private final int[] valueColumns;
   private final int[] keyColumns;
   private final int[] valueTypes;
@@ -37,6 +39,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
       String description,
       long sliceMillis,
       int timeColumn,
+      int windowStartColumn,
+      int windowEndColumn,
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
@@ -50,6 +54,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
         description);
     this.sliceMillis = sliceMillis;
     this.timeColumn = timeColumn;
+    this.windowStartColumn = windowStartColumn;
+    this.windowEndColumn = windowEndColumn;
     this.valueColumns = valueColumns;
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
@@ -70,6 +76,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
             sliceMillis,
             sliceMillis,
             timeColumn,
+            windowStartColumn,
+            windowEndColumn,
             valueColumns,
             keyColumns,
             NativeWindowOperatorCore.keyTypes((RowType) getOutputType(), keyColumns.length),

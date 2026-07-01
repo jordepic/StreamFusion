@@ -23,6 +23,10 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
   private final RelDataType outputRowType;
   private final long sliceMillis;
   private final int timeColumn;
+  // Window-attached mode (q5): window boundaries read from these columns instead of slicing a rowtime;
+  // both -1 in the ordinary rowtime mode.
+  private final int windowStartColumn;
+  private final int windowEndColumn;
   private final int[] valueColumns;
   private final int[] keyColumns;
   private final int[] valueTypes;
@@ -35,6 +39,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
       RelDataType outputRowType,
       long sliceMillis,
       int timeColumn,
+      int windowStartColumn,
+      int windowEndColumn,
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
@@ -43,6 +49,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
     this.outputRowType = outputRowType;
     this.sliceMillis = sliceMillis;
     this.timeColumn = timeColumn;
+    this.windowStartColumn = windowStartColumn;
+    this.windowEndColumn = windowEndColumn;
     this.valueColumns = valueColumns;
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
@@ -68,6 +76,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
         outputRowType,
         sliceMillis,
         timeColumn,
+        windowStartColumn,
+        windowEndColumn,
         valueColumns,
         keyColumns,
         valueTypes,
@@ -83,6 +93,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
         getRelDetailedDescription(),
         sliceMillis,
         timeColumn,
+        windowStartColumn,
+        windowEndColumn,
         valueColumns,
         keyColumns,
         valueTypes,

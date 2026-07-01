@@ -1018,6 +1018,43 @@ impl TumblingAggregator {
                 grouped.entry((start, end, owned)).or_default().push(row as u32);
             }
         }
+        self.accumulate_grouped(grouped, &values);
+    }
+
+    /// Window-attached local half: each row already carries its window as `window_start`/`window_end`
+    /// columns (epoch millis) — the output of an upstream window aggregate, re-aggregated per window
+    /// (Nexmark q5's hot-items MAX over per-auction counts). Unlike `update`, there is no rowtime to
+    /// slice: the row folds into exactly the one window it names (dropping rows whose window the
+    /// watermark has already closed). `flush_partial` then emits the partials keyed by window end.
+    fn update_attached(&mut self, batch: &RecordBatch) {
+        let starts = column_i64(batch, "window_start");
+        let ends = column_i64(batch, "window_end");
+        let values: Vec<&ArrayRef> = (0..self.aggregates.len())
+            .map(|i| batch.column_by_name(&format!("value{i}")).expect("missing value column"))
+            .collect();
+        let key_arrays = key_arrays(batch);
+        self.key_types = key_types(&key_arrays);
+
+        // No late-data drop here (unlike `update`): the upstream window aggregate emits each window's
+        // rows exactly at the watermark that closes it, so a re-aggregation over the same window bounds
+        // legitimately receives rows whose end equals the current watermark. They fold into their window
+        // and the immediately-following flush(watermark) emits it — the re-aggregation window closes with
+        // the same watermark as its input.
+        let mut grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>> = ahash::HashMap::default();
+        for row in 0..batch.num_rows() {
+            let key = read_key(&key_arrays, row);
+            grouped.entry((starts.value(row), ends.value(row), key)).or_default().push(row as u32);
+        }
+        self.accumulate_grouped(grouped, &values);
+    }
+
+    /// Folds the grouped row positions into their (window, key) accumulators. The value columns are
+    /// sliced by type-agnostic `take`, so each accumulator sees its column's own type.
+    fn accumulate_grouped(
+        &mut self,
+        grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>>,
+        values: &[&ArrayRef],
+    ) {
         for ((start, end, key), rows) in grouped {
             let indices = UInt32Array::from(rows);
             let columns: Vec<ArrayRef> =
@@ -8511,6 +8548,23 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateTumblin
     aggregator.update(&batch);
 }
 
+/// Window-attached local half: folds a batch whose rows carry explicit `window_start`/`window_end`
+/// columns (an upstream window aggregate's output being re-aggregated per window — Nexmark q5).
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateAttachedTumblingAggregator<
+    'local,
+>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+) {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    aggregator.update_attached(&batch);
+}
+
 /// Emits the windows the given watermark has closed as a batch and drops them from state.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushTumblingAggregator<'local>(
@@ -12472,6 +12526,35 @@ mod tests {
         assert_eq!(values(&out, 1), vec![0, 0, 0]); // window_start
         assert_eq!(values(&out, 2), vec![1000, 2000, 3000]); // window_end
         assert_eq!(values(&out, 3), vec![10, 30, 60]); // running SUM
+    }
+
+    // Window-attached local half (q5): rows carry explicit window_start/window_end (epoch millis)
+    // instead of a rowtime to slice; each folds into the one window it names, and flush_partial emits
+    // the per-window partial keyed by window end. No late-data drop — a row whose window the watermark
+    // has already reached still folds (the upstream emits it exactly at that watermark).
+    #[test]
+    fn window_attached_local_folds_per_named_window() {
+        // SUM over bigint, no grouping key (grouped only by window). window/slide are unused by the
+        // attached ingest, so their values are immaterial.
+        let mut agg = TumblingAggregator::new(10000, 10000, false, vec![0], vec![0]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("window_start", DataType::Int64, false),
+                Field::new("window_end", DataType::Int64, false),
+                Field::new("value0", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0i64, 0, 2000])),
+                Arc::new(Int64Array::from(vec![10000i64, 10000, 12000])),
+                Arc::new(Int64Array::from(vec![3i64, 5, 7])),
+            ],
+        )
+        .unwrap();
+        agg.update_attached(&batch);
+        let out = agg.flush_partial(20000);
+        // Output columns: [partial0, slice_end]. Windows emitted in ascending end order.
+        assert_eq!(values(&out, 1), vec![10000, 12000]); // slice_end == the named window ends
+        assert_eq!(values(&out, 0), vec![8, 7]); // (0,10000] sums 3+5, (2000,12000] sums 7
     }
 
     // A `[key0, value0, $row_kind$]` changelog batch (key/value bigint) for the GROUP BY tests;

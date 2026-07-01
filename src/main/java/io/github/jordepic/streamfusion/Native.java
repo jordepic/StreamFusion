@@ -392,6 +392,14 @@ public final class Native {
       long handle, long inArrayAddress, long inSchemaAddress);
 
   /**
+   * Window-attached local half: folds a batch whose rows carry explicit {@code window_start}/{@code
+   * window_end} columns (epoch millis) — an upstream window aggregate's output being re-aggregated per
+   * window (Nexmark q5) — into the open windows, folding each row into the single window it names.
+   */
+  public static native void updateAttachedTumblingAggregator(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
    * Emits the windows the watermark has closed as a batch (columns {@code window_start} and {@code
    * total}) and drops them from state.
    */
