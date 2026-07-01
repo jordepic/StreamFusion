@@ -607,6 +607,15 @@ final class RexExpression {
     }
     SqlTypeName source = sourceType.getSqlTypeName();
     SqlTypeName targetType = resultType.getSqlTypeName();
+    // A widening VARCHAR→VARCHAR cast (target length ≥ source, e.g. a bounded computed string coerced to
+    // an unbounded STRING sink column — Nexmark q14/q21's CASE result). Flink neither pads nor truncates
+    // when widening a VARCHAR, so the value is unchanged: emit the operand as a passthrough. Narrowing
+    // (target < source) truncates and is not admitted.
+    if (source == SqlTypeName.VARCHAR
+        && targetType == SqlTypeName.VARCHAR
+        && resultType.getPrecision() >= sourceType.getPrecision()) {
+      return emit(call.getOperands().get(0));
+    }
     // A cast to DECIMAL. From an exact source (another DECIMAL, e.g. coercing q1's `0.908 * price` to
     // the sink's DECIMAL(23,3), or an integer) it is byte-exact: Arrow rescales Decimal128 with HALF_UP
     // rounding, the same mode Flink uses. From a float/double source it is not (the binary value is

@@ -168,6 +168,22 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
+  void wideningVarcharCastMatchesHost() throws Exception {
+    // A bounded computed string coerced to a wider VARCHAR (as a CASE result feeding a STRING sink does,
+    // Nexmark q14/q21) is a no-op — Flink neither pads nor truncates — so it stays native and matches.
+    NativeParity.assertParity(
+        FlinkCalcSqlHarnessTest::environment,
+        "SELECT CAST(CASE WHEN v > 15 THEN 'longvalue' ELSE 'sv' END AS VARCHAR(100)) FROM f");
+  }
+
+  @Test
+  void narrowingVarcharCastFallsBack() throws Exception {
+    // Narrowing a VARCHAR truncates, which the native passthrough would not do, so it falls back.
+    NativeParity.assertFallback(
+        FlinkCalcSqlHarnessTest::environment, "SELECT CAST(s AS VARCHAR(2)) FROM f");
+  }
+
+  @Test
   void charLengthMatchesHost() throws Exception {
     NativeParity.assertParity(FlinkCalcSqlHarnessTest::environment, "SELECT CHAR_LENGTH(s) FROM f");
   }
