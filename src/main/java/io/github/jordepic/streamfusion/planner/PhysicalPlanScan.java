@@ -1115,8 +1115,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           return noteDisabled(current, "lookupJoin");
         }
         substitutions++;
-        // A synchronous lookup join is stateless (no keyed shuffle); the probe input passes through
-        // as-is, and the dimension is a LookupFunction the operator holds — not an input.
+        // A lookup join is stateless (no keyed shuffle); the probe input passes through as-is, and the
+        // dimension is a (sync or async) lookup function the operator holds — not an input.
         return new StreamPhysicalNativeLookupJoin(
             join.getCluster(),
             join.getTraitSet(),
@@ -1125,7 +1125,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             LookupJoinMatcher.temporalTable(join),
             LookupJoinMatcher.orderedDimKeys(join),
             LookupJoinMatcher.probeKeyIndices(join),
-            LookupJoinMatcher.joinTypeCode(join));
+            LookupJoinMatcher.joinTypeCode(join),
+            LookupJoinMatcher.isAsync(join));
       }
     }
 

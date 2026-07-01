@@ -3,8 +3,9 @@
 **Status:** open (tracking) — all window aggregates, OVER (subset), event-time INNER
 joins, the non-windowed `GROUP BY` aggregate (changelog emission *and* consumption, incl.
 MIN/MAX retraction), filter/projection, watermark, shuffle, and Parquet source/sink are done.
-What remains is async-gated (lookup join, async UDF — ticket 01) plus operator feature tails
-(outer/semi/anti joins, rank-number / RANK / retracting-input Top-N, OVER frames).
+Lookup join (sync + async) is done via the within-batch model. What remains is async UDF (ticket 01 —
+low priority, pure I/O) plus operator feature tails (outer/semi/anti joins, rank-number / RANK /
+retracting-input Top-N, OVER frames).
 **Source:** user direction — "everything Arroyo already supports, routed over"
 
 Goal: reach Flink parity (identical results, verified by the parity harness) for
@@ -62,9 +63,12 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
       (dedup = limit 1). window_start/window_end rendered session-local on emit (UTC internally).
 - [x] Event-time sort (`TemporalSort`) — `ORDER BY rowtime`: buffer rows, release them in
       ascending rowtime order as the watermark advances (stable for ties). Insert-only.
-- [ ] Lookup join (`lookup_join.rs`) — stateless async enrichment against an external
-      table; uses ticket 01's async pattern, not the synchronous stateful path.
-- [ ] Async UDF (`async_udf.rs`) — async scalar UDF; same async dependency (ticket 01).
+- [x] Lookup join (`lookup_join.rs`) — stateless enrichment against an external table, sync and async
+      connectors, INNER + LEFT. Arrow in/out, per-row `LookupFunction` (sync) or per-distinct-key
+      concurrent `asyncLookup` awaited within the batch (async) — Arroyo's own within-batch model, no
+      operator mailbox (divergences: see ticket 40 / ticket 01). Remaining: calc/residual on the dim.
+- [ ] Async UDF (`async_udf.rs`) — async scalar UDF; the same within-batch-concurrent trick would apply
+      if wanted (ticket 01), but it's pure external I/O with no compute to accelerate — low priority.
 
 ## Stateless
 - [x] Filter + projection routed from SQL via the native expression engine — the

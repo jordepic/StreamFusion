@@ -5,6 +5,15 @@
 only worthwhile unlock is a native columnar source; lookup join / async UDF are
 I/O-bound and don't fit a compute accelerator (see "What the async pattern unlocks").
 
+**Update (2026-07-01): async lookup join shipped *without* the async bridge.** An async
+lookup connector now routes natively (`NativeAsyncLookupJoinOperator`, ticket 40) — but
+using the **within-batch concurrent** model (Arroyo/RisingWave), not Flink's
+`AsyncWaitOperator`. It fires a batch's distinct-key lookups concurrently and
+`join()`s them on the task thread inside `processElement`, so no mailbox, no ordered
+queue, and no in-flight-across-batches snapshot/replay — nothing is in flight when a
+barrier runs. This *confirms* the decision below: we still don't build the
+`AsyncWaitOperator` bridge, because the Arrow batch is already the I/O-overlap unit.
+
 ## Decision
 Run stateful native operators synchronously on the task (mailbox) thread, with
 bounded per-batch work, exactly as Flink runs its own window/join/aggregate
@@ -96,12 +105,17 @@ Ticket 1's `AsyncWaitOperator` pattern would enable three Arroyo operators. They
 - **Native columnar source** (availability futures) — **worth it.** A columnar source
   feeds a fully-native pipeline (no input transpose) and is throughput-relevant. This is
   the valuable async-gated work; it overlaps [ticket 24](24-columnar-endpoints-beyond-local-parquet.md).
-- **Lookup join** (`lookup_join.rs`) and **async UDF** (`async_udf.rs`) — **low value,
-  likely not worth building.** Both are *I/O-bound*: the lookup hits a JVM
-  `LookupTableSource` (JDBC/HBase/…) and the async UDF calls an external function — the
-  bottleneck is the external call, not row compute, and that I/O **cannot** move to Rust
-  (it's a JVM connector). A "native" version would transpose RowData↔Arrow around a join
-  concat / function call with no columnar compute to accelerate — pure overhead for zero
-  throughput gain. By the project's own bar ("if benchmarks don't improve, reconsider the
-  feature"), these should stay on the host. Build only if a concrete reason appears
-  (e.g. the probe side carries heavy native compute that dominates the I/O).
+- **Lookup join** (`lookup_join.rs`) — **built, but not via this async pattern.** The
+  earlier reasoning was that a "native" async lookup adds RowData↔Arrow transpose around a
+  JVM I/O call with no compute to accelerate. That still holds for the *`AsyncWaitOperator`
+  port*. But the actual value is **island continuity** (same reason the sync operator
+  exists — an async-preferred connector otherwise breaks the columnar island around the
+  lookup) plus a real win: firing a batch's distinct-key lookups concurrently overlaps the
+  I/O (≈ one round-trip vs N serial). Both are captured by the **within-batch** operator
+  (ticket 40) with none of this ticket's machinery. So async lookup join is done; the
+  `AsyncWaitOperator` bridge is not.
+- **Async UDF** (`async_udf.rs`) — **low value, likely not worth building.** Still purely
+  I/O-bound (calls an external function), the bottleneck is the external call not row
+  compute, and it can't move to Rust. If ever wanted, the same within-batch-concurrent
+  trick the async lookup join uses would apply (fire the batch's calls, join on the task
+  thread) — no async bridge needed. Build only if a concrete reason appears.

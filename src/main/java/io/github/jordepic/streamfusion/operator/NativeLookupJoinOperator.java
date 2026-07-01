@@ -29,8 +29,8 @@ import org.apache.flink.types.RowKind;
  * falling back around the lookup.
  *
  * <p>Only the dimension lookup is row-oriented (as it must be — a per-key point lookup); the probe
- * batch and the emitted batch are Arrow. Synchronous lookups only — an async lookup function needs the
- * operator mailbox and falls back to the host (ticket 40). The lookup function lives in this operator
+ * batch and the emitted batch are Arrow. This is the synchronous connector path; an async connector
+ * routes to {@link NativeAsyncLookupJoinOperator} instead. The lookup function lives in this operator
  * (built at plan time), so this covers execution sharing the planner's JVM.
  */
 public class NativeLookupJoinOperator extends AbstractStreamOperator<ArrowBatch>
