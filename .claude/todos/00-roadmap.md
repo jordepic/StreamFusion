@@ -128,7 +128,13 @@ here when the ticket is deleted.
   now run natively via a native→JVM columnar Arrow upcall (`NativeUdf`/`JvmUdf`), but the function lives in
   a process-global plan-time registry — local/embedded/benchmark JVM only. Distributed task managers need
   the function serialized into the operator (thread it through the `Calc` rel/exec/operator, register at
-  `open()`, deregister at `close()`).
+  `open()`, deregister at `close()`). The same upcall now also carries `REGEXP_EXTRACT` and `UPPER`/`LOWER`
+  by default (host-exact regex/case folding), so q21 accelerates with no flag; these builtins hit the same
+  distributed-registry limitation until ticket 38 lands.
+- **Nexmark q6 / q13 — documented exclusions** (ticket 39): every Flink-runnable Nexmark query now
+  accelerates fully and by default. q6 (`OVER` can't consume the retractions its winning-bid Top-N emits —
+  Flink SQL can't run it) and q13 (processing-time lookup join to a bounded side input — async external
+  I/O, outside the columnar island) stay out for reasons that aren't StreamFusion's to fix. Not planned.
 - **Disaggregated state store** (ticket 37): move operator state off-heap to a remote/tiered store
   (likely Fluss's PK-table KV) with a local working-set cache — decoupling state size from worker RAM
   and enabling incremental checkpoints + lazy rescale (Flink 2.0 ForSt / RisingWave Hummock direction).
