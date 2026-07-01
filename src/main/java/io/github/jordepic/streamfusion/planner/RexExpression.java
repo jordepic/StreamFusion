@@ -58,6 +58,10 @@ final class RexExpression {
   // A day-time INTERVAL literal: payload is the long-pool index of its value in milliseconds. The
   // native side builds an Arrow IntervalDayTime, so `timestamp - interval` evaluates to a timestamp.
   private static final int KIND_LIT_INTERVAL = 15;
+  // An exact DECIMAL literal: payload indexes the string pool, whose entry is "unscaled|precision|scale"
+  // (the unscaled integer as a string, as it can exceed i64). The native side builds a Decimal128 scalar,
+  // so decimal arithmetic stays exact instead of routing through double.
+  private static final int KIND_LIT_DECIMAL = 16;
 
   // Cast target type codes, mirrored on the native side.
   private static final int CAST_TINYINT = 0;
@@ -297,10 +301,26 @@ final class RexExpression {
           longs.add(value);
           return true;
         }
+      case DECIMAL:
+        {
+          java.math.BigDecimal value = literal.getValueAs(java.math.BigDecimal.class);
+          if (value == null) {
+            return false;
+          }
+          // Emit as an exact Decimal128: one string-pool entry "unscaled|precision|scale", where
+          // unscaled is the integer value at the declared scale (a string, as it can exceed i64).
+          // Decimal arithmetic then stays in Decimal128 rather than routing through double.
+          int precision = literal.getType().getPrecision();
+          int scale = literal.getType().getScale();
+          java.math.BigInteger unscaled =
+              value.setScale(scale, java.math.RoundingMode.UNNECESSARY).unscaledValue();
+          add(KIND_LIT_DECIMAL, strings.size(), 0);
+          strings.add(unscaled + "|" + precision + "|" + scale);
+          return true;
+        }
       case FLOAT:
       case REAL:
       case DOUBLE:
-      case DECIMAL:
         {
           Double value = literal.getValueAs(Double.class);
           if (value == null) {
@@ -345,21 +365,26 @@ final class RexExpression {
     if (call.getKind() == SqlKind.REINTERPRET) {
       return emit(call.getOperands().get(0));
     }
-    // Decimal-typed arithmetic. Without the approximate-decimal flag it falls back: the native engine
-    // computes it in double, which is not byte-identical to Flink's decimal semantics. With the flag,
-    // emit a cast-to-DECIMAL wrapper and fall through to the plain (double) arithmetic below — the cast
-    // makes the output column the declared DECIMAL(p, s) (so the converter reads it correctly), at the
-    // cost of exactness. Intended for benchmarking throughput.
+    // Decimal-typed arithmetic. Add/subtract/multiply are exact: the operands reach the native side as
+    // Decimal128 (columns already are; literals now emit as exact Decimal128), and Arrow's Decimal128
+    // add/sub/multiply match Flink's — the products carry the full scale (sum of input scales for ×,
+    // aligned max scale for ±), and the wrapping cast to the declared DECIMAL(p, s) rounds HALF_UP, the
+    // same rounding Flink uses. Division/modulo derive a rounded quotient scale that Arrow and Flink
+    // disagree on, so those stay behind the approximate-decimal flag. The cast wrapper pins the output
+    // column to the declared type either way.
     if (isDecimalArithmetic(call)) {
-      if (!NativeConfig.allowsApproximateDecimal()) {
+      boolean exact = call.getKind() == SqlKind.PLUS
+          || call.getKind() == SqlKind.MINUS
+          || call.getKind() == SqlKind.TIMES;
+      if (!exact && !NativeConfig.allowsApproximateDecimal()) {
         return reject(
-            "decimal arithmetic not native by default; enable approximate (non-exact) decimal with"
-                + " -Dstreamfusion.expression.decimalArithmetic.approximate=true");
+            "decimal division/modulo not native by default; enable approximate (non-exact) decimal"
+                + " with -Dstreamfusion.expression.decimalArithmetic.approximate=true");
       }
       int precision = call.getType().getPrecision();
       int scale = call.getType().getScale();
       add(KIND_CAST_DECIMAL, precision * 100 + scale, 1);
-      // fall through: the arithmetic op is emitted next as this cast's single child, in double.
+      // fall through: the arithmetic op is emitted next as this cast's single child.
     }
     // PROCTIME() / PROCTIME_MATERIALIZE(): a nullary current-processing-time column.
     if (call.getOperator().getName().toUpperCase(java.util.Locale.ROOT).contains("PROCTIME")) {
@@ -571,13 +596,17 @@ final class RexExpression {
     }
     SqlTypeName source = sourceType.getSqlTypeName();
     SqlTypeName targetType = resultType.getSqlTypeName();
-    // A cast to DECIMAL (e.g. coercing q1's `0.908 * price` to the sink's DECIMAL(23,3)) is admitted
-    // only under the approximate-decimal flag: it is computed in double and cast to the declared
-    // precision/scale, not byte-identical to Flink's decimal rounding — same trade-off as the
-    // arithmetic path. Off by default, so it falls back.
-    if (targetType == SqlTypeName.DECIMAL && NativeConfig.allowsApproximateDecimal()) {
-      add(KIND_CAST_DECIMAL, resultType.getPrecision() * 100 + resultType.getScale(), 1);
-      return emit(call.getOperands().get(0));
+    // A cast to DECIMAL. From an exact source (another DECIMAL, e.g. coercing q1's `0.908 * price` to
+    // the sink's DECIMAL(23,3), or an integer) it is byte-exact: Arrow rescales Decimal128 with HALF_UP
+    // rounding, the same mode Flink uses. From a float/double source it is not (the binary value is
+    // already inexact), so that stays behind the approximate-decimal flag.
+    if (targetType == SqlTypeName.DECIMAL) {
+      boolean exactSource =
+          source == SqlTypeName.DECIMAL || numericRank(source) >= 0 && numericRank(source) <= 3;
+      if (exactSource || NativeConfig.allowsApproximateDecimal()) {
+        add(KIND_CAST_DECIMAL, resultType.getPrecision() * 100 + resultType.getScale(), 1);
+        return emit(call.getOperands().get(0));
+      }
     }
     int target = wideningTargetCode(source, targetType);
     if (target < 0) {
