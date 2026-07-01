@@ -85,13 +85,32 @@ class NexmarkMatrixBenchmark {
     final String[] setup; // extra SQL run before the insert (q12 proctime view, q13 dim+proctime); else null
     final String sinkDdl; // %TS% substituted with the harness's event-time type
     final String insertSql;
+    // A second native measurement run with these extra properties set — used to report a query both on
+    // its byte-identical default path and on a faster opt-in path that diverges from Flink at an edge.
+    // q21's REGEXP_EXTRACT/LOWER default to a Flink-parity JVM upcall; allowIncompatible switches them to
+    // the pure-native Rust regex/case path. Null for queries with no such variant.
+    final String nativeVariantLabel;
+    final Map<String, String> nativeVariantProps;
 
     Query(String label, boolean approximateDecimal, String[] setup, String sinkDdl, String insertSql) {
+      this(label, approximateDecimal, setup, sinkDdl, insertSql, null, null);
+    }
+
+    Query(
+        String label,
+        boolean approximateDecimal,
+        String[] setup,
+        String sinkDdl,
+        String insertSql,
+        String nativeVariantLabel,
+        Map<String, String> nativeVariantProps) {
       this.label = label;
       this.approximateDecimal = approximateDecimal;
       this.setup = setup;
       this.sinkDdl = sinkDdl;
       this.insertSql = insertSql;
+      this.nativeVariantLabel = nativeVariantLabel;
+      this.nativeVariantProps = nativeVariantProps;
     }
   }
 
@@ -350,7 +369,9 @@ class NexmarkMatrixBenchmark {
             + " '2' WHEN lower(channel) = 'baidu' THEN '3' ELSE REGEXP_EXTRACT(url,"
             + " '(&|^)channel_id=([^&]*)', 2) END AS channel_id FROM bid WHERE REGEXP_EXTRACT(url,"
             + " '(&|^)channel_id=([^&]*)', 2) IS NOT NULL OR lower(channel) IN ('apple', 'google',"
-            + " 'facebook', 'baidu')"),
+            + " 'facebook', 'baidu')",
+        "native regex/case (incompatible)",
+        Map.of("streamfusion.expression.allowIncompatible", "true")),
     new Query(
         "q23",
         false,
@@ -386,9 +407,16 @@ class NexmarkMatrixBenchmark {
 
     if (runGenerator) {
       for (Query q : queries) {
-        double flink = generatorBest(q, false);
-        double nativeRun = generatorBest(q, true);
+        double flink = generatorBest(q, false, null);
+        double nativeRun = generatorBest(q, true, null);
         report.get(q.label).add(cell("generator", flink, nativeRun));
+        // A query with a faster opt-in path that diverges from Flink at an edge (q21's native
+        // regex/case) reports it too, against the same Flink baseline — parity and non-parity side by
+        // side, so the cost of staying byte-identical is visible.
+        if (q.nativeVariantProps != null) {
+          double variant = generatorBest(q, true, q.nativeVariantProps);
+          report.get(q.label).add(variantCell("generator", q.nativeVariantLabel, flink, variant));
+        }
       }
     }
 
@@ -447,8 +475,10 @@ class NexmarkMatrixBenchmark {
     boolean nativeRun = !"false".equals(System.getProperty("profile.native", "true"));
     long deadline = System.currentTimeMillis() + Long.getLong("profile.seconds", 60L) * 1000L;
     long iterations = 0;
+    Map<String, String> variant =
+        "true".equals(System.getProperty("profile.variant")) ? q.nativeVariantProps : null;
     while (System.currentTimeMillis() < deadline) {
-      withDecimal(q, nativeRun, () -> runGeneratorOnce(q, nativeRun));
+      withProps(q, nativeRun, variant, () -> runGeneratorOnce(q, nativeRun));
       iterations++;
     }
     System.out.println("[profile] " + (nativeRun ? "native " : "flink ") + label + " iterations: " + iterations);
@@ -483,12 +513,19 @@ class NexmarkMatrixBenchmark {
         source, flink, ROWS / flink, nativeRun, ROWS / nativeRun, flink / nativeRun);
   }
 
+  private static String variantCell(String source, String label, double flink, double variant) {
+    return String.format(
+        "%-10s [%s]  Native %6.3fs (%,.0f ev/s)  %.2fx",
+        source, label, variant, ROWS / variant, flink / variant);
+  }
+
   // ----- generator source -----
 
-  private static double generatorBest(Query q, boolean nativeRun) throws Exception {
+  private static double generatorBest(Query q, boolean nativeRun, Map<String, String> extra)
+      throws Exception {
     double best = Double.MAX_VALUE;
     for (int run = 0; run < WARMUP + RUNS; run++) {
-      double seconds = withDecimal(q, nativeRun, () -> runGeneratorOnce(q, nativeRun));
+      double seconds = withProps(q, nativeRun, extra, () -> runGeneratorOnce(q, nativeRun));
       if (run >= WARMUP) {
         best = Math.min(best, seconds);
       }
@@ -604,21 +641,32 @@ class NexmarkMatrixBenchmark {
     double get() throws Exception;
   }
 
-  private static double withDecimal(Query q, boolean nativeRun, Run run) throws Exception {
-    String property = "streamfusion.expression.decimalArithmetic.approximate";
-    if (!(nativeRun && q.approximateDecimal)) {
+  private static double withProps(Query q, boolean nativeRun, Map<String, String> extra, Run run)
+      throws Exception {
+    Map<String, String> props = new LinkedHashMap<>();
+    if (nativeRun && q.approximateDecimal) {
+      props.put("streamfusion.expression.decimalArithmetic.approximate", "true");
+    }
+    if (nativeRun && extra != null) {
+      props.putAll(extra);
+    }
+    if (props.isEmpty()) {
       return run.get();
     }
-    String previous = System.getProperty(property);
-    System.setProperty(property, "true");
+    Map<String, String> previous = new LinkedHashMap<>();
+    props.forEach((k, v) -> previous.put(k, System.getProperty(k)));
+    props.forEach(System::setProperty);
     try {
       return run.get();
     } finally {
-      if (previous == null) {
-        System.clearProperty(property);
-      } else {
-        System.setProperty(property, previous);
-      }
+      previous.forEach(
+          (k, v) -> {
+            if (v == null) {
+              System.clearProperty(k);
+            } else {
+              System.setProperty(k, v);
+            }
+          });
     }
   }
 }
