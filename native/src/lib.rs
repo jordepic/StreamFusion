@@ -5468,25 +5468,31 @@ impl TopNRanker {
             (0..arity).map(|i| SortField::new(batch.column(i).data_type().clone())).collect(),
         )
         .expect("top-n payload converter");
-        let sort = RowConverter::new(
-            self.sort_columns
-                .iter()
-                .map(|s| {
-                    SortField::new_with_options(
-                        batch.column(s.index).data_type().clone(),
-                        SortOptions { descending: !s.ascending, nulls_first: s.nulls_first },
-                    )
-                })
-                .collect(),
-        )
-        .expect("top-n sort converter");
-        let partition = RowConverter::new(
-            self.partition_columns
-                .iter()
-                .map(|&i| SortField::new(batch.column(i).data_type().clone()))
-                .collect(),
-        )
-        .expect("top-n partition converter");
+        // A plain LIMIT (no ORDER BY) has zero sort columns; like the empty partition key, encode a
+        // constant dummy so all rows compare equal and the buffer preserves arrival order (Flink's
+        // first-n by arrival). With sort columns present, encode them memcomparable with their options.
+        let sort = if self.sort_columns.is_empty() {
+            RowConverter::new(vec![SortField::new(DataType::Boolean)]).expect("top-n empty sort converter")
+        } else {
+            RowConverter::new(
+                self.sort_columns
+                    .iter()
+                    .map(|s| {
+                        SortField::new_with_options(
+                            batch.column(s.index).data_type().clone(),
+                            SortOptions { descending: !s.ascending, nulls_first: s.nulls_first },
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("top-n sort converter")
+        };
+        // A global Top-N (LIMIT / SortLimit with no PARTITION BY) has zero partition columns; arrow-row
+        // can't encode N rows of no columns, so key on a constant dummy column (all rows → one group),
+        // exactly as the group-aggregate keying does.
+        let partition_refs: Vec<&ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let partition = key_row_converter(&partition_refs);
         self.converters = Some(TopNConverters { partition, sort, payload });
     }
 
@@ -5502,8 +5508,8 @@ impl TopNRanker {
         let sort_arrays: Vec<ArrayRef> =
             self.sort_columns.iter().map(|s| batch.column(s.index).clone()).collect();
         let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
-        let parts = conv.partition.convert_columns(&partition_arrays).expect("encode partition");
-        let keys = conv.sort.convert_columns(&sort_arrays).expect("encode sort key");
+        let parts = encode_group_keys(&conv.partition, &partition_arrays, batch.num_rows());
+        let keys = encode_group_keys(&conv.sort, &sort_arrays, batch.num_rows());
         let payloads = conv.payload.convert_columns(&data_arrays).expect("encode payload");
 
         let limit = self.limit as usize;
@@ -5616,8 +5622,8 @@ impl TopNRanker {
             let sort_arrays: Vec<ArrayRef> =
                 ranker.sort_columns.iter().map(|s| batch.column(s.index).clone()).collect();
             let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
-            let parts = conv.partition.convert_columns(&partition_arrays).expect("encode partition");
-            let keys = conv.sort.convert_columns(&sort_arrays).expect("encode sort key");
+            let parts = encode_group_keys(&conv.partition, &partition_arrays, batch.num_rows());
+            let keys = encode_group_keys(&conv.sort, &sort_arrays, batch.num_rows());
             let payloads = conv.payload.convert_columns(&data_arrays).expect("encode payload");
             let groups = &mut ranker.groups;
             for row in 0..batch.num_rows() {
