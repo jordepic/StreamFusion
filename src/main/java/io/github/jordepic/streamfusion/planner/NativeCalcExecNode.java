@@ -3,6 +3,7 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeCalcOperator;
+import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.Collections;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
@@ -34,6 +35,7 @@ public class NativeCalcExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] projectionRoots;
   private final int conditionRoot;
   private final String[] outputNames;
+  private final NativeUdf.Binding udfBinding;
 
   public NativeCalcExecNode(
       ReadableConfig tableConfig,
@@ -48,7 +50,8 @@ public class NativeCalcExecNode extends ExecNodeBase<ArrowBatch>
       String[] strings,
       int[] projectionRoots,
       int conditionRoot,
-      String[] outputNames) {
+      String[] outputNames,
+      NativeUdf.Binding udfBinding) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-calc_1"),
@@ -65,6 +68,7 @@ public class NativeCalcExecNode extends ExecNodeBase<ArrowBatch>
     this.projectionRoots = projectionRoots;
     this.conditionRoot = conditionRoot;
     this.outputNames = outputNames;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -78,7 +82,7 @@ public class NativeCalcExecNode extends ExecNodeBase<ArrowBatch>
         createTransformationMeta(TRANSFORMATION, config),
         new NativeCalcOperator(
             kinds, payload, childCounts, longs, doubles, strings, projectionRoots, conditionRoot,
-            outputNames),
+            outputNames, udfBinding),
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

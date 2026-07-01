@@ -3,6 +3,7 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarUpdatingJoinOperator;
+import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.Arrays;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
@@ -82,7 +83,8 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
             predicate == null ? EMPTY_INT : predicate.childCounts(),
             predicate == null ? EMPTY_LONG : predicate.longs(),
             predicate == null ? EMPTY_DOUBLE : predicate.doubles(),
-            predicate == null ? EMPTY_STRING : predicate.strings()),
+            predicate == null ? EMPTY_STRING : predicate.strings(),
+            predicate == null ? NativeUdf.Binding.EMPTY : predicate.udfBinding()),
         ArrowBatchTypeInformation.INSTANCE,
         left.getParallelism(),
         false);

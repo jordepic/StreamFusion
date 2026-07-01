@@ -102,6 +102,14 @@ final class RexExpression {
           java.util.Map.entry("ATAN", 79),
           java.util.Map.entry("LOG10", 80));
 
+  // UDFs referenced by KIND_UDF nodes, and the longs-pool slots holding their local indices. Rather
+  // than registering into NativeUdf's (planner-JVM) registry at encode time and baking a global id —
+  // which a task manager's empty registry wouldn't have — we carry a serializable descriptor per UDF
+  // and bake its local index; the operator registers them at open() and patches the slots.
+  private final List<io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor> udfs =
+      new ArrayList<>();
+  private final List<Integer> udfIdSlots = new ArrayList<>();
+
   private final List<Integer> projectionRoots = new ArrayList<>();
   private int conditionRoot = -1;
   private String[] outputNames = new String[0];
@@ -138,7 +146,8 @@ final class RexExpression {
         predicate.childCounts(),
         predicate.longs(),
         predicate.doubles(),
-        predicate.strings());
+        predicate.strings(),
+        predicate.udfBinding());
   }
 
   /**
@@ -252,6 +261,26 @@ final class RexExpression {
 
   String[] strings() {
     return strings.toArray(new String[0]);
+  }
+
+  /**
+   * Records a UDF to register at operator open() and returns its local index (baked into the {@code
+   * longs} pool in place of a plan-time global id); also notes the next {@code longs} slot as the one
+   * holding that index, so the operator's {@link
+   * io.github.jordepic.streamfusion.operator.NativeUdf.Binding} can patch it to the runtime id.
+   */
+  private int addUdf(io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor descriptor) {
+    int localIndex = udfs.size();
+    udfs.add(descriptor);
+    udfIdSlots.add(longs.size());
+    return localIndex;
+  }
+
+  /** The UDF registrations this encoded expression needs, to carry into the operator. */
+  io.github.jordepic.streamfusion.operator.NativeUdf.Binding udfBinding() {
+    return new io.github.jordepic.streamfusion.operator.NativeUdf.Binding(
+        udfs.toArray(new io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor[0]),
+        toIntArray(udfIdSlots));
   }
 
   /** Appends {@code node} in pre-order; returns false (abandoning the encode) on an unsupported node. */
@@ -928,11 +957,12 @@ final class RexExpression {
       return reject("REGEXP_EXTRACT host implementation unavailable: " + e.getMessage());
     }
     int returnCode = io.github.jordepic.streamfusion.operator.NativeUdf.TYPE_STRING;
-    int id =
-        io.github.jordepic.streamfusion.operator.NativeUdf.registerBuiltin(
-            regexpExtract, argCodes, returnCode);
+    int localIndex =
+        addUdf(
+            io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor.forBuiltin(
+                regexpExtract, argCodes, returnCode));
     add(KIND_UDF, longs.size(), args.size());
-    longs.add((long) id);
+    longs.add((long) localIndex);
     longs.add((long) returnCode);
     for (RexNode arg : args) {
       if (!emit(arg)) {
@@ -978,10 +1008,12 @@ final class RexExpression {
       return reject(
           "UDF " + scalar.getClass().getName() + " has no single eval of arity " + args.size());
     }
-    int id =
-        io.github.jordepic.streamfusion.operator.NativeUdf.register(scalar, eval, argCodes, returnCode);
+    int localIndex =
+        addUdf(
+            io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor.forFunction(
+                scalar, eval, argCodes, returnCode));
     add(KIND_UDF, longs.size(), args.size());
-    longs.add((long) id);
+    longs.add((long) localIndex);
     longs.add((long) returnCode);
     for (RexNode arg : args) {
       if (!emit(arg)) {
@@ -1244,11 +1276,14 @@ final class RexExpression {
       return reject(method + " host implementation unavailable: " + e.getMessage());
     }
     int returnCode = io.github.jordepic.streamfusion.operator.NativeUdf.TYPE_STRING;
-    int id =
-        io.github.jordepic.streamfusion.operator.NativeUdf.registerBuiltin(
-            impl, new int[] {io.github.jordepic.streamfusion.operator.NativeUdf.TYPE_STRING}, returnCode);
+    int localIndex =
+        addUdf(
+            io.github.jordepic.streamfusion.operator.NativeUdf.Descriptor.forBuiltin(
+                impl,
+                new int[] {io.github.jordepic.streamfusion.operator.NativeUdf.TYPE_STRING},
+                returnCode));
     add(KIND_UDF, longs.size(), 1);
-    longs.add((long) id);
+    longs.add((long) localIndex);
     longs.add((long) returnCode);
     return emit(args.get(0));
   }

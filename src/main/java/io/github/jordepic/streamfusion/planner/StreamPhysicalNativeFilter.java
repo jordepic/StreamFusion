@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion.planner;
 
+import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.List;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
@@ -29,6 +30,7 @@ public class StreamPhysicalNativeFilter extends SingleRel
   private final long[] longs;
   private final double[] doubles;
   private final String[] strings;
+  private final NativeUdf.Binding udfBinding;
 
   public StreamPhysicalNativeFilter(
       RelOptCluster cluster,
@@ -41,7 +43,8 @@ public class StreamPhysicalNativeFilter extends SingleRel
       int[] childCounts,
       long[] longs,
       double[] doubles,
-      String[] strings) {
+      String[] strings,
+      NativeUdf.Binding udfBinding) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.projection = projection;
@@ -51,6 +54,7 @@ public class StreamPhysicalNativeFilter extends SingleRel
     this.longs = longs;
     this.doubles = doubles;
     this.strings = strings;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -76,7 +80,8 @@ public class StreamPhysicalNativeFilter extends SingleRel
         childCounts,
         longs,
         doubles,
-        strings);
+        strings,
+        udfBinding);
   }
 
   @Override
@@ -92,6 +97,7 @@ public class StreamPhysicalNativeFilter extends SingleRel
         childCounts,
         longs,
         doubles,
-        strings);
+        strings,
+        udfBinding);
   }
 }

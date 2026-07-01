@@ -1,5 +1,6 @@
 package io.github.jordepic.streamfusion.planner;
 
+import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.List;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
@@ -31,6 +32,7 @@ public class StreamPhysicalNativeCalc extends SingleRel
   private final int[] projectionRoots;
   private final int conditionRoot;
   private final String[] outputNames;
+  private final NativeUdf.Binding udfBinding;
 
   public StreamPhysicalNativeCalc(
       RelOptCluster cluster,
@@ -51,7 +53,8 @@ public class StreamPhysicalNativeCalc extends SingleRel
         encoded.strings(),
         encoded.projectionRoots(),
         encoded.conditionRoot(),
-        encoded.outputNames());
+        encoded.outputNames(),
+        encoded.udfBinding());
   }
 
   private StreamPhysicalNativeCalc(
@@ -67,7 +70,8 @@ public class StreamPhysicalNativeCalc extends SingleRel
       String[] strings,
       int[] projectionRoots,
       int conditionRoot,
-      String[] outputNames) {
+      String[] outputNames,
+      NativeUdf.Binding udfBinding) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.kinds = kinds;
@@ -79,6 +83,7 @@ public class StreamPhysicalNativeCalc extends SingleRel
     this.projectionRoots = projectionRoots;
     this.conditionRoot = conditionRoot;
     this.outputNames = outputNames;
+    this.udfBinding = udfBinding;
   }
 
   @Override
@@ -106,7 +111,8 @@ public class StreamPhysicalNativeCalc extends SingleRel
         strings,
         projectionRoots,
         conditionRoot,
-        outputNames);
+        outputNames,
+        udfBinding);
   }
 
   @Override
@@ -124,6 +130,7 @@ public class StreamPhysicalNativeCalc extends SingleRel
         strings,
         projectionRoots,
         conditionRoot,
-        outputNames);
+        outputNames,
+        udfBinding);
   }
 }

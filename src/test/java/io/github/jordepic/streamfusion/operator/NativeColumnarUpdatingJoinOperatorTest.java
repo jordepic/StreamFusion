@@ -42,7 +42,8 @@ class NativeColumnarUpdatingJoinOperatorTest {
         new int[0],
         new long[0],
         new double[0],
-        new String[0]);
+        new String[0],
+        NativeUdf.Binding.EMPTY);
   }
 
   @Test
