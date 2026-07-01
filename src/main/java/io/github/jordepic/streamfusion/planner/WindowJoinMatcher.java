@@ -11,12 +11,14 @@ import org.apache.flink.table.planner.plan.nodes.physical.common.CommonPhysicalJ
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalWindowJoin;
 
 /**
- * Recognizes the event-time INNER window joins the native operator implements:
+ * Recognizes the event-time window joins the native operator implements:
  * {@code a JOIN b ON a.k = b.k} where both sides were windowed by identical event-time windowing
  * TVFs, so each row carries matching {@code window_start}/{@code window_end} columns. Requires an
- * INNER join, one or more equi-join keys of supported types (bigint/int/string/boolean/date/timestamp/decimal), null-filtering
- * keys, no residual non-equi predicate, and a window-attached event-time windowing on both sides.
- * Anything else (outer joins, proctime, an extra filter, an unsupported key type) falls back.
+ * INNER/LEFT/RIGHT/FULL join, equi-join keys of supported types
+ * (bigint/int/string/boolean/date/timestamp/decimal) — zero or more, since the sides' window bounds are
+ * always joined on, so a windows-only join (Nexmark q5) matches within each window — null-filtering keys,
+ * a natively expressible residual (if any), and a window-attached event-time windowing on both sides.
+ * Anything else (proctime, an inexpressible filter, an unsupported key type) falls back.
  */
 final class WindowJoinMatcher {
 
@@ -34,9 +36,12 @@ final class WindowJoinMatcher {
     }
     int[] leftKeys = joinSpec.getLeftKeys();
     int[] rightKeys = joinSpec.getRightKeys();
-    if (leftKeys.length == 0 || leftKeys.length != rightKeys.length) {
-      return "window join: needs at least one equi-join key";
+    if (leftKeys.length != rightKeys.length) {
+      return "window join: mismatched equi-join key counts";
     }
+    // Zero user equi-keys is allowed: the native joiner always joins on the two sides' window bounds
+    // (window_start/window_end), so with no extra key it matches every pair within a window (subject to
+    // the residual) — Nexmark q5's `AuctionBids JOIN MaxBids ON starttime/endtime AND num >= maxn`.
     if (joinSpec.getNonEquiCondition().isPresent() && nonEquiPredicate(join) == null) {
       return "window join: the residual non-equi condition is not natively expressible";
     }

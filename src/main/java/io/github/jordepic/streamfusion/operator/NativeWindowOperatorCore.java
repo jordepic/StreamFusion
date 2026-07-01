@@ -4,6 +4,7 @@ import io.github.jordepic.streamfusion.Native;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.List;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -232,6 +233,21 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   }
 
   /**
+   * Inverse of the window-boundary local rendering (see {@code fillLocalTimestamps}): an upstream window
+   * operator emits its boundaries as the session-zone wall-clock stored as if UTC, so a window-attached
+   * re-aggregation must undo that shift back to epoch millis before folding — otherwise its own boundary
+   * rendering would double-shift them (the boundaries would then miss an equi-join on the window bounds).
+   */
+  protected final long toEpochFromLocal(long localMillis) {
+    return Instant.ofEpochMilli(localMillis)
+        .atZone(ZoneOffset.UTC)
+        .toLocalDateTime()
+        .atZone(zone)
+        .toInstant()
+        .toEpochMilli();
+  }
+
+  /**
    * Folds raw rows (event-time column, value, optional key) into the native aggregator. Shared by
    * the single-phase and local operators, which both consume raw input.
    */
@@ -292,6 +308,65 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   protected final void updateColumnarProctime(
       VectorSchemaRoot in, long nowMillis, int[] valueColumns, int[] keyColumns, int[] keyTypes) {
     updateColumnarInternal(in, -1, nowMillis, valueColumns, keyColumns, keyTypes);
+  }
+
+  /**
+   * Window-attached variant of {@link #updateColumnar}: the input rows already carry their window as
+   * {@code windowStartColumn}/{@code windowEndColumn} (nanosecond timestamps, as the transpose encodes
+   * them) rather than a rowtime to slice — an upstream window aggregate's output re-aggregated per
+   * window (Nexmark q5). Emits an Arrow batch with the canonical {@code window_start}/{@code window_end}
+   * (epoch millis), {@code value{i}}, and {@code key{j}} columns the native window-attached fold reads.
+   */
+  protected final void updateColumnarAttached(
+      VectorSchemaRoot in,
+      int windowStartColumn,
+      int windowEndColumn,
+      int[] valueColumns,
+      int[] keyColumns,
+      int[] keyTypes) {
+    int rows = in.getRowCount();
+    BigIntVector windowStart = new BigIntVector("window_start", allocator);
+    BigIntVector windowEnd = new BigIntVector("window_end", allocator);
+    FieldVector[] values = new FieldVector[valueColumns.length];
+    FieldVector[] srcValues = new FieldVector[valueColumns.length];
+    FieldVector[] keys = new FieldVector[keyColumns.length];
+    List<FieldVector> vectors = new java.util.ArrayList<>();
+    vectors.add(windowStart);
+    vectors.add(windowEnd);
+    for (int a = 0; a < valueColumns.length; a++) {
+      values[a] = newValueVector("value" + a, valueTypes[a]);
+      srcValues[a] = valueColumns[a] < 0 ? null : in.getFieldVectors().get(valueColumns[a]);
+      vectors.add(values[a]);
+    }
+    for (int j = 0; j < keyColumns.length; j++) {
+      keys[j] = newKeyVector("key" + j, keyTypes[j]);
+      vectors.add(keys[j]);
+    }
+    TimeStampNanoVector srcStart = (TimeStampNanoVector) in.getVector(windowStartColumn);
+    TimeStampNanoVector srcEnd = (TimeStampNanoVector) in.getVector(windowEndColumn);
+    try (VectorSchemaRoot root = new VectorSchemaRoot(vectors);
+        ArrowArray array = ArrowArray.allocateNew(allocator);
+        ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+      for (int i = 0; i < rows; i++) {
+        // The upstream boundaries are session-zone wall-clock (see toEpochFromLocal); fold on epoch
+        // millis so this aggregate's own boundary rendering shifts them exactly once, not twice.
+        windowStart.setSafe(i, toEpochFromLocal(srcStart.get(i) / 1_000_000L));
+        windowEnd.setSafe(i, toEpochFromLocal(srcEnd.get(i) / 1_000_000L));
+        for (int a = 0; a < valueColumns.length; a++) {
+          if (valueColumns[a] < 0) {
+            ((BigIntVector) values[a]).setSafe(i, 1L); // COUNT(*): a non-null constant counts rows
+          } else {
+            copyValue(values[a], i, srcValues[a], valueTypes[a]);
+          }
+        }
+        for (int j = 0; j < keyColumns.length; j++) {
+          setKeyFromVector(keys[j], i, in.getFieldVectors().get(keyColumns[j]), keyTypes[j]);
+        }
+      }
+      root.setRowCount(rows);
+      Data.exportVectorSchemaRoot(allocator, root, dictionaries, array, schema);
+      Native.updateAttachedTumblingAggregator(handle, array.memoryAddress(), schema.memoryAddress());
+    }
   }
 
   private void updateColumnarInternal(

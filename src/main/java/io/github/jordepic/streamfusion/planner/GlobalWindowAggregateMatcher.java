@@ -7,6 +7,7 @@ import org.apache.flink.table.planner.plan.logical.CumulativeWindowSpec;
 import org.apache.flink.table.planner.plan.logical.HoppingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.SliceAttachedWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
+import org.apache.flink.table.planner.plan.logical.WindowAttachedWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.WindowSpec;
 import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalGlobalWindowAggregate;
@@ -30,11 +31,17 @@ final class GlobalWindowAggregateMatcher {
   /** The specific reason this global window aggregate is not accelerable, or null if it is. */
   static String unsupportedReason(StreamPhysicalGlobalWindowAggregate aggregate) {
     WindowingStrategy windowing = aggregate.windowing();
-    if (!(windowing instanceof SliceAttachedWindowingStrategy)) {
-      return "global window aggregate: requires a slice-attached windowing";
+    // Slice-attached: the local emits per-slice partials the global fans into windows. Window-attached
+    // (q5): the partials already correspond to full windows, so the global merges each into its one
+    // window (no fan-out; see slideMillis) and the fan-out divide checks below do not apply.
+    boolean attached = windowing instanceof WindowAttachedWindowingStrategy;
+    if (!(windowing instanceof SliceAttachedWindowingStrategy) && !attached) {
+      return "global window aggregate: requires a slice-attached or window-attached windowing";
     }
     WindowSpec spec = windowing.getWindow();
-    if (spec instanceof HoppingWindowSpec) {
+    if (attached) {
+      // No fan-out to bound; only the aggregate/key shape (checked below) matters.
+    } else if (spec instanceof HoppingWindowSpec) {
       // The global fans each slice into size/slide windows, which requires slide to divide size.
       HoppingWindowSpec hop = (HoppingWindowSpec) spec;
       if (hop.getSize().toMillis() % hop.getSlide().toMillis() != 0) {
@@ -121,6 +128,11 @@ final class GlobalWindowAggregateMatcher {
 
   /** The slide in millis: the hopping slide, the cumulative step, or the size for tumbling. */
   static long slideMillis(StreamPhysicalGlobalWindowAggregate aggregate) {
+    // Window-attached: each partial is already a full window, so the global must not fan out — a slide
+    // equal to the size makes the merge place each partial into exactly one window.
+    if (aggregate.windowing() instanceof WindowAttachedWindowingStrategy) {
+      return windowMillis(aggregate);
+    }
     WindowSpec spec = aggregate.windowing().getWindow();
     if (spec instanceof HoppingWindowSpec) {
       return ((HoppingWindowSpec) spec).getSlide().toMillis();

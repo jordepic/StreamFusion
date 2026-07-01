@@ -917,7 +917,15 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
                   agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())
               && WindowAggregateMatcher.isCumulative(agg.windowing())
               && !WindowAggregateMatcher.containsAvg(agg.aggCalls());
-      if (tumbling || hopping || cumulativeLocal) {
+      // Window-attached local (q5): the input already carries window_start/window_end; the local folds
+      // each row into the one window it names rather than slicing a rowtime.
+      boolean attached =
+          !hopping
+              && !tumbling
+              && !cumulativeLocal
+              && WindowAggregateMatcher.matchesAttachedLocal(
+                  agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType());
+      if (tumbling || hopping || cumulativeLocal || attached) {
         if (!NativeConfig.operatorEnabled("localWindowAggregate")) {
           return noteDisabled(current, "localWindowAggregate");
         }
@@ -944,7 +952,13 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
                 ? WindowAggregateMatcher.hoppingLocalValueTypes(agg.aggCalls(), localInput)
                 : WindowAggregateMatcher.valueTypeCodes(agg.aggCalls(), localInput);
         long sliceSize = WindowAggregateMatcher.sliceSize(agg.windowing());
-        int timeColumn = WindowAggregateMatcher.timeColumn(agg.windowing());
+        // Window-attached mode reads the window from columns (no rowtime slice); the two modes are
+        // mutually exclusive, so the unused indices are -1.
+        int timeColumn = attached ? -1 : WindowAggregateMatcher.timeColumn(agg.windowing());
+        int windowStartColumn =
+            attached ? WindowAggregateMatcher.windowStartColumn(agg.windowing()) : -1;
+        int windowEndColumn =
+            attached ? WindowAggregateMatcher.windowEndColumn(agg.windowing()) : -1;
         int[] keyColumns = WindowAggregateMatcher.keyColumns(agg.grouping());
         // Always columnar: the local pre-aggregate emits Arrow partials. Its input feeds
         // directly (no shuffle precedes a local); the transition pass inserts a row→Arrow transpose
@@ -956,6 +970,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             agg.getRowType(),
             sliceSize,
             timeColumn,
+            windowStartColumn,
+            windowEndColumn,
             valueColumns,
             keyColumns,
             valueTypes,

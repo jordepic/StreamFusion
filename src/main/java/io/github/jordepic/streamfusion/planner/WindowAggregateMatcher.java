@@ -10,6 +10,7 @@ import org.apache.flink.table.planner.plan.logical.HoppingWindowSpec;
 import org.apache.flink.table.planner.plan.logical.SessionWindowSpec;
 import org.apache.flink.table.planner.plan.logical.TimeAttributeWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.TumblingWindowSpec;
+import org.apache.flink.table.planner.plan.logical.WindowAttachedWindowingStrategy;
 import org.apache.flink.table.planner.plan.logical.WindowSpec;
 import org.apache.flink.table.planner.plan.logical.WindowingStrategy;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
@@ -123,6 +124,36 @@ final class WindowAggregateMatcher {
     return supportedAggregation(windowing, grouping, aggCalls, inputType)
         && allValueTypes(aggCalls, inputType, 0) // bigint values only, matching the global half
         && !containsAvg(aggCalls);
+  }
+
+  /**
+   * A window-attached local half (Nexmark q5): the input rows already carry their window as
+   * {@code window_start}/{@code window_end} columns (an upstream window aggregate's output being
+   * re-aggregated per window), so there is no rowtime to slice — the local folds each row into the one
+   * window it names. Restricted, like the hopping local, to single-field mergeable partials
+   * (bigint/double, no AVG) so the two-phase global can merge them. Event-time only.
+   */
+  static boolean matchesAttachedLocal(
+      WindowingStrategy windowing,
+      int[] grouping,
+      scala.collection.Seq<AggregateCall> aggCalls,
+      RelDataType inputType) {
+    if (!(windowing instanceof WindowAttachedWindowingStrategy) || !windowing.isRowtime()) {
+      return false;
+    }
+    return allPartialsMergeable(aggCalls, inputType)
+        && !containsAvg(aggCalls)
+        && supportedAggregates(grouping, aggCalls, inputType);
+  }
+
+  /** The input-column index of the attached {@code window_start}. */
+  static int windowStartColumn(WindowingStrategy windowing) {
+    return ((WindowAttachedWindowingStrategy) windowing).getWindowStart();
+  }
+
+  /** The input-column index of the attached {@code window_end}. */
+  static int windowEndColumn(WindowingStrategy windowing) {
+    return ((WindowAttachedWindowingStrategy) windowing).getWindowEnd();
   }
 
   /** True if every aggregate's value column has the given native type code. */

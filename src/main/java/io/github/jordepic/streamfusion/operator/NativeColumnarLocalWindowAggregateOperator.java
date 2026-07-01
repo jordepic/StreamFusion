@@ -19,6 +19,11 @@ public class NativeColumnarLocalWindowAggregateOperator extends NativeWindowOper
     implements OneInputStreamOperator<ArrowBatch, ArrowBatch> {
 
   private final int timeColumn;
+  // Window-attached mode (Nexmark q5): the input rows already carry their window in these columns
+  // (an upstream window aggregate's output re-aggregated per window), so there is no rowtime to slice.
+  // Both are -1 in the ordinary time-column (rowtime) mode.
+  private final int windowStartColumn;
+  private final int windowEndColumn;
   private final int[] valueColumns;
   private final int[] keyColumns;
   private final int[] keyTypes;
@@ -27,6 +32,8 @@ public class NativeColumnarLocalWindowAggregateOperator extends NativeWindowOper
       long windowMillis,
       long slideMillis,
       int timeColumn,
+      int windowStartColumn,
+      int windowEndColumn,
       int[] valueColumns,
       int[] keyColumns,
       int[] keyTypes,
@@ -41,6 +48,8 @@ public class NativeColumnarLocalWindowAggregateOperator extends NativeWindowOper
         aggregateKinds,
         timeZoneId);
     this.timeColumn = timeColumn;
+    this.windowStartColumn = windowStartColumn;
+    this.windowEndColumn = windowEndColumn;
     this.valueColumns = valueColumns;
     this.keyColumns = keyColumns;
     this.keyTypes = keyTypes;
@@ -49,7 +58,12 @@ public class NativeColumnarLocalWindowAggregateOperator extends NativeWindowOper
   @Override
   public void processElement(StreamRecord<ArrowBatch> element) {
     try (VectorSchemaRoot in = element.getValue().root()) {
-      updateColumnar(in, timeColumn, valueColumns, keyColumns, keyTypes);
+      if (windowEndColumn >= 0) {
+        updateColumnarAttached(
+            in, windowStartColumn, windowEndColumn, valueColumns, keyColumns, keyTypes);
+      } else {
+        updateColumnar(in, timeColumn, valueColumns, keyColumns, keyTypes);
+      }
     }
   }
 
