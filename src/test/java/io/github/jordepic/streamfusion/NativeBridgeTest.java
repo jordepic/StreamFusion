@@ -19,4 +19,15 @@ class NativeBridgeTest {
   void nativeRuntimeDrivesAsyncWorkToCompletion() {
     assertEquals(42, Native.blockingAnswer());
   }
+
+  /** The live-handle sentinel the harness leak check polls must see creates and drain on close. */
+  @Test
+  void liveHandleBreakdownTracksCreateAndClose() {
+    assertEquals("", Native.liveNativeHandles());
+    long sorter = Native.createTemporalSorter(0, -1);
+    String breakdown = Native.liveNativeHandles();
+    assertTrue(breakdown.contains("TemporalSorter=1"), "unexpected breakdown: " + breakdown);
+    Native.closeTemporalSorter(sorter);
+    assertEquals("", Native.liveNativeHandles());
+  }
 }

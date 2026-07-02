@@ -45,7 +45,7 @@ use jni::objects::{
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
 /// Takes ownership of a batch the JVM exported through the C Data Interface, swapping in released
@@ -103,6 +103,56 @@ fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address:
         std::ptr::write(array_address as *mut FFI_ArrowArray, out_array);
         std::ptr::write(schema_address as *mut FFI_ArrowSchema, out_schema);
     }
+}
+
+/// Live native handles by type — the leak sentinel the test harness polls. Every handle the JVM
+/// creates increments its type's count and every close decrements it, so a non-empty breakdown
+/// after all operators have closed pinpoints a missing close call: memory the JVM's own tooling
+/// cannot see. (Comet only logs a warning on this condition; tests can afford to fail hard.)
+static LIVE_HANDLES: OnceLock<Mutex<BTreeMap<&'static str, i64>>> = OnceLock::new();
+
+fn live_handles() -> &'static Mutex<BTreeMap<&'static str, i64>> {
+    LIVE_HANDLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Boxes a value into an opaque JVM handle, counting it in the live-handle registry.
+fn into_handle<T>(value: T) -> jlong {
+    *live_handles().lock().unwrap().entry(std::any::type_name::<T>()).or_insert(0) += 1;
+    Box::into_raw(Box::new(value)) as jlong
+}
+
+/// Reclaims a handle created by [`into_handle`], draining it from the live-handle registry. The
+/// caller owns the returned box; most close paths drop it immediately.
+///
+/// # Safety
+/// `handle` must have come from [`into_handle`] with the same `T` and not have been reclaimed yet.
+unsafe fn from_handle<T>(handle: jlong) -> Box<T> {
+    let mut live = live_handles().lock().unwrap();
+    if let Some(count) = live.get_mut(std::any::type_name::<T>()) {
+        *count -= 1;
+        if *count == 0 {
+            live.remove(std::any::type_name::<T>());
+        }
+    }
+    Box::from_raw(handle as *mut T)
+}
+
+/// `std::any::type_name` output with every module path stripped, so the breakdown reads
+/// `Box<dyn BatchSource>` rather than `alloc::boxed::Box<dyn streamfusion::BatchSource>`.
+fn short_type_name(full: &str) -> String {
+    let mut out = String::new();
+    let mut ident = String::new();
+    for c in full.chars() {
+        if c.is_alphanumeric() || c == '_' || c == ':' {
+            ident.push(c);
+        } else {
+            out.push_str(ident.rsplit("::").next().unwrap_or(&ident));
+            ident.clear();
+            out.push(c);
+        }
+    }
+    out.push_str(ident.rsplit("::").next().unwrap_or(&ident));
+    out
 }
 
 /// Builds a built-in aggregate over an int64 `value` column. SUM/MIN/MAX/COUNT all reduce an int64
@@ -8012,6 +8062,27 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_version<'loca
         .into_raw()
 }
 
+/// The live-handle breakdown, e.g. `SessionAggregator=1,MessageDecoder=2` — empty once every
+/// handle has been closed. The test harness asserts it drains to empty after each job, so a
+/// missing close call fails the test naming the leaking type instead of slowly growing RSS.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_liveNativeHandles<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let live = live_handles().lock().unwrap();
+    let breakdown = live
+        .iter()
+        .filter(|(_, count)| **count != 0)
+        .map(|(name, count)| format!("{}={count}", short_type_name(name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    drop(live);
+    env.new_string(breakdown)
+        .expect("failed to allocate Java string for the live-handle breakdown")
+        .into_raw()
+}
+
 /// Drives a trivial asynchronous computation to completion on the shared runtime, proving the
 /// blocking pull bridge a JVM thread will use to await native plan execution.
 #[no_mangle]
@@ -9333,7 +9404,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createFilterE
         strings: read_strings(&mut env, &strings),
         compiled: None,
     };
-    Box::into_raw(Box::new(expression)) as jlong
+    into_handle(expression)
 }
 
 /// Filters a batch from the JVM through a compiled predicate handle, exporting the surviving rows.
@@ -9361,7 +9432,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeFilterEx
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut FilterExpression));
+        drop(from_handle::<FilterExpression>(handle));
     }
 }
 
@@ -9511,7 +9582,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createCalcExp
             .collect(),
         compiled: None,
     };
-    Box::into_raw(Box::new(expression)) as jlong
+    into_handle(expression)
 }
 
 /// Runs a batch from the JVM through a compiled Calc handle, exporting the projected output batch.
@@ -9539,7 +9610,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeCalcExpr
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut CalcExpression));
+        drop(from_handle::<CalcExpression>(handle));
     }
 }
 
@@ -9667,7 +9738,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeLocalGro
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut LocalGroupAggregator));
+        drop(from_handle::<LocalGroupAggregator>(handle));
     }
 }
 
@@ -9761,7 +9832,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createParquet
     path: JString<'local>,
 ) -> jlong {
     let path: String = env.get_string(&path).expect("failed to read path").into();
-    Box::into_raw(Box::new(ParquetSink::new(path))) as jlong
+    into_handle(ParquetSink::new(path))
 }
 
 /// Appends an Arrow batch the JVM exported to the open file behind `handle`.
@@ -9785,7 +9856,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquetW
     _class: JClass<'local>,
     handle: jlong,
 ) {
-    let sink = unsafe { Box::from_raw(handle as *mut ParquetSink) };
+    let sink = unsafe { from_handle::<ParquetSink>(handle) };
     sink.close();
 }
 
@@ -10432,7 +10503,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openParquet<'
     ) as Arc<dyn datafusion::datasource::physical_plan::FileSource>;
     let source: Box<dyn BatchSource> =
         Box::new(FileScan::open(file_source, &path, schema, &projection, range_start, range_length));
-    Box::into_raw(Box::new(source)) as jlong
+    into_handle(source)
 }
 
 /// Exports the next Arrow batch from the source into the consumer-allocated C structs, returning
@@ -10464,7 +10535,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSource<'
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut Box<dyn BatchSource>));
+        drop(from_handle::<Box<dyn BatchSource>>(handle));
     }
 }
 
@@ -10491,7 +10562,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openOrc<'loca
         as Arc<dyn datafusion::datasource::physical_plan::FileSource>;
     let source: Box<dyn BatchSource> =
         Box::new(FileScan::open(file_source, &path, schema, &projection, range_start, range_length));
-    Box::into_raw(Box::new(source)) as jlong
+    into_handle(source)
 }
 
 /// Holds the per-partition sub-batches of one split, pulled out one at a time by the JVM.
@@ -10514,7 +10585,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_splitByKey<'l
     let batch = import_record_batch(in_array_address, in_schema_address);
     let keys: Vec<usize> = read_int_array(&env, &key_columns).into_iter().map(|k| k as usize).collect();
     let partitions = partition_batch(&batch, &keys, num_partitions as usize);
-    Box::into_raw(Box::new(SplitState { partitions, cursor: 0 })) as jlong
+    into_handle(SplitState { partitions, cursor: 0 })
 }
 
 /// Exports the next sub-batch into the consumer-allocated C structs and returns its partition, or
@@ -10545,7 +10616,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSplit<'l
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut SplitState));
+        drop(from_handle::<SplitState>(handle));
     }
 }
 
@@ -10630,7 +10701,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTumblin
 /// a null handle when its budget was already exceeded (a restore larger than the budget).
 fn boxed_or_throw<T>(env: &mut JNIEnv, operator: Result<T, DataFusionError>) -> jlong {
     match operator {
-        Ok(operator) => Box::into_raw(Box::new(operator)) as jlong,
+        Ok(operator) => into_handle(operator),
         Err(e) => {
             throw_memory_limit(env, &e.to_string());
             0
@@ -10806,7 +10877,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTumbling
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut TumblingAggregator));
+        drop(from_handle::<TumblingAggregator>(handle));
     }
 }
 
@@ -10973,7 +11044,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeOverAggr
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut OverWindowAggregator));
+        drop(from_handle::<OverWindowAggregator>(handle));
     }
 }
 
@@ -11080,7 +11151,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTemporal
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut TemporalSorter));
+        drop(from_handle::<TemporalSorter>(handle));
     }
 }
 
@@ -11174,7 +11245,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKeepFirs
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut KeepFirstDeduplicator));
+        drop(from_handle::<KeepFirstDeduplicator>(handle));
     }
 }
 
@@ -11263,7 +11334,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKeepLast
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut KeepLastDeduplicator));
+        drop(from_handle::<KeepLastDeduplicator>(handle));
     }
 }
 
@@ -11382,7 +11453,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeWindowRa
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut WindowRanker));
+        drop(from_handle::<WindowRanker>(handle));
     }
 }
 
@@ -11536,7 +11607,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeGroupAgg
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut GroupAggregator));
+        drop(from_handle::<GroupAggregator>(handle));
     }
 }
 
@@ -12206,13 +12277,13 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createDecoder
     // Empty unless the planner pushed a projection into an Avro decode: the narrowed reader schema.
     let reader_avro_schema: String =
         env.get_string(&reader_avro_schema).map(Into::into).unwrap_or_default();
-    Box::into_raw(Box::new(MessageDecoder::new(
+    into_handle(MessageDecoder::new(
         format,
         schema,
         &avro_schema,
         &reader_avro_schema,
         schema_id,
-    ))) as jlong
+    ))
 }
 
 /// Creates a protobuf message decoder (Flink's `protobuf` format: bare message bytes, no framing) and
@@ -12241,7 +12312,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createProtobu
         descriptor
     };
     let decoder = MessageDecoder::Protobuf(ProtobufDecoder::new(&descriptor, &message_name));
-    Box::into_raw(Box::new(decoder)) as jlong
+    into_handle(decoder)
 }
 
 /// Decodes one body batch into a typed batch, exporting it into the consumer-allocated C structs.
@@ -12284,7 +12355,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeDecoder<
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut MessageDecoder));
+        drop(from_handle::<MessageDecoder>(handle));
     }
 }
 
@@ -12669,7 +12740,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaCons
         proto_descriptor,
         proto_message_name,
     );
-    Box::into_raw(Box::new(reader)) as jlong
+    into_handle(reader)
 }
 
 /// Adds splits to the reader and re-assigns: `topics`/`partitions`/`startOffsets` are index-aligned;
@@ -12763,7 +12834,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKafkaCon
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut KafkaSplitReader));
+        drop(from_handle::<KafkaSplitReader>(handle));
     }
 }
 
@@ -13172,7 +13243,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeInterval
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut IntervalJoiner));
+        drop(from_handle::<IntervalJoiner>(handle));
     }
 }
 
@@ -13355,7 +13426,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTemporal
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut TemporalJoiner));
+        drop(from_handle::<TemporalJoiner>(handle));
     }
 }
 
@@ -13607,7 +13678,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeUpdating
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut UpdatingJoiner));
+        drop(from_handle::<UpdatingJoiner>(handle));
     }
 }
 
@@ -13745,7 +13816,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeTopNRank
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut TopNHandle));
+        drop(from_handle::<TopNHandle>(handle));
     }
 }
 
@@ -13825,7 +13896,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeChangelo
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut ChangelogNormalizer));
+        drop(from_handle::<ChangelogNormalizer>(handle));
     }
 }
 
@@ -13944,7 +14015,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeWindowJo
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut WindowJoiner));
+        drop(from_handle::<WindowJoiner>(handle));
     }
 }
 
@@ -14077,7 +14148,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSessionA
     handle: jlong,
 ) {
     unsafe {
-        drop(Box::from_raw(handle as *mut SessionAggregator));
+        drop(from_handle::<SessionAggregator>(handle));
     }
 }
 

@@ -13,6 +13,13 @@ public final class Native {
   public static native String version();
 
   /**
+   * The native side's live-handle breakdown by type (e.g. {@code SessionAggregator=1}), empty once
+   * every handle has been closed. The test harness asserts this drains to empty after each test, so
+   * a missing close call fails the test naming the leaking type instead of slowly growing RSS.
+   */
+  public static native String liveNativeHandles();
+
+  /**
    * Awaits a trivial async computation on the native runtime, proving the blocking bridge a JVM
    * thread uses to drive native plan execution.
    */
