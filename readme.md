@@ -78,8 +78,7 @@ engines (standard tuned-prod setting).
 StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively end-to-end with no
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
 ([analysis](.claude/todos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, from a
-rowwise `RowData` source, a local Parquet file, and each Kafka value format, sorted by the `RowData`
-speedup:
+rowwise `RowData` source, a local Parquet file, and each Kafka value format, ordered by query number:
 
 Each Kafka cell is the best of the three source rungs (JVM transpose / native decode / native rdkafka
 source) for that format. Several queries run a byte-parity default with a faster opt-in path that can
@@ -89,30 +88,30 @@ one row with a footnote.
 
 | Query | Shape | From RowData | From Parquet file | From JSON on Kafka | From Avro on Kafka | From Protobuf on Kafka |
 |---|---|---|---|---|---|---|
+| q0 | pass-through projection of `bid` | **1.34×** | **3.40×** | **1.11×** | **1.47×** | **1.14×** |
+| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.17×** | **3.67×** | **1.02×** | **1.41×** | **1.16×** |
+| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.27×** | **3.69×** | **1.06×** | **1.43×** | **1.19×** |
+| q3 | updating join `auction ⋈ person` | 0.80× | **4.21×** | 0.91× | **1.26×** | **1.10×** |
+| q4 | regular join → `MAX` → `AVG` per category | **1.29×** | **2.34×** | 0.97× | **1.39×** | **1.26×** |
+| q5 | Hot Items (window re-agg + window join) | **1.00×** | **2.92×** | **1.10×** | **1.45×** | **1.32×** |
+| q7 | tumble `MAX` ⋈ bid | **1.32×** | **2.41×** | **1.13×** | **1.39×** | **1.31×** |
+| q8 | tumble windowed-distinct ⋈ join | 0.70× | **4.60×** | 0.94× | **1.30×** | **1.12×** |
+| q9 | regular join → `ROW_NUMBER` (≤ 1) | 0.99× | **1.35×** | **1.09×** | **1.07×** | **1.21×** |
+| q10 § | `DATE_FORMAT` projection | 0.99× | **1.98×** | **1.01×** | **1.18×** | **1.03×** |
 | q11 | session-window `COUNT` per bidder | **2.41×** | **2.88×** | **1.58×** | **2.18×** | **2.21×** |
 | q12 | proctime tumble `COUNT` per bidder | **1.53×** | **4.05×** | **1.18×** | **1.51×** | **1.23×** |
-| q0 | pass-through projection of `bid` | **1.34×** | **3.40×** | **1.11×** | **1.47×** | **1.14×** |
-| q7 | tumble `MAX` ⋈ bid | **1.32×** | **2.41×** | **1.13×** | **1.39×** | **1.31×** |
-| q4 | regular join → `MAX` → `AVG` per category | **1.29×** | **2.34×** | 0.97× | **1.39×** | **1.26×** |
-| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.27×** | **3.69×** | **1.06×** | **1.43×** | **1.19×** |
-| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.17×** | **3.67×** | **1.02×** | **1.41×** | **1.16×** |
-| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.14×** | **1.52×** | **1.14×** | **1.35×** | **1.09×** |
-| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.09×** | **2.92×** | **1.15×** | **1.52×** | **1.20×** |
-| q5 | Hot Items (window re-agg + window join) | **1.00×** | **2.92×** | **1.10×** | **1.45×** | **1.32×** |
-| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | **1.00×** | **3.22×** | 0.95× | **1.28×** | **1.07×** |
-| q10 § | `DATE_FORMAT` projection | 0.99× | **1.98×** | **1.01×** | **1.18×** | **1.03×** |
-| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | 0.99× | **1.44×** | **1.02×** | **1.25×** | **1.07×** |
-| q9 | regular join → `ROW_NUMBER` (≤ 1) | 0.99× | **1.35×** | **1.09×** | **1.07×** | **1.21×** |
 | q13 | lookup join (bounded dimension) | 0.96× | **1.76×** | **1.00×** | **1.24×** | **1.02×** |
-| q19 | `ROW_NUMBER` topN (≤ 10) | 0.92× | **1.17×** | **1.14×** | **1.17×** | **1.17×** |
-| q23 | three-way join `bid ⋈ person ⋈ auction` | 0.87× | **2.15×** | **1.04×** | **1.42×** | **1.27×** |
+| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | **1.00×** | **3.22×** | 0.95× | **1.28×** | **1.07×** |
+| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.14×** | **1.52×** | **1.14×** | **1.35×** | **1.09×** |
 | q16 § | multi-`DISTINCT` per channel/day | 0.84× | 0.85× | 0.99× | **1.07×** | **1.01×** |
+| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | 0.99× | **1.44×** | **1.02×** | **1.25×** | **1.07×** |
 | q18 | `ROW_NUMBER` dedup (≤ 1) | 0.82× | **1.10×** | 0.96× | **1.14×** | 0.96× |
-| q3 | updating join `auction ⋈ person` | 0.80× | **4.21×** | 0.91× | **1.26×** | **1.10×** |
+| q19 | `ROW_NUMBER` topN (≤ 10) | 0.92× | **1.17×** | **1.14×** | **1.17×** | **1.17×** |
 | q20 | updating join (`category = 10`) | 0.73× | **2.84×** | 0.97× | **1.39×** | **1.12×** |
 | q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.71× | **1.58×** | **1.04×** | **1.15×** | 0.94× |
 | q21 † | …opt-in native regex/case (`allowIncompatible`) | **1.50×** | **5.68×** | **1.21×** | **1.63×** | **1.41×** |
-| q8 | tumble windowed-distinct ⋈ join | 0.70× | **4.60×** | 0.94× | **1.30×** | **1.12×** |
+| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.09×** | **2.92×** | **1.15×** | **1.52×** | **1.20×** |
+| q23 | three-way join `bid ⋈ person ⋈ auction` | 0.87× | **2.15×** | **1.04×** | **1.42×** | **1.27×** |
 
 From `RowData`, projection/filter/scalar and the windowed and group aggregates win outright; the
 queries that still trail 1× there are the wide changelog joins and multi-`DISTINCT` aggregates, whose
