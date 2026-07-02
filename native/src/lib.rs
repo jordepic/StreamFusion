@@ -959,7 +959,7 @@ fn unnest_array(
 /// start, so the start is carried here.
 struct AlignedWindow {
     start: i64,
-    keys: HashMap<GroupKey, Vec<Box<dyn Accumulator>>>,
+    keys: HashMap<OwnedRow, Vec<Box<dyn Accumulator>>>,
 }
 
 /// Event-time aligned-window aggregation that holds open windows across batches: tumbling and
@@ -973,6 +973,11 @@ struct TumblingAggregator {
     cumulative: bool,
     aggregates: Vec<WindowAggregate>,
     windows: BTreeMap<i64, AlignedWindow>,
+    // Groups are keyed by the arrow-row memcomparable encoding of the key columns, not a
+    // `Vec<ScalarValue>` — the same trade the non-windowed GROUP BY made: the scalar key's per-row
+    // alloc/hash/drop dominates the keyed update loop, byte keys do not. `key_converter` encodes
+    // the key columns once per batch and decodes stored keys back into output columns.
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     // The highest watermark flushed so far; a row whose window ends at or before it is late (its
     // window already closed) and is dropped, matching the host's per-row late-data handling.
@@ -991,6 +996,14 @@ const GROUP_ENTRY_OVERHEAD: usize = 64;
 /// [`GROUP_ENTRY_OVERHEAD`]).
 fn group_key_bytes(key: &GroupKey) -> usize {
     key.iter().map(ScalarValue::size).sum::<usize>() + GROUP_ENTRY_OVERHEAD
+}
+
+/// Encodes a batch's key columns to memcomparable byte rows, building the converter (shared with
+/// the decode on flush/snapshot) on first touch.
+fn encode_keys(converter: &mut Option<RowConverter>, key_arrays: &[&ArrayRef], n: usize) -> Rows {
+    let conv = converter.get_or_insert_with(|| key_row_converter(key_arrays));
+    let key_owned: Vec<ArrayRef> = key_arrays.iter().map(|a| (*a).clone()).collect();
+    encode_group_keys(conv, &key_owned, n)
 }
 
 /// Estimated heap footprint of one group's accumulators.
@@ -1107,6 +1120,7 @@ impl TumblingAggregator {
             cumulative,
             aggregates: build_aggregates(&kinds, &value_types),
             windows: BTreeMap::new(),
+            key_converter: None,
             key_types: Vec::new(),
             current_watermark: i64::MIN,
             memory: OperatorMemory::unaccounted(),
@@ -1139,16 +1153,16 @@ impl TumblingAggregator {
                 window
                     .keys
                     .iter()
-                    .map(|(key, accumulators)| group_key_bytes(key) + accumulators_bytes(accumulators))
+                    .map(|(key, accumulators)| owned_row_bytes(key) + accumulators_bytes(accumulators))
                     .sum::<usize>()
             })
             .sum()
     }
 
     /// Removes a dropped group's footprint from the tracked state size (a flush closing its window).
-    fn forget_group_bytes(&mut self, key: &GroupKey, accumulators: &[Box<dyn Accumulator>]) {
+    fn forget_group_bytes(&mut self, key: &OwnedRow, accumulators: &[Box<dyn Accumulator>]) {
         if self.memory.tracking() {
-            self.memory.forget(group_key_bytes(key) + accumulators_bytes(accumulators));
+            self.memory.forget(owned_row_bytes(key) + accumulators_bytes(accumulators));
         }
     }
 
@@ -1163,7 +1177,7 @@ impl TumblingAggregator {
     /// The N accumulators (one per aggregate) for a (window, key), created on first touch. Windows
     /// are keyed by end; the start is stored on first creation. The group key is a composite of the
     /// (zero or more) grouping columns.
-    fn accumulators(&mut self, start: i64, end: i64, key: GroupKey) -> &mut Vec<Box<dyn Accumulator>> {
+    fn accumulators(&mut self, start: i64, end: i64, key: OwnedRow) -> &mut Vec<Box<dyn Accumulator>> {
         let aggregates = &self.aggregates;
         self.windows
             .entry(end)
@@ -1187,25 +1201,23 @@ impl TumblingAggregator {
             .collect();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, batch.num_rows());
 
         // Group the row positions for each (window, key); the value columns are sliced by type-
-        // agnostic take, so the accumulators see each column's own type (int, double, ...).
-        let mut grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>> = ahash::HashMap::default();
+        // agnostic take, so the accumulators see each column's own type (int, double, ...). The
+        // grouping key is a borrowed byte-row view into the batch's encoded keys — no per-row
+        // allocation; a key is materialized once per touched group in `accumulate_grouped`.
+        let mut grouped: ahash::HashMap<(i64, i64, Row<'_>), Vec<u32>> = ahash::HashMap::default();
         let mut windows = Vec::new();
         for row in 0..batch.num_rows() {
-            let mut key = read_key(&key_arrays, row);
+            let key = keys_encoded.row(row);
             self.windows_for(ts.value(row), &mut windows);
             // Drop windows already closed by the watermark — the row is late for them. The host's
             // per-row assigner drops such rows; the columnar assigner slices batches so a closing
             // watermark precedes any row it makes late, and this is where that row is discarded.
             windows.retain(|(_, end)| *end > self.current_watermark);
-            // Move the row's key into its last window rather than cloning for every one; tumbling has
-            // a single window, so this drops the per-row key clone entirely in the common case.
-            let last = windows.len().saturating_sub(1);
-            for index in 0..windows.len() {
-                let (start, end) = windows[index];
-                let owned = if index == last { std::mem::take(&mut key) } else { key.clone() };
-                grouped.entry((start, end, owned)).or_default().push(row as u32);
+            for &(start, end) in windows.iter() {
+                grouped.entry((start, end, key)).or_default().push(row as u32);
             }
         }
         self.accumulate_grouped(grouped, &values)
@@ -1224,15 +1236,16 @@ impl TumblingAggregator {
             .collect();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, batch.num_rows());
 
         // No late-data drop here (unlike `update`): the upstream window aggregate emits each window's
         // rows exactly at the watermark that closes it, so a re-aggregation over the same window bounds
         // legitimately receives rows whose end equals the current watermark. They fold into their window
         // and the immediately-following flush(watermark) emits it — the re-aggregation window closes with
         // the same watermark as its input.
-        let mut grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>> = ahash::HashMap::default();
+        let mut grouped: ahash::HashMap<(i64, i64, Row<'_>), Vec<u32>> = ahash::HashMap::default();
         for row in 0..batch.num_rows() {
-            let key = read_key(&key_arrays, row);
+            let key = keys_encoded.row(row);
             grouped.entry((starts.value(row), ends.value(row), key)).or_default().push(row as u32);
         }
         self.accumulate_grouped(grouped, &values)
@@ -1244,7 +1257,7 @@ impl TumblingAggregator {
     /// measuring only touched groups keeps accounting O(batch), not O(open state).
     fn accumulate_grouped(
         &mut self,
-        grouped: ahash::HashMap<(i64, i64, GroupKey), Vec<u32>>,
+        grouped: ahash::HashMap<(i64, i64, Row<'_>), Vec<u32>>,
         values: &[&ArrayRef],
     ) -> Result<(), DataFusionError> {
         let track = self.memory.tracking();
@@ -1252,11 +1265,12 @@ impl TumblingAggregator {
             let indices = UInt32Array::from(rows);
             let columns: Vec<ArrayRef> =
                 values.iter().map(|v| take(v, &indices, None).expect("failed to take values")).collect();
+            let key = key.owned();
             let mut delta = 0isize;
             if track {
                 delta = match self.windows.get(&end).and_then(|w| w.keys.get(&key)) {
                     Some(accumulators) => -(accumulators_bytes(accumulators) as isize),
-                    None => group_key_bytes(&key) as isize,
+                    None => owned_row_bytes(&key) as isize,
                 };
             }
             let accumulators = self.accumulators(start, end, key);
@@ -1278,16 +1292,16 @@ impl TumblingAggregator {
     fn flush(&mut self, watermark: i64) -> RecordBatch {
         self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<OwnedRow> = Vec::new();
         let mut starts = Vec::new();
         let mut ends = Vec::new();
         let mut results: Vec<Vec<ScalarValue>> = vec![Vec::new(); n];
         for end in self.closed_windows(watermark) {
             let window = self.windows.remove(&end).expect("window present");
             let start = window.start;
-            let mut group: Vec<(GroupKey, Vec<Box<dyn Accumulator>>)> =
+            let mut group: Vec<(OwnedRow, Vec<Box<dyn Accumulator>>)> =
                 window.keys.into_iter().collect();
-            group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            group.sort_by(|(a, _), (b, _)| a.cmp(b));
             for (key, mut accumulators) in group {
                 self.forget_group_bytes(&key, &accumulators);
                 keys.push(key);
@@ -1301,7 +1315,7 @@ impl TumblingAggregator {
         self.memory.account_shrink();
 
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -1319,14 +1333,14 @@ impl TumblingAggregator {
     fn flush_partial(&mut self, watermark: i64) -> RecordBatch {
         self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<OwnedRow> = Vec::new();
         let mut slice_ends = Vec::new();
         let mut partials: Vec<Vec<ScalarValue>> = vec![Vec::new(); n];
         for end in self.closed_windows(watermark) {
             let window = self.windows.remove(&end).expect("window present");
-            let mut group: Vec<(GroupKey, Vec<Box<dyn Accumulator>>)> =
+            let mut group: Vec<(OwnedRow, Vec<Box<dyn Accumulator>>)> =
                 window.keys.into_iter().collect();
-            group.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            group.sort_by(|(a, _), (b, _)| a.cmp(b));
             for (key, mut accumulators) in group {
                 self.forget_group_bytes(&key, &accumulators);
                 keys.push(key);
@@ -1340,7 +1354,7 @@ impl TumblingAggregator {
         self.memory.account_shrink();
 
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         for (i, scalars) in partials.into_iter().enumerate() {
             let partial_type = self.aggregates[i].state_fields()[0].data_type().clone();
             fields.push(Field::new(format!("partial{i}"), partial_type.clone(), false));
@@ -1358,6 +1372,7 @@ impl TumblingAggregator {
         let n = self.aggregates.len();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, batch.num_rows());
         let slice_ends = column_i64(batch, "slice_end");
         // Partials are read as whole columns and merged a row-slice at a time, so any partial type
         // (int64 sum/count, float64 sum, …) flows through without per-type handling here.
@@ -1367,13 +1382,13 @@ impl TumblingAggregator {
         let track = self.memory.tracking();
         for row in 0..batch.num_rows() {
             let slice_end = slice_ends.value(row);
-            let key = read_key(&key_arrays, row);
+            let key = keys_encoded.row(row).owned();
             for (start, end) in self.partial_windows(slice_end) {
                 let mut delta = 0isize;
                 if track {
                     delta = match self.windows.get(&end).and_then(|w| w.keys.get(&key)) {
                         Some(accumulators) => -(accumulators_bytes(accumulators) as isize),
-                        None => group_key_bytes(&key) as isize,
+                        None => owned_row_bytes(&key) as isize,
                     };
                 }
                 let accumulators = self.accumulators(start, end, key.clone());
@@ -1427,7 +1442,7 @@ impl TumblingAggregator {
 
         let mut ends: Vec<i64> = Vec::new();
         let mut starts: Vec<i64> = Vec::new();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<OwnedRow> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_fields.len()];
         for (end, window) in self.windows.iter_mut() {
             for (key, accumulators) in window.keys.iter_mut() {
@@ -1451,7 +1466,7 @@ impl TumblingAggregator {
         let mut columns: Vec<ArrayRef> =
             vec![Arc::new(Int64Array::from(ends)), Arc::new(Int64Array::from(starts))];
         fields.extend(key_fields(&self.key_types));
-        columns.extend(key_columns(&keys, &self.key_types));
+        columns.extend(decode_keys(self.key_converter.as_ref(), &keys, &self.key_types));
         fields.extend(state_fields.iter().cloned());
         for (index, scalars) in state_columns.into_iter().enumerate() {
             columns.push(if scalars.is_empty() {
@@ -1506,8 +1521,10 @@ impl TumblingAggregator {
                 batch.column(1).as_any().downcast_ref::<Int64Array>().expect("window_start int64");
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(2 + j)).collect();
             aggregator.key_types = key_types(&key_arrays);
+            let keys_encoded =
+                encode_keys(&mut aggregator.key_converter, &key_arrays, batch.num_rows());
             for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
+                let key = keys_encoded.row(row).owned();
                 let mut column = 2 + arity;
                 for (i, accumulator) in aggregator
                     .accumulators(starts.value(row), ends.value(row), key)
@@ -7577,7 +7594,10 @@ fn merge_into(into: &mut [Box<dyn Accumulator>], mut from: Vec<Box<dyn Accumulat
 struct SessionAggregator {
     gap_millis: i64,
     aggregates: Vec<WindowAggregate>,
-    sessions: HashMap<GroupKey, BTreeMap<i64, Session>>,
+    // Keyed by the arrow-row memcomparable key encoding, like the other aggregators (see
+    // `TumblingAggregator::key_converter`).
+    sessions: HashMap<OwnedRow, BTreeMap<i64, Session>>,
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     memory: OperatorMemory,
 }
@@ -7593,6 +7613,7 @@ impl SessionAggregator {
             gap_millis,
             aggregates: build_aggregates(&kinds, &value_types),
             sessions: HashMap::new(),
+            key_converter: None,
             key_types: Vec::new(),
             memory: OperatorMemory::unaccounted(),
         }
@@ -7605,7 +7626,7 @@ impl SessionAggregator {
             .sessions
             .iter()
             .map(|(key, map)| {
-                group_key_bytes(key) + map.values().map(session_bytes).sum::<usize>()
+                owned_row_bytes(key) + map.values().map(session_bytes).sum::<usize>()
             })
             .sum();
         self.memory.attach("session-aggregate", budget_bytes, state)?;
@@ -7620,6 +7641,7 @@ impl SessionAggregator {
             .collect();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, batch.num_rows());
 
         // Group row positions per key, then segment each key's rows (in timestamp order) into
         // gap-connected runs — within a run every row is within `gap` of the next, so the run forms
@@ -7627,16 +7649,17 @@ impl SessionAggregator {
         // per row (Arroyo's session operator likewise partitions the batch per key and feeds
         // sessions batch slices). The runs are exactly the connected components the row-at-a-time
         // walk would build, so merging each run against the stored sessions gives the same result.
-        let mut by_key: ahash::HashMap<GroupKey, Vec<u32>> = ahash::HashMap::default();
+        let mut by_key: ahash::HashMap<Row<'_>, Vec<u32>> = ahash::HashMap::default();
         for row in 0..batch.num_rows() {
-            by_key.entry(read_key(&key_arrays, row)).or_default().push(row as u32);
+            by_key.entry(keys_encoded.row(row)).or_default().push(row as u32);
         }
         let track = self.memory.tracking();
         for (key, mut rows) in by_key {
             rows.sort_by_key(|&row| ts.value(row as usize));
+            let key = key.owned();
             let mut delta = 0isize;
             if track && !self.sessions.contains_key(&key) {
-                delta += group_key_bytes(&key) as isize;
+                delta += owned_row_bytes(&key) as isize;
             }
             let map = self.sessions.entry(key).or_default();
             let mut run_start = 0;
@@ -7710,7 +7733,7 @@ impl SessionAggregator {
     /// not a fixed offset, so it travels as its own column.
     fn flush(&mut self, watermark: i64) -> RecordBatch {
         let n = self.aggregates.len();
-        let mut rows: Vec<(GroupKey, i64, i64, Vec<ScalarValue>)> = Vec::new();
+        let mut rows: Vec<(OwnedRow, i64, i64, Vec<ScalarValue>)> = Vec::new();
         let track = self.memory.tracking();
         let mut freed = 0usize;
         for (key, map) in self.sessions.iter_mut() {
@@ -7732,7 +7755,7 @@ impl SessionAggregator {
         self.sessions.retain(|key, map| {
             if map.is_empty() {
                 if track {
-                    freed += group_key_bytes(key);
+                    freed += owned_row_bytes(key);
                 }
                 return false;
             }
@@ -7742,13 +7765,13 @@ impl SessionAggregator {
             self.memory.forget(freed);
             self.memory.account_shrink();
         }
-        rows.sort_by(|a, b| (&a.0, a.1).partial_cmp(&(&b.0, b.1)).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
 
-        let keys: Vec<GroupKey> = rows.iter().map(|(key, ..)| key.clone()).collect();
+        let keys: Vec<OwnedRow> = rows.iter().map(|(key, ..)| key.clone()).collect();
         let starts: Vec<i64> = rows.iter().map(|(_, start, ..)| *start).collect();
         let ends: Vec<i64> = rows.iter().map(|(_, _, end, _)| *end).collect();
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -7768,7 +7791,7 @@ impl SessionAggregator {
         let state_fields: Vec<Field> =
             self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
 
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<OwnedRow> = Vec::new();
         let mut starts: Vec<i64> = Vec::new();
         let mut ends: Vec<i64> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_fields.len()];
@@ -7788,7 +7811,7 @@ impl SessionAggregator {
         }
 
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         fields.push(Field::new("window_start", DataType::Int64, false));
         fields.push(Field::new("window_end", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(starts)));
@@ -7826,6 +7849,8 @@ impl SessionAggregator {
             let arity = batch.num_columns() - 2 - state_field_total;
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
             aggregator.key_types = key_types(&key_arrays);
+            let keys_encoded =
+                encode_keys(&mut aggregator.key_converter, &key_arrays, batch.num_rows());
             let starts = batch
                 .column(arity)
                 .as_any()
@@ -7849,7 +7874,7 @@ impl SessionAggregator {
                 }
                 aggregator
                     .sessions
-                    .entry(read_key(&key_arrays, row))
+                    .entry(keys_encoded.row(row).owned())
                     .or_default()
                     .insert(starts.value(row), Session { end: ends.value(row), accumulators });
             }

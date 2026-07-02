@@ -109,10 +109,12 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (the ticket 11
    operators and any remaining expression tail) before broadening where we read/write.
-2. **Operator-level perf** (ticket 20 backlog): per-row `GroupKey` allocation in aggregators.
-   (Session `update` now batches gap-connected runs instead of slicing per row — 9.4× on the dense
-   shape; the `RowData → Arrow` transpose was made row-major + pre-sized, ~25% faster; a native
-   decoder was investigated and rejected on benchmark grounds — ticket 28.)
+2. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
+   keyed loops (dedup, `OVER` partitions, Top-N, exchange split) — swap to arrow-row keys only
+   with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
+   session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
+   transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
+   rejected on benchmark grounds — ticket 28.)
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate

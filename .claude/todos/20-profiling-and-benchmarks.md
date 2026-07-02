@@ -42,19 +42,20 @@ vs. Flink fallback, tracked over time so a regression is visible.
   The legacy `filterBatch`/`filterGreaterThan`/`doubleColumn` still re-plan per batch
   but are superseded (filterBatch) or demos — remove once the planner routes through
   the expression handle.
-- **Per-row key allocation.** The aggregator `update` builds a `GroupKey`
-  (`Vec<ScalarValue>`, and a `String` per row for string keys) for every row. The
-  per-window *clone* is gone (moved into the last window) and the grouping map now uses a
-  fast hash (`ahash`) instead of SipHash, but the per-row `Vec` allocation remains.
-  - **[done]** The non-windowed `GROUP BY` no longer clones the key per row to reach its
-    group: an existing group (the steady state) is reached by `get_mut`, cloning only when a
-    new group is inserted. ~8% on the string-key micro-bench (`group_by/sum_string_key`,
-    2.00 → 1.85 ms). The same get-vs-insert pattern could be applied to the other keyed
-    operators' update loops.
-  - Remaining: the per-row `read_key` `Vec`/`String` allocation itself. Row-format
-    (`arrow::row::RowConverter`) or dictionary-encoded keys are the next target — biggest win
-    for string/composite keys (a single bigint key barely allocates). The `ahash` swap likely
-    helps the session/partial grouping maps too — apply once those have benches.
+- **Per-row key allocation.** The aggregator `update` built a `GroupKey`
+  (`Vec<ScalarValue>`, and a `String` per row for string keys) for every row.
+  - **[done]** The non-windowed `GROUP BY` keys its state by the arrow-row memcomparable
+    encoding (encoded once per batch), reaching an existing group by `get_mut` and cloning
+    only on insert.
+  - **[done]** The windowed aggregators (tumbling/hopping/cumulative + session) made the same
+    swap: per-batch grouping maps hold borrowed byte-row views (zero per-row allocation), state
+    maps hold `OwnedRow`, and flush decodes keys straight back into output columns via the
+    shared converter. Keyed tumbling 245 → 110 µs (2.2×, ~37 Melem/s), dense session
+    217 → 101 µs, unkeyed tumbling −12%, accounted variant identical.
+  - Remaining: the scalar `GroupKey` survives in the smaller keyed loops — dedup, `OVER`
+    partitions, Top-N bookkeeping, the exchange by-key split (`partition_batch`). Swap each to
+    row keys only with a bench showing it pays; the exchange's consistent hash would change
+    key→partition mapping, which is internal but worth a note when touched.
 - **[fixed]** `windows_for` allocated a `Vec` per row in the update loop. Reusing one
   buffer across rows cut the tumbling bench ~26% (244 → 181 µs / 17 → 22.6 Melem/s).
 - **[fixed]** Session `update` sliced one row at a time. Now grouped per key and segmented into

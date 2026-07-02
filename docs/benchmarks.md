@@ -53,21 +53,21 @@ measured before the pin (or without it) are not comparable to these.
 | Benchmark | Rows/batch | Time/batch | Elements/s | Notes |
 |---|---|---|---|---|
 | `filter/gt_literal` | 4096 | 2.5 µs | ~1.63 Gelem/s | compiled predicate, ~50% selectivity |
-| `tumbling/sum_update_flush` | 4096 | 84 µs | ~48.8 Melem/s | 16 windows, no key |
-| `tumbling/sum_keyed_update_flush` | 4096 | 245 µs | ~16.7 Melem/s | 16 windows, 64 bigint keys |
-| `tumbling/sum_keyed_update_flush_accounted` | 4096 | 246 µs | ~16.6 Melem/s | same, managed-memory budget attached (≤1% overhead) |
+| `tumbling/sum_update_flush` | 4096 | 77 µs | ~53.5 Melem/s | 16 windows, no key |
+| `tumbling/sum_keyed_update_flush` | 4096 | 110 µs | ~37.4 Melem/s | 16 windows, 64 bigint keys |
+| `tumbling/sum_keyed_update_flush_accounted` | 4096 | 106 µs | ~38.5 Melem/s | same, managed-memory budget attached (≤1% overhead) |
 | `interval_join/equi_key_push` | 4096 | 63 µs | ~65 Melem/s | INNER, 1:1, equi-key + interval filter |
 | `window_join/equi_key_flush` | 4096 | 130 µs | ~31.5 Melem/s | INNER, 1:1, equi-key + window bounds |
 | `over/running_sum_keyed` | 4096 | 515 µs | ~8.0 Melem/s | running aggregate, specialized fold, 64 keys |
 | `over/row_number_keyed` | 4096 | 410 µs | ~10.0 Melem/s | per-key counter, 64 keys |
-| `session/sum_keyed_update_flush` | 4096 | ~2.4 ms | ~1.7 Melem/s | one-row sessions, 64 keys (high-variance) |
-| `session/sum_keyed_dense_update_flush` | 4096 | 217 µs | ~18.8 Melem/s | gap-chained sessions, 64 keys |
+| `session/sum_keyed_update_flush` | 4096 | ~2.2 ms | ~1.9 Melem/s | one-row sessions, 64 keys (high-variance) |
+| `session/sum_keyed_dense_update_flush` | 4096 | 101 µs | ~40.4 Melem/s | gap-chained sessions, 64 keys |
 | `json_decode/three_field_object` | 4096 | 610 µs | ~6.7 Melem/s | ~46 B docs, simd-json tape walk |
 | `json_decode/nexmark_bid_shape` | 4096 | 985 µs | ~4.2 Melem/s | ~210 B docs, 4 of 7 fields skipped |
 
 The gap between filter and aggregation is the signal: the filter is a compiled
-expression plus one Arrow kernel, while the tumbling aggregator groups every row by a
-`GroupKey` (`Vec<ScalarValue>`) — and the keyed case still costs ~2.4× the unkeyed one.
+expression plus one Arrow kernel, while an aggregator groups every row by its key and
+holds per-group accumulator state across batches.
 Profiling-driven cuts so far (tumbling, 4096-row batch):
 
 - reusing the per-row window buffer instead of allocating one per row (244 → 181 µs);
@@ -91,18 +91,25 @@ Profiling-driven cuts so far (tumbling, 4096-row batch):
   (2.04 ms → 217 µs, 9.4×, on the dense gap-chained shape; the one-row-session shape is
   per-session-bound and unchanged). The open-session merge scan also became a bounded
   `BTreeMap` range probe instead of a walk of every open session, which matters when a key
-  holds many not-yet-closed sessions.
+  holds many not-yet-closed sessions;
+- the windowed aggregators (tumbling/hopping/cumulative and session) swapped their
+  `Vec<ScalarValue>` group keys for the arrow-row memcomparable encoding the non-windowed
+  GROUP BY already used: keys are encoded once per batch, the per-batch grouping map holds
+  borrowed byte-row views (no per-row allocation), and flush decodes stored keys straight
+  back into output columns (keyed tumbling 245 → 110 µs, 2.2×; dense session 217 → 101 µs;
+  the managed-memory-accounted variant gained the same).
 
-Net so far: the unkeyed tumbling path is ~2.9× faster (244 → ~84 µs) and the keyed path ~1.6×
-(395 → ~245 µs). The remaining per-row `GroupKey` allocation is the next target
-(row-format or dictionary-encoded keys) — see the [profiling
+Net so far: the unkeyed tumbling path is ~3.2× faster (244 → ~77 µs) and the keyed path ~3.6×
+(395 → ~110 µs). The scalar `GroupKey` now survives only in the smaller keyed loops (dedup,
+`OVER` partitions, Top-N, the exchange split) — candidates for the same row-key swap if their
+benches say it pays; see the [profiling
 ticket](../.claude/todos/20-profiling-and-benchmarks.md).
 
 The running `OVER` aggregate was the per-row outlier (~2.6 Melem/s, a DataFusion accumulator
 `update_batch` + `evaluate` per row); replacing it with a specialized typed running fold —
 matching the accumulators exactly (wrapping integer sum, null-skipping) but without the per-row
 call — took it to ~8 Melem/s (3×). The session aggregator's dense (gap-chained) shape now runs at
-tumbling-level throughput (~18.8 Melem/s); its sparse shape (~1.7 Melem/s, high-variance) is bound
+tumbling-level throughput (~40 Melem/s); its sparse shape (~1.9 Melem/s, high-variance) is bound
 by genuinely per-session costs — accumulator creation and flush materialization for 4096 one-row
 sessions — not by the update loop.
 
