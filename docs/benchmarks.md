@@ -308,8 +308,9 @@ holds that state easily, so the benchmark cluster is sized to match). Reserving 
 bookkeeping, not allocation — the budget costs nothing until state actually grows into it.
 
 All the stateful operators run **columnar on Arrow byte-state**: Top-N, keep-last dedup, the updating
-join, and the group/`DISTINCT` aggregate key and buffer their state as memcomparable arrow-row bytes (à
-la RisingWave's value-encoded state + Arroyo's `RowConverter`), not boxed `Vec<ScalarValue>`.
+join, and the group/`DISTINCT` and windowed (tumbling/hopping/cumulative/session) aggregates key and
+buffer their state as memcomparable arrow-row bytes (à la RisingWave's value-encoded state + Arroyo's
+`RowConverter`), not boxed `Vec<ScalarValue>`.
 
 _Numbers are one **combined run** — every query in a single JVM, best of 2 after a warmup, 500K events.
 A combined run accumulates heap/GC pressure that disproportionately slows the alloc-heavier native side,
@@ -320,22 +321,23 @@ twice — the byte-parity default and the opt-in native regex/case path, see †
 
 | Query | Shape | Native vs. Flink |
 |---|---|---|
-| q11 | session-window `COUNT` per bidder | **2.41×** |
+| q11 | session-window `COUNT` per bidder | **2.73×** |
 | q12 | proctime tumble `COUNT` per bidder | **1.53×** |
 | q0 | pass-through projection of `bid` | **1.34×** |
 | q7 | tumble `MAX` ⋈ bid | **1.32×** |
+| q5 | Hot Items (window re-agg + window join) | **1.32×** |
 | q4 | regular join → `MAX` → `AVG` per category | **1.29×** |
 | q2 | filter `WHERE MOD(auction, 123) = 0` | **1.27×** |
 | q1 | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.17×** |
 | q15 | multi-`DISTINCT` `COUNT`s per day | **1.14×** |
 | q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.09×** |
-| q5 | Hot Items (window re-agg + window join) | **1.00×** |
 | q14 | `HOUR`/`CASE` + `count_char` UDF + decimal | **1.00×** |
 | q10 | `DATE_FORMAT` projection | 0.99× |
 | q17 | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | 0.99× |
 | q9 | regular join → `ROW_NUMBER` (≤ 1) | 0.99× |
 | q13 | lookup join (bounded dimension) | 0.96× |
 | q19 | `ROW_NUMBER` topN (≤ 10) | 0.92× |
+| q8 | tumble windowed-distinct ⋈ join | 0.92× |
 | q23 | three-way join `bid ⋈ person ⋈ auction` | 0.87× |
 | q16 | multi-`DISTINCT` per channel/day | 0.84× |
 | q18 | `ROW_NUMBER` dedup (≤ 1) | 0.82× |
@@ -343,7 +345,6 @@ twice — the byte-parity default and the opt-in native regex/case path, see †
 | q20 | updating join (`category = 10`) | 0.73× |
 | q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.71× |
 | q21 † | …same, pure-native Rust regex/case (opt-in, non-parity) | **1.50×** |
-| q8 | tumble windowed-distinct ⋈ join | 0.70× |
 
 **Parquet file** — the columnar-source case: the native island reads Arrow straight from the
 `filesystem`/`parquet` scan, so there is no `RowData → Arrow` transpose at ingest (only the sink
@@ -367,15 +368,17 @@ transpose remains). Same queries, same order as the generator table above:
 
 Every query but q16 clears 1× by a wide margin — **2–4.6×** — because the ingest transpose is gone: the
 scan feeds Arrow batches directly into the operator, and only the `blackhole` sink pays a transpose.
-The queries that are transpose-bound on the generator (q8 at 0.70×, q3 at 0.80×, q20 at 0.73×) are
+The queries that are transpose-bound on the generator (q8 at 0.92×, q3 at 0.80×, q20 at 0.73×) are
 exactly the ones that jump the most here (q8 4.60×, q3 4.21×, q20 2.84×) — confirming their generator
 cost was the `RowData` perimeter, not the operator. Parquet's rowtime is a plain `TIMESTAMP(3)`, so the
 `DATE_FORMAT`/`HOUR` queries (q10/q14/q15/q16/q17) run natively (over the Kafka `TIMESTAMP_LTZ` they run
 natively too now — see the Kafka table's `§` note). Only q16's multi-`DISTINCT` accumulator (still
 `ScalarValue`-boxed) stays below 1×.
 
-**Ten clear 1.0× even on this conservative combined run, and another seven (q9/q13/q15/q17/q19/q23/q5)
-sit within noise of parity.** The **updating-join family is the big mover**: a CPU profile put ~40% of
+**Ten clear 1.0× even on this conservative combined run, and another seven (q8/q9/q10/q13/q14/q17/q19)
+sit within noise of parity.** The window-aggregate queries moved when the aggregators went to
+arrow-row keys and the session update went run-batched: **q5 1.00→1.32, q8 0.70→0.92, q11
+2.41→2.73**. The **updating-join family was the earlier big mover**: a CPU profile put ~40% of
 the worst query (q9) in the joiner. Making the INNER join batch its whole input — gather all candidate
 pairs against the fixed probe side, evaluate the residual predicate once columnar, emit by
 `filter_record_batch`, and move rows into state instead of re-cloning — lifted **q9 0.39→0.97, q4
@@ -387,7 +390,8 @@ reuses pooled `BinaryRowData`, its cost landing in GC). Cutting those allocation
 allocator, closed the gap ([divergences/08](../divergences/08-columnar-flow-transitions.md)).
 
 What still trails 1× is three distinct residues: q8 is transpose-bound (a window join with only a ~9%
-native island); q16's multi-`DISTINCT` accumulator still churns `ScalarValue`; and q20/q3 are wide
+native island — its windowed-distinct half got 0.70→0.92 from the arrow-row keys, the rest is the
+perimeter); q16's multi-`DISTINCT` accumulator still churns `ScalarValue`; and q20/q3 are wide
 updating joins whose remaining cost is the per-row state store that Flink pools.
 
 **† q21 is reported on both paths.** By default its `REGEXP_EXTRACT` and `LOWER` run through a
