@@ -58,6 +58,8 @@ measured before the pin (or without it) are not comparable to these.
 | `over/running_sum_keyed` | 4096 | 515 µs | ~8.0 Melem/s | running aggregate, specialized fold, 64 keys |
 | `over/row_number_keyed` | 4096 | 410 µs | ~10.0 Melem/s | per-key counter, 64 keys |
 | `session/sum_keyed_update_flush` | 4096 | ~2.5 ms | ~1.7 Melem/s | gap merge, 64 keys (high-variance) |
+| `json_decode/three_field_object` | 4096 | 610 µs | ~6.7 Melem/s | ~46 B docs, simd-json tape walk |
+| `json_decode/nexmark_bid_shape` | 4096 | 985 µs | ~4.2 Melem/s | ~210 B docs, 4 of 7 fields skipped |
 
 The gap between filter and aggregation is the signal: the filter is a compiled
 expression plus one Arrow kernel, while the tumbling aggregator groups every row by a
@@ -74,7 +76,11 @@ Profiling-driven cuts so far (tumbling, 4096-row batch):
 - the joins stopped rebuilding a full DataFusion `SessionContext` (its entire function
   registry) per pushed batch — a bare `TaskContext` (or the operator's cached pool-wired
   one, when accounted) is all a hash join needs (interval join ~115 → ~63 µs, window join
-  ~184 → ~130 µs at equal codegen settings).
+  ~184 → ~130 µs at equal codegen settings);
+- the Kafka JSON/CDC decode swapped arrow-json's scalar tokenizer for a simd-json (SIMD
+  stage-1) parse walked straight into typed Arrow builders — ~8% on tiny 3-field documents,
+  ~27% on a realistic Nexmark-bid-sized document (1.36 ms → 985 µs; decimal-bearing schemas
+  keep the arrow-json raw-literal path for exactness — see `divergences/18`).
 
 Net so far: the unkeyed tumbling path is ~2.9× faster (244 → ~84 µs) and the keyed path ~1.6×
 (395 → ~245 µs). The remaining per-row `GroupKey` allocation is the next target

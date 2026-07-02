@@ -171,11 +171,39 @@ fn bench_json_decode(c: &mut Criterion) {
     )
     .unwrap();
 
-    let decoder = JsonDecode::new(schema);
+    let decoder = JsonDecode::new(schema.clone());
     let mut group = c.benchmark_group("json_decode");
     group.throughput(Throughput::Elements(ROWS as u64));
     group.bench_function("three_field_object", |b| {
         b.iter(|| black_box(decoder.decode(black_box(&batch))))
+    });
+
+    // A Nexmark-bid-sized document (~210 bytes): the same three projected fields plus the fields a
+    // real event carries that the pruned schema skips — the shape a routed query actually decodes.
+    let docs: Vec<&[u8]> = (0..ROWS)
+        .map(|i| {
+            Box::leak(
+                format!(
+                    r#"{{"id": {i}, "name": "row-{i}", "score": {}.5, "channel": "channel-{}", "url": "https://example.com/item/{i}?tab=all", "dateTime": "2026-07-01 12:{:02}:{:02}.{:03}", "extra": "IdMkfLtiXpKuwqNnWEyPTgAbCdEfGhIjKlMnOpQrStUv"}}"#,
+                    i % 100,
+                    i % 10,
+                    i % 60,
+                    (i / 60) % 60,
+                    i % 1000
+                )
+                .into_boxed_str(),
+            )
+            .as_bytes()
+        })
+        .collect();
+    let body: ArrayRef = Arc::new(arrow::array::BinaryArray::from(docs));
+    let wide = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)])),
+        vec![body],
+    )
+    .unwrap();
+    group.bench_function("nexmark_bid_shape", |b| {
+        b.iter(|| black_box(decoder.decode(black_box(&wide))))
     });
     group.finish();
 }

@@ -1,10 +1,19 @@
+use arrow::array::builder::{BooleanBuilder, PrimitiveBuilder, StringBuilder};
+use arrow::array::types::{
+    Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+    TimestampNanosecondType,
+};
 use arrow::array::{
-    make_array, new_empty_array, new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array,
-    Float32Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
+    make_array, new_empty_array, new_null_array, Array, ArrayRef, BooleanArray, Decimal128Array,
+    Float32Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray,
     RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, UInt32Array,
 };
+use arrow::array::NullBufferBuilder;
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::compute::kernels::cast_utils::{string_to_datetime, Parser};
 use arrow::compute::{concat_batches, filter_record_batch, take, SortOptions};
+use arrow::datatypes::ArrowPrimitiveType;
 use arrow::row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
@@ -9777,45 +9786,529 @@ fn orc_file_schema(path: &str) -> SchemaRef {
 /// `byte[] -> tree -> RowData` materialization with a single batched decode straight to columnar
 /// form, so the row representation never exists on the hot ingest path. The body column may arrive as
 /// binary or string (whichever the source-edge transpose produced for the message bytes).
+/// One column's JSON→Arrow appender in the simd-json decode path: a schema-driven walk of the parse
+/// tape appending straight into a typed builder. `None` (a field absent from the object) and an
+/// explicit JSON null both append SQL NULL. The per-type semantics replicate arrow-json's reader —
+/// which the Kafka JSON parity tests pin against Flink — so swapping the parser changes no output.
+trait JsonAppend {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>);
+    /// Appends a JSON object key (always a raw string): scalar targets parse it exactly like a
+    /// string-positioned value. Only map key columns reach this.
+    fn append_key(&mut self, key: &str);
+    fn finish(&mut self) -> ArrayRef;
+}
+
+/// Integers, floats, and dates: numbers convert through `NumCast` (a float for an integer column
+/// truncates toward zero) and strings parse via arrow-cast's `Parser`, both exactly as arrow-json.
+struct PrimitiveJsonAppender<T: ArrowPrimitiveType> {
+    builder: PrimitiveBuilder<T>,
+    data_type: DataType,
+}
+
+impl<T: ArrowPrimitiveType> PrimitiveJsonAppender<T> {
+    fn new(data_type: &DataType, capacity: usize) -> PrimitiveJsonAppender<T> {
+        PrimitiveJsonAppender {
+            builder: PrimitiveBuilder::<T>::with_capacity(capacity)
+                .with_data_type(data_type.clone()),
+            data_type: data_type.clone(),
+        }
+    }
+}
+
+impl<T> JsonAppend for PrimitiveJsonAppender<T>
+where
+    T: ArrowPrimitiveType + Parser,
+    T::Native: num_traits::NumCast,
+{
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use num_traits::NumCast;
+        use simd_json::prelude::*;
+        let Some(v) = value else {
+            self.builder.append_null();
+            return;
+        };
+        let parsed: Option<T::Native> = match v.value_type() {
+            simd_json::ValueType::Null => {
+                self.builder.append_null();
+                return;
+            }
+            simd_json::ValueType::String => {
+                self.append_key(v.as_str().expect("string node"));
+                return;
+            }
+            simd_json::ValueType::I64 => NumCast::from(v.as_i64().expect("i64 node")),
+            simd_json::ValueType::U64 => NumCast::from(v.as_u64().expect("u64 node")),
+            simd_json::ValueType::F64 => NumCast::from(v.as_f64().expect("f64 node")),
+            other => panic!("failed to decode JSON {other:?} as {}", self.data_type),
+        };
+        let parsed =
+            parsed.unwrap_or_else(|| panic!("JSON number out of range for {}", self.data_type));
+        self.builder.append_value(parsed);
+    }
+
+    fn append_key(&mut self, key: &str) {
+        let parsed = T::parse(key)
+            .unwrap_or_else(|| panic!("failed to parse \"{key}\" as {}", self.data_type));
+        self.builder.append_value(parsed);
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        Arc::new(self.builder.finish())
+    }
+}
+
+/// TIMESTAMP / TIMESTAMP_LTZ (nanosecond): strings parse through the same arrow-cast datetime parser
+/// arrow-json uses (SQL `yyyy-MM-dd HH:mm:ss[.SSS]` and ISO-8601 forms); a bare number is taken as a
+/// raw nanosecond epoch value, saturating like arrow-json's float fallback.
+struct TimestampJsonAppender {
+    builder: PrimitiveBuilder<TimestampNanosecondType>,
+    data_type: DataType,
+}
+
+impl TimestampJsonAppender {
+    fn new(data_type: &DataType, capacity: usize) -> TimestampJsonAppender {
+        TimestampJsonAppender {
+            builder: PrimitiveBuilder::with_capacity(capacity).with_data_type(data_type.clone()),
+            data_type: data_type.clone(),
+        }
+    }
+}
+
+impl JsonAppend for TimestampJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let Some(v) = value else {
+            self.builder.append_null();
+            return;
+        };
+        let nanos = match v.value_type() {
+            simd_json::ValueType::Null => {
+                self.builder.append_null();
+                return;
+            }
+            simd_json::ValueType::String => {
+                self.append_key(v.as_str().expect("string node"));
+                return;
+            }
+            simd_json::ValueType::I64 => v.as_i64().expect("i64 node"),
+            simd_json::ValueType::U64 => {
+                v.as_u64().expect("u64 node").min(i64::MAX as u64) as i64
+            }
+            simd_json::ValueType::F64 => v.as_f64().expect("f64 node") as i64,
+            other => panic!("failed to decode JSON {other:?} as {}", self.data_type),
+        };
+        self.builder.append_value(nanos);
+    }
+
+    fn append_key(&mut self, key: &str) {
+        let date = string_to_datetime(&chrono::Utc, key)
+            .unwrap_or_else(|e| panic!("failed to parse \"{key}\" as {}: {e}", self.data_type));
+        let nanos = date
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| panic!("\"{key}\" overflows 64-bit signed nanoseconds"));
+        self.builder.append_value(nanos);
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        Arc::new(self.builder.finish())
+    }
+}
+
+struct BooleanJsonAppender {
+    builder: BooleanBuilder,
+}
+
+impl JsonAppend for BooleanJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let Some(v) = value else {
+            self.builder.append_null();
+            return;
+        };
+        match v.value_type() {
+            simd_json::ValueType::Null => self.builder.append_null(),
+            simd_json::ValueType::Bool => {
+                self.builder.append_value(v.as_bool().expect("bool node"))
+            }
+            other => panic!("failed to decode JSON {other:?} as BOOLEAN"),
+        }
+    }
+
+    fn append_key(&mut self, key: &str) {
+        panic!("failed to parse map key \"{key}\" as BOOLEAN");
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        Arc::new(self.builder.finish())
+    }
+}
+
+struct StringJsonAppender {
+    builder: StringBuilder,
+}
+
+impl JsonAppend for StringJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let Some(v) = value else {
+            self.builder.append_null();
+            return;
+        };
+        match v.value_type() {
+            simd_json::ValueType::Null => self.builder.append_null(),
+            simd_json::ValueType::String => {
+                self.builder.append_value(v.as_str().expect("string node"))
+            }
+            other => panic!("failed to decode JSON {other:?} as VARCHAR"),
+        }
+    }
+
+    fn append_key(&mut self, key: &str) {
+        self.builder.append_value(key);
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        Arc::new(self.builder.finish())
+    }
+}
+
+struct StructJsonAppender {
+    fields: Fields,
+    children: Vec<Box<dyn JsonAppend>>,
+    /// Name→child lookup above a linear-scan threshold (arrow-json's heuristic: a map only pays for
+    /// itself on wide structs).
+    index: Option<HashMap<String, usize>>,
+    nulls: NullBufferBuilder,
+}
+
+impl StructJsonAppender {
+    fn new(fields: &Fields, capacity: usize) -> StructJsonAppender {
+        let children =
+            fields.iter().map(|f| make_json_appender(f.data_type(), capacity)).collect();
+        let index = (fields.len() >= 16).then(|| {
+            let mut map = HashMap::with_capacity(fields.len());
+            for (i, field) in fields.iter().enumerate() {
+                map.entry(field.name().clone()).or_insert(i);
+            }
+            map
+        });
+        StructJsonAppender {
+            fields: fields.clone(),
+            children,
+            index,
+            nulls: NullBufferBuilder::new(capacity),
+        }
+    }
+
+    fn field_index(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(map) => map.get(name).copied(),
+            None => self.fields.iter().position(|f| f.name() == name),
+        }
+    }
+
+    /// Collects the last value per field first (duplicate keys: last wins, like arrow-json and
+    /// Jackson; unknown keys are ignored), then appends one value per child so every column stays
+    /// row-aligned.
+    fn append_object(&mut self, object: &simd_json::tape::Object<'_, '_>) {
+        const STACK_FIELDS: usize = 32;
+        let count = self.children.len();
+        let mut stack = [None; STACK_FIELDS];
+        let mut heap = Vec::new();
+        let slots: &mut [Option<simd_json::tape::Value>] = if count <= STACK_FIELDS {
+            &mut stack[..count]
+        } else {
+            heap.resize(count, None);
+            &mut heap
+        };
+        for (key, value) in object {
+            if let Some(i) = self.field_index(key) {
+                slots[i] = Some(value);
+            }
+        }
+        for (child, slot) in self.children.iter_mut().zip(slots.iter()) {
+            child.append(*slot);
+        }
+    }
+
+    fn finish_columns(&mut self) -> Vec<ArrayRef> {
+        self.children.iter_mut().map(|c| c.finish()).collect()
+    }
+}
+
+impl JsonAppend for StructJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let object = value.and_then(|v| match v.value_type() {
+            simd_json::ValueType::Null => None,
+            _ => Some(
+                v.as_object()
+                    .unwrap_or_else(|| panic!("failed to decode JSON {:?} as ROW", v.value_type())),
+            ),
+        });
+        match object {
+            None => {
+                self.nulls.append_null();
+                for child in &mut self.children {
+                    child.append(None);
+                }
+            }
+            Some(object) => {
+                self.nulls.append_non_null();
+                self.append_object(&object);
+            }
+        }
+    }
+
+    fn append_key(&mut self, key: &str) {
+        panic!("failed to parse map key \"{key}\" as ROW");
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let columns = self.finish_columns();
+        let nulls = self.nulls.finish();
+        Arc::new(
+            StructArray::try_new(self.fields.clone(), columns, nulls)
+                .expect("failed to build JSON struct column"),
+        )
+    }
+}
+
+struct ListJsonAppender {
+    field: FieldRef,
+    child: Box<dyn JsonAppend>,
+    offsets: Vec<i32>,
+    nulls: NullBufferBuilder,
+}
+
+impl ListJsonAppender {
+    fn new(field: &FieldRef, capacity: usize) -> ListJsonAppender {
+        ListJsonAppender {
+            field: field.clone(),
+            child: make_json_appender(field.data_type(), capacity),
+            offsets: vec![0],
+            nulls: NullBufferBuilder::new(capacity),
+        }
+    }
+}
+
+impl JsonAppend for ListJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let array = value.and_then(|v| match v.value_type() {
+            simd_json::ValueType::Null => None,
+            _ => Some(v.as_array().unwrap_or_else(|| {
+                panic!("failed to decode JSON {:?} as ARRAY", v.value_type())
+            })),
+        });
+        let mut end = *self.offsets.last().expect("non-empty offsets");
+        match array {
+            None => self.nulls.append_null(),
+            Some(array) => {
+                self.nulls.append_non_null();
+                for element in &array {
+                    self.child.append(Some(element));
+                    end = end.checked_add(1).expect("offset overflow decoding ARRAY");
+                }
+            }
+        }
+        self.offsets.push(end);
+    }
+
+    fn append_key(&mut self, key: &str) {
+        panic!("failed to parse map key \"{key}\" as ARRAY");
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let values = self.child.finish();
+        let offsets =
+            OffsetBuffer::new(ScalarBuffer::from(std::mem::replace(&mut self.offsets, vec![0])));
+        Arc::new(
+            ListArray::try_new(self.field.clone(), offsets, values, self.nulls.finish())
+                .expect("failed to build JSON array column"),
+        )
+    }
+}
+
+/// MAP (and MULTISET riding as `MAP<E, INT>`): a JSON object per row, each key parsed by the key
+/// column's scalar appender and each value decoded normally.
+struct MapJsonAppender {
+    entries_field: FieldRef,
+    entry_fields: Fields,
+    keys: Box<dyn JsonAppend>,
+    values: Box<dyn JsonAppend>,
+    offsets: Vec<i32>,
+    nulls: NullBufferBuilder,
+}
+
+impl MapJsonAppender {
+    fn new(entries_field: &FieldRef, capacity: usize) -> MapJsonAppender {
+        let entry_fields = match entries_field.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => fields.clone(),
+            other => panic!("MAP entries must be a two-field struct, got {other}"),
+        };
+        MapJsonAppender {
+            entries_field: entries_field.clone(),
+            keys: make_json_appender(entry_fields[0].data_type(), capacity),
+            values: make_json_appender(entry_fields[1].data_type(), capacity),
+            entry_fields,
+            offsets: vec![0],
+            nulls: NullBufferBuilder::new(capacity),
+        }
+    }
+}
+
+impl JsonAppend for MapJsonAppender {
+    fn append(&mut self, value: Option<simd_json::tape::Value<'_, '_>>) {
+        use simd_json::prelude::*;
+        let object = value.and_then(|v| match v.value_type() {
+            simd_json::ValueType::Null => None,
+            _ => Some(
+                v.as_object()
+                    .unwrap_or_else(|| panic!("failed to decode JSON {:?} as MAP", v.value_type())),
+            ),
+        });
+        let mut end = *self.offsets.last().expect("non-empty offsets");
+        match object {
+            None => self.nulls.append_null(),
+            Some(object) => {
+                self.nulls.append_non_null();
+                for (key, value) in &object {
+                    self.keys.append_key(key);
+                    self.values.append(Some(value));
+                    end = end.checked_add(1).expect("offset overflow decoding MAP");
+                }
+            }
+        }
+        self.offsets.push(end);
+    }
+
+    fn append_key(&mut self, key: &str) {
+        panic!("failed to parse map key \"{key}\" as MAP");
+    }
+
+    fn finish(&mut self) -> ArrayRef {
+        let entries = StructArray::try_new(
+            self.entry_fields.clone(),
+            vec![self.keys.finish(), self.values.finish()],
+            None,
+        )
+        .expect("failed to build JSON map entries");
+        let offsets =
+            OffsetBuffer::new(ScalarBuffer::from(std::mem::replace(&mut self.offsets, vec![0])));
+        Arc::new(
+            MapArray::try_new(self.entries_field.clone(), offsets, entries, self.nulls.finish(), false)
+                .expect("failed to build JSON map column"),
+        )
+    }
+}
+
+/// The types here are exactly the ones the boundary type gate admits (see
+/// `docs/coverage-and-fallbacks.md` §4) minus DECIMAL, which `JsonDecoder` routes to the arrow-json
+/// path instead — anything else can never reach a native decode.
+fn make_json_appender(data_type: &DataType, capacity: usize) -> Box<dyn JsonAppend> {
+    use arrow::datatypes::TimeUnit;
+    match data_type {
+        DataType::Int8 => Box::new(PrimitiveJsonAppender::<Int8Type>::new(data_type, capacity)),
+        DataType::Int16 => Box::new(PrimitiveJsonAppender::<Int16Type>::new(data_type, capacity)),
+        DataType::Int32 => Box::new(PrimitiveJsonAppender::<Int32Type>::new(data_type, capacity)),
+        DataType::Int64 => Box::new(PrimitiveJsonAppender::<Int64Type>::new(data_type, capacity)),
+        DataType::Float32 => {
+            Box::new(PrimitiveJsonAppender::<Float32Type>::new(data_type, capacity))
+        }
+        DataType::Float64 => {
+            Box::new(PrimitiveJsonAppender::<Float64Type>::new(data_type, capacity))
+        }
+        DataType::Date32 => Box::new(PrimitiveJsonAppender::<Date32Type>::new(data_type, capacity)),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            Box::new(TimestampJsonAppender::new(data_type, capacity))
+        }
+        DataType::Boolean => Box::new(BooleanJsonAppender { builder: BooleanBuilder::new() }),
+        DataType::Utf8 => Box::new(StringJsonAppender { builder: StringBuilder::new() }),
+        DataType::Struct(fields) => Box::new(StructJsonAppender::new(fields, capacity)),
+        DataType::List(field) => Box::new(ListJsonAppender::new(field, capacity)),
+        DataType::Map(entries, false) => Box::new(MapJsonAppender::new(entries, capacity)),
+        other => panic!("JSON decode does not support {other}"),
+    }
+}
+
+/// Whether any (nested) leaf is DECIMAL. simd-json's tape parses numbers eagerly to i64/f64 and
+/// drops the raw literal, so a decimal with more significant digits than an f64 carries would round;
+/// arrow-json and Flink both parse the raw digit string exactly. Decimal-bearing schemas therefore
+/// stay on the arrow-json path.
+fn json_needs_raw_number_literals(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Decimal128(_, _) => true,
+        DataType::Struct(fields) => {
+            fields.iter().any(|f| json_needs_raw_number_literals(f.data_type()))
+        }
+        DataType::List(field) => json_needs_raw_number_literals(field.data_type()),
+        DataType::Map(entries, _) => json_needs_raw_number_literals(entries.data_type()),
+        _ => false,
+    }
+}
+
+/// Decodes one JSON document per body row into `schema` via a simd-json tape walk. A null or
+/// all-whitespace body contributes no row (exactly what feeding it to arrow-json did); each present
+/// body must be a single complete object. simd-json parses in place, so each body is copied into a
+/// reused scratch buffer — the copy is part of the measured win over arrow-json.
+fn decode_json_bodies_simd(schema: &SchemaRef, bodies: &RecordBatch) -> RecordBatch {
+    let column = bodies.column(0);
+    let mut root = StructJsonAppender::new(schema.fields(), bodies.num_rows());
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut buffers = simd_json::Buffers::default();
+    for row in 0..bodies.num_rows() {
+        let Some(bytes) = binary_body(column, row) else { continue };
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(bytes);
+        let tape = simd_json::to_tape_with_buffers(&mut scratch, &mut buffers)
+            .expect("failed to decode JSON record");
+        let value = tape.as_value();
+        let object = value.as_object().expect("JSON body was not a single object");
+        root.append_object(&object);
+    }
+    RecordBatch::try_new(schema.clone(), root.finish_columns())
+        .expect("failed to build JSON batch")
+}
+
 struct JsonDecoder {
     schema: SchemaRef,
+    /// DECIMAL columns need the raw number literal for exactness (see
+    /// `json_needs_raw_number_literals`); those schemas decode via arrow-json, all others via the
+    /// simd-json tape walk.
+    raw_literals: bool,
 }
 
 impl JsonDecoder {
     fn new(schema: SchemaRef) -> JsonDecoder {
-        JsonDecoder { schema }
+        let raw_literals =
+            schema.fields().iter().any(|f| json_needs_raw_number_literals(f.data_type()));
+        JsonDecoder { schema, raw_literals }
     }
 
     /// Decodes the single body column of `bodies` into a batch of the target schema. Each row is a
-    /// complete document, so feeding them one at a time keeps the decoder's record boundaries aligned
-    /// with the input rows; a null body contributes no row.
+    /// complete document; a null body contributes no row.
     fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
-        let column = bodies.column(0);
-        let row_count = bodies.num_rows();
-        let body = |row: usize| -> Option<&[u8]> {
-            match column.data_type() {
-                DataType::Binary => {
-                    let array = column.as_any().downcast_ref::<BinaryArray>().unwrap();
-                    array.is_valid(row).then(|| array.value(row))
-                }
-                DataType::LargeBinary => {
-                    let array = column.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                    array.is_valid(row).then(|| array.value(row))
-                }
-                DataType::Utf8 => {
-                    let array = column.as_any().downcast_ref::<StringArray>().unwrap();
-                    array.is_valid(row).then(|| array.value(row).as_bytes())
-                }
-                other => panic!("unsupported JSON body column type {other:?}"),
-            }
-        };
+        if self.raw_literals {
+            return self.decode_raw_literals(bodies);
+        }
+        decode_json_bodies_simd(&self.schema, bodies)
+    }
 
+    /// The arrow-json path for decimal-bearing schemas: its tape keeps each number's raw literal, so
+    /// decimals parse from the exact digit string. Documents feed one at a time to keep the decoder's
+    /// record boundaries aligned with the input rows.
+    fn decode_raw_literals(&self, bodies: &RecordBatch) -> RecordBatch {
+        let column = bodies.column(0);
         let mut decoder = arrow::json::ReaderBuilder::new(self.schema.clone())
-            .with_batch_size(row_count.max(1))
+            .with_batch_size(bodies.num_rows().max(1))
             .build_decoder()
             .expect("failed to build JSON decoder");
-        for row in 0..row_count {
-            if let Some(bytes) = body(row) {
+        for row in 0..bodies.num_rows() {
+            if let Some(bytes) = binary_body(column, row) {
                 let consumed = decoder.decode(bytes).expect("failed to decode JSON record");
                 assert_eq!(consumed, bytes.len(), "JSON body was not a single complete document");
             }
@@ -11385,10 +11878,10 @@ enum RowSource {
 /// `$row_kind$` is our columnar `RowKind` (divergences/13). It feeds the existing native changelog
 /// operators, so a CDC → GROUP BY/join/Top-N pipeline materializes zero rows end to end.
 struct CdcJsonDecoder {
-    /// The envelope `arrow-json` decodes into: the pre/post images as nested structs of the physical
-    /// columns (made nullable, since the absent side / unchanged fields are null), plus the op field as
-    /// Utf8. Envelope fields not in this schema (`source`, `ts_ms`, `database`, …) are ignored by arrow-json.
-    envelope: SchemaRef,
+    /// Decodes the envelope: the pre/post images as nested structs of the physical columns (made
+    /// nullable, since the absent side / unchanged fields are null), plus the op field as Utf8.
+    /// Envelope fields not in this schema (`source`, `ts_ms`, `database`, …) are ignored.
+    envelope: JsonDecoder,
     /// Output schema: the physical columns (nullable) + trailing `$row_kind$` Int8.
     output: SchemaRef,
     /// Number of physical columns (envelope/output arity excludes op and `$row_kind$`).
@@ -11422,26 +11915,15 @@ impl CdcJsonDecoder {
         let mut output_fields: Vec<FieldRef> = nullable.iter().cloned().collect();
         output_fields.push(Arc::new(Field::new(ROW_KIND_COLUMN, DataType::Int8, false)));
         let output = Arc::new(Schema::new(output_fields));
-        CdcJsonDecoder { envelope, output, arity: nullable.len(), dialect }
+        CdcJsonDecoder { envelope: JsonDecoder::new(envelope), output, arity: nullable.len(), dialect }
     }
 
     fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
         use arrow::array::ListArray;
-        let column = bodies.column(0);
-        let mut decoder = arrow::json::ReaderBuilder::new(self.envelope.clone())
-            .with_batch_size(bodies.num_rows().max(1))
-            .build_decoder()
-            .expect("failed to build CDC JSON decoder");
-        for row in 0..bodies.num_rows() {
-            if let Some(bytes) = binary_body(column, row) {
-                let consumed = decoder.decode(bytes).expect("failed to decode CDC envelope");
-                assert_eq!(consumed, bytes.len(), "CDC body was not a single complete document");
-            }
+        let envelope = self.envelope.decode(bodies);
+        if envelope.num_rows() == 0 {
+            return RecordBatch::new_empty(self.output.clone());
         }
-        let envelope = match decoder.flush().expect("failed to flush CDC envelope batch") {
-            Some(batch) => batch,
-            None => return RecordBatch::new_empty(self.output.clone()),
-        };
 
         let spec = self.dialect.spec();
         let ops = envelope.column(2).as_any().downcast_ref::<StringArray>().expect("op string");
@@ -11530,7 +12012,8 @@ impl CdcJsonDecoder {
 
 /// The single, format-dispatched decode core shared by every ingest path: it turns a batch of one
 /// binary column — raw message bodies, one per row — into a typed Arrow batch. JSON goes through
-/// `arrow-json`, CSV through `arrow-csv`, Avro (bare or Confluent-framed) through `arrow-avro` against a
+/// the simd-json tape walk (arrow-json for decimal-bearing schemas — see `JsonDecoder`), CSV
+/// through `arrow-csv`, Avro (bare or Confluent-framed) through `arrow-avro` against a
 /// local schema-id store, protobuf through `prost-reflect`/`ptars`, the CDC changelog formats through
 /// `CdcJsonDecoder`, and `raw` is a passthrough. Both the shallow path (Flink polls bytes, hands them
 /// here) and the native source (rdkafka polls bytes, hands them here) feed the *same* `MessageDecoder`;
@@ -13771,6 +14254,7 @@ pub mod bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::BinaryArray;
 
     fn sample_batch() -> RecordBatch {
         let a: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 6, 3, 9]));
@@ -14119,6 +14603,164 @@ mod tests {
         let out = JsonDecoder::new(json_schema()).decode(&bodies(vec![]));
         assert_eq!(out.num_rows(), 0);
         assert_eq!(out.schema(), json_schema());
+    }
+
+    // Every scalar type the boundary admits decodes: numbers for the numeric widths (a float for an
+    // integer column truncates), true/false for BOOLEAN, and strings for DATE and for TIMESTAMP in
+    // both the SQL and ISO-8601 forms (a bare number is a raw nanosecond epoch).
+    #[test]
+    fn json_decode_covers_boundary_scalar_types() {
+        use arrow::array::{
+            BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+            Int8Array, TimestampNanosecondArray,
+        };
+        use arrow::datatypes::TimeUnit;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("i8", DataType::Int8, true),
+            Field::new("i16", DataType::Int16, true),
+            Field::new("i32", DataType::Int32, true),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("f32", DataType::Float32, true),
+            Field::new("f64", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("day", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ]));
+        let batch = bodies(vec![
+            Some(
+                br#"{"i8": -3, "i16": 300, "i32": 70000, "i64": 5000000000, "f32": 1.5,
+                    "f64": 2.5, "flag": true, "day": "2026-07-01", "ts": "2026-07-01 12:00:00.123"}"#,
+            ),
+            Some(
+                br#"{"i8": 1.9, "i16": -2, "i32": 3, "i64": "42", "f32": 2, "f64": -0.25,
+                    "flag": false, "day": "1970-01-02", "ts": "2026-07-01T12:00:00.123"}"#,
+            ),
+            Some(br#"{"ts": 123456789}"#),
+        ]);
+        let out = JsonDecoder::new(schema).decode(&batch);
+        assert_eq!(out.num_rows(), 3);
+        let i8s = out.column(0).as_any().downcast_ref::<Int8Array>().unwrap();
+        assert_eq!((i8s.value(0), i8s.value(1)), (-3, 1)); // 1.9 truncates toward zero
+        let i16s = out.column(1).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!((i16s.value(0), i16s.value(1)), (300, -2));
+        let i32s = out.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!((i32s.value(0), i32s.value(1)), (70000, 3));
+        assert_eq!(values(&out, 3), vec![5000000000, 42, 0]);
+        assert!(out.column(3).is_null(2));
+        let f32s = out.column(4).as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!((f32s.value(0), f32s.value(1)), (1.5, 2.0));
+        let f64s = out.column(5).as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!((f64s.value(0), f64s.value(1)), (2.5, -0.25));
+        let flags = out.column(6).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(flags.value(0) && !flags.value(1));
+        let days = out.column(7).as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(days.value(1), 1);
+        let ts = out.column(8).as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+        let expected = 1_782_907_200_123_000_000i64; // 2026-07-01T12:00:00.123Z
+        assert_eq!((ts.value(0), ts.value(1), ts.value(2)), (expected, expected, 123456789));
+    }
+
+    // Nested ROW/ARRAY/MAP decode recursively: a null or missing struct nulls its children, list
+    // elements keep order and admit nulls, and map keys parse as the key column's type.
+    #[test]
+    fn json_decode_covers_nested_types() {
+        use arrow::array::{ListArray, MapArray, StructArray};
+        let nested = Fields::from(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("row", DataType::Struct(nested.clone()), true),
+            Field::new(
+                "nums",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "tags",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Int64, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+        let batch = bodies(vec![
+            Some(br#"{"row": {"a": 1, "b": "x"}, "nums": [1, null, 3], "tags": {"7": "seven"}}"#),
+            Some(br#"{"row": {"a": 2}, "nums": [], "tags": {}}"#),
+            Some(br#"{"row": null}"#),
+        ]);
+        let out = JsonDecoder::new(schema).decode(&batch);
+        assert_eq!(out.num_rows(), 3);
+
+        let row = out.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let a = row.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((a.value(0), a.value(1)), (1, 2));
+        assert!(row.column(1).is_null(1)); // missing nested field -> null
+        assert!(row.is_null(2)); // null struct -> null row
+
+        let nums = out.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        let first = nums.value(0);
+        let first = first.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((first.value(0), first.value(2)), (1, 3));
+        assert!(first.is_null(1));
+        assert_eq!(nums.value_length(1), 0);
+        assert!(nums.is_null(2)); // missing list -> null
+
+        let tags = out.column(2).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = tags.keys().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(keys.value(0), 7); // object key parsed as the BIGINT key type
+        let map_values = tags.values().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(map_values.value(0), "seven");
+        assert_eq!(tags.value_length(1), 0);
+        assert!(tags.is_null(2));
+    }
+
+    // Unknown keys are skipped and a duplicated field keeps its last value — Jackson (hence Flink)
+    // and arrow-json agree on both.
+    #[test]
+    fn json_decode_skips_unknown_keys_and_keeps_last_duplicate() {
+        let batch =
+            bodies(vec![Some(br#"{"extra": [1, {"x": 2}], "id": 1, "name": "a", "id": 5}"#)]);
+        let out = JsonDecoder::new(json_schema()).decode(&batch);
+        assert_eq!(values(&out, 0), vec![5]);
+    }
+
+    // DECIMAL columns route to the raw-literal (arrow-json) path: a number with more significant
+    // digits than an f64 carries still decodes exactly, in number and string position alike.
+    #[test]
+    fn json_decode_decimal_stays_exact_beyond_f64_precision() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("d", DataType::Decimal128(30, 10), true)]));
+        let batch = bodies(vec![
+            Some(br#"{"d": 12345678901234567.8901234567}"#),
+            Some(br#"{"d": "12345678901234567.8901234567"}"#),
+        ]);
+        let out = JsonDecoder::new(schema).decode(&batch);
+        let d = out.column(0).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        let exact = 123456789012345678901234567i128;
+        assert_eq!((d.value(0), d.value(1)), (exact, exact));
+    }
+
+    #[test]
+    #[should_panic(expected = "as Int64")]
+    fn json_decode_rejects_type_mismatch() {
+        let batch = bodies(vec![Some(br#"{"id": true}"#)]);
+        JsonDecoder::new(json_schema()).decode(&batch);
+    }
+
+    #[test]
+    #[should_panic(expected = "single object")]
+    fn json_decode_rejects_non_object_document() {
+        let batch = bodies(vec![Some(br#"[{"id": 1}]"#)]);
+        JsonDecoder::new(json_schema()).decode(&batch);
     }
 
     // OVER (ORDER BY rt RANGE UNBOUNDED PRECEDING) running SUM: ties in rt share the post-fold value,

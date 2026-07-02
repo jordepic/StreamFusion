@@ -56,6 +56,13 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 # Fast hashing for the per-row grouping map (the same hasher arrow/datafusion use internally).
 ahash = "0.8"
+# SIMD stage-1 JSON parse for the Kafka JSON/CDC decode: the tape walk into Arrow builders replaces
+# arrow-json's scalar tokenizer on the hot ingest edge (RisingWave uses the same parser family).
+# Runtime CPU detection on x86, NEON on aarch64 — nothing machine-specific in the build.
+simd-json = "0.17"
+# NumCast for the JSON number → Arrow primitive conversions, mirroring arrow-json's number path.
+# Already in the tree transitively via arrow; pinned here for direct use.
+num-traits = "0.2"
 
 [features]
 # Opt-in: the native rdkafka consumer (statically links a bundled librdkafka — no system install).

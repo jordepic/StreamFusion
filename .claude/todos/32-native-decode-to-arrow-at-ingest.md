@@ -42,7 +42,7 @@ The right design depends on where the bytes live:
   zero-copy end state — owning the consumer in Rust — is large enough to be its own effort
   (**ticket 33**), deferred until the decode-operator path proves the copy is the bottleneck.
 
-The native **decoders** (arrow-json/csv/avro, prost-reflect, …) are shared across both kinds; what
+The native **decoders** (simd-json/arrow-csv/arrow-avro, prost-reflect, …) are shared across both kinds; what
 differs is the *entry point*: a file reader over a path vs. a push `Decoder` over a bytes column.
 
 ## Streaming seam: keep the Flink source, pay one cheap copy
@@ -121,7 +121,8 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
 
 ### JSON — ✅ built (format 0)
 - Flink: `~/data/flink/flink-formats/flink-json/src/main/java/org/apache/flink/formats/json/JsonRowDataDeserializationSchema.java`
-- Rust: `arrow-json` `Decoder` (`decode`/`flush` push API), schema-driven. `JsonDecoder` in lib.rs.
+- Rust: a simd-json tape walk into typed Arrow builders, schema-driven (arrow-json's raw-literal
+  path retained for decimal-bearing schemas — divergences/18). `JsonDecoder` in lib.rs.
 
 ### CSV — ✅ built (format 2)
 - Flink: `~/data/flink/flink-formats/flink-csv/src/main/java/org/apache/flink/formats/csv/CsvRowDataDeserializationSchema.java`
@@ -146,7 +147,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
 
 ### Debezium / OGG / Maxwell / Canal (CDC JSON) — ✅ all four built (formats 6, 7, 8, 9)
 - **Built (2026-06-26):** `CdcJsonDecoder` (native/src/lib.rs) decodes a CDC envelope straight to a
-  **columnar changelog batch** — physical columns + trailing `$row_kind$` Int8. One arrow-json pass decodes
+  **columnar changelog batch** — physical columns + trailing `$row_kind$` Int8. One JSON-decode pass decodes
   every body's envelope (the pre/post images as nested structs of the physical columns, made nullable; the op
   field per dialect; unknown envelope fields ignored), then each physical column is gathered with a single
   `arrow::compute::interleave` choosing the right pre/post-image struct child **per output row** (built per
@@ -166,7 +167,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
     (DDL) skipped. Same `DataOld` merge, applied per array element (`data[i]` paired with `old[i]`); a message
     fans out per element. Envelope images are `List<Struct>`; the gather indexes into the flattened list values.
   - **Divergence (DataOld):** a field deliberately changed *to* null is indistinguishable from an absent
-    (unchanged) field once arrow-json decodes `old`, so it falls back to `data`; Flink keeps the null
+    (unchanged) field once the JSON decode parses `old`, so it falls back to `data`; Flink keeps the null
     (`oldField.findValue` sees JSON key presence). Rare; documented in `CdcShape::DataOld`.
 - All decoded against the exported physical schema via `createDecoder` (no new JNI). Rust tests green:
   `cdc_debezium_decode_emits_changelog`, `cdc_debezium_skips_tombstone_and_unknown_op`,
@@ -183,7 +184,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
   Flink's own decoder in place). `KafkaTables.isCdcDecode` routes a scan only when **all** hold, else fall back:
   - format ∈ {debezium-json (6), ogg-json (7)} — the full pre/post-image dialects. **Maxwell (8)/Canal (9)
     fall back**: their partial-`old` pre-image can't be reproduced bit-identically from the decoded image
-    alone (a field changed *to* null is indistinguishable from an unchanged/absent one once arrow-json
+    alone (a field changed *to* null is indistinguishable from an unchanged/absent one once the JSON decode
     decodes `old`; Flink uses raw JSON key-presence). Decoders + unit tests stay (correct for the
     no-null-change case); just not planner-routed.
   - `<format>.schema-include` ≠ true (the `{schema, payload}` wrapper isn't handled).
@@ -203,7 +204,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
 - **Remaining CDC follow-ups (each would lift one fallback restriction):** (a) **Maxwell/Canal exact parity** —
   needs JSON key-presence in `old` (a light per-message scan, or carry presence out of the decode) to match
   Flink's "absent ⇒ copy data, present-null ⇒ keep null"; then route them. (b) **`ignore-parse-errors=true`** —
-  make the decoder *skip* malformed rows (per-record error isolation in the arrow-json feed) instead of
+  make the decoder *skip* malformed rows (per-record error isolation in the decode feed) instead of
   failing, so we match Flink's skip mode and can route it. (c) **`schema-include`** (`{schema, payload}`
   wrapper) + CDC **metadata columns** (ts_ms, source.*) — decode the wrapper / project metadata, then drop
   those fallback gates. (d) **debezium-avro-confluent** — same envelope shape, Avro decoder inside (arrow-avro
@@ -219,7 +220,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
   - `.../canal/CanalJsonDeserializationSchema.java` (~`:213`)
   - `.../maxwell/MaxwellJsonDeserializationSchema.java` (~`:124`)
   - `.../ogg/OggJsonDeserializationSchema.java` (~`:158`)
-- Rust: the body is JSON → `arrow-json` `Decoder` (Debezium also has a Confluent-Avro variant →
+- Rust: the body is JSON → the shared JSON decode (Debezium also has a Confluent-Avro variant →
   `arrow-avro`). The before/after/op envelope → a **native interpreter that emits our `$row_kind$`
   column** (divergences/13) and feeds the existing native changelog operators (GROUP BY / updating
   join / Top-N). A CDC → native-changelog pipeline then materializes **zero rows** end to end. This
@@ -244,7 +245,7 @@ tail (time-based flush; Maxwell/Canal auto-routing; CSV/JSON file sources).
   Both live inside their projects — no `arrow-cdc` crate to drop in; we port the pattern.
 - **Columnar wrinkles a row-at-a-time engine avoids but we must handle:** (a) **update row-doubling** —
   output row count ≠ input row count, computed per batch then gathered; (b) **nested before/after
-  extraction** — decoding the envelope with `arrow-json` yields `before`/`after` as nested *struct*
+  extraction** — decoding the envelope yields `before`/`after` as nested *struct*
   columns, so building the final top-level columns is a per-row `take`/gather of the right struct's
   fields by `op`, plus the `$row_kind$` Int8 column. RisingWave sidesteps this by being accessor/row-
   oriented at parse; our batch decode does struct-column surgery + gather.
@@ -377,7 +378,7 @@ The native **decoders** are shared; the two source kinds wrap them differently:
   follow-up. (`NativeJsonBytesDecodeOperator` is now superseded by the general `NativeBytesDecodeOperator`
   — only a benchmark still references the old one.)
 - **Phase 3 — CDC family. DONE for Debezium + OGG JSON (2026-06-26).** `CdcJsonDecoder` decodes the
-  `{before, after, op}` envelope in one arrow-json pass and `interleave`s the right before/after struct
+  `{before, after, op}` envelope in one JSON-decode pass and `interleave`s the right before/after struct
   child per output row to a columnar changelog (physical columns + `$row_kind$`), updates fanning out to
   UB+UA — the batch form of RisingWave's row-at-a-time `DebeziumChangeEvent`. Formats 6 (debezium-json) /
   7 (ogg-json); routed before `PhysicalPlanScan`'s insert-only guard since a CDC source is itself a

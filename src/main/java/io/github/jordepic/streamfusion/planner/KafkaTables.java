@@ -150,7 +150,7 @@ final class KafkaTables {
 
   /**
    * Whether this table's decoder honors a pruned output schema — decoding only the columns and nested
-   * sub-fields the schema names. JSON ({@code arrow-json} is schema-driven and self-describing, so a
+   * sub-fields the schema names. JSON (the decode is schema-driven and JSON self-describing, so a
    * narrowed schema skips the other keys), bare Avro (the decode carries the full writer schema and
    * resolves the narrowed output as the reader schema), and protobuf (the descriptor is pruned to the
    * read fields; ptars builds a column per descriptor field and skips unmatched wire tags) do. CSV/raw
