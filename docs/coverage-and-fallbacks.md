@@ -264,7 +264,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   (text/fraction/zone fields) — the JVM-upcall LTZ path accepts any pattern Flink's formatter does;
   `EXTRACT` a fractional/convention-divergent field (`SECOND`/`DOW`/`WEEK`/`QUARTER`); a `TIMESTAMP_LTZ`
   argument to either now runs natively (session-zone aware — see the datetime bullet above);
-  `TO_TIMESTAMP_LTZ` precision ≠ 3; wrong arity for any admitted function.
+  `TO_TIMESTAMP_LTZ` precision ≠ 3; a **non-literal subscript** in `array[i]` / `map[key]` (a runtime
+  negative index counts from the end in DataFusion but is NULL in Flink, and the native map lookup
+  binds its key at compile time — literal subscripts run natively, `array[i]` requiring the literal
+  ≥ 1); wrong arity for any admitted function.
 
 ### 4. Type level
 - **Scalar leaf types.** Every column (and every nested leaf) must be a type the boundary converter
@@ -282,6 +285,9 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   (`bid.price`, nested `a.b.c`) is native — the expression engine encodes it as DataFusion's
   `get_field`, returning NULL for a null struct, matching Flink. (This is what lets the Nexmark
   `person`/`auction`/`bid` views — `SELECT bid.price … FROM events WHERE event_type = N` — accelerate.)
+  **Subscripting with a literal** — `array[1]`, `map['key']` — is also native (DataFusion
+  `array_element` / map `get_field`: NULL on a null collection, an out-of-range index, or an absent
+  key, matching Flink); a non-literal subscript falls back (see the literal/arity guards above).
   What still falls back for a nested column:
   - **Ordering a nested value** — `MAX`/`MIN` over it, `ORDER BY` it, or a Top-N/sort on it. Flink
     itself rejects `MAX(array)` and `ORDER BY array`, so this matches the host.

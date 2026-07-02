@@ -35,7 +35,9 @@ final class NativeParity {
     PhysicalPlanScan scan = NativePlanner.install(nativeEnvironment);
     List<List<Object>> nativeRows = collect(nativeEnvironment, sql);
 
-    assertTrue(scan.substitutions() > 0, "query did not route to native; parity check is moot");
+    assertTrue(
+        scan.substitutions() > 0,
+        "query did not route to native; parity check is moot; reasons=" + scan.fallbackReasons());
     assertEquals(sorted(host), sorted(nativeRows), "native result differs from host");
   }
 

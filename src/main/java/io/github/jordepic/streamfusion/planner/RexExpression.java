@@ -71,6 +71,12 @@ final class RexExpression {
   // Java cast, since arrow's own cast errors on overflow rather than wrapping.
   private static final int KIND_CAST_NARROW = 18;
 
+  // ARRAY[i] / MAP[key] subscript (Calcite's ITEM), two children: the collection, then the literal
+  // index/key. The native side dispatches on the collection type to DataFusion's array_element /
+  // map get_field, whose null-on-miss semantics match Flink's subscript. Only literal subscripts
+  // are admitted — see emitItem.
+  private static final int KIND_ITEM = 19;
+
   // Cast target type codes, mirrored on the native side.
   private static final int CAST_TINYINT = 0;
   private static final int CAST_SMALLINT = 1;
@@ -439,6 +445,9 @@ final class RexExpression {
       add(KIND_PROCTIME, 0, 0);
       return true;
     }
+    if ("ITEM".equals(call.getOperator().getName())) {
+      return emitItem(call);
+    }
     if ("COALESCE".equalsIgnoreCase(call.getOperator().getName())) {
       return emitCoalesceAsCase(call.getOperands());
     }
@@ -784,6 +793,32 @@ final class RexExpression {
    * out-of-range prefix against the length), and a runtime position can't be checked — so a non-
    * literal or out-of-range bound falls back rather than risk a wrong answer.
    */
+  /**
+   * Emits the SQL subscript {@code array[i]} / {@code map[key]} (Calcite's ITEM). Admitted only with
+   * a literal subscript: DataFusion counts a runtime-negative array index from the end where Flink
+   * returns NULL, and the native map lookup binds the key at compile time — so a non-literal
+   * subscript falls back rather than risk a wrong answer. An array index literal below 1 also falls
+   * back, leaving the host to raise its plan-time validation error. NULL-on-miss semantics (null
+   * collection, index past the end, absent key) match Flink on the native side.
+   */
+  private boolean emitItem(RexCall call) {
+    RexNode collection = call.getOperands().get(0);
+    RexNode subscript = call.getOperands().get(1);
+    if (!(subscript instanceof RexLiteral) || ((RexLiteral) subscript).isNull()) {
+      return reject("non-literal ARRAY index / MAP key");
+    }
+    SqlTypeName collectionType = collection.getType().getSqlTypeName();
+    if (collectionType == SqlTypeName.ARRAY) {
+      if (!isIntLiteralAtLeast(subscript, 1)) {
+        return reject("ARRAY index below 1");
+      }
+    } else if (collectionType != SqlTypeName.MAP) {
+      return reject("ITEM over " + collectionType + " (only ARRAY and MAP)");
+    }
+    add(KIND_ITEM, 0, 2);
+    return emit(collection) && emit(subscript);
+  }
+
   private boolean emitSubstring(List<RexNode> args) {
     if (args.size() != 2 && args.size() != 3) {
       return reject("unsupported SUBSTRING arity");

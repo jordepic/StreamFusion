@@ -8313,6 +8313,37 @@ fn build_expr(
             );
             datafusion::functions::core::expr_fn::get_field(child, name)
         }
+        // ITEM — the SQL subscript `array[i]` / `map[key]`, dispatched on the collection child's
+        // type. Both DataFusion functions reproduce Flink's subscript semantics: NULL for a null
+        // collection, an out-of-range (1-based) index, or an absent key, and map lookup takes the
+        // first match like Flink's linear scan. The JVM encoder admits only literal subscripts —
+        // a dynamic negative index counts from the end in DataFusion but is NULL in Flink, and map
+        // extraction requires a literal key — so a non-literal subscript never reaches here.
+        19 => {
+            use datafusion::logical_expr::ExprSchemable;
+            let collection = build_expr(
+                schema, kinds, payload, child_counts, longs, doubles, strings, cursor,
+            );
+            let subscript = build_expr(
+                schema, kinds, payload, child_counts, longs, doubles, strings, cursor,
+            );
+            let df_schema =
+                DFSchema::try_from(Arc::clone(schema)).expect("calc input schema");
+            let collection_type =
+                collection.get_type(&df_schema).expect("subscripted collection type");
+            match collection_type {
+                DataType::List(_) => datafusion::functions_nested::expr_fn::array_element(
+                    collection, subscript,
+                ),
+                DataType::Map(_, _) => {
+                    let datafusion::prelude::Expr::Literal(key, _) = subscript else {
+                        panic!("map subscript must be a literal")
+                    };
+                    datafusion::functions::core::expr_fn::get_field(collection, key)
+                }
+                other => panic!("ITEM over unsupported collection type {other}"),
+            }
+        }
         // PROCTIME(): the current processing time as a TIMESTAMP_LTZ(3) literal. Stamped once when the
         // Calc is compiled; the proctime-ordered operators read it only as an arrival-order key (which
         // they ignore) and project it away, so a fixed value per operator is correct for them.
@@ -16354,6 +16385,58 @@ mod tests {
             out.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values(),
             &[99, 40, 200]
         );
+    }
+
+    // A Calc projects SQL subscripts (kind 19 → ITEM): `nums[1]` over an ARRAY column and
+    // `tags['a']` over a MAP column, both NULL for an empty/null collection or an absent key.
+    #[test]
+    fn calc_subscripts_array_and_map() {
+        use arrow::array::{Int64Builder, MapBuilder};
+        let nums = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(10), Some(20)]),
+            Some(vec![]),
+            None,
+        ]);
+        let mut tags = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        tags.keys().append_value("a");
+        tags.values().append_value(5);
+        tags.keys().append_value("b");
+        tags.values().append_value(6);
+        tags.append(true).unwrap();
+        tags.keys().append_value("b");
+        tags.values().append_value(7);
+        tags.append(true).unwrap();
+        tags.append(false).unwrap();
+        let tags = tags.finish();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("nums", nums.data_type().clone(), true),
+                Field::new("tags", tags.data_type().clone(), true),
+            ])),
+            vec![Arc::new(nums), Arc::new(tags)],
+        )
+        .unwrap();
+
+        let mut calc = CalcExpression {
+            // Root 0: ITEM(col nums, lit-int 1); root 1: ITEM(col tags, lit-string "a").
+            kinds: vec![19, 0, 7, 19, 0, 3],
+            payload: vec![0, 0, 0, 0, 1, 0],
+            child_counts: vec![2, 0, 0, 2, 0, 0],
+            longs: vec![1],
+            doubles: vec![],
+            strings: vec![Some("a".to_string())],
+            projection_roots: vec![0, 3],
+            condition_root: -1,
+            output_names: vec!["first_num".to_string(), "tag_a".to_string()],
+            compiled: None,
+        };
+        let out = calc.evaluate(batch);
+        let first_num = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(first_num.value(0), 10);
+        assert!(first_num.is_null(1) && first_num.is_null(2));
+        let tag_a = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(tag_a.value(0), 5);
+        assert!(tag_a.is_null(1) && tag_a.is_null(2));
     }
 
     // A Calc projecting a mixed-case top-level column (INPUT_REF) must resolve it by its exact name;
