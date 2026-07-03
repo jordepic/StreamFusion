@@ -1,5 +1,8 @@
 # StreamFusion
 
+> [!NOTE]
+> This project is not part of Apache Flink or Apache DataFusion.
+
 Run Apache Flink SQL faster by executing supported operators natively (Rust + Apache
 Arrow/DataFusion over JNI) while Flink continues to own planning, coordination, and
 everything not yet supported. Substitution is transparent and conservative: a query is
