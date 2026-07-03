@@ -23,7 +23,11 @@ The shipped form is the `mimalloc` cargo feature: build.rs emits link-time alias
 libc allocation symbols (`malloc`/`calloc`/`realloc`/`free`/`strdup`/`strndup`/aligned variants)
 to mimalloc's inside `libstreamfusion` only — every allocation in the library (librdkafka's C and
 the Rust side's own, where the changelog operators measurably churn the system allocator) lands on
-mimalloc, nothing is exported, and the hosting JVM process keeps its allocator. Two dead ends are
+mimalloc, nothing is exported, and the hosting JVM process keeps its allocator. Verified on both
+platforms at the symbol level: macOS (ld64 `-alias` — plus the full suite, ITs, ladder, matrix) and
+Linux (`--defsym`, rust:1 container, aarch64 — `nm -D` shows no exported allocator symbol and no
+unresolved import of the redirected set, so the aliases bind library-locally under the cdylib's
+export list; a full Linux suite/benchmark run still wants a Linux runner). Two dead ends are
 recorded so they aren't re-tried: a process-wide `MI_MALLOC_OVERRIDE` zone swap measured the same
 win (raw delivery 3.33M/s → 3.95M/s, +19%) but crashed SIGSEGV under JVM thread churn, and the
 mimalloc **v3** branch crashes in its lazy thread-init (`_mi_subproc` on an uninitialized heap)

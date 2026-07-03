@@ -18,10 +18,12 @@ watermark, so leaving it off would have left every watermarked Kafka table unacc
 Remaining tails:
 
 ## Productionize the fast path
-- **Verify the `mimalloc` link aliases on Linux.** build.rs emits `--defsym=malloc=mi_malloc`
-  (et al.) there; confirm the aliases bind library-locally under the cdylib version script (no
-  exported `malloc`), rerun the suite + ladder, and then decide whether `kafka` should imply the
-  feature. macOS (ld64 `-alias`) is verified: full suite, ITs, ladder, matrix.
+- **`mimalloc` link aliases on Linux: symbol-level VERIFIED (2026-07-03).** A rust:1 container
+  build (aarch64, `--features mimalloc`) shows no dynamically exported allocator symbol and no
+  unresolved dynamic import of the redirected set — the `--defsym` aliases bind library-locally
+  under the cdylib's export list, mirroring the macOS `-alias` result (divergences/19). Still
+  outstanding: a full suite + ladder run on a Linux host before recommending the feature there
+  unreservedly (no Linux runner locally).
 - **Multi-broker parallel fetch** remains unmeasured (single-broker Testcontainers only).
   librdkafka fetches per-broker on parallel threads; the Java client is one network thread. This
   can only widen the native win, but confirm on a 3-broker cluster before quoting it.
