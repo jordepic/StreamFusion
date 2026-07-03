@@ -19,8 +19,13 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
   partial is TWO columns per AVG — a widened sum (bigint for integer inputs, double for
   float/double) plus a bigint non-null count, `(sum$i, count$j)` in the local's output row — merged
   at the global by summing both, then the existing single-phase AVG finish (null on zero count,
-  integer division truncating, cast to the input type). Verified against the planner: only AVG
-  widens its partial.
+  integer division truncating, cast to the input type). Partial types verified against the planner:
+  AVG(int/smallint/tinyint/bigint) → `(BIGINT, BIGINT)`, AVG(float/double) → `(DOUBLE, BIGINT)` —
+  exactly the single-phase accumulator's widening. Note AVG breaks the matchers' one-partial-per-
+  aggregate positional assumption (`valueColumns[i] = base + i`): both halves need per-aggregate
+  partial OFFSETS once an AVG contributes two columns. The global merge is a new "AVG-merge" kind on
+  the shared group-aggregate operator: fold the pre-summed sum partial into the sum and the count
+  partial into the count (instead of +1 per non-null row); the finish is unchanged.
 - **Wider two-phase value types** — smallint/tinyint/float value columns decline the local matcher
   today (the single-phase path takes them); extend the running types to match the single-phase set.
   (The previously-listed "widening partials" item was a misdiagnosis: Flink's SUM partial keeps the
