@@ -10,8 +10,12 @@ live in `divergences/19-kafka-consume-fast-path.md` and `docs/optimizations.md`.
 source rung with the `mimalloc` build: JSON 2.20–2.26x, Avro 2.99–3.38x, protobuf 2.29–2.36x
 stock Flink.
 
-The planner gate (`kafkaSource`) still defaults to **false**. Remaining work before flipping it,
-roughly ordered:
+**The gate is FLIPPED (2026-07-03): `kafkaSource` defaults on, and the `kafka` cargo feature is a
+default build feature** (bundled-static librdkafka — portable; opt out with `--no-default-features`,
+which the planner detects via the `kafkaFeatureBuilt` probe and falls back cleanly). The flip became
+necessary, not just nice: the source is the only Kafka path that regenerates a pushed-down
+watermark, so leaving it off would have left every watermarked Kafka table unaccelerated by default.
+Remaining tails:
 
 ## Productionize the fast path
 - **Verify the `mimalloc` link aliases on Linux.** build.rs emits `--defsym=malloc=mi_malloc`

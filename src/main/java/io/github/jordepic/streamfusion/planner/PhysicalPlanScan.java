@@ -640,10 +640,11 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           scan.getCluster(), scan.getTraitSet(), scan.getRowType(), OrcSourceMatcher.path(scan));
     }
 
-    // The fully-native rdkafka source (Rust owns the consume) is opt-in and off by default — it is
-    // shelved behind the optional `kafka` cargo feature and the shallow decode path below won the
-    // throughput comparison. When explicitly enabled (and built with the feature) it takes the JSON
-    // tables it can run; otherwise the branch is skipped and they fall through to the decode path.
+    // The fully-native rdkafka source (Rust owns the consume) is the default Kafka path for the
+    // formats it decodes (JSON/bare-Avro/protobuf): the consume fast path made it decisively faster
+    // than the decode path (divergences/19), and it is the only path that regenerates a pushed-down
+    // watermark. Tables it can't run (other formats, untranslatable config, an opt-out native build)
+    // fall through to the decode path below.
     if (KafkaTables.isNativeKafka(current) && NativeConfig.operatorEnabled("kafkaSource")) {
       StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
       substitutions++;

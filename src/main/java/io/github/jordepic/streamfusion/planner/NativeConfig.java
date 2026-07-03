@@ -52,15 +52,15 @@ public final class NativeConfig {
    * Whether a specific operator may be substituted ({@code streamfusion.operator.<name>.enabled}) — the
    * operator analog of {@link #allowsIncompatible}, for keeping an operator on the host where native
    * does not pay (e.g. a lone row-source filter that measures below 1×), mirroring Comet's {@code
-   * spark.comet.exec.<op>.enabled}. Defaults on, except {@code kafkaSource}: the native rdkafka consumer
-   * is shelved behind the optional {@code kafka} cargo feature (the normal build excludes it) and the
-   * shallow decode path won the throughput comparison, so it is opt-in — a JSON Kafka table routes
-   * through the always-built decode path instead unless it is explicitly enabled.
+   * spark.comet.exec.<op>.enabled}. All operators default on — including {@code kafkaSource}, since
+   * the consume fast path made the native rdkafka source decisively faster than the decode path
+   * (divergences/19) and it is the only Kafka path that regenerates a pushed-down watermark; the
+   * planner still probes the build ({@code Native.kafkaFeatureBuilt}) so an opt-out
+   * {@code --no-default-features} library falls back cleanly.
    */
   public static boolean operatorEnabled(String operator) {
-    String defaultEnabled = "kafkaSource".equals(operator) ? "false" : "true";
     return Boolean.parseBoolean(
-        System.getProperty("streamfusion.operator." + operator + ".enabled", defaultEnabled));
+        System.getProperty("streamfusion.operator." + operator + ".enabled", "true"));
   }
 
   /**

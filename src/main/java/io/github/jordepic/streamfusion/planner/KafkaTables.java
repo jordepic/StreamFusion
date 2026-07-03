@@ -48,6 +48,11 @@ final class KafkaTables {
     if (!(node instanceof StreamPhysicalTableSourceScan)) {
       return false;
     }
+    // The kafka cargo feature is a default, but an opt-out library must fall back to the decode
+    // path rather than route to JNI symbols it doesn't carry.
+    if (!io.github.jordepic.streamfusion.Native.kafkaFeatureBuilt()) {
+      return false;
+    }
     StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) node;
     // A watermarked table routes only when the pushed watermark is a shape the source regenerates
     // (per-split bounded out-of-orderness); the scan replaces the host source, so an unreproducible

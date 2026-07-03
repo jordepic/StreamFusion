@@ -27,8 +27,9 @@ Native coverage is broad — most of the streaming SQL surface:
 - **Changelog:** non-windowed `GROUP BY`, streaming Top-N / `LIMIT`, deduplication, changelog
   normalization — all consuming and emitting a retract changelog.
 - **Connectors:** Parquet/ORC file sources and a Parquet sink (native Arrow scan/write); Kafka
-  source decode for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC (including an opt-in fully
-  native rdkafka source).
+  source decode for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC — JSON/Avro/protobuf via a
+  fully native rdkafka source (the default path; it also regenerates the table's watermark
+  per partition, exactly as Flink's source does).
 - **UDFs:** a Flink `ScalarFunction` the expression engine can't implement itself is invoked over
   Arrow columns by a native→JVM upcall (Comet's `JvmScalarUdfExpr` pattern), one JNI crossing per
   batch, so the pipeline stays native *through* the UDF and the result is byte-identical.
@@ -78,7 +79,7 @@ engines (standard tuned-prod setting).
 StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively end-to-end with no
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
 ([analysis](.claude/wontdos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, on the
-recommended `kafka,mimalloc` native build, from a rowwise `RowData` source, a local Parquet file, and
+recommended `mimalloc` native build (the Kafka feature is a default), from a rowwise `RowData` source, a local Parquet file, and
 each Kafka value format, ordered by query number:
 
 Each Kafka cell is the fully native rdkafka source — Rust owns the consume *and* the decode. Since

@@ -12763,6 +12763,16 @@ fn max_rowtime_millis(batch: &RecordBatch, index: usize) -> i64 {
     }
 }
 
+/// Whether this build carries the native Kafka source (the `kafka` cargo feature). Compiled into
+/// every build so the planner can probe before routing a table to a source the library can't run.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_kafkaFeatureBuilt<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jboolean {
+    cfg!(feature = "kafka") as jni::sys::jboolean
+}
+
 /// Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
 /// `closeKafkaConsumer`. `configKeys`/`configValues` are the translated librdkafka config (applied
 /// verbatim). `format` selects the decoder (the same codes the shallow decode path uses): 0 JSON

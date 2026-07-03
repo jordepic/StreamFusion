@@ -143,7 +143,9 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Per-operator kill switch**: `-Dstreamfusion.operator.<name>.enabled=false` (e.g. `filter`,
   `groupAggregate`, `union`, `limit`, `expand`, `changelogNormalize`, `windowRank`,
   `localGroupAggregate`, `miniBatchAssigner`, `lookupJoin`, …). The two-phase global half reuses the
-  `groupAggregate` switch. `kafkaSource` defaults to *false*.
+  `groupAggregate` switch. All default on, `kafkaSource` included — the planner probes whether the
+  loaded native library carries the (default) `kafka` cargo feature and falls back to the decode
+  path on an opt-out build.
 
 ### 2. Per-operator matcher declines (exact conditions)
 - **OVER** — a frame not of the form `… PRECEDING .. CURRENT ROW` (a `ROWS`/`RANGE` lower bound that

@@ -70,9 +70,13 @@ num-traits = "0.2"
 libmimalloc-sys = { version = "0.1", optional = true }
 
 [features]
-# Opt-in: the native rdkafka consumer (statically links a bundled librdkafka — no system install).
-# `kafka` builds the production split reader; `kafka-bench` additionally builds the throwaway
-# whole-topic benchmark consumer.
+# The native rdkafka consumer is a DEFAULT feature: it statically links a bundled librdkafka (mklove
+# build — a C toolchain + make, no system install, portable for any dev who clones the repo), and
+# since the source is the only Kafka path that regenerates a pushed-down watermark, a build without
+# it loses acceleration for every watermarked (i.e. most real) Kafka table. Opt out with
+# --no-default-features; the planner probes the build (`kafkaFeatureBuilt`) and falls back cleanly.
+# `kafka-bench` additionally builds the throwaway whole-topic benchmark consumer.
+default = ["kafka"]
 kafka = ["dep:rdkafka"]
 kafka-bench = ["kafka"]
 # Rebind the C allocator to mimalloc for everything linked into THIS library (librdkafka included),

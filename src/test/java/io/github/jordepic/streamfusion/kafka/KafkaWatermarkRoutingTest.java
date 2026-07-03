@@ -33,9 +33,9 @@ class KafkaWatermarkRoutingTest {
 
   @Test
   void watermarkedTableRoutesToNativeSourceWhichRegeneratesWatermarks() {
+    // Default configuration: the native source is on by default and takes the watermarked table.
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(watermarkedTable(""));
-    System.setProperty("streamfusion.operator.kafkaSource.enabled", "true");
     String plan = NativePlanner.explain(tEnv, QUERY);
     assertTrue(
         plan.contains("NativeKafkaSource(topic="),
@@ -48,11 +48,12 @@ class KafkaWatermarkRoutingTest {
 
   @Test
   void watermarkedTableFallsBackWithReasonWhenNativeSourceIsOff() {
-    // Default configuration: kafkaSource gate off. The decode path must NOT take the table (it
-    // regenerates no watermarks — an unbounded event-time query would never emit), and the fallback
-    // reason should say exactly why.
+    // With the source gate off (or an opt-out native build), the decode path must NOT take the
+    // table (it regenerates no watermarks — an unbounded event-time query would never emit), and
+    // the fallback reason should say exactly why.
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(watermarkedTable(""));
+    System.setProperty("streamfusion.operator.kafkaSource.enabled", "false");
     String plan = NativePlanner.explain(tEnv, QUERY);
     assertTrue(
         !plan.contains("NativeKafkaDecode") && !plan.contains("NativeKafkaSource"),
@@ -75,7 +76,6 @@ class KafkaWatermarkRoutingTest {
             + ") WITH ('connector' = 'kafka', 'topic' = 't',"
             + " 'properties.bootstrap.servers' = 'localhost:9092',"
             + " 'scan.startup.mode' = 'earliest-offset', 'format' = 'json')");
-    System.setProperty("streamfusion.operator.kafkaSource.enabled", "true");
     String plan =
         NativePlanner.explain(
             tEnv,
@@ -96,7 +96,6 @@ class KafkaWatermarkRoutingTest {
     // every row) is not reproducible; the table must stay on Flink.
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(watermarkedTable(", 'scan.watermark.emit.strategy' = 'on-event'"));
-    System.setProperty("streamfusion.operator.kafkaSource.enabled", "true");
     String plan = NativePlanner.explain(tEnv, QUERY);
     assertTrue(
         !plan.contains("NativeKafkaDecode") && !plan.contains("NativeKafkaSource"),
@@ -105,6 +104,9 @@ class KafkaWatermarkRoutingTest {
 
   @Test
   void unwatermarkedTableStillTakesTheDecodePath() {
+    // Pin the source gate off: this guards the decode-path routing, which serves the formats and
+    // builds the native source doesn't.
+    System.setProperty("streamfusion.operator.kafkaSource.enabled", "false");
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(
         "CREATE TABLE plain (id BIGINT, price BIGINT) WITH ("

@@ -249,7 +249,7 @@ stock Flink. Three rungs, each one layer more native (projection pushed in at ev
 3. **Rust poll + Rust transpose** — the native rdkafka source: Rust owns the consume *and* the decode.
    No Flink Kafka client, no `RowData`.
 
-`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features kafka,mimalloc"
+`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features mimalloc"
 -Dtest=NexmarkKafkaLadderBenchmark`. 2 M events, ×vs stock Flink (best rung **bold**; the
 `mimalloc` feature — the recommended Kafka build — link-aliases the library's allocator, worth
 +12–22% on the source rung, divergences/19):
@@ -296,8 +296,8 @@ see [.claude/wontdos/39-nexmark-q6-exclusion.md](../.claude/wontdos/39-nexmark-q
 source it can be fed by** — the rowwise generator, a local Parquet file, and Kafka json/avro/protobuf
 across the ladder — all vs stock Flink, same steelmanned perimeter. 500K events.
 
-`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features kafka,mimalloc"
--Dtest=NexmarkMatrixBenchmark` (Testcontainers Kafka; the native source needs the `kafka` feature, and
+`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features mimalloc"
+-Dtest=NexmarkMatrixBenchmark` (Testcontainers Kafka; the `kafka` feature is a build default, and
 `mimalloc` — the recommended build — rebinds the library's allocator, divergences/19). Column
 toggles: `SF_MATRIX_GENERATOR` / `SF_MATRIX_PARQUET` / `SF_MATRIX_KAFKA` (`false` skips one).
 

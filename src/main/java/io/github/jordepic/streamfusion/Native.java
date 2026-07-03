@@ -881,6 +881,13 @@ public final class Native {
       String[] configKeys, String[] configValues, String topic, long maxMessages);
 
   /**
+   * Whether the loaded native library was built with the {@code kafka} cargo feature (the default).
+   * The planner probes this before routing a table to the native Kafka source, so an opt-out build
+   * ({@code --no-default-features}) falls back cleanly instead of hitting a missing JNI symbol.
+   */
+  public static native boolean kafkaFeatureBuilt();
+
+  /**
    * Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
    * {@link #closeKafkaConsumer}. One rdkafka consumer multiplexes the subtask's partitions; splits are
    * added later with {@link #assignKafkaSplits} as the enumerator assigns them. The reader manually

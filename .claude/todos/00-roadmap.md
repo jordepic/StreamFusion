@@ -106,9 +106,12 @@ here when the ticket is deleted.
   backlog below.
 
 ## Next, roughly in order (coverage push, prioritized 2026-07-03)
-1. **Finish the native Kafka source and flip its gate** (ticket 33): per-partition
-   watermarks/idleness, specific-offsets / topic-pattern startup, `key.format`, Linux mimalloc
-   link-alias verification — then default `kafkaSource` on so the fast path is reachable.
+1. **Native Kafka source: gate FLIPPED (2026-07-03)** (ticket 33). Per-partition watermarks/idleness
+   and specific-offsets/topic-pattern startup shipped; `kafkaSource` defaults on and the `kafka`
+   cargo feature is a default build feature (probe-guarded for opt-out builds). Remaining tails in
+   the ticket: `key.format`, SASL/SSL build features, Linux mimalloc link-alias verification,
+   multi-broker measurement — plus a Nexmark re-run to re-quote the Kafka numbers now that
+   watermarks actually flow mid-stream (and the ladder's decode rung declines watermarked tables).
 2. **Mini-batch coverage** (ticket 41): `IncrementalGroupAggregate` (what any distinct aggregate
    plans to under mini-batch), two-phase `AVG`, widening partials (`SUM(INT)`), two-phase decimal
    `SUM`, row-time mini-batch.
