@@ -114,8 +114,9 @@ here when the ticket is deleted.
    readme/benchmarks Kafka numbers re-quoted (floor 1.38x, peak q11 4.3–4.8x — watermark
    regeneration costs nothing measurable).
 2. **Mini-batch coverage** (ticket 41): `IncrementalGroupAggregate` (what any distinct aggregate
-   plans to under mini-batch), two-phase `AVG`, widening partials (`SUM(INT)`), two-phase decimal
-   `SUM`, row-time mini-batch.
+   plans to under mini-batch), two-phase decimal `SUM`, wider two-phase value types, row-time
+   mini-batch. (Two-phase `AVG` shipped 2026-07-03; the "widening partials" item was a misdiagnosis
+   — Flink's SUM partial keeps the value type and already routes.)
 3. **High-frequency aggregate/expression tail** (ticket 42): decimal `AVG` (plain + windowed),
    `SUM`/`MIN`/`MAX` `DISTINCT`, byte-exact number↔string `CAST`, byte-exact decimal division.
 4. **Legacy group windows** (ticket 43): map `GROUP BY TUMBLE/HOP(...)` onto the existing native
@@ -127,7 +128,10 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (the ticket 11
    operators and any remaining expression tail) before broadening where we read/write.
-7. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
+7. **Flaky test** (ticket 44): `NativeMemoryMetricsTest` intermittently fails full-suite runs
+   ("no metric named X was registered", varying X); green in isolation. Costs a suite re-run when
+   it fires — root-cause when convenient.
+8. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
    keyed loops (dedup, `OVER` partitions, Top-N, exchange split) — swap to arrow-row keys only
    with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
