@@ -142,9 +142,11 @@ here when the ticket is deleted.
   joins incl. outer/semi/anti, the non-windowed GROUP BY aggregate, the regular updating join,
   append-only Top-N, keep-first deduplication, window Top-N / window deduplication, and event-time
   sort are now done.)
-- **Fully native Kafka source, no JNI** (ticket 33, back burner): subscribe in Rust, decode →Arrow,
-  lifting the connector semantics (partition/offset/checkpoint/watermark) from Arroyo. Removes the one
-  off-heap copy ticket 32 pays; only worth it once that decode path proves the copy is the bottleneck.
+- **Native Kafka source** (ticket 33): built, and now decisively faster than the shallow path on
+  every format (divergences/19 — malloc override, `check.crcs` default, callback drain + inline
+  decode; raw consume 1.21x the Java client). Remaining before the `kafkaSource` gate can default
+  on: per-partition watermarks/idleness, specific-offsets / topic-pattern startup, key.format,
+  SASL/SSL build features, Linux `alloc-override` verification, multi-broker measurement.
 - **Nexmark with Apache Fluss as the source** (ticket 36): add Fluss (columnar streaming storage) as a
   fourth source in the Nexmark matrix; its columnar format may let the native island ingest Arrow with
   little/no row transpose — the perimeter transpose is a visible share of the remaining stateful-query

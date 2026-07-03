@@ -62,6 +62,14 @@ fn capture_jvm(env: &JNIEnv) {
     }
 }
 
+/// Anchors libmimalloc-sys's object file into the link (nothing else references the crate, so the
+/// archive member — allocator plus the MI_MALLOC_OVERRIDE load-time hook that swaps the process
+/// allocator — would otherwise be dropped). See the `alloc-override` feature in Cargo.toml.
+#[cfg(feature = "alloc-override")]
+#[used]
+static FORCE_LINK_MIMALLOC_OVERRIDE: unsafe extern "C" fn(*mut std::os::raw::c_void) =
+    libmimalloc_sys::mi_free;
+
 /// Raises the managed-memory-limit exception on the calling JVM thread; the native call returns
 /// immediately after, so the task fails with the budget message instead of the container OOM-killing
 /// the process.
@@ -12418,34 +12426,6 @@ fn read_string_array(env: &mut JNIEnv, array: &JObjectArray) -> Vec<String> {
     out
 }
 
-/// The production native Kafka consumer for one Flink subtask: a single rdkafka `BaseConsumer` that
-/// multiplexes all of the subtask's assigned partitions (Flink-parity — one consumer, not one per
-/// split). It manually `assign()`s (topic, partition) at explicit offsets and re-assigns as the
-/// enumerator hands over more splits — never `subscribe()`/group-rebalance, matching Flink's
-/// `KafkaPartitionSplitReader`. Each poll buckets messages **by partition** and decodes one typed Arrow
-/// batch per partition, so every split's checkpointed offset advances independently; the decoded
-/// batches sit in `pending` until the JVM drains them into its per-split `RecordsWithSplitIds`. Payloads
-/// go straight from librdkafka into an Arrow builder (no JVM heap byte[], no per-record JNI). The
-/// librdkafka config is the map from the JVM-side `KafkaConfigTranslator`; this side is a dumb applier.
-/// One partition's raw message bytes for a poll cycle: a single binary "body" column, sent from the
-/// fetcher thread to the decode thread.
-#[cfg(feature = "kafka")]
-struct RawWork {
-    topic: String,
-    partition: i32,
-    next_offset: i64,
-    body: RecordBatch,
-}
-
-/// A decoded typed-Arrow batch coming back from the decode thread.
-#[cfg(feature = "kafka")]
-struct Decoded {
-    topic: String,
-    partition: i32,
-    next_offset: i64,
-    batch: RecordBatch,
-}
-
 /// Decodes a binary "body" batch into typed Arrow via arrow-avro against the local schema-id store. When
 /// `bare`, each message is a raw datum (Flink's `avro`) and we prepend the 5-byte id-0 Confluent header
 /// (`0x00` + 4-byte 0) so arrow-avro's framed decoder resolves it against the schema at id 0; otherwise
@@ -12489,39 +12469,31 @@ fn decode_avro_body(
 
 /// The production native Kafka consumer for one Flink subtask: a single rdkafka `BaseConsumer` that
 /// multiplexes all of the subtask's assigned partitions (Flink-parity — one consumer, not one per
-/// split). The fetcher thread (driving `poll`) only consumes bytes into per-partition binary batches and
-/// hands them to a **background decode thread**, so polling and decoding pipeline across cores instead
-/// of serializing on one thread; the JVM drains the decoded batches the thread produces. Manual
-/// `assign()`+seek, never `subscribe()`/rebalance.
+/// split). Each `poll` buckets the drained payloads by partition and decodes them to typed Arrow
+/// INLINE on the fetcher thread: a separate decode thread was benchmarked slower on every format —
+/// Flink already pipelines the fetcher thread against the task thread, so the extra hop only added
+/// channel/wakeup overhead. Manual `assign()`+seek, never `subscribe()`/rebalance.
 #[cfg(feature = "kafka")]
 struct KafkaSplitReader {
     consumer: rdkafka::consumer::BaseConsumer,
-    /// The consumer's message queue, batch-drained with `rd_kafka_consume_batch_queue` so we pull many
-    /// messages per FFI call instead of one (rust-rdkafka's `poll()` allocates an op + `Arc` per
-    /// message — the per-message poll path the flame graph showed dominating the fetcher thread).
+    /// The consumer's message queue, drained via the callback API (see `poll`).
     consumer_queue: *mut rdkafka::bindings::rd_kafka_queue_t,
     body_schema: SchemaRef,
+    /// The same format-dispatched decoder the shallow path uses; only who produces the body batch
+    /// (rdkafka vs Flink) differs. Owned here and driven only from the fetcher thread.
+    decoder: MessageDecoder,
     /// Next offset to consume per assigned partition — the split's checkpoint position.
     next_offsets: HashMap<(String, i32), i64>,
+    /// Topics whose broker metadata has been primed (see `reassign`).
+    warmed_topics: std::collections::HashSet<String>,
     /// Decoded batches ready for the JVM to drain one split at a time, in arrival (offset) order so a
     /// split's offset never goes backwards when several of its batches are drained in one cycle.
     pending: std::collections::VecDeque<(String, i32, i64, RecordBatch)>,
-    /// Fetcher -> decode thread (raw bytes); dropping it shuts the thread down.
-    raw_tx: Option<std::sync::mpsc::Sender<RawWork>>,
-    /// Decode thread -> here (typed Arrow).
-    ready_rx: std::sync::mpsc::Receiver<Decoded>,
-    decode_thread: Option<std::thread::JoinHandle<()>>,
-    /// Batches submitted to the decode thread but not yet drained back.
-    in_flight: usize,
 }
 
 #[cfg(feature = "kafka")]
 impl Drop for KafkaSplitReader {
     fn drop(&mut self) {
-        self.raw_tx.take(); // closing the channel ends the decode loop
-        if let Some(handle) = self.decode_thread.take() {
-            let _ = handle.join();
-        }
         if !self.consumer_queue.is_null() {
             unsafe { rdkafka::bindings::rd_kafka_queue_destroy(self.consumer_queue) };
         }
@@ -12534,8 +12506,7 @@ impl KafkaSplitReader {
     /// against `output_schema`; bare Avro (4) / Confluent Avro (1) build a schema store mapping
     /// `schema_id` → `avro_schema` (the writer schema JSON), optionally projecting to `reader_avro_schema`
     /// (the narrowed output) via Avro resolution; protobuf (5) decodes against `proto_descriptor` (an
-    /// encoded `FileDescriptorSet`) / `proto_message_name`. The decoder is built and owned by the
-    /// background decode thread, so its state never crosses threads.
+    /// encoded `FileDescriptorSet`) / `proto_message_name`.
     fn open(
         config: &[(String, String)],
         format: i32,
@@ -12554,52 +12525,31 @@ impl KafkaSplitReader {
         }
         let consumer: rdkafka::consumer::BaseConsumer =
             client.create().expect("failed to create kafka consumer");
-        // The consumer's queue, for batch draining. (assign/seek still go through the BaseConsumer.)
+        // The consumer's queue, for draining. (assign/seek still go through the BaseConsumer.)
         let consumer_queue = unsafe {
             use rdkafka::consumer::Consumer;
             rdkafka::bindings::rd_kafka_queue_get_consumer(consumer.client().native_ptr())
         };
 
-        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<RawWork>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Decoded>();
-        let avro_schema = avro_schema.to_string();
-        let reader_avro_schema = reader_avro_schema.to_string();
-        let decode_thread = std::thread::spawn(move || {
-            // The same format-dispatched decoder the shallow path uses; built here so its state never
-            // crosses threads. Only who produces the body batch (rdkafka vs Flink) differs. Protobuf
-            // is built straight from the descriptor (not in MessageDecoder::new, like the shallow path's
-            // createProtobufDecoder); every other format dispatches through MessageDecoder::new.
-            let decoder = if format == 5 {
-                // Prune the descriptor to the output schema's fields so ptars builds only those columns
-                // (projection pushed into the source); a no-op when the schema is the full message.
-                let pruned = prune_descriptor_set(&proto_descriptor, &proto_message_name, &output_schema);
-                MessageDecoder::Protobuf(ProtobufDecoder::new(&pruned, &proto_message_name))
-            } else {
-                MessageDecoder::new(format, output_schema, &avro_schema, &reader_avro_schema, schema_id)
-            };
-            while let Ok(work) = raw_rx.recv() {
-                let decoded = Decoded {
-                    topic: work.topic,
-                    partition: work.partition,
-                    next_offset: work.next_offset,
-                    batch: decoder.decode(&work.body),
-                };
-                if ready_tx.send(decoded).is_err() {
-                    break;
-                }
-            }
-        });
+        // Protobuf is built straight from the descriptor (not in MessageDecoder::new, like the shallow
+        // path's createProtobufDecoder); every other format dispatches through MessageDecoder::new.
+        let decoder = if format == 5 {
+            // Prune the descriptor to the output schema's fields so ptars builds only those columns
+            // (projection pushed into the source); a no-op when the schema is the full message.
+            let pruned = prune_descriptor_set(&proto_descriptor, &proto_message_name, &output_schema);
+            MessageDecoder::Protobuf(ProtobufDecoder::new(&pruned, &proto_message_name))
+        } else {
+            MessageDecoder::new(format, output_schema, avro_schema, reader_avro_schema, schema_id)
+        };
 
         KafkaSplitReader {
             consumer,
             consumer_queue,
             body_schema: Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)])),
+            decoder,
             next_offsets: HashMap::new(),
+            warmed_topics: std::collections::HashSet::new(),
             pending: std::collections::VecDeque::new(),
-            raw_tx: Some(raw_tx),
-            ready_rx,
-            decode_thread: Some(decode_thread),
-            in_flight: 0,
         }
     }
 
@@ -12639,6 +12589,21 @@ impl KafkaSplitReader {
             self.consumer.unassign().expect("failed to unassign");
             return;
         }
+        // Prime broker metadata for topics this consumer hasn't resolved yet, BEFORE assigning:
+        // an assign on a cold connection parks each partition in leader-query until librdkafka's
+        // periodic metadata refresh resolves it — measured as ~0.5s of dead time before the first
+        // fetch. An explicit blocking metadata fetch resolves leaders now (the same warm-up the
+        // Java client gets from its initial metadata round). Failure is ignored: assign still
+        // works through the refresh cycle, just slower.
+        for topic in
+            self.next_offsets.keys().map(|(topic, _)| topic.clone()).collect::<Vec<_>>()
+        {
+            if self.warmed_topics.insert(topic.clone()) {
+                let _ = self
+                    .consumer
+                    .fetch_metadata(Some(&topic), std::time::Duration::from_secs(10));
+            }
+        }
         let mut tpl = TopicPartitionList::new();
         for ((topic, partition), &offset) in &self.next_offsets {
             let position = match offset {
@@ -12660,81 +12625,101 @@ impl KafkaSplitReader {
     fn poll(&mut self, max_records: usize, timeout: std::time::Duration) -> usize {
         use arrow::array::BinaryBuilder;
         use rdkafka::bindings as rdsys;
+        use rdkafka::consumer::Consumer;
 
-        // Fetcher thread: batch-drain the consumer queue in ONE FFI call (vs one op+Arc allocation per
-        // message via BaseConsumer::poll), copy each payload into a per-partition binary builder, and
-        // hand each partition's batch to the decode thread. Decoding overlaps the next poll.
-        let mut builders: HashMap<i32, (String, BinaryBuilder, i64)> = HashMap::new();
-        let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); max_records];
-        let received = unsafe {
-            rdsys::rd_kafka_consume_batch_queue(
-                self.consumer_queue,
-                timeout.as_millis() as std::os::raw::c_int,
-                messages.as_mut_ptr(),
-                max_records,
-            )
-        };
-        let mut buffered = 0usize;
-        if received > 0 {
-            for &message_ptr in &messages[..received as usize] {
-                let message = unsafe { &*message_ptr };
-                if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
-                    && !message.payload.is_null()
+        // Fetcher thread: drain the consumer queue with the CALLBACK API — one queue-mutex acquisition
+        // moves the whole queued backlog local (rd_kafka_consume_batch_queue re-locks per message,
+        // contending with the broker thread's enqueue), each payload is copied into a per-partition
+        // binary builder from the callback, and librdkafka frees each op after its callback returns.
+        // `max_records` is enforced with rd_kafka_yield (a thread-local stop flag): the dispatch loop
+        // stops and prepends the untaken remainder back onto the queue head.
+        struct PollContext {
+            rk: *mut rdsys::rd_kafka_t,
+            max_records: usize,
+            seen: usize,
+            buffered: usize,
+            /// Per-partition buckets: a subtask holds a handful of partitions and a fetch response
+            /// delivers a partition's records contiguously, so a last-bucket cache + linear scan
+            /// beats a per-message hash lookup.
+            buckets: Vec<(i32, String, BinaryBuilder, i64)>,
+            last_bucket: usize,
+        }
+        unsafe extern "C" fn bucket_message(
+            message: *mut rdsys::rd_kafka_message_t,
+            opaque: *mut std::os::raw::c_void,
+        ) {
+            let context = &mut *(opaque as *mut PollContext);
+            context.seen += 1;
+            let message = &*message;
+            if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+                && !message.payload.is_null()
+            {
+                let payload = std::slice::from_raw_parts(message.payload as *const u8, message.len);
+                let index = if context
+                    .buckets
+                    .get(context.last_bucket)
+                    .is_some_and(|bucket| bucket.0 == message.partition)
                 {
-                    let payload =
-                        unsafe { std::slice::from_raw_parts(message.payload as *const u8, message.len) };
-                    let entry = builders.entry(message.partition).or_insert_with(|| {
-                        // Topic resolved once per partition (not per message); pre-size so the binary
-                        // buffers don't reallocate as the batch fills.
-                        let topic = unsafe {
-                            std::ffi::CStr::from_ptr(rdsys::rd_kafka_topic_name(message.rkt))
-                        }
-                        .to_string_lossy()
-                        .into_owned();
-                        (topic, BinaryBuilder::with_capacity(max_records, max_records * 64), 0)
-                    });
-                    entry.1.append_value(payload);
-                    entry.2 = message.offset + 1;
-                    buffered += 1;
-                }
-                // Errors here are queue events (e.g. transient connectivity); skip them. Every message
-                // (data or event) must be destroyed to release librdkafka's reference.
-                unsafe { rdsys::rd_kafka_message_destroy(message_ptr) };
+                    context.last_bucket
+                } else if let Some(found) =
+                    context.buckets.iter().position(|bucket| bucket.0 == message.partition)
+                {
+                    found
+                } else {
+                    // Topic resolved once per partition (not per message); pre-size so the binary
+                    // buffers don't reallocate as the batch fills.
+                    let topic =
+                        std::ffi::CStr::from_ptr(rdsys::rd_kafka_topic_name(message.rkt))
+                            .to_string_lossy()
+                            .into_owned();
+                    // Pre-size for the poll cap (bounded — the cap can be huge when a caller wants
+                    // an unchunked drain; the builder grows amortized past this).
+                    let presize = context.max_records.min(65536);
+                    context.buckets.push((
+                        message.partition,
+                        topic,
+                        BinaryBuilder::with_capacity(presize, presize * 64),
+                        0,
+                    ));
+                    context.buckets.len() - 1
+                };
+                context.last_bucket = index;
+                let bucket = &mut context.buckets[index];
+                bucket.2.append_value(payload);
+                bucket.3 = message.offset + 1;
+                context.buffered += 1;
+            }
+            // Errors are queue events (e.g. transient connectivity); they are counted against the cap
+            // but otherwise skipped. librdkafka destroys every op after this returns.
+            if context.seen >= context.max_records {
+                rdsys::rd_kafka_yield(context.rk);
             }
         }
-        let tx = self.raw_tx.as_ref().expect("reader is closed");
-        for (partition, (topic, mut builder, next_offset)) in builders {
+        let mut context = PollContext {
+            rk: self.consumer.client().native_ptr(),
+            max_records,
+            seen: 0,
+            buffered: 0,
+            buckets: Vec::new(),
+            last_bucket: 0,
+        };
+        unsafe {
+            rdsys::rd_kafka_consume_callback_queue(
+                self.consumer_queue,
+                timeout.as_millis() as std::os::raw::c_int,
+                Some(bucket_message),
+                &mut context as *mut PollContext as *mut std::os::raw::c_void,
+            )
+        };
+        // Decode inline: one typed batch per partition, straight into `pending` (the JVM drains all
+        // of them right after this returns, so nothing is ever left behind on a bounded finish).
+        self.pending.clear();
+        for (partition, topic, mut builder, next_offset) in context.buckets {
             let body = RecordBatch::try_new(self.body_schema.clone(), vec![Arc::new(builder.finish())])
                 .expect("failed to build kafka body batch");
             self.next_offsets.insert((topic.clone(), partition), next_offset);
-            tx.send(RawWork { topic, partition, next_offset, body }).expect("decode thread gone");
-            self.in_flight += 1;
-        }
-
-        // Drain whatever the decode thread has finished (from this and prior polls).
-        self.pending.clear();
-        while let Ok(decoded) = self.ready_rx.try_recv() {
-            self.in_flight -= 1;
-            self.pending
-                .push_back((decoded.topic, decoded.partition, decoded.next_offset, decoded.batch));
-        }
-        // When the consumer is drained (nothing polled), block until the decode pipeline empties so the
-        // JVM's bounded-finish logic sees every offset before it concludes the split is done.
-        if buffered == 0 {
-            while self.in_flight > 0 {
-                match self.ready_rx.recv() {
-                    Ok(decoded) => {
-                        self.in_flight -= 1;
-                        self.pending.push_back((
-                            decoded.topic,
-                            decoded.partition,
-                            decoded.next_offset,
-                            decoded.batch,
-                        ));
-                    }
-                    Err(_) => break,
-                }
-            }
+            let batch = self.decoder.decode(&body);
+            self.pending.push_back((topic, partition, next_offset, batch));
         }
         self.pending.len()
     }
@@ -12884,7 +12869,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKafkaCon
     }
 }
 
-/// Benchmark-only: drive the **production** split reader (poll + the background decode thread) over a
+/// Benchmark-only: drive the **production** split reader (poll + inline decode) over a
 /// whole topic and count the decoded rows **entirely in Rust** — the decoded Arrow batches are consumed
 /// in Rust and never exported to the JVM, exactly as they would feed a downstream native operator in a
 /// fused pipeline. This is the honest "fastest way to get Arrow batches in Rust" measurement: it
@@ -12920,8 +12905,14 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let mut idle = 0;
     // The topic holds exactly `max_messages`; loop until we've decoded them all. A generous idle guard
     // (≈10s of empty polls) only trips if the broker truly stops delivering, avoiding a hang.
+    // Poll cap from SF env via JVM? Keep it simple: an experiment knob compiled in — the production
+    // reader is driven with the same generous cap the SQL source uses.
+    let poll_cap: usize = std::env::var("SF_KAFKA_POLL_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65536);
     while rows < max_messages && idle < 40 {
-        let count = reader.poll(65536, timeout);
+        let count = reader.poll(poll_cap, timeout);
         if count == 0 {
             idle += 1;
             continue;
@@ -12978,36 +12969,51 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkCons
     consumer.assign(&tpl).expect("assign");
     let queue = unsafe { rdsys::rd_kafka_queue_get_consumer(consumer.client().native_ptr()) };
 
-    let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); 65536];
-    let mut count: i64 = 0;
-    let mut idle = 0;
-    while count < max_messages && idle < 40 {
-        let received =
-            unsafe { rdsys::rd_kafka_consume_batch_queue(queue, 250, messages.as_mut_ptr(), 65536) };
-        if received <= 0 {
-            idle += 1;
-            continue;
+    // Drain with the callback API instead of `rd_kafka_consume_batch_queue`: the batch call locks
+    // and unlocks the queue mutex PER MESSAGE (contending with the broker thread's enqueue), while
+    // the callback path bulk-moves the whole queued backlog under ONE lock and dispatches lock-free
+    // (librdkafka destroys each op after the callback returns).
+    struct CountCtx {
+        count: i64,
+    }
+    unsafe extern "C" fn count_message(
+        message: *mut rdsys::rd_kafka_message_t,
+        opaque: *mut std::os::raw::c_void,
+    ) {
+        let context = &mut *(opaque as *mut CountCtx);
+        let message = &*message;
+        if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+            && !message.payload.is_null()
+        {
+            context.count += 1; // no decode — raw delivery only
         }
-        idle = 0;
-        for &message_ptr in &messages[..received as usize] {
-            let message = unsafe { &*message_ptr };
-            if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
-                && !message.payload.is_null()
-            {
-                count += 1; // no decode — raw delivery only
-            }
-            unsafe { rdsys::rd_kafka_message_destroy(message_ptr) };
+    }
+    let mut context = CountCtx { count: 0 };
+    let mut idle = 0;
+    while context.count < max_messages && idle < 40 {
+        let served = unsafe {
+            rdsys::rd_kafka_consume_callback_queue(
+                queue,
+                250,
+                Some(count_message),
+                &mut context as *mut CountCtx as *mut std::os::raw::c_void,
+            )
+        };
+        if served <= 0 {
+            idle += 1;
+        } else {
+            idle = 0;
         }
     }
     unsafe { rdsys::rd_kafka_queue_destroy(queue) };
-    count
+    context.count
 }
 
-/// Benchmark-only: the SERIAL counterpart to `benchmarkNativeConsume` — same rdkafka batch consume and
-/// the same `MessageDecoder`, but decode runs INLINE on the consume thread (no decode thread, no channel
-/// handoff). Isolates whether the pipelining helps or whether the per-batch handoff is overhead: for a
-/// cheap decode (Avro) serial should match or beat the pipelined path; for an expensive decode (JSON)
-/// the pipeline should win by overlapping decode with the next poll. Returns the decoded row count.
+/// Benchmark-only: a hand-rolled consume+decode loop with none of the split-reader machinery (no
+/// per-partition bucketing, no offset tracking, no pending queue) — the ideal-case floor the
+/// production reader is validated against. The decode-thread experiment this leg once judged is
+/// settled: inline decode won on every format, and the production reader now decodes inline too.
+/// Returns the decoded row count.
 #[cfg(feature = "kafka")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNativeConsumeSerial<'local>(
@@ -13054,32 +13060,48 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let decoder = MessageDecoder::new(format, schema, &avro_schema, "", schema_id);
     let body_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)]));
 
-    let mut messages: Vec<*mut rdsys::rd_kafka_message_t> = vec![std::ptr::null_mut(); 65536];
+    // Callback drain (one queue lock per poll, not per message — see benchmarkConsumeOnly); each
+    // payload is copied into the Arrow binary builder from the callback, librdkafka frees the op after.
+    struct SerialCtx {
+        builder: BinaryBuilder,
+        appended: usize,
+    }
+    unsafe extern "C" fn append_payload(
+        message: *mut rdsys::rd_kafka_message_t,
+        opaque: *mut std::os::raw::c_void,
+    ) {
+        let context = &mut *(opaque as *mut SerialCtx);
+        let message = &*message;
+        if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
+            && !message.payload.is_null()
+        {
+            let payload = std::slice::from_raw_parts(message.payload as *const u8, message.len);
+            context.builder.append_value(payload);
+            context.appended += 1;
+        }
+    }
     let mut rows: i64 = 0;
     let mut idle = 0;
     while rows < max_messages && idle < 40 {
-        let received =
-            unsafe { rdsys::rd_kafka_consume_batch_queue(queue, 250, messages.as_mut_ptr(), 65536) };
-        if received <= 0 {
-            idle += 1;
+        let mut context =
+            SerialCtx { builder: BinaryBuilder::with_capacity(8192, 8192 * 64), appended: 0 };
+        let served = unsafe {
+            rdsys::rd_kafka_consume_callback_queue(
+                queue,
+                250,
+                Some(append_payload),
+                &mut context as *mut SerialCtx as *mut std::os::raw::c_void,
+            )
+        };
+        if served <= 0 || context.appended == 0 {
+            idle += if served <= 0 { 1 } else { 0 };
             continue;
         }
         idle = 0;
-        let mut builder = BinaryBuilder::with_capacity(received as usize, received as usize * 64);
-        for &message_ptr in &messages[..received as usize] {
-            let message = unsafe { &*message_ptr };
-            if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
-                && !message.payload.is_null()
-            {
-                let payload =
-                    unsafe { std::slice::from_raw_parts(message.payload as *const u8, message.len) };
-                builder.append_value(payload);
-            }
-            unsafe { rdsys::rd_kafka_message_destroy(message_ptr) };
-        }
         // Decode INLINE — the next batch is not fetched until this returns.
-        let body = RecordBatch::try_new(body_schema.clone(), vec![Arc::new(builder.finish())])
-            .expect("failed to build kafka body batch");
+        let body =
+            RecordBatch::try_new(body_schema.clone(), vec![Arc::new(context.builder.finish())])
+                .expect("failed to build kafka body batch");
         rows += decoder.decode(&body).num_rows() as i64;
     }
     unsafe { rdsys::rd_kafka_queue_destroy(queue) };

@@ -63,6 +63,12 @@ simd-json = "0.17"
 # NumCast for the JSON number → Arrow primitive conversions, mirroring arrow-json's number path.
 # Already in the tree transitively via arrow; pinned here for direct use.
 num-traits = "0.2"
+# Opt-in malloc override (see the `alloc-override` feature): librdkafka allocates one op per consumed
+# message on the broker thread and frees it on the app thread; the system allocator makes that
+# cross-thread malloc/free pattern the top cost on both threads (macOS even madvises pages back
+# mid-loop). mimalloc built with MI_MALLOC_OVERRIDE replaces the process malloc when the dylib loads
+# (macOS: registered as the default malloc zone, safe for cross-zone frees).
+libmimalloc-sys = { version = "0.1", features = ["override"], optional = true }
 
 [features]
 # Opt-in: the native rdkafka consumer (statically links a bundled librdkafka — no system install).
@@ -70,6 +76,9 @@ num-traits = "0.2"
 # whole-topic benchmark consumer.
 kafka = ["dep:rdkafka"]
 kafka-bench = ["kafka"]
+# Replace the C allocator for the whole hosting process with mimalloc (JVM included) — the lever for
+# librdkafka's per-message op malloc/free, which a Rust #[global_allocator] cannot intercept.
+alloc-override = ["dep:libmimalloc-sys"]
 
 # The engine is one large crate; the default parallel codegen-unit split severs cross-unit inlining
 # at arbitrary points, so hot operator loops were measured swinging ~50% from unrelated code

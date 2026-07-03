@@ -45,7 +45,6 @@ class KafkaConfigTranslatorTest {
     // librdkafka would otherwise default these the other way — the silent-divergence trap.
     Map<String, String> c = translated(props("group.id", "g"));
     assertEquals("read_uncommitted", c.get("isolation.level"));
-    assertEquals("true", c.get("check.crcs"));
     assertEquals("true", c.get("allow.auto.create.topics"));
     assertEquals("540000", c.get("connections.max.idle.ms"));
     assertEquals("300000", c.get("metadata.max.age.ms"));
@@ -56,6 +55,15 @@ class KafkaConfigTranslatorTest {
     // default beats Java's small fixed default, so we leave librdkafka to choose.
     assertNull(c.get("socket.send.buffer.bytes"));
     assertNull(c.get("socket.receive.buffer.bytes"));
+    // check.crcs is NOT pinned either (librdkafka default false, as Arroyo ships): CRC verification
+    // is robustness, not a results-affecting semantic, and librdkafka's software CRC32C on ARM
+    // measurably taxes delivery. An explicit user value still passes through (see below).
+    assertNull(c.get("check.crcs"));
+  }
+
+  @Test
+  void userCheckCrcsPassesThrough() {
+    assertEquals("true", translated(props("check.crcs", "true")).get("check.crcs"));
   }
 
   @Test

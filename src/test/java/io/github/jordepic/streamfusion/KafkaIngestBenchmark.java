@@ -43,7 +43,9 @@ import org.testcontainers.utility.DockerImageName;
  * client — consume message values as heap {@code byte[]}s, batch them into an Arrow binary column,
  * decode natively) vs the native path (rdkafka consumes straight into an Arrow builder, no JVM
  * byte[]/JNI per record, then the same decode). Decode is shared, so the gap is purely the consume +
- * byte-delivery saving — ~5x here, which is what justifies building the production native source.
+ * byte-delivery saving. Build the native side with {@code kafka-bench,alloc-override} — the malloc
+ * override is what pays for librdkafka's per-message op malloc/free (see the feature's Cargo.toml
+ * note); without it the native consumer loses to the JVM client's bulk-GC allocation.
  *
  * <p>Opt-in via {@code SF_BENCHMARK=true}; requires Docker (Testcontainers Kafka). The native side
  * builds with the {@code kafka-bench} cargo feature, which statically links a bundled librdkafka (no
@@ -82,15 +84,22 @@ class KafkaIngestBenchmark {
       String brokers = kafka.getBootstrapServers();
       produce(brokers, MESSAGES);
 
-      // Profiling mode: loop one native JSON leg so a sampler has a long, stable window.
-      // SF_KAFKA_PROFILE=1 loops the pipelined path; =json-serial loops the inline-decode path.
+      // Profiling mode: loop one JSON leg so a sampler has a long, stable window.
+      // SF_KAFKA_PROFILE=1 loops the production-reader native path; =json-serial the hand-rolled
+      // serial native path; =json-shallow the Java-consume-then-native-decode path.
       String jsonProfile = System.getenv("SF_KAFKA_PROFILE");
-      if (jsonProfile != null && (jsonProfile.equals("1") || jsonProfile.equals("json-serial"))) {
-        boolean serialLeg = jsonProfile.equals("json-serial");
+      if (jsonProfile != null
+          && (jsonProfile.equals("1")
+              || jsonProfile.equals("json-serial")
+              || jsonProfile.equals("json-shallow"))) {
         System.err.println("PROFILE_CONSUME_LOOP_START");
         System.err.flush();
         for (int i = 0; i < 60; i++) {
-          nativeConsumeAndDecode(brokers, serialLeg);
+          switch (jsonProfile) {
+            case "json-shallow" -> consumeAndDecode(brokers);
+            case "json-serial" -> nativeConsumeAndDecode(brokers, true);
+            default -> nativeConsumeAndDecode(brokers); // 1 (production reader)
+          }
         }
         return;
       }
@@ -99,15 +108,15 @@ class KafkaIngestBenchmark {
       // the JVM, as they'd feed a downstream native operator. The only difference is who polls Kafka:
       // Java's batch poll vs librdkafka's per-message poll.
       double shallow = time(() -> consumeAndDecode(brokers)); // Java batch poll -> bytes -> native decode
-      double nativeSecs = time(() -> nativeConsumeAndDecode(brokers)); // rdkafka poll ‖ decode thread
+      double nativeSecs = time(() -> nativeConsumeAndDecode(brokers)); // production split reader
       double serial = time(() -> nativeConsumeAndDecode(brokers, true)); // rdkafka poll + inline decode
 
       System.out.printf(
           "%n[kafka -> Arrow IN RUST, %,d three-field JSON msgs, same plain-JVM harness]%n"
               + "  shallow (Java batch poll -> native decode): %.2fs  =  %,.0f msgs/s%n"
-              + "  native pipelined (rdkafka poll ‖ decode):   %.2fs  =  %,.0f msgs/s%n"
+              + "  native (production reader, inline decode):  %.2fs  =  %,.0f msgs/s%n"
               + "  native serial    (rdkafka poll + inline):   %.2fs  =  %,.0f msgs/s%n"
-              + "  native(pipelined) speedup vs shallow: %.2fx   pipelined vs serial: %.2fx%n",
+              + "  native(production) speedup vs shallow: %.2fx   production vs hand-rolled serial: %.2fx%n",
           MESSAGES, shallow, MESSAGES / shallow, nativeSecs, MESSAGES / nativeSecs, serial,
           MESSAGES / serial, shallow / nativeSecs, serial / nativeSecs);
     }
@@ -202,7 +211,7 @@ class KafkaIngestBenchmark {
       produceAvro(brokers, MESSAGES, avroSchema);
 
       // Profiling: loop one Avro leg so a sampler gets a stable window. SF_KAFKA_PROFILE=avro-native
-      // loops the pipelined native path (rdkafka consume thread ‖ decode thread); =avro-shallow loops
+      // loops the production-reader native path; =avro-shallow loops
       // the serial Java-consume-then-decode path.
       String profile = System.getenv("SF_KAFKA_PROFILE");
       if (profile != null && profile.startsWith("avro-")) {
@@ -212,7 +221,7 @@ class KafkaIngestBenchmark {
           switch (profile) {
             case "avro-shallow" -> consumeAndDecodeAvro(brokers, avroSchema);
             case "avro-serial" -> nativeConsumeAndDecodeAvro(brokers, avroSchema, true);
-            default -> nativeConsumeAndDecodeAvro(brokers, avroSchema); // avro-native (pipelined)
+            default -> nativeConsumeAndDecodeAvro(brokers, avroSchema); // avro-native (production)
           }
         }
         return;
@@ -225,9 +234,9 @@ class KafkaIngestBenchmark {
       System.out.printf(
           "%n[kafka -> Arrow IN RUST, %,d three-field Confluent-Avro msgs, same plain-JVM harness]%n"
               + "  shallow (Java batch poll -> native decode): %.2fs  =  %,.0f msgs/s%n"
-              + "  native pipelined (rdkafka poll ‖ decode):   %.2fs  =  %,.0f msgs/s%n"
+              + "  native (production reader, inline decode):  %.2fs  =  %,.0f msgs/s%n"
               + "  native serial    (rdkafka poll + inline):   %.2fs  =  %,.0f msgs/s%n"
-              + "  native(pipelined) speedup vs shallow: %.2fx   pipelined vs serial: %.2fx%n",
+              + "  native(production) speedup vs shallow: %.2fx   production vs hand-rolled serial: %.2fx%n",
           MESSAGES, shallow, MESSAGES / shallow, nativeSecs, MESSAGES / nativeSecs, serial,
           MESSAGES / serial, shallow / nativeSecs, serial / nativeSecs);
     }
@@ -491,9 +500,8 @@ class KafkaIngestBenchmark {
 
   /**
    * The librdkafka config the production native source uses for a typical consumer: the {@link
-   * io.github.jordepic.streamfusion.kafka.KafkaConfigTranslator} output (check.crcs left on, as in
-   * production and the Java client) plus the librdkafka-only throughput tuning {@code KafkaTables} folds
-   * in. Returned as {@code {keys, values}} for the JNI string-array call. Keeping this identical to the
+   * io.github.jordepic.streamfusion.kafka.KafkaConfigTranslator} output plus the librdkafka-only
+   * throughput tuning {@code KafkaTables} folds in. Returned as {@code {keys, values}} for the JNI string-array call. Keeping this identical to the
    * production path is the point: the benchmark measures what a real SQL Kafka table actually runs.
    */
   private static String[][] nativeConfig(String brokers, String group) {
@@ -511,6 +519,12 @@ class KafkaIngestBenchmark {
     config.putIfAbsent("fetch.queue.backoff.ms", "2");
     config.putIfAbsent("queued.min.messages", "1000000");
     config.putIfAbsent("queued.max.messages.kbytes", "2097151");
+    // A/B knob: the translator leaves check.crcs at librdkafka's default (false — see the
+    // translator's note; librdkafka has no hardware CRC32C on ARM, so verification costs real
+    // delivery-thread CPU). SF_KAFKA_CHECK_CRCS=true re-enables it to measure that tax.
+    if (System.getenv("SF_KAFKA_CHECK_CRCS") != null) {
+      config.put("check.crcs", System.getenv("SF_KAFKA_CHECK_CRCS"));
+    }
     String[] keys = config.keySet().toArray(new String[0]);
     String[] values = new String[keys.length];
     for (int i = 0; i < keys.length; i++) {

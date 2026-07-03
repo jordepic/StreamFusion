@@ -108,7 +108,26 @@ queue drain to amortize per-message poll cost, decode overlapped on a background
 from parity to ~1.15x over the shallow path on JSON (`b5fa0c2`); letting librdkafka auto-tune socket
 buffers instead of pinning the Java client's small defaults removed a measurable throttle
 (`f6e658b`); cutting the poll timeout 1000 → 100 ms removed dead seconds at a bounded read's tail
-(`81a9f54`).
+(`81a9f54`). The decode thread was later removed — see the consume fast path below.
+
+**Kafka consume fast path** (divergences/19). Per-thread profiling showed librdkafka's delivery
+thread, not the app thread, capped native consume ~30% below the Java client, and its top non-I/O
+costs were per-message bookkeeping the JVM sidesteps via TLAB + bulk GC and CRC intrinsics. Three
+levers, compounding on 10M-msg raw consume from 3.33M/s (0.73x the Java client) to 5.34M/s (1.21x):
+the opt-in `alloc-override` cargo feature statically links a mimalloc malloc override into the
+dylib, paying for librdkafka's per-message op calloc (broker thread) + free (app thread) that no
+Rust `#[global_allocator]` can reach (+19% — benchmark-grade only, see divergences/19: the
+process-wide zone swap is racy under JVM thread churn; the targeted librdkafka→mimalloc redirect
+is the shippable follow-up); `check.crcs` now follows librdkafka's default of
+false — its software CRC32C on ARM (no HW path outside x86 SSE4.2) taxed the delivery thread
+~13.5% (+22%); and the reader drains with `rd_kafka_consume_callback_queue`, which bulk-moves the
+backlog under one queue lock instead of locking per message against the enqueuing broker thread
+(+11%), with `max_records` enforced via `rd_kafka_yield`. The split reader's background decode
+thread is gone — with consume this fast, inline decode won on every format (Flink already
+pipelines fetcher vs task thread) — and the reader primes broker metadata before `assign()`
+(a cold assign parks partitions in leader-query for ~0.5s until the periodic refresh). Net:
+production consume+decode past the shallow path on both formats — Avro 5.21M/s (1.27x), JSON
+3.87M/s (1.41x) — within noise of a hand-rolled ideal consume loop.
 
 **Projection pushdown into every decoder** (`64ddc2a`, `83b3d69`, `86908f1`, `4af9d63`). The query's
 projection narrows what the decoder builds: JSON decodes straight to the narrowed schema, Avro keeps

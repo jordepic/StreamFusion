@@ -64,6 +64,7 @@ public final class KafkaConfigTranslator {
     "client.id",
     "client.rack",
     "enable.auto.commit",
+    "check.crcs",
     "fetch.min.bytes",
     "fetch.max.bytes",
     "max.partition.fetch.bytes",
@@ -100,11 +101,16 @@ public final class KafkaConfigTranslator {
   // throughput, not correctness, and librdkafka's default (OS-auto-tuned) outperforms Java's small
   // fixed defaults — pinning Java's 64KB receive buffer measurably throttled the native consumer. The
   // user's explicit value is still honored via the rename above; we just don't force Java's default.
+  //
+  // check.crcs is likewise not pinned (librdkafka default: false, the posture Arroyo ships with).
+  // CRC verification is corruption-detection robustness, not a results-affecting semantic, and
+  // librdkafka has no hardware CRC32C on ARM (x86 SSE4.2 only) — the software fallback measurably
+  // taxes the delivery thread while the JVM's intrinsic CRC32C is nearly free. An explicit user
+  // value is still copied verbatim. Recorded in divergences/.
   private static final Map<String, String[]> DEFAULT_PINS =
       new LinkedHashMap<>(
           Map.of(
               "isolation.level", new String[] {"isolation.level", "read_uncommitted"},
-              "check.crcs", new String[] {"check.crcs", "true"},
               "allow.auto.create.topics", new String[] {"allow.auto.create.topics", "true"},
               "connections.max.idle.ms", new String[] {"connections.max.idle.ms", "540000"},
               "metadata.max.age.ms", new String[] {"metadata.max.age.ms", "300000"},
