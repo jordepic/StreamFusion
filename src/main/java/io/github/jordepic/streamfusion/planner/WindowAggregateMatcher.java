@@ -297,14 +297,17 @@ final class WindowAggregateMatcher {
       }
       // SUM/AVG keep the input numeric type, admitted only where a custom native accumulator
       // reproduces the host exactly (integer SUM/AVG wrap/truncate; float SUM stays 4-byte; float/
-      // double AVG sum in double). MIN/MAX/COUNT are type-preserving and need no such gate.
+      // double AVG sum in double; decimal SUM/AVG hold an i128 sum at the input scale with Flink's
+      // overflow-to-NULL and exact-division semantics). MIN/MAX/COUNT are type-preserving and need
+      // no such gate.
       boolean numericSumAvg =
           valueType == SqlTypeName.BIGINT
               || valueType == SqlTypeName.INTEGER
               || valueType == SqlTypeName.SMALLINT
               || valueType == SqlTypeName.TINYINT
               || valueType == SqlTypeName.DOUBLE
-              || valueType == SqlTypeName.FLOAT;
+              || valueType == SqlTypeName.FLOAT
+              || valueType == SqlTypeName.DECIMAL;
       if (kind == KIND_SUM && !numericSumAvg) {
         return false;
       }

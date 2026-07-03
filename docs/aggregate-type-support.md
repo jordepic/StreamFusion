@@ -23,7 +23,7 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 | INT     | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | SMALLINT / TINYINT | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | FLOAT (REAL) | ✓ (custom f32) | ✓ (custom f64→f32) | ✓ | ✓ | ✓ |
-| DECIMAL | ✓ non-windowed / ✗ windowed | ✓ non-windowed / ✗ windowed | ✓ | ✓ | ✓ |
+| DECIMAL | ✓ (✗ two-phase) | ✓ (✗ two-phase) | ✓ | ✓ | ✓ |
 | CHAR / VARCHAR | ✗ | ✗ | ✓ (byte-lexicographic) | ✓ (byte-lexicographic) | ✓ |
 
 Notes / divergences this avoids:
@@ -42,13 +42,15 @@ Notes / divergences this avoids:
   same per-row order as the host, so the result is bit-identical — verified by a
   parity test over values whose float running sum carries rounding error.
 - **DECIMAL** carries `MIN`/`MAX`/`COUNT` everywhere (type-preserving comparisons/counts
-  over an Arrow decimal vector of the column's precision/scale). The **non-windowed
-  `GROUP BY`** also runs decimal `SUM` (an i128 running sum at the input scale,
-  reported as Flink's `DECIMAL(38, s)`, overflow → NULL) and decimal `AVG` (that sum
-  divided by the non-null count with Flink's exact decimal division — 38-significant-digit
-  quotient then HALF_UP rescale — reported as `findAvgAggType`'s `DECIMAL(38, max(6, s))`).
-  The **windowed** aggregates still leave decimal `SUM`/`AVG` on the host: their
-  accumulators don't carry the custom decimal state yet.
+  over an Arrow decimal vector of the column's precision/scale). The non-windowed
+  `GROUP BY` and the **single-phase windowed** aggregates also run decimal `SUM` (an
+  i128 running sum at the input scale, reported as Flink's `DECIMAL(38, s)`,
+  overflow → NULL) and decimal `AVG` (that sum divided by the non-null count with
+  Flink's exact decimal division — 38-significant-digit quotient then HALF_UP
+  rescale — reported as `findAvgAggType`'s `DECIMAL(38, max(6, s))`). The
+  **two-phase** split (non-windowed mini-batch and windowed local/global) still
+  leaves decimal `SUM`/`AVG` on the host — its partial columns are gated to
+  bigint/double (ticket 41).
 
 ## Predicate arithmetic (filter expressions)
 The native expression engine admits `+`/`-`/`*` in filter predicates. DataFusion
@@ -71,8 +73,9 @@ Comparisons are width-insensitive and always safe.
   `FLOAT` — carries all five aggregates, with custom accumulators where DataFusion
   would diverge from the host's type/precision (integer `SUM` wraps, integer `AVG`
   truncates, float `SUM` stays 4-byte, float `AVG` narrows from a double sum, double
-  `AVG` divides in double). `DECIMAL` carries `MIN`/`MAX`/`COUNT` (its `SUM`/`AVG` stay
-  on the host — precision rules). The native value path is type-general; each type is an
+  `AVG` divides in double). `DECIMAL` carries all five (custom i128 accumulators with
+  Flink's overflow-to-NULL and exact-division semantics; two-phase excepted — its
+  partials are bigint/double only). The native value path is type-general; each type is an
   Arrow vector class + getter + a value-type code (decimal packs precision/scale in).
 - **Multiple value columns:** each aggregate reads its own value column, so
   `SUM(a), SUM(b)` over different columns (of different types) is accelerated. The

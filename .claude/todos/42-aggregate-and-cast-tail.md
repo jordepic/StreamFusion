@@ -1,4 +1,4 @@
-# High-frequency aggregate + expression tail (number↔string CAST, windowed decimal)
+# High-frequency aggregate + expression tail (number↔string CAST)
 
 **Status:** TODO. Prioritized 2026-07-03 (tier 3 of the coverage push). These are the small,
 individually-scoped gaps most likely to silently kill otherwise-simple real queries.
@@ -15,10 +15,11 @@ Shipped 2026-07-03:
   float/double→DECIMAL cast).
 - **Decimal `AVG`** (non-windowed single-phase) — SUM's `DECIMAL(38, s)` accumulator plus the exact
   division on emit, reporting `findAvgAggType`'s `DECIMAL(38, max(6, s))`.
+- **Window-aggregate decimal `SUM`/`AVG`** (single-phase) — the same accumulators as window
+  `Accumulator`s. The two-phase decimal split (windowed local/global and non-windowed mini-batch)
+  remains with ticket 41 — its partial columns are gated to bigint/double.
 
 Remaining:
-- **Window-aggregate decimal `SUM`/`AVG`** — the non-windowed decimal SUM/AVG accumulators exist;
-  carry them into the windowed aggregates (one- and two-phase per ticket 41).
 - **Number↔string `CAST`** — `CAST(x AS VARCHAR)` / `CAST(s AS INT)` are probably the most common
   expression-level fallback in the wild. Must be byte-exact to Flink's formatting/parsing
   (`BinaryStringDataUtil` / Flink's cast rules — trailing zeros, scientific notation thresholds,

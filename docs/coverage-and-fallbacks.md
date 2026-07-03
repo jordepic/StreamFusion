@@ -53,10 +53,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   too (bigint/int/double values; see the mini-batch bullet below). **Decimal `AVG`** is also native
   for the single-phase non-windowed `GROUP BY`: the sum is SUM's `DECIMAL(38, s)` accumulator and
   the emit divides by the non-null count with Flink's exact decimal division (38-significant-digit
-  quotient, HALF_UP rescale), reporting `DECIMAL(38, max(6, s))` — `findAvgAggType`'s type. Still
-  falling back: two-phase decimal `SUM`/`AVG`, and window-aggregate
-  decimal `SUM`/`AVG`; value types outside bigint/double/int/smallint/tinyint/float/decimal (see
-  `aggregate-type-support.md`).
+  quotient, HALF_UP rescale), reporting `DECIMAL(38, max(6, s))` — `findAvgAggType`'s type. The
+  **single-phase windowed** aggregates run decimal `SUM`/`AVG` the same way. Still falling back:
+  the **two-phase** decimal split (non-windowed mini-batch and windowed local/global — the partial
+  columns are gated to bigint/double); value types outside
+  bigint/double/int/smallint/tinyint/float/decimal (see `aggregate-type-support.md`).
 - **Two-phase (mini-batch) `GROUP BY`** — all four operators run native: a native `MiniBatchAssigner`
   emits the proc-time marker, the local is a transient in-memory bundle flushed on that marker / a
   `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
@@ -317,8 +318,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Key types** outside bigint/int/string/boolean/date/timestamp/decimal **(plus the nested types
   above)** for join/OVER/window/group keys.
 - **Aggregate value types** outside the parity matrix in `aggregate-type-support.md`. The non-windowed
-  `GROUP BY` covers `DECIMAL` for `SUM`/`MIN`/`MAX`/`COUNT`/`AVG`; window-aggregate decimal
-  `SUM`/`AVG` still fall back.
+  `GROUP BY` and the single-phase windowed aggregates cover `DECIMAL` for
+  `SUM`/`MIN`/`MAX`/`COUNT`/`AVG`; the two-phase decimal split still falls back.
 
 ### 5. Source / sink / connector
 - **Filesystem** — non-local path (`hdfs:`/`s3:`/…) for the Parquet/ORC source and Parquet sink; any

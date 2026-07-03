@@ -330,6 +330,83 @@ impl Accumulator for WrappingIntSumAccumulator {
     }
 }
 
+/// Decimal SUM/AVG window accumulator with Flink's semantics: an i128 running sum at the input scale
+/// with overflow past DECIMAL(38, s) latched to NULL (Flink's fromBigDecimal, where DataFusion's
+/// decimal sum errors instead), plus the non-null count. SUM evaluates to the sum as DECIMAL(38, s);
+/// AVG divides sum by count with Flink's exact decimal division (38-significant-digit quotient, then
+/// the HALF_UP rescale) at findAvgAggType's DECIMAL(38, max(6, s)). The snapshot state is the
+/// (sum, count) pair; a NULL sum with a live count marks an overflowed accumulator on restore.
+#[derive(Debug)]
+struct DecimalWindowAccumulator {
+    sum: i128,
+    count: i64,
+    overflow: bool,
+    scale: i8,
+    avg: bool,
+}
+
+impl DecimalWindowAccumulator {
+    fn new(scale: i8, avg: bool) -> Self {
+        DecimalWindowAccumulator { sum: 0, count: 0, overflow: false, scale, avg }
+    }
+}
+
+impl Accumulator for DecimalWindowAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array =
+            values[0].as_any().downcast_ref::<Decimal128Array>().expect("value decimal128");
+        for value in array.iter().flatten() {
+            accumulate_decimal(&mut self.sum, &mut self.overflow, value);
+            self.count += 1;
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<Decimal128Array>().expect("sum decimal128");
+        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
+        for row in 0..sums.len() {
+            let count = if counts.is_null(row) { 0 } else { counts.value(row) };
+            if sums.is_valid(row) {
+                accumulate_decimal(&mut self.sum, &mut self.overflow, sums.value(row));
+            } else if count > 0 {
+                self.overflow = true; // a live count with a NULL sum is an overflowed partial
+            }
+            self.count += count;
+        }
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        let sum = (!self.overflow && self.count != 0).then_some(self.sum);
+        Ok(vec![
+            ScalarValue::Decimal128(sum, 38, self.scale),
+            ScalarValue::Int64(Some(self.count)),
+        ])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        if !self.avg {
+            let sum = (!self.overflow && self.count != 0).then_some(self.sum);
+            return Ok(ScalarValue::Decimal128(sum, 38, self.scale));
+        }
+        let result_scale = self.scale.max(6);
+        if self.overflow || self.count == 0 {
+            return Ok(ScalarValue::Decimal128(None, 38, result_scale));
+        }
+        let (unscaled, qscale) = quotient_38_digits(self.sum, self.scale, self.count as i128, 0);
+        Ok(ScalarValue::Decimal128(
+            rescale_half_up(unscaled, qscale, 38, result_scale),
+            38,
+            result_scale,
+        ))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
 /// Sum of a narrow integer column (smallint/tinyint) matching the host's semantics: the host keeps
 /// the input type and casts back each accumulate step, so the running sum wraps at the narrow width.
 /// We fold at int64 but wrap to the width on every step, and emit the narrow type. Null when no
@@ -547,25 +624,33 @@ enum WindowAggregate {
     FloatSum,
     FloatAvg,
     DoubleAvg,
+    // Decimal SUM/AVG carry Flink's semantics, which DataFusion's decimal aggregates don't: SUM is
+    // an i128 running sum at the input scale reported as DECIMAL(38, s) with overflow → NULL (not an
+    // error), and AVG divides that sum by the non-null count with Flink's exact decimal division,
+    // reported as findAvgAggType's DECIMAL(38, max(6, s)).
+    DecimalSum { scale: i8 },
+    DecimalAvg { scale: i8 },
 }
 
 impl WindowAggregate {
     fn new(kind: i64, value_type: &DataType) -> Self {
-        match kind {
+        match (kind, value_type) {
             // SUM over a narrow int keeps the host's narrow, wrapping semantics rather than widening.
-            0 if *value_type == DataType::Int32 => WindowAggregate::WrappingIntSum,
-            0 if *value_type == DataType::Int16 || *value_type == DataType::Int8 => {
+            (0, DataType::Int32) => WindowAggregate::WrappingIntSum,
+            (0, DataType::Int16 | DataType::Int8) => {
                 WindowAggregate::WrappingNarrowSum(value_type.clone())
             }
             // SUM over float keeps the host's 4-byte precision rather than widening to double.
-            0 if *value_type == DataType::Float32 => WindowAggregate::FloatSum,
-            0..=3 => WindowAggregate::Builtin(build_builtin(kind, value_type)),
+            (0, DataType::Float32) => WindowAggregate::FloatSum,
+            (0, DataType::Decimal128(_, s)) => WindowAggregate::DecimalSum { scale: *s },
+            (0..=3, _) => WindowAggregate::Builtin(build_builtin(kind, value_type)),
             // Float AVG sums in double and narrows to float; double AVG stays double; integer AVG
             // truncates to its type.
-            4 if *value_type == DataType::Float32 => WindowAggregate::FloatAvg,
-            4 if *value_type == DataType::Float64 => WindowAggregate::DoubleAvg,
-            4 => WindowAggregate::IntegerAvg(value_type.clone()),
-            other => panic!("unsupported aggregate kind: {other}"),
+            (4, DataType::Float32) => WindowAggregate::FloatAvg,
+            (4, DataType::Float64) => WindowAggregate::DoubleAvg,
+            (4, DataType::Decimal128(_, s)) => WindowAggregate::DecimalAvg { scale: *s },
+            (4, _) => WindowAggregate::IntegerAvg(value_type.clone()),
+            (other, _) => panic!("unsupported aggregate kind: {other}"),
         }
     }
 
@@ -584,6 +669,12 @@ impl WindowAggregate {
             WindowAggregate::FloatSum => Box::<FloatSumAccumulator>::default(),
             WindowAggregate::FloatAvg => Box::<FloatAvgAccumulator>::default(),
             WindowAggregate::DoubleAvg => Box::<DoubleAvgAccumulator>::default(),
+            WindowAggregate::DecimalSum { scale } => {
+                Box::new(DecimalWindowAccumulator::new(*scale, false))
+            }
+            WindowAggregate::DecimalAvg { scale } => {
+                Box::new(DecimalWindowAccumulator::new(*scale, true))
+            }
         }
     }
 
@@ -615,6 +706,10 @@ impl WindowAggregate {
                 Field::new("sum", DataType::Float64, true),
                 Field::new("count", DataType::Int64, true),
             ],
+            WindowAggregate::DecimalSum { scale } | WindowAggregate::DecimalAvg { scale } => vec![
+                Field::new("sum", DataType::Decimal128(38, *scale), true),
+                Field::new("count", DataType::Int64, true),
+            ],
         }
     }
 
@@ -627,6 +722,9 @@ impl WindowAggregate {
             WindowAggregate::WrappingNarrowSum(data_type) => data_type.clone(),
             WindowAggregate::FloatSum | WindowAggregate::FloatAvg => DataType::Float32,
             WindowAggregate::DoubleAvg => DataType::Float64,
+            WindowAggregate::DecimalSum { scale } => DataType::Decimal128(38, *scale),
+            // Flink's findAvgAggType: DECIMAL(38, max(6, s)).
+            WindowAggregate::DecimalAvg { scale } => DataType::Decimal128(38, (*scale).max(6)),
         }
     }
 }

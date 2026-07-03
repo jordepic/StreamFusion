@@ -46,11 +46,12 @@ here when the ticket is deleted.
   shift cascade — UPDATE_BEFORE/UPDATE_AFTER per shifted rank, plus the appended rank column).
   Top-N also handles an `OFFSET` and a retracting input; `RANK`/`DENSE_RANK` are parity (Flink
   rejects them in streaming).
-- **Window aggregate input schemas:** all five aggregates over every non-decimal
-  numeric value type (custom accumulators keep the host's type/precision) plus decimal MIN/MAX/COUNT;
+- **Window aggregate input schemas:** all five aggregates over every numeric value type incl.
+  decimal (custom accumulators keep the host's type/precision; decimal SUM/AVG are single-phase —
+  the two-phase partial columns stay bigint/double, ticket 41);
   multiple value columns (`SUM(a), SUM(b)`); bigint/int/string/boolean/date/timestamp/decimal grouping
   keys; and `COUNT(*)` (one- and two-phase). Parity matrix in `docs/aggregate-type-support.md`.
-  Decimal `SUM`/`AVG` stay on the host (precision rules). Join/`OVER` partition keys now carry the
+  Join/`OVER` partition keys now carry the
   full grouping-key set (bigint/int/string/boolean/date/timestamp/decimal) — the native key path is
   type-general, so OVER, interval join, and window join were widened from bigint/int/string to match
   the group-by/window aggregate (float/double stay out — key equality on them is ill-defined).
@@ -118,11 +119,12 @@ here when the ticket is deleted.
    plans to under mini-batch), two-phase decimal `SUM`, wider two-phase value types, row-time
    mini-batch. (Two-phase `AVG` shipped 2026-07-03; the "widening partials" item was a misdiagnosis
    — Flink's SUM partial keeps the value type and already routes.)
-3. **High-frequency aggregate/expression tail** (ticket 42): byte-exact number↔string `CAST`,
-   windowed decimal `SUM`/`AVG`. (Shipped 2026-07-03: `SUM`/`MIN`/`MAX` `DISTINCT` — and windowed
-   DISTINCT aggregates, previously admitted as plain folds (a wrong-results bug), now fall back;
-   byte-exact decimal `/`/`%` by default, retiring the approximate flag for arithmetic; and
-   non-windowed decimal `AVG` via the exact division.)
+3. **High-frequency aggregate/expression tail** (ticket 42): byte-exact number↔string `CAST`.
+   (Shipped 2026-07-03: `SUM`/`MIN`/`MAX` `DISTINCT` — and windowed DISTINCT aggregates, previously
+   admitted as plain folds (a wrong-results bug), now fall back; byte-exact decimal `/`/`%` by
+   default, retiring the approximate flag for arithmetic; and decimal `AVG` + windowed decimal
+   `SUM`/`AVG` (single-phase) via the exact division. The two-phase decimal split moved to
+   ticket 41.)
 4. **Legacy group windows** (ticket 43): map `GROUP BY TUMBLE/HOP(...)` onto the existing native
    window operators — the event-time `SESSION` exception is the template.
 5. **Cheap wins, interleaved:** the format-option parity audit (ticket 32). (Shipped 2026-07-03:

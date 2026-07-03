@@ -25,8 +25,10 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
   today (the single-phase path takes them); extend the running types to match the single-phase set.
   (The previously-listed "widening partials" item was a misdiagnosis: Flink's SUM partial keeps the
   value's own type — `SUM(INT)` two-phase already routes.)
-- **Two-phase decimal `SUM`** — the single-phase decimal SUM (i128, `DECIMAL(38, s)`) is native;
-  carry the same accumulator through the local/global split.
+- **Two-phase decimal `SUM`/`AVG`** — the single-phase decimal SUM/AVG (i128, `DECIMAL(38, s)`,
+  exact division for AVG) are native, non-windowed and windowed alike; carry the same accumulators
+  through the local/global splits (both the mini-batch pair here and the windowed local/global —
+  their partial columns are gated to bigint/double today).
 - **Row-time mini-batch** — the mini-batch assigner over a rowtime (watermark-driven flush) falls
   back; only the proc-time marker is native.
 

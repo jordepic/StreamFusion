@@ -436,12 +436,26 @@ class FlinkWindowSqlHarnessTest {
   }
 
   @Test
-  void decimalSumFallsBack() throws Exception {
-    // SUM over DECIMAL stays on the host (DataFusion's sum precision derivation differs from Flink's),
-    // so the window aggregate can't be native and the whole query falls back. The result still matches.
-    NativeParity.assertFallback(
+  void decimalSumMatchesHost() throws Exception {
+    // SUM over DECIMAL(p, s): an i128 running sum at the input scale, reported as Flink's
+    // DECIMAL(38, s) with overflow → NULL — the custom accumulator, since DataFusion's decimal sum
+    // errors on overflow instead.
+    NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentWithSource,
-        "SELECT window_start, window_end, SUM(price) AS s "
+        "SELECT window_start, window_end, SUM(price) AS s, MIN(price) AS lo "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void decimalAvgMatchesHost() throws Exception {
+    // AVG over DECIMAL(p, s): the SUM accumulator divided by the non-null count with Flink's exact
+    // decimal division, reported as findAvgAggType's DECIMAL(38, max(6, s)). Three rows land in the
+    // first window, so the quotient is a repeating decimal exercising both rounding steps. (AVG is
+    // a lone aggregate — the multi-field partial restriction.)
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentWithSource,
+        "SELECT window_start, window_end, AVG(price) AS a "
             + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
             + "GROUP BY window_start, window_end");
   }
