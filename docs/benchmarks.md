@@ -420,37 +420,43 @@ Flink baseline), sorted by the JSON speedup:
 
 | Query | JSON | Avro | Protobuf |
 |---|---|---|---|
-| q11 | **3.89×** | **5.11×** | **4.85×** |
-| q7 | **2.97×** | **3.36×** | **2.99×** |
-| q22 | **2.75×** | **3.52×** | **2.94×** |
-| q14 § | **2.69×** | **3.05×** | **2.58×** |
-| q0 | **2.66×** | **3.36×** | **2.71×** |
-| q10 § | **2.66×** | **2.61×** | **2.12×** |
-| q17 § | **2.60×** | **2.61×** | **2.17×** |
-| q15 § | **2.54×** | **2.50×** | **2.15×** |
-| q13 | **2.53×** | **2.82×** | **2.27×** |
-| q12 | **2.52×** | **3.16×** | **2.78×** |
-| q18 | **2.50×** | **2.55×** | **2.11×** |
-| q1 | **2.45×** | **3.22×** | **2.73×** |
-| q2 | **2.43×** | **3.10×** | **2.51×** |
-| q5 | **2.36×** | **3.48×** | **2.94×** |
-| q4 | **2.35×** | **2.92×** | **2.75×** |
-| q20 | **2.34×** | **3.50×** | **2.60×** |
-| q3 | **2.17×** | **2.78×** | **2.31×** |
-| q21 | **2.12×** | **2.05×** | **1.79×** |
-| q21 † | **3.02×** | **3.48×** | **3.13×** |
-| q23 | **2.10×** | **2.47×** | **2.24×** |
-| q9 | **2.08×** | **2.02×** | **1.99×** |
-| q8 | **2.07×** | **2.91×** | **2.25×** |
-| q19 | **1.74×** | **1.68×** | **1.67×** |
-| q16 § | **1.62×** | **1.62×** | **1.39×** |
+| q11 | **4.29×** | **4.82×** | **4.58×** |
+| q0 | **3.03×** | **3.65×** | **2.81×** |
+| q10 § | **2.79×** | **2.89×** | **2.30×** |
+| q7 | **2.78×** | **3.70×** | **2.85×** |
+| q14 § | **2.75×** | **3.16×** | **2.71×** |
+| q15 § | **2.72×** | **2.54×** | **2.11×** |
+| q1 | **2.63×** | **3.35×** | **2.56×** |
+| q17 § | **2.55×** | **2.80×** | **2.26×** |
+| q4 | **2.48×** | **3.20×** | **2.66×** |
+| q18 | **2.46×** | **2.64×** | **2.44×** |
+| q5 | **2.42×** | **3.21×** | **2.93×** |
+| q22 | **2.38×** | **2.96×** | **2.50×** |
+| q20 | **2.32×** | **3.51×** | **2.96×** |
+| q8 | **2.32×** | **2.72×** | **2.38×** |
+| q12 | **2.31×** | **2.59×** | **2.28×** |
+| q13 | **2.29×** | **2.76×** | **2.19×** |
+| q3 | **2.23×** | **2.20×** | **1.94×** |
+| q23 | **2.20×** | **2.90×** | **2.36×** |
+| q2 | **2.16×** | **2.51×** | **2.13×** |
+| q9 | **2.12×** | **1.94×** | **1.84×** |
+| q21 | **2.09×** | **2.17×** | **1.73×** |
+| q21 † | **2.42×** | **2.91×** | **2.49×** |
+| q19 | **1.92×** | **1.90×** | **1.90×** |
+| q16 § | **1.61×** | **1.68×** | **1.38×** |
 
-**Every Kafka row clears 1.39×, all but a handful clear 2×, and the peak is q11 at 3.9–5.1×.** An
+**Every Kafka row clears 1.38×, all but a handful clear 2×, and the peak is q11 at 4.3–4.8×.**
+These numbers include the source's per-partition watermark regeneration (the matrix tables declare a
+`WATERMARK`, pushed into the scan): windows fire incrementally mid-stream exactly as on stock Flink,
+and the per-batch max-rowtime scan that feeds it costs nothing measurable. The same watermark work
+collapses the two middle rungs on these tables — the decode rung declines a watermarked table (it
+cannot regenerate the pushed watermark), so its per-rung numbers now equal the JVM-transpose rung's;
+the un-watermarked ladder tables above are unaffected. An
 earlier version of this table reported "best rung per format", because the source rung was capped by
 a per-poll ceiling and the shallow decode (or even the JVM transpose) rung often led; the consume
 fast path removed that ceiling and made the source rung strictly dominant — including for the
 changelog-heavy queries (q9/q19) that previously gained nothing from faster decode, and
-q3/q14/q18/q21, whose JSON rows were below 1× on their old best rung and now sit at 2×+. The floor
+q3/q14/q18/q21, whose JSON rows were below 1× on their old best rung and now sit at ~2×+. The floor
 of the table is q16 and the changelog-bound q9/q19 — operator-bound queries where the consume saving
 is diluted, not reversed.
 

@@ -110,8 +110,9 @@ here when the ticket is deleted.
    and specific-offsets/topic-pattern startup shipped; `kafkaSource` defaults on and the `kafka`
    cargo feature is a default build feature (probe-guarded for opt-out builds). Remaining tails in
    the ticket: `key.format`, SASL/SSL build features, Linux mimalloc link-alias verification,
-   multi-broker measurement — plus a Nexmark re-run to re-quote the Kafka numbers now that
-   watermarks actually flow mid-stream (and the ladder's decode rung declines watermarked tables).
+   multi-broker measurement. The Kafka matrix was re-run with watermarks flowing mid-stream and the
+   readme/benchmarks Kafka numbers re-quoted (floor 1.38x, peak q11 4.3–4.8x — watermark
+   regeneration costs nothing measurable).
 2. **Mini-batch coverage** (ticket 41): `IncrementalGroupAggregate` (what any distinct aggregate
    plans to under mini-batch), two-phase `AVG`, widening partials (`SUM(INT)`), two-phase decimal
    `SUM`, row-time mini-batch.

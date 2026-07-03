@@ -43,8 +43,10 @@ Remaining tails:
   now declines watermarked tables outright — it silently dropped the pushed watermark before, which
   bounded benchmark runs masked; its own watermark story (needs split-lifecycle visibility inside
   the operator, or folding the decode into a source reader) is a follow-up if CSV/raw/CDC event-time
-  tables matter. The ladder's middle (decode) rung therefore now equals the transpose rung on
-  watermarked tables; re-measure before quoting it.
+  tables matter. On the matrix's watermarked tables the decode rung
+  now equals the transpose rung — confirmed in the 2026-07-03 Kafka matrix re-run, from which the
+  readme/benchmarks Kafka numbers were re-quoted (floor 1.38x, peak q11 4.3–4.8x; watermark
+  regeneration costs nothing measurable). The un-watermarked ladder tables are unaffected.
 - **Startup modes: DONE (2026-07-03).** specific-offsets (Flink's own `OffsetsInitializer.offsets`
   over the factory-validated option) and topic-pattern (the pattern subscriber in the reused
   enumerator — the reader only ever sees concrete splits) both route, on both native paths;
