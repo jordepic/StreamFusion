@@ -58,9 +58,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
   `MapBundleOperator`), the keyed shuffle is a native exchange, and the global reuses the single-phase
   group-aggregate operator (`COUNT` merges as a `SUM` over partial counts).
-  Scope: SUM/MIN/MAX/COUNT over bigint/int/double, with **no widening of the partial** — `SUM(INT)`
-  (whose partial Flink widens to bigint) routes single-phase, as does `AVG`/distinct (the latter plans
-  as `IncrementalGroupAggregate`). Row-time mini-batch falls back.
+  Scope: SUM/MIN/MAX/COUNT over bigint/int/double value columns. (Flink's SUM partial keeps the
+  value's own type — nothing is lost to widening; only `AVG` widens its sum partial, and `AVG` is the
+  gap.) Still falling back: `AVG` (its two-column `(sum, count)` widened partial isn't modelled),
+  distinct aggregates (they plan as `IncrementalGroupAggregate`), smallint/tinyint/float/decimal
+  value columns, and row-time mini-batch.
 - **`OVER`** — the unbounded `RANGE … CURRENT ROW` frame (running fold), the bounded
   `ROWS BETWEEN n PRECEDING AND CURRENT ROW` frame (recomputed over the row slice), **and** the
   bounded `RANGE BETWEEN INTERVAL n PRECEDING AND CURRENT ROW` frame (recomputed over the rowtime
@@ -192,7 +194,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   per-aggregate **`FILTER (WHERE …)`** is native — the operator folds a row into
   an aggregate only where that aggregate's filter (a boolean input column) is true.
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT;
-  a value type outside bigint/int/double; a partial Flink widens past the value type (e.g. `SUM(INT)`);
+  a value type outside bigint/int/double; a partial whose declared type differs from the value type
+  (defensive — Flink's SUM partial keeps the value's type; only AVG widens, and AVG already declines);
   an unsupported grouping-key/input column type.
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT; a partial
   column outside bigint/int/double; an unsupported grouping-key/output column type. (Both halves must

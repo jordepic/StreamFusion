@@ -18,9 +18,10 @@ import scala.collection.Seq;
  * <p>The native local emits each aggregate's partial in its running type ({@code SUM/MIN/MAX} of a
  * value keep that value's type, COUNT is bigint). The global reads those partials by their declared
  * (Flink) type, so each partial column's declared type must equal what the native side emits —
- * otherwise the two halves disagree on the column type. SUM over a narrow value Flink widens (e.g.
- * {@code SUM(INT)} → bigint partial) therefore routes single-phase; the per-aggregate type check
- * below declines it so the whole query falls back cleanly rather than mismatching at the boundary.
+ * otherwise the two halves disagree on the column type. Flink's SUM partial keeps the value's own
+ * type (verified against the planner — only AVG widens its sum partial), so the equality check below
+ * is defensive: a partial declared wider than its value would fall back cleanly rather than
+ * mismatch at the boundary.
  */
 final class LocalGroupAggregateMatcher {
 

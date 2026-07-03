@@ -15,12 +15,16 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
   `~/data/flink` `table/runtime .../aggregate/MiniBatchIncrementalGroupAggFunction` before design;
   we already have the per-key distinct value set (native `COUNT(DISTINCT)`) and the two-phase
   local/global operators to compose from.
-- **Two-phase `AVG`** — single-phase `AVG` is native; the local/global split (sum + count partials,
-  merged then divided at the global) is not modelled. The global merge is a SUM over partials plus
-  the existing `AVG` finish; the local needs the two-column partial.
-- **Widening partials** — a partial Flink widens past the value type (`SUM(INT)` → bigint partial)
-  makes the local matcher decline; today those route single-phase. Model the widened partial type
-  in the local/global pair.
+- **Two-phase `AVG`** — single-phase `AVG` is native; the local/global split is not modelled. The
+  partial is TWO columns per AVG — a widened sum (bigint for integer inputs, double for
+  float/double) plus a bigint non-null count, `(sum$i, count$j)` in the local's output row — merged
+  at the global by summing both, then the existing single-phase AVG finish (null on zero count,
+  integer division truncating, cast to the input type). Verified against the planner: only AVG
+  widens its partial.
+- **Wider two-phase value types** — smallint/tinyint/float value columns decline the local matcher
+  today (the single-phase path takes them); extend the running types to match the single-phase set.
+  (The previously-listed "widening partials" item was a misdiagnosis: Flink's SUM partial keeps the
+  value's own type — `SUM(INT)` two-phase already routes.)
 - **Two-phase decimal `SUM`** — the single-phase decimal SUM (i128, `DECIMAL(38, s)`) is native;
   carry the same accumulator through the local/global split.
 - **Row-time mini-batch** — the mini-batch assigner over a rowtime (watermark-driven flush) falls
