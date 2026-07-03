@@ -35,7 +35,7 @@ import org.testcontainers.utility.DockerImageName;
  * <p>The query set is every query StreamFusion accelerates: q0–q5, q7–q23 (q1's and q14's decimal are
  * exact and native by default; q21's REGEXP_EXTRACT/LOWER and q14's HOUR route through the host
  * implementation via the columnar JVM upcall; q13 is a synchronous lookup join against a bounded
- * {@code test-lookup} dimension). Only q6 is out — Flink itself cannot run it (ticket 39). q10/q14/q15/
+ * {@code test-lookup} dimension). Only q6 is out — Flink itself cannot run it (wontdos/39). q10/q14/q15/
  * q16/q17 report on the generator only, since their {@code DATE_FORMAT}/{@code HOUR} need a plain
  * {@code TIMESTAMP} and would partially fall back over the Kafka {@code TIMESTAMP_LTZ} rowtime.
  * Each query runs over the same logical {@code person}/{@code auction}/{@code bid} views the published

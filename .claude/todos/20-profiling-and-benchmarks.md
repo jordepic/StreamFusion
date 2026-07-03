@@ -68,10 +68,10 @@ vs. Flink fallback, tracked over time so a regression is visible.
   per (window, key), then a single `take` + `update_batch` per group, so accumulators
   see batches, not individual rows. Don't "optimize" this without numbers.
 - **Whole-row converter (Java).** `RowDataArrowConverter` is the cost of every row↔columnar
-  transpose. It was made row-major + pre-sized (~25% faster — ticket 28); a further
+  transpose. It was made row-major + pre-sized (~25% faster — wontdos/28); a further
   column-vectorized rewrite could speed it more. **Not** a native/JNI candidate — the row side is
   JVM `RowData`, so the work is irreducibly on the JVM (a native decoder was investigated and
-  rejected — ticket 28). Java optimization only; bench the transpose before/after.
+  rejected — wontdos/28). Java optimization only; bench the transpose before/after.
 
 ## Acceptance criteria
 - `cargo bench` runs the native operator benches and prints rows/s per operator.

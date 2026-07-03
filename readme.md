@@ -77,7 +77,7 @@ engines (standard tuned-prod setting).
 
 StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively end-to-end with no
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
-([analysis](.claude/todos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, from a
+([analysis](.claude/wontdos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, from a
 rowwise `RowData` source, a local Parquet file, and each Kafka value format, ordered by query number:
 
 Each Kafka cell is the best of the three source rungs (JVM transpose / native decode / native rdkafka

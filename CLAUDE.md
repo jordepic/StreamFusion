@@ -97,9 +97,16 @@ once done its state belongs in `docs/coverage-and-fallbacks.md` (the coverage so
 ("Where we are"), and a `divergences/` note if a decision was made — not in a stale "build X" ticket. When you
 delete a ticket you must also remove every pointer to it (the `00-roadmap.md` index line and any `(ticket N)` /
 `todos/N-…` cross-references in other tickets, divergences, and the docs) so no dangling links remain — grep for
-the number to be sure. Two exceptions stay as records: a partially-done ticket (trim it to what remains), and a
-*rejected* investigation (keep it, clearly marked, so the dead end isn't re-explored). As we knock things out,
-update `docs/coverage-and-fallbacks.md` so it reflects exactly what is accelerated and what falls back.
+the number to be sure. One exception stays on the board: a partially-done ticket (trim it to what remains). As we
+knock things out, update `docs/coverage-and-fallbacks.md` so it reflects exactly what is accelerated and what
+falls back.
+
+The `.claude/wontdos/` directory holds the work we have **deliberately decided not to do**: rejected
+investigations (kept with the benchmark or reasoning that killed them) and documented exclusions (things outside
+our problem, like a query Flink itself cannot run). The moment a ticket's outcome is "don't", move it there — in
+the same commit as the decision, keeping its number — and update every pointer to its new path. A wontdo is not
+deleted history; it exists so the dead end isn't re-explored and the reasoning survives. If circumstances change
+(a benchmark result invalidated, an upstream limit lifted), a wontdo can move back to the todo board — note why.
 
 `docs/coverage-and-fallbacks.md` is the **source of truth for coverage** — everything not excluded there runs
 natively — listing what we do **not** support and **every** specific cause of a fallback to Flink (gate,

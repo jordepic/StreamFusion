@@ -144,7 +144,7 @@ coalesces batches into size-targeted files
 (rolling on a row target / checkpoint) instead of one file per batch, so per-file overhead no longer
 scales with batch count — this also lifted the columnar copy (2.61 → 4.68×). Other row-source ops
 still pay a `RowData → Arrow` transpose at the input, ~25% cheaper since the converter was made
-row-major + pre-sized ([ticket 28](../.claude/todos/28-native-row-transpose-and-shuffle.md)): `OVER`
+row-major + pre-sized ([wontdos/28](../.claude/wontdos/28-native-row-transpose-and-shuffle.md)): `OVER`
 running `SUM` **1.56×**, tumbling **1.24×**. The lone stateless **filter stays below 1× at 0.75×** —
 a single cheap predicate cannot earn back the `RowData → Arrow → RowData` round-trip. A lone operator
 crosses 1× once fed by a columnar source or chained with other native operators (no transpose between
@@ -293,7 +293,7 @@ ever materialized to `RowData`).
 ### The full accelerating set, every source
 
 `NexmarkMatrixBenchmark` runs **every query StreamFusion accelerates** (q0–q5, q7–q23 — only q6 is out;
-see [.claude/todos/39-nexmark-q6-exclusion.md](../.claude/todos/39-nexmark-q6-exclusion.md)) over **every
+see [.claude/wontdos/39-nexmark-q6-exclusion.md](../.claude/wontdos/39-nexmark-q6-exclusion.md)) over **every
 source it can be fed by** — the rowwise generator, a local Parquet file, and Kafka json/avro/protobuf
 across the ladder — all vs stock Flink, same steelmanned perimeter. 500K events.
 

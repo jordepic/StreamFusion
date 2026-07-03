@@ -90,7 +90,7 @@ here when the ticket is deleted.
 - **Release benchmarks vs Flink (clean):** Parquet copy 4.97×, Parquet sink 2.24×, windowed-over-
   columnar 1.82×, interval join 1.71×, OVER 1.56×, tumbling 1.24×, bare filter 0.75×. Sink coalescing
   lifted both Parquet paths; the row-major + pre-sized transpose build lifted the row-source ops (a
-  native row decoder was investigated and rejected — ticket 28). Only the lone stateless filter stays
+  native row decoder was investigated and rejected — wontdos/28). Only the lone stateless filter stays
   below 1× (its `RowData → Arrow → RowData` round-trip); leave it on the host via the per-operator flag.
 - **Native decode-to-Arrow at ingest — done.** File sources (Parquet + ORC) read through DataFusion's
   file scan with the framework owning enumeration/splits/checkpointing, splittable at row-group/stripe
@@ -98,7 +98,7 @@ here when the ticket is deleted.
   decodes Kafka bytes → Arrow for JSON, Confluent/bare Avro, CSV, protobuf, and Debezium/OGG CDC
   envelopes (→ our `$row_kind$` changelog). The residual tail lives in ticket 32 (a time-based flush for
   sub-batch unbounded streams; Maxwell/Canal auto-routing; CSV/JSON *file* sources).
-- **Nexmark matrix vs Flink — running.** The full q0–q22 suite (q6 excluded, ticket 39) runs
+- **Nexmark matrix vs Flink — running.** The full q0–q22 suite (q6 excluded, wontdos/39) runs
   native-substituted vs stock Flink across four source rungs (generator, Kafka JSON/Avro/Protobuf);
   per-query routed-fraction/fallback reasons via `NexmarkExplainTest`, throughput matrix in the readme.
   It is the standing prioritization + regression gate; the coverage/perf gaps it surfaces feed the
@@ -114,7 +114,7 @@ here when the ticket is deleted.
    with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
-   rejected on benchmark grounds — ticket 28.)
+   rejected on benchmark grounds — wontdos/28.)
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate
@@ -156,10 +156,6 @@ here when the ticket is deleted.
   distinct-key lookups concurrently and awaits them on the task thread (Arroyo/RisingWave within-batch
   model — no operator mailbox). Follow-ups in ticket 40: calc-on-temporal-table + residual condition,
   constant keys, columnar/preload assembly, distributed serialization.
-- **Nexmark q6 — documented exclusion** (ticket 39): the one query Flink 2.2.1 itself can't run (invalid
-  as written; wrapped, Flink rejects the bounded `OVER` over the Top-N's non-time-attribute `dateTime` —
-  FLINK-19059, the retraction limit the nexmark README cites, is fixed in 2.1.0, so that barrier is gone,
-  but a different one remains). No host plan to mirror or parity-check. Not StreamFusion's to fix.
 - **Disaggregated state store** (ticket 37): move operator state off-heap to a remote/tiered store
   (likely Fluss's PK-table KV) with a local working-set cache — decoupling state size from worker RAM
   and enabling incremental checkpoints + lazy rescale (Flink 2.0 ForSt / RisingWave Hummock direction).
@@ -169,3 +165,12 @@ here when the ticket is deleted.
   route. What remains: a custom columnar sink beyond Parquet (no ORC sink / columnar collect yet), and
   the protobuf representation reconciliations still gated (`enum` int-vs-name, unsigned/`fixed` ints,
   `bytes` parity, proto3 missing-field defaults).
+
+## Decided against (records live in `.claude/wontdos/`)
+- **Nexmark q6** (wontdos/39): the one query Flink 2.2.1 itself can't run — invalid as written, and
+  fixed up it hits a still-present Flink limit (bounded `OVER` over a non-time-attribute sort). No
+  host plan to mirror or parity-check; not StreamFusion's to fix.
+- **Native row→Arrow transpose / fused keyed shuffle** (wontdos/28): prototyped and rejected on
+  benchmark grounds — native decode only ties the honest JVM build before paying JNI costs, and
+  Comet builds Arrow on the JVM too. The measurement instead shipped the row-major pre-sized
+  converter (~25% faster), which aligns with the reference.

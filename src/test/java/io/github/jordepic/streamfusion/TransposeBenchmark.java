@@ -23,7 +23,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 /**
- * Isolates where the {@code RowData → Arrow} build cost goes (ticket 28 follow-up): the current
+ * Isolates where the {@code RowData → Arrow} build cost goes (wontdos/28 follow-up): the current
  * converter creates fresh Arrow vectors per batch and lets {@code setSafe} grow them as it writes.
  * This times three build strategies over the same 4096-row batch — fresh + grow (current), fresh +
  * pre-sized (one allocation, no growth reallocs; still a fresh batch so no buffer sharing hazard),
