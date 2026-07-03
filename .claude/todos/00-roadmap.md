@@ -146,7 +146,7 @@ here when the ticket is deleted.
   every format (divergences/19 — malloc override, `check.crcs` default, callback drain + inline
   decode; raw consume 1.21x the Java client). Remaining before the `kafkaSource` gate can default
   on: per-partition watermarks/idleness, specific-offsets / topic-pattern startup, key.format,
-  SASL/SSL build features, Linux `alloc-override` verification, multi-broker measurement.
+  SASL/SSL build features, Linux `mimalloc` link-alias verification, multi-broker measurement.
 - **Nexmark with Apache Fluss as the source** (ticket 36): add Fluss (columnar streaming storage) as a
   fourth source in the Nexmark matrix; its columnar format may let the native island ingest Arrow with
   little/no row transpose — the perimeter transpose is a visible share of the remaining stateful-query

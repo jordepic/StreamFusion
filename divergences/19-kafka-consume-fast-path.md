@@ -8,7 +8,7 @@ biggest non-I/O costs were per-message bookkeeping the Java client structurally 
 changes flip the verdict; each deviates from a reference or an earlier in-tree decision, so all
 three are recorded here.
 
-## 1. Process malloc override (mimalloc), opt-in `alloc-override` cargo feature
+## 1. Library-scoped mimalloc, opt-in `mimalloc` cargo feature
 
 librdkafka allocates one op struct per consumed message on its broker thread
 (`rd_kafka_op_new_fetch_msg` → `rd_calloc`) and frees it on the app thread
@@ -16,17 +16,22 @@ librdkafka allocates one op struct per consumed message on its broker thread
 and ~76% of the app thread's busy time (macOS's allocator even returned pages to the kernel via
 `madvise` mid-loop). The Java client pays nothing comparable: its per-record objects are TLAB
 bump-allocations reclaimed in bulk by GC. This is the one allocation a Rust `#[global_allocator]`
-cannot intercept — it happens in C — so the fix is mimalloc built with `MI_MALLOC_OVERRIDE`
-linked into the dylib (macOS: registers as the default malloc zone at load, zone dispatch keeps
-cross-allocator frees safe). Comet has no analog (no C client library in its data path); Arroyo
-inherits whatever allocator the process runs. Raw delivery: 3.33M/s → 3.95M/s (+19%).
+cannot intercept — it happens in C. Comet has no analog (no C client library in its data path);
+Arroyo inherits whatever allocator the process runs.
 
-**Status: benchmark-grade, not production-safe.** The process-wide zone swap is racy when the
-dylib is dlopen'd into a JVM that is concurrently creating threads: a full Nexmark run crashed
-SIGSEGV in `mi_thread_init` (the ingest benchmark survived many runs; heavier thread churn tripped
-it). The feature stays opt-in for measurement. The production-safe follow-up is a *targeted*
-redirect — compiling the bundled librdkafka's allocation calls against `mi_malloc`/`mi_free`
-directly, so only librdkafka's allocations move and no process-wide override exists (ticket 33).
+The shipped form is the `mimalloc` cargo feature: build.rs emits link-time aliases binding the
+libc allocation symbols (`malloc`/`calloc`/`realloc`/`free`/`strdup`/`strndup`/aligned variants)
+to mimalloc's inside `libstreamfusion` only — every allocation in the library (librdkafka's C and
+the Rust side's own, where the changelog operators measurably churn the system allocator) lands on
+mimalloc, nothing is exported, and the hosting JVM process keeps its allocator. Two dead ends are
+recorded so they aren't re-tried: a process-wide `MI_MALLOC_OVERRIDE` zone swap measured the same
+win (raw delivery 3.33M/s → 3.95M/s, +19%) but crashed SIGSEGV under JVM thread churn, and the
+mimalloc **v3** branch crashes in its lazy thread-init (`_mi_subproc` on an uninitialized heap)
+when a JVM-created thread's first allocation enters through the dylib — the feature pins the
+battle-tested v2 branch. v2's cross-thread free (an atomic delayed-free handoff per op) gives back
+part of the raw-consume win the zone swap measured, but the end-to-end verdict is unambiguous:
+the Nexmark ladder gains +12–22% on every format over the default build (source rung: JSON
+2.20–2.26x stock Flink, Avro 2.99–3.38x, protobuf 2.29–2.36x).
 
 ## 2. `check.crcs` follows librdkafka's default (false), not the Java client's (true)
 
@@ -66,15 +71,18 @@ bounded reads.
 
 The production split reader vs the shallow path, after all four changes:
 
-| 10M msgs | with `alloc-override` | default build (no override) |
+| 10M msgs | `mimalloc` build | default build |
 |---|---|---|
-| Avro | 5.21M/s (1.27x shallow) | 3.87M/s (0.98x) |
-| JSON | 3.87M/s (1.41x shallow) | 2.49M/s (1.16x) |
-| raw consume | 5.34M/s (1.21x the Java client) | 3.94M/s (0.85x; was 0.73x) |
+| Avro | 3.87M/s (0.96x shallow) | 3.87M/s (0.98x) |
+| JSON | 3.81M/s (1.45x shallow) | 2.49M/s (1.16x) |
+| raw consume | 3.37M/s (0.73x the Java client) | 3.94M/s (0.85x) |
 
-The allocator carries a large share of the micro-benchmark win — which is why the targeted
-librdkafka→mimalloc redirect is the priority follow-up. The end-to-end SQL picture is stronger
-than the micro-benchmark even on the default build: in the Nexmark Kafka ladder (2M events,
-q0–q2), the native source rung runs ~2x stock Flink and 1.5–1.7x the shallow rung on every format
-(docs/benchmarks.md) — Nexmark's decode is heavier than the 3-field micro-messages, and the SQL
-shallow rung carries Flink source-operator overhead the plain-JVM micro-harness does not.
+The micro-benchmark is a worst case for mimalloc v2 (its raw-consume loop is pure cross-thread
+free churn, where v2 pays an atomic handoff per op; the v3/zone variants measured 5.2–5.3M/s
+there before being ruled out for the init crashes above). Real pipelines allocate mostly
+thread-locally — decode builders, operator state — and there the feature wins outright: in the
+Nexmark Kafka ladder (2M events, q0–q2) the source rung runs 2.2–3.4x stock Flink with the
+`mimalloc` build vs ~2–2.6x default, +12–22% on every format, and JSON consume+decode above is
++53% over the default build. The end-to-end SQL picture also beats the micro-benchmark on the
+default build — Nexmark's decode is heavier than the 3-field micro-messages, and the SQL shallow
+rung carries Flink source-operator overhead the plain-JVM micro-harness does not.

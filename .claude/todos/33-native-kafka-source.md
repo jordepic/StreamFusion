@@ -2,33 +2,31 @@
 
 **Status:** BUILT and, as of 2026-07-02, **decisively faster than the shallow path** on every
 format — the 2026-06-25 shelving verdict is reversed. The re-profiling found the delivery thread
-(not the app thread) was the ceiling, and four fixes flipped it: the `alloc-override` mimalloc
-feature (librdkafka's per-message op calloc/free), `check.crcs` following librdkafka's default,
-the callback-queue drain + inline decode (no decode thread), and metadata warm-up before assign
-(a cold assign lost ~0.5s to leader-query). Numbers, per-thread profile, and the reasoning live in
-`divergences/19-kafka-consume-fast-path.md` and `docs/optimizations.md`. The production split
-reader on 10M msgs: Avro 5.21M/s vs shallow 4.11M/s (1.27x); JSON 3.87M/s vs 2.75M/s (1.41x);
-raw consume 1.21x the Java client — all within noise of a hand-rolled ideal consume loop.
-Next validation step: rerun the Nexmark Kafka ladder/matrix with the fast path.
+(not the app thread) was the ceiling, and four fixes flipped it: the library-scoped `mimalloc`
+cargo feature (librdkafka's per-message op calloc/free), `check.crcs` following librdkafka's
+default, the callback-queue drain + inline decode (no decode thread), and metadata warm-up before
+assign (a cold assign lost ~0.5s to leader-query). Numbers, per-thread profile, and the reasoning
+live in `divergences/19-kafka-consume-fast-path.md` and `docs/optimizations.md`. Nexmark ladder
+source rung with the `mimalloc` build: JSON 2.20–2.26x, Avro 2.99–3.38x, protobuf 2.29–2.36x
+stock Flink.
 
 The planner gate (`kafkaSource`) still defaults to **false**. Remaining work before flipping it,
 roughly ordered:
 
 ## Productionize the fast path
-- **Replace `alloc-override` with a targeted librdkafka→mimalloc redirect.** The process-wide
-  zone swap is benchmark-grade only: it crashed SIGSEGV in `mi_thread_init` under a full Nexmark
-  run (racy when the dylib is dlopen'd into a JVM concurrently creating threads), so it must not
-  ship as the default. The safe design: compile the bundled librdkafka's allocation calls against
-  `mi_malloc`/`mi_calloc`/`mi_free`/`mi_realloc`/`mi_strdup` directly (CFLAGS define-redirect or a
-  build.rs patch of rdkafka-sys's mklove build), linking plain libmimalloc-sys WITHOUT the
-  override feature — only librdkafka's allocations move, no zone registration, works identically
-  on Linux (no `-Bsymbolic` questions). Re-measure the +19%, then decide whether `kafka` implies it.
+- **Verify the `mimalloc` link aliases on Linux.** build.rs emits `--defsym=malloc=mi_malloc`
+  (et al.) there; confirm the aliases bind library-locally under the cdylib version script (no
+  exported `malloc`), rerun the suite + ladder, and then decide whether `kafka` should imply the
+  feature. macOS (ld64 `-alias`) is verified: full suite, ITs, ladder, matrix.
 - **Multi-broker parallel fetch** remains unmeasured (single-broker Testcontainers only).
   librdkafka fetches per-broker on parallel threads; the Java client is one network thread. This
   can only widen the native win, but confirm on a 3-broker cluster before quoting it.
-- **rdkafka crate bump** (0.36 bundles librdkafka 2.3.0; current is 2.12.x) — retest after.
-- **Upstream librdkafka ARM hardware CRC32C** (`crc32c.c` is x86 SSE4.2 only; 2.12.1 still says
-  "FIXME: Hardware support on ARM"). Would let us re-pin `check.crcs=true` at ~no cost on ARM.
+- **Revisit mimalloc v3 when its dlopen'd lazy thread-init stabilizes** (crashes in `_mi_subproc`
+  today — see divergences/19). v3's cross-thread free is markedly faster than v2's on the
+  raw-consume pattern (5.3M/s vs 3.4M/s micro), which is the one number v2 gives back.
+- **Upstream librdkafka ARM hardware CRC32C** (`crc32c.c` is x86 SSE4.2 only; the bundled 2.12.1
+  still says "FIXME: Hardware support on ARM"). Would let us re-pin `check.crcs=true` at ~no cost
+  on ARM. (The bundled librdkafka is already current — rdkafka-sys 4.10 ships 2.12.1.)
 
 ## Feature gaps (fall back to the shallow path today)
 - **Watermarks/event-time**: the source emits `noWatermarks()`; per-partition watermarking +

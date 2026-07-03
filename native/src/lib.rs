@@ -62,12 +62,12 @@ fn capture_jvm(env: &JNIEnv) {
     }
 }
 
-/// Anchors libmimalloc-sys's object file into the link (nothing else references the crate, so the
-/// archive member — allocator plus the MI_MALLOC_OVERRIDE load-time hook that swaps the process
-/// allocator — would otherwise be dropped). See the `alloc-override` feature in Cargo.toml.
-#[cfg(feature = "alloc-override")]
+/// Anchors libmimalloc-sys's object file into the link: nothing references the crate by symbol
+/// until build.rs's link aliases resolve, so without this the archive member they alias into would
+/// be dropped. See the `mimalloc` feature in Cargo.toml.
+#[cfg(feature = "mimalloc")]
 #[used]
-static FORCE_LINK_MIMALLOC_OVERRIDE: unsafe extern "C" fn(*mut std::os::raw::c_void) =
+static FORCE_LINK_MIMALLOC: unsafe extern "C" fn(*mut std::os::raw::c_void) =
     libmimalloc_sys::mi_free;
 
 /// Raises the managed-memory-limit exception on the calling JVM thread; the native call returns

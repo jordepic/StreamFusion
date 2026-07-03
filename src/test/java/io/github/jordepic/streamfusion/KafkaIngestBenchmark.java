@@ -43,9 +43,8 @@ import org.testcontainers.utility.DockerImageName;
  * client — consume message values as heap {@code byte[]}s, batch them into an Arrow binary column,
  * decode natively) vs the native path (rdkafka consumes straight into an Arrow builder, no JVM
  * byte[]/JNI per record, then the same decode). Decode is shared, so the gap is purely the consume +
- * byte-delivery saving. Build the native side with {@code kafka-bench,alloc-override} — the malloc
- * override is what pays for librdkafka's per-message op malloc/free (see the feature's Cargo.toml
- * note); without it the native consumer loses to the JVM client's bulk-GC allocation.
+ * byte-delivery saving. Build the native side with {@code kafka-bench,mimalloc} — the allocator
+ * rebind pays for librdkafka's per-message op malloc/free (see the feature's Cargo.toml note).
  *
  * <p>Opt-in via {@code SF_BENCHMARK=true}; requires Docker (Testcontainers Kafka). The native side
  * builds with the {@code kafka-bench} cargo feature, which statically links a bundled librdkafka (no

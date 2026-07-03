@@ -114,11 +114,11 @@ buffers instead of pinning the Java client's small defaults removed a measurable
 thread, not the app thread, capped native consume ~30% below the Java client, and its top non-I/O
 costs were per-message bookkeeping the JVM sidesteps via TLAB + bulk GC and CRC intrinsics. Three
 levers, compounding on 10M-msg raw consume from 3.33M/s (0.73x the Java client) to 5.34M/s (1.21x):
-the opt-in `alloc-override` cargo feature statically links a mimalloc malloc override into the
-dylib, paying for librdkafka's per-message op calloc (broker thread) + free (app thread) that no
-Rust `#[global_allocator]` can reach (+19% — benchmark-grade only, see divergences/19: the
-process-wide zone swap is racy under JVM thread churn; the targeted librdkafka→mimalloc redirect
-is the shippable follow-up); `check.crcs` now follows librdkafka's default of
+the opt-in `mimalloc` cargo feature link-aliases the libc allocation symbols to mimalloc inside
+the library only, paying for librdkafka's per-message op calloc (broker thread) + free (app
+thread) that no Rust `#[global_allocator]` can reach — and for the Rust side's own allocator
+churn — with no process-wide override (divergences/19 records the zone-swap and mimalloc-v3
+dead ends); `check.crcs` now follows librdkafka's default of
 false — its software CRC32C on ARM (no HW path outside x86 SSE4.2) taxed the delivery thread
 ~13.5% (+22%); and the reader drains with `rd_kafka_consume_callback_queue`, which bulk-moves the
 backlog under one queue lock instead of locking per message against the enqueuing broker thread
@@ -126,9 +126,8 @@ backlog under one queue lock instead of locking per message against the enqueuin
 thread is gone — with consume this fast, inline decode won on every format (Flink already
 pipelines fetcher vs task thread) — and the reader primes broker metadata before `assign()`
 (a cold assign parks partitions in leader-query for ~0.5s until the periodic refresh). Net:
-production consume+decode past the shallow path on both formats — Avro 5.21M/s (1.27x), JSON
-3.87M/s (1.41x) with the override; on the default build the end-to-end Nexmark Kafka ladder has
-the native source rung at ~2x stock Flink and 1.5–1.7x the shallow rung on every format.
+the end-to-end Nexmark Kafka ladder's source rung at 2.2–3.4x stock Flink with the `mimalloc`
+build (JSON 2.20–2.26x, Avro 2.99–3.38x, protobuf 2.29–2.36x; ~2–2.6x on the default build).
 
 **Projection pushdown into every decoder** (`64ddc2a`, `83b3d69`, `86908f1`, `4af9d63`). The query's
 projection narrows what the decoder builds: JSON decodes straight to the narrowed schema, Avro keeps

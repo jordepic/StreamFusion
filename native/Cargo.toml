@@ -63,12 +63,11 @@ simd-json = "0.17"
 # NumCast for the JSON number → Arrow primitive conversions, mirroring arrow-json's number path.
 # Already in the tree transitively via arrow; pinned here for direct use.
 num-traits = "0.2"
-# Opt-in malloc override (see the `alloc-override` feature): librdkafka allocates one op per consumed
-# message on the broker thread and frees it on the app thread; the system allocator makes that
-# cross-thread malloc/free pattern the top cost on both threads (macOS even madvises pages back
-# mid-loop). mimalloc built with MI_MALLOC_OVERRIDE replaces the process malloc when the dylib loads
-# (macOS: registered as the default malloc zone, safe for cross-zone frees).
-libmimalloc-sys = { version = "0.1", features = ["override"], optional = true }
+# Opt-in mimalloc (see the `mimalloc` feature): librdkafka allocates one op per consumed message
+# on the broker thread and frees it on the app thread; the system allocator makes that cross-thread
+# malloc/free pattern the top cost on both threads (macOS even madvises pages back mid-loop), and
+# the changelog operators measurably churn the system allocator too.
+libmimalloc-sys = { version = "0.1", optional = true }
 
 [features]
 # Opt-in: the native rdkafka consumer (statically links a bundled librdkafka — no system install).
@@ -76,9 +75,13 @@ libmimalloc-sys = { version = "0.1", features = ["override"], optional = true }
 # whole-topic benchmark consumer.
 kafka = ["dep:rdkafka"]
 kafka-bench = ["kafka"]
-# Replace the C allocator for the whole hosting process with mimalloc (JVM included) — the lever for
-# librdkafka's per-message op malloc/free, which a Rust #[global_allocator] cannot intercept.
-alloc-override = ["dep:libmimalloc-sys"]
+# Rebind the C allocator to mimalloc for everything linked into THIS library (librdkafka included),
+# via link-time symbol aliases emitted by build.rs. Library-scoped: the hosting JVM process keeps
+# its own allocator, so this carries none of the risk of a process-wide malloc override (a zone-swap
+# variant was tried and crashed under JVM thread churn — divergences/19). Pinned to the mimalloc v2
+# branch: v3's lazy thread-init dereferences an uninitialized heap when a JVM-created thread's first
+# allocation enters through the dylib (SIGSEGV in _mi_subproc under Flink task threads).
+mimalloc = ["dep:libmimalloc-sys", "libmimalloc-sys/v2"]
 
 # The engine is one large crate; the default parallel codegen-unit split severs cross-unit inlining
 # at arbitrary points, so hot operator loops were measured swinging ~50% from unrelated code
