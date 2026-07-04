@@ -1034,12 +1034,13 @@ final class RexExpression {
   }
 
   /**
-   * Emits {@code REGEXP_EXTRACT} as a JVM-upcall node (op {@link #KIND_UDF}) backed by the host's
-   * {@code org.apache.flink.table.runtime.functions.SqlFunctionUtils.regexpExtract} — the very method
-   * Flink's codegen calls. The native engine packs the argument columns and upcalls per batch, so the
-   * match runs under {@code java.util.regex} and is byte-identical to the host for every pattern (the
-   * two- and three-argument forms both apply). The string arguments must be string-typed and the group
-   * index INTEGER or BIGINT; anything else falls back.
+   * Emits {@code REGEXP_EXTRACT} as a JVM-upcall node (op {@link #KIND_UDF}) backed by
+   * {@code NativeBuiltinFunctions.regexpExtract} — Flink's own {@code SqlFunctionUtils.regexpExtract}
+   * logic byte-for-byte, minus its per-call {@code Pattern.compile}. The native engine packs the
+   * argument columns and upcalls per batch, so the match runs under {@code java.util.regex} and is
+   * byte-identical to the host for every pattern (the two- and three-argument forms both apply). The
+   * string arguments must be string-typed and the group index INTEGER or BIGINT; anything else falls
+   * back.
    */
   private boolean emitRegexpExtractJvm(List<RexNode> args) {
     if (args.size() != 2 && args.size() != 3) {
@@ -1081,8 +1082,8 @@ final class RexExpression {
     java.lang.reflect.Method regexpExtract;
     try {
       regexpExtract =
-          Class.forName("org.apache.flink.table.runtime.functions.SqlFunctionUtils")
-              .getMethod("regexpExtract", signature);
+          io.github.jordepic.streamfusion.operator.NativeBuiltinFunctions.class.getMethod(
+              "regexpExtract", signature);
     } catch (ReflectiveOperationException e) {
       return reject("REGEXP_EXTRACT host implementation unavailable: " + e.getMessage());
     }

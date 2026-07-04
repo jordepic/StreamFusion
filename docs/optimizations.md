@@ -224,6 +224,14 @@ parity, island preserved. The pure-Rust path stays available behind `allowIncomp
 measures the honest price of the guarantee: 0.76x via the upcall vs 1.57x pure-native; for the
 zone-aware datetime functions the two measure within noise (the call isn't the bottleneck).
 
+**Host-exact REGEXP_EXTRACT compiles its pattern once.** Flink's own
+`SqlFunctionUtils.regexpExtract` calls `Pattern.compile` on *every invocation*; the upcall now
+routes to a byte-identical reimplementation that caches the compiled `Pattern` per regex string
+(the same `java.util.regex` engine, so the output cannot differ — compilation is pure). A CPU
+profile put the per-call compile at ~13% of q21's total; caching it lifted the whole query +12.5%
+(96 → 108 profile-loop iterations), with the compile subtree measuring zero after. Stock Flink
+pays this cost on every REGEXP_EXTRACT row; we no longer do.
+
 **Lookup joins kept in the island** (`d985f82`, `f339a12`). A lookup join left on the host drags
 the probe-side Calc and source back to rowwise with it. The sync operator keeps probe batches
 Arrow and calls the connector's real `LookupFunction` per row — the point lookup is row-oriented,
