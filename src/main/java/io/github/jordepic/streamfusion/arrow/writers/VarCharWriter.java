@@ -19,9 +19,11 @@
 package io.github.jordepic.streamfusion.arrow.writers;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.core.memory.MemorySegment;
 import org.apache.flink.table.data.ArrayData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
+import org.apache.flink.table.data.binary.BinaryStringData;
 
 import org.apache.arrow.vector.VarCharVector;
 
@@ -49,12 +51,31 @@ public abstract class VarCharWriter<T> extends ArrowFieldWriter<T> {
 
     @Override
     public void doWrite(T in, int ordinal) {
+        VarCharVector vector = (VarCharVector) getValueVector();
         if (isNullAt(in, ordinal)) {
-            ((VarCharVector) getValueVector()).setNull(getCount());
-        } else {
-            ((VarCharVector) getValueVector())
-                    .setSafe(getCount(), readString(in, ordinal).toBytes());
+            vector.setNull(getCount());
+            return;
         }
+        StringData value = readString(in, ordinal);
+        // The common case — a single-segment heap BinaryStringData (every string coming out of
+        // Flink's row formats) — copies its UTF-8 bytes straight into the Arrow buffer.
+        // toBytes() would first copy them into a fresh byte[] only for setSafe to copy again;
+        // string columns dominate the entry transpose in the Nexmark profiles, so the doubled
+        // copy (and its per-string garbage) was a measurable share of every rowwise-fed query.
+        if (value instanceof BinaryStringData) {
+            BinaryStringData binary = (BinaryStringData) value;
+            binary.ensureMaterialized();
+            MemorySegment[] segments = binary.getSegments();
+            if (segments.length == 1 && !segments[0].isOffHeap()) {
+                vector.setSafe(
+                        getCount(),
+                        segments[0].getArray(),
+                        binary.getOffset(),
+                        binary.getSizeInBytes());
+                return;
+            }
+        }
+        vector.setSafe(getCount(), value.toBytes());
     }
 
     // ------------------------------------------------------------------------------------------

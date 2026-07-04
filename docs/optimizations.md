@@ -88,6 +88,16 @@ over the Arrow vectors (the Spark/Comet columnar→row model), keeping the batch
 emit loop. With Flink object reuse enabled — a standard prod setting, applied to both sides of the
 benchmark — native q0 roughly doubled (`713a0a3`).
 
+**Strings cross the entry transpose with one copy, and the lookup join writes rows straight into
+Arrow.** The transpose's VarChar writer called `StringData.toBytes()` — a fresh `byte[]` copy —
+only for Arrow's `setSafe` to copy those bytes again; a single-segment heap `BinaryStringData`
+(every string coming out of Flink's row formats) now feeds its segment straight into the Arrow
+buffer, halving the copies and deleting the per-string garbage on the string-dominated entry
+transposes (q9/q18/q19/q20/q21/q22). The sync lookup join stopped defensively copying every
+looked-up row (`RowDataSerializer.copy`, ~27% of q13's lookup path) plus buffering them in a list:
+the collector writes each row's fields into the Arrow builders at collect time, where the runner's
+reused row object is still valid.
+
 **Projection pruning into the entry transpose** (`8523187`). When a native calc reads a few
 columns/nested struct fields of a wide row, the planner narrows the transpose to exactly those
 leaves and remaps the calc, so the unread person/auction structs of the Nexmark wide event are

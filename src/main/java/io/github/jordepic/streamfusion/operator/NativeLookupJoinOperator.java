@@ -2,8 +2,7 @@ package io.github.jordepic.streamfusion.operator;
 
 import io.github.jordepic.streamfusion.arrow.ArrowConversion;
 import io.github.jordepic.streamfusion.arrow.ArrowReader;
-import java.util.ArrayList;
-import java.util.List;
+import io.github.jordepic.streamfusion.arrow.ArrowWriter;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.functions.DefaultOpenContext;
@@ -14,7 +13,6 @@ import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.runtime.generated.FilterCondition;
 import org.apache.flink.table.runtime.operators.join.lookup.LookupJoinRunner;
-import org.apache.flink.table.runtime.typeutils.RowDataSerializer;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.Collector;
 
@@ -45,7 +43,6 @@ public class NativeLookupJoinOperator extends AbstractStreamOperator<ArrowBatch>
   private final RowType outputType;
 
   private transient BufferAllocator allocator;
-  private transient RowDataSerializer outputSerializer;
 
   public NativeLookupJoinOperator(LookupJoinRunner runner, RowType probeType, RowType outputType) {
     this.runner = runner;
@@ -57,7 +54,6 @@ public class NativeLookupJoinOperator extends AbstractStreamOperator<ArrowBatch>
   public void open() throws Exception {
     super.open();
     allocator = NativeAllocator.SHARED;
-    outputSerializer = new RowDataSerializer(outputType);
     FunctionUtils.setFunctionRuntimeContext(runner, getRuntimeContext());
     FunctionUtils.openFunction(runner, DefaultOpenContext.INSTANCE);
   }
@@ -70,13 +66,17 @@ public class NativeLookupJoinOperator extends AbstractStreamOperator<ArrowBatch>
 
   @Override
   public void processElement(StreamRecord<ArrowBatch> element) throws Exception {
-    List<RowData> outRows = new ArrayList<>();
-    // The runner reuses its joined-row objects across emissions, so gather copies.
+    // The runner reuses its joined-row objects across emissions, but each is only *read* during
+    // collect — writing its fields into the Arrow builders right there needs no defensive copy
+    // (the per-row RowDataSerializer.copy was ~27% of q13's lookup-path CPU) and no gather list.
+    VectorSchemaRoot out =
+        VectorSchemaRoot.create(ArrowConversion.toArrowSchema(outputType), allocator);
+    ArrowWriter<RowData> writer = ArrowConversion.createRowDataArrowWriter(out, outputType);
     Collector<RowData> gather =
         new Collector<>() {
           @Override
           public void collect(RowData row) {
-            outRows.add(outputSerializer.copy(row));
+            writer.write(row);
           }
 
           @Override
@@ -93,9 +93,12 @@ public class NativeLookupJoinOperator extends AbstractStreamOperator<ArrowBatch>
         }
         runner.padNullForLeftJoin(probe, gather);
       }
+    } catch (Exception e) {
+      out.close(); // the half-built output would otherwise outlive the failed element
+      throw e;
     }
     // Insert-only: a processing-time lookup requires an append-only probe, so no row-kind column.
-    VectorSchemaRoot out = RowDataArrowConverter.write(outRows, outputType, allocator, false);
+    writer.finish();
     output.collect(new StreamRecord<>(new ArrowBatch(out)));
   }
 }
