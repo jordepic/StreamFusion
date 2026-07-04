@@ -135,10 +135,7 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (the ticket 11
    operators and any remaining expression tail) before broadening where we read/write.
-6. **Flaky test** (ticket 44): `NativeMemoryMetricsTest` intermittently fails full-suite runs
-   ("no metric named X was registered", varying X); green in isolation. Costs a suite re-run when
-   it fires — root-cause when convenient.
-7. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
+6. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
    keyed loops (dedup, `OVER` partitions, Top-N, exchange split) — swap to arrow-row keys only
    with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
