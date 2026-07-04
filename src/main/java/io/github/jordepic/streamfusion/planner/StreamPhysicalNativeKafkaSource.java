@@ -100,6 +100,9 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
         getCluster(), traitSet, writerRowType, outputRowType, options, watermark);
   }
 
+
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
   @Override
   public RelWriter explainTerms(RelWriter writer) {
     RelWriter w =
@@ -111,7 +114,7 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
     if (watermark != null) {
       w = w.item("watermark", watermark.rowtimeFieldName + " - " + watermark.delayMillis + "ms");
     }
-    return w;
+    return NativeRelDigests.withBarrier(w, reuseBarrier);
   }
 
   @Override

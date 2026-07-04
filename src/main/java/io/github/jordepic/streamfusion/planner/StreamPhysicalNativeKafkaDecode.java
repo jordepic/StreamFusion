@@ -79,11 +79,16 @@ public class StreamPhysicalNativeKafkaDecode extends AbstractRelNode
         getCluster(), traitSet, outputRowType, writerRowType, options);
   }
 
+
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
   @Override
   public RelWriter explainTerms(RelWriter writer) {
-    return super.explainTerms(writer)
-        .item("topic", options.get("topic"))
-        .item("format", options.getOrDefault("value.format", options.get("format")));
+    return NativeRelDigests.withBarrier(
+        super.explainTerms(writer)
+            .item("topic", options.get("topic"))
+            .item("format", options.getOrDefault("value.format", options.get("format"))),
+        reuseBarrier);
   }
 
   @Override

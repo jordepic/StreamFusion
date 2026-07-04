@@ -208,6 +208,18 @@ The all-or-nothing gate (`196058a`) raises the stakes on every expression and op
 non-native node no longer costs one extra transpose — it sends the entire query back to stock
 Flink. Several optimizations exist primarily to prevent that:
 
+**Sub-plan reuse scoped by digest barriers.** Installing the native planner used to disable
+Flink's sub-plan reuse outright — the safe-but-blunt way to keep any Arrow batch from fanning out
+to two consumers (the hand-off is zero-copy; the consumer closes the buffers). That also un-shared
+the *rowwise* prefix, so every multi-view/self-join query generated and converted its source
+stream once per branch: the profiling round measured an exactly-2x `Row→RowData` conversion tax on
+q3/q4/q5/q7/q8/q9/q20. Reuse now stays enabled and every native rel adds a per-instance term to
+its digest (emitted only at the digest explain level, so `EXPLAIN` output is unchanged) — Flink's
+post-optimize reuse pass, which merges by digest, can therefore never merge a columnar subtree,
+while the rowwise prefix under the islands merges as on stock Flink. Measured on the generator
+profile loop: q3 +17%, q9 +9%, q20 +6%, with the conversion cost per iteration restored to parity
+with stock Flink's.
+
 **UDFs via a columnar JVM upcall** (`13d175a`). A user `ScalarFunction` the native engine can't
 implement itself runs *inside* the island: the argument columns are packed into one batch, exported
 over the C Data Interface, evaluated by the real function on the JVM, and the result column

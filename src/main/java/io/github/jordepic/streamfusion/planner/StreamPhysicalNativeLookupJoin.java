@@ -7,6 +7,7 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexNode;
@@ -115,4 +116,13 @@ public class StreamPhysicalNativeLookupJoin extends SingleRel
         leftOuterJoin,
         asyncOptions);
   }
+
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
+
+  @Override
+  public RelWriter explainTerms(RelWriter pw) {
+    return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
+  }
 }
+

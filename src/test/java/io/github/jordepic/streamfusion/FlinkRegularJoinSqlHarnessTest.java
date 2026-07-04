@@ -111,6 +111,19 @@ class FlinkRegularJoinSqlHarnessTest {
             + "(SELECT k, SUM(w) AS sw FROM B GROUP BY k) rb ON la.k = rb.k");
   }
 
+  /**
+   * A self-join reads the same view twice; sub-plan reuse (enabled under the native planner, with
+   * native nodes digest-barriered) shares the rowwise prefix while each branch keeps its own entry
+   * transpose. Parity plus the suite's native leak check pin the fan-out down: shared rowwise
+   * records must not corrupt either island, and no Arrow batch may be freed twice.
+   */
+  @Test
+  void selfJoinOverSharedRowwisePrefixMatchesHost() throws Exception {
+    NativeParity.assertChangelogParity(
+        FlinkRegularJoinSqlHarnessTest::environment,
+        "SELECT a.k, a.v + b.v FROM A a JOIN A b ON a.k = b.k");
+  }
+
   private static TableEnvironment environment() {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);

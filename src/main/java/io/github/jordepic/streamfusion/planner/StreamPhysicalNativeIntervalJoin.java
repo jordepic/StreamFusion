@@ -5,6 +5,7 @@ import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.BiRel;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
@@ -110,4 +111,13 @@ public class StreamPhysicalNativeIntervalJoin extends BiRel
         predicate,
         proctime);
   }
+
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
+
+  @Override
+  public RelWriter explainTerms(RelWriter pw) {
+    return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
+  }
 }
+

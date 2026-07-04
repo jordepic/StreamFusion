@@ -9,7 +9,8 @@ reference engines point at a better one).
 **Measured:** the updating joiner is 4-7 CPU samples/iteration on q9/q7/q4/q20 (islands) and its
 per-row costs are the two `.owned()` heap rows per input row (key + payload) into
 `HashMap<OwnedRow, HashMap<OwnedRow, RowMeta>>`, plus hashing. q3/q20 sit at 0.60-0.82x on the
-generator (their remaining deficit is split between this store, the forked prefix — ticket 45 —
+generator (their remaining deficit is split between this store, the forked prefix — fixed
+2026-07-04 by the digest-scoped sub-plan reuse —
 and the entry transpose); Alibaba's Java engine reports 5.8x on q20, so this family is where the
 5-10x target lives.
 

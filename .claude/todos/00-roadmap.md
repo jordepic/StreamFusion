@@ -81,10 +81,13 @@ here when the ticket is deleted.
   substitutes nothing and the query runs as stock Flink (a rowwise source/sink is bridged by a
   perimeter transpose, not a fall-back trigger). Top-N and the updating join keep row-materialized
   *internal* state for sort/retract correctness — fine, since their boundary is Arrow.
-  **Sub-plan reuse is disabled** when native is installed (`NativePlanner.install`): an island's
-  zero-copy hand-off assumes each Arrow batch is consumed once (the consumer closes its off-heap
-  buffers), so a reused branch fanning batches to two consumers would double-free → null rows.
-  Disabling reuse keeps the plan a tree; output is identical (only the execution graph changes).
+  **Sub-plan reuse stays enabled, scoped by digest barriers** (shipped 2026-07-04): every native
+  rel carries a per-instance digest term, so Flink's post-optimize reuse can never merge a
+  columnar subtree (an island's zero-copy hand-off assumes each Arrow batch is consumed once —
+  a merged branch would double-free), while the rowwise prefix (source + Row→RowData conversion)
+  merges normally — a multi-view/self-join query reads and converts its source once, not per
+  branch (was an exactly-2x conversion tax on q3/q4/q5/q7/q8/q9/q20; fixing it measured q3 +17%,
+  q9 +9%, q20 +6% on the generator profile loop).
 - **Joins delegate the match to DataFusion** (`HashJoinExec` over the batches we buffer), like
   Arroyo; we own buffering + watermark eviction (divergences/12).
 - **Profiling/benchmarks (ticket 20):** Criterion native micro-benches; `ThroughputBenchmark`
@@ -116,13 +119,12 @@ here when the ticket is deleted.
 0. **Profile-driven operator perf round toward the 5-10x target** (research:
    `.claude/research/nexmark-operator-profiles-2026-07.md` — differential flame graphs of every
    Nexmark query, native vs Flink, plus Arroyo/RisingWave/Proton technique survey and the
-   provenance of Alibaba's 5-10x claim). The ranked levers, each its own ticket:
-   ticket 45 (stop forking the rowwise prefix — sub-plan reuse scoped to columnar edges, an
-   exactly-2x source-conversion tax on 7+ queries today), ticket 46 (Top-N net-diff staging +
-   decode-free emit — q19's operator is 72% arrow-row decode), ticket 47 (DISTINCT dedup by
-   visibility masking + dirty-group emit — q15/q16/q17), ticket 48 (updating-join block state —
-   q3/q20/q9/q23), plus the now-evidenced items appended to tickets 20 (dedup SipHash, entry-
-   transpose string fast path) and 40 (q13 per-row copy).
+   provenance of Alibaba's 5-10x claim). The ranked levers, each its own ticket
+   (ticket 45 — the forked rowwise prefix — shipped 2026-07-04, see "Fully-columnar native
+   islands" above): ticket 46 (Top-N net-diff staging + decode-free emit — q19's operator is 72%
+   arrow-row decode), ticket 47 (DISTINCT dedup + cheaper per-row emit — q15/q16/q17), ticket 48
+   (updating-join block state — q3/q20/q9/q23), plus the now-evidenced items appended to tickets
+   20 (dedup SipHash — shipped; entry-transpose string fast path) and 40 (q13 per-row copy).
 1. **Native Kafka source: gate FLIPPED (2026-07-03)** (ticket 33). Per-partition watermarks/idleness
    and specific-offsets/topic-pattern startup shipped; `kafkaSource` defaults on and the `kafka`
    cargo feature is a default build feature (probe-guarded for opt-out builds). Remaining tails in

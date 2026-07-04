@@ -59,6 +59,47 @@ class NativePlannerTest {
     assertEquals(List.of(3, 4, 5), result);
   }
 
+  /**
+   * A self-join reads the same table twice. Sub-plan reuse stays enabled under the native planner,
+   * scoped by digest barriers: the rowwise prefix (the scan) merges — the plan shows a {@code
+   * Reused} reference — while each branch keeps its own native island (two entry transposes), so no
+   * Arrow batch ever fans out to two consumers.
+   */
+  @Test
+  void reusesRowwisePrefixButNeverNativeNodes() {
+    TableEnvironment tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+    createSequenceTable(tEnv);
+    String explain =
+        NativePlanner.explain(
+            tEnv, "SELECT a.k, a.v + b.v FROM src a JOIN src b ON a.k = b.k");
+    assertTrue(
+        explain.contains("Reused(reference_id="),
+        "the shared rowwise scan should be merged by sub-plan reuse:\n" + explain);
+    int transposes = countOccurrences(explain, "RowDataToArrow");
+    assertTrue(
+        transposes >= 2,
+        "each branch must keep its own entry transpose (no shared Arrow edge), saw "
+            + transposes
+            + ":\n"
+            + explain);
+  }
+
+  private static void createSequenceTable(TableEnvironment tEnv) {
+    tEnv.executeSql(
+        "CREATE TABLE src (k BIGINT, v BIGINT) WITH ('connector' = 'datagen', "
+            + "'number-of-rows' = '100', "
+            + "'fields.k.kind' = 'sequence', 'fields.k.start' = '0', 'fields.k.end' = '99', "
+            + "'fields.v.kind' = 'sequence', 'fields.v.start' = '100', 'fields.v.end' = '199')");
+  }
+
+  private static int countOccurrences(String haystack, String needle) {
+    int count = 0;
+    for (int i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + 1)) {
+      count++;
+    }
+    return count;
+  }
+
   private static List<Integer> collectInts(TableEnvironment tEnv, String sql) throws Exception {
     TableResult result = tEnv.executeSql(sql);
     List<Integer> values = new ArrayList<>();

@@ -45,9 +45,12 @@ public class StreamPhysicalNativeOrcSource extends AbstractRelNode
     return new StreamPhysicalNativeOrcSource(getCluster(), traitSet, outputRowType, path);
   }
 
+
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
   @Override
   public RelWriter explainTerms(RelWriter writer) {
-    return super.explainTerms(writer).item("path", path);
+    return NativeRelDigests.withBarrier(super.explainTerms(writer).item("path", path), reuseBarrier);
   }
 
   @Override
