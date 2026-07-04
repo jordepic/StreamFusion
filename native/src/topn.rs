@@ -271,10 +271,30 @@ impl TopNRanker {
         }
         let schema = self.schema.as_ref().expect("schema set once a row was processed");
         let conv = self.converters.as_ref().expect("converters set");
-        // One vectorized row->columnar pass rebuilds every data column, replacing the per-cell
-        // `scalars_to_array` over per-row scalar clones.
-        let mut columns: Vec<ArrayRef> =
-            conv.payload.convert_rows(out_rows.iter().map(|r| r.row())).expect("decode top-n payloads");
+        // The rank cascade emits the same buffered (Arc-shared) row at many positions — often the
+        // same hot top-N rows across every cascade in the batch — so decode each distinct row once
+        // and rebuild the emitted positions with a take. The output batch is unchanged; only the
+        // row->columnar decode (the operator's dominant cost in the q19 profile) shrinks from
+        // O(emitted) to O(distinct).
+        let mut index_of: HashMap<*const OwnedRow, u32> = HashMap::default();
+        let mut distinct: Vec<&Arc<OwnedRow>> = Vec::new();
+        let mut positions: Vec<u32> = Vec::with_capacity(out_rows.len());
+        for row in &out_rows {
+            let idx = *index_of.entry(Arc::as_ptr(row)).or_insert_with(|| {
+                distinct.push(row);
+                (distinct.len() - 1) as u32
+            });
+            positions.push(idx);
+        }
+        let decoded: Vec<ArrayRef> = conv
+            .payload
+            .convert_rows(distinct.iter().map(|r| r.row()))
+            .expect("decode top-n payloads");
+        let indices = UInt32Array::from(positions);
+        let mut columns: Vec<ArrayRef> = decoded
+            .iter()
+            .map(|c| take(c, &indices, None).expect("gather top-n payloads"))
+            .collect();
         let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
         if self.output_rank_number {
             fields.push(Field::new("w0$o0", DataType::Int64, false));

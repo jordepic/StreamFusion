@@ -171,6 +171,15 @@ untrusted callers, so collision resistance buys nothing. Tumbling aggregation ~3
 dedup (q18) was spending ~35% of its island in SipHash; the alias swap cut that island's CPU ~16%
 (11.6 → 9.8 samples/iteration) and closed the gap for every future operator by default.
 
+**Top-N emit decodes distinct rows, not emitted rows.** The with-rank cascade emits the same
+`Arc`-shared buffered rows at many rank positions — in a hot partition, the same top-N rows over
+and over across the batch's cascades — while emit decoded arrow-row state bytes per *emitted* row
+(72% of the operator's CPU in the q19 profile). Emit now decodes each distinct row once and
+rebuilds the emitted positions with a vectorized `take`: output byte-identical, decode O(distinct).
+q19 +13% end to end (generator profile loop), decode share 72% → 6%; the operator is now bound by
+materializing the cascade's output volume itself, which is Flink's own changelog contract
+(the per-batch net-diff question is parity-gated — ticket 46).
+
 **Allocation discipline on the per-row paths.** Reuse the per-row window buffer instead of
 allocating one per row (26% on tumbling, `3833e8d`); move the grouping key into its last window
 instead of cloning (~18% keyed, `ffec81e`); reach existing groups by `get_mut` and clone the key
