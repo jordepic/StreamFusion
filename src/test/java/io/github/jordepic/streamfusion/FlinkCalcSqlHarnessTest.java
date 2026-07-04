@@ -207,9 +207,10 @@ class FlinkCalcSqlHarnessTest {
   }
 
   @Test
-  void narrowingVarcharCastFallsBack() throws Exception {
-    // Narrowing a VARCHAR truncates, which the native passthrough would not do, so it falls back.
-    NativeParity.assertFallback(
+  void narrowingVarcharCastMatchesHost() throws Exception {
+    // Narrowing a VARCHAR truncates; the host-cast upcall runs Flink's own CastExecutor, so the
+    // query stays native (see FlinkStringCastSqlHarnessTest for the full cast-family coverage).
+    NativeParity.assertParity(
         FlinkCalcSqlHarnessTest::environment, "SELECT CAST(s AS VARCHAR(2)) FROM f");
   }
 
