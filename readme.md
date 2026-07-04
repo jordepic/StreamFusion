@@ -95,39 +95,40 @@ one row with a footnote.
 
 | Query | Shape | From RowData | From Parquet file | From JSON on Kafka | From Avro on Kafka | From Protobuf on Kafka |
 |---|---|---|---|---|---|---|
-| q0 | pass-through projection of `bid` | **1.38×** | **3.29×** | **3.03×** | **3.65×** | **2.81×** |
-| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.17×** | **3.07×** | **2.63×** | **3.35×** | **2.56×** |
-| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.30×** | **3.80×** | **2.16×** | **2.51×** | **2.13×** |
-| q3 | updating join `auction ⋈ person` | 0.80× | **4.03×** | **2.23×** | **2.20×** | **1.94×** |
-| q4 | regular join → `MAX` → `AVG` per category | **1.17×** | **3.11×** | **2.48×** | **3.20×** | **2.66×** |
-| q5 | Hot Items (window re-agg + window join) | **1.24×** | **3.05×** | **2.42×** | **3.21×** | **2.93×** |
-| q7 | tumble `MAX` ⋈ bid | **1.34×** | **3.36×** | **2.78×** | **3.70×** | **2.85×** |
-| q8 | tumble windowed-distinct ⋈ join | 0.88× | **4.46×** | **2.32×** | **2.72×** | **2.38×** |
-| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.11×** | **1.71×** | **2.12×** | **1.94×** | **1.84×** |
-| q10 § | `DATE_FORMAT` projection | **1.12×** | **3.01×** | **2.79×** | **2.89×** | **2.30×** |
-| q11 | session-window `COUNT` per bidder | **2.72×** | **5.13×** | **4.29×** | **4.82×** | **4.58×** |
-| q12 | proctime tumble `COUNT` per bidder | **1.45×** | **3.43×** | **2.31×** | **2.59×** | **2.28×** |
-| q13 | lookup join (bounded dimension) | 0.90× | **1.75×** | **2.29×** | **2.76×** | **2.19×** |
-| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | 0.99× | **3.12×** | **2.75×** | **3.16×** | **2.71×** |
-| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.38×** | **2.06×** | **2.72×** | **2.54×** | **2.11×** |
-| q16 § | multi-`DISTINCT` per channel/day | **1.19×** | **1.18×** | **1.61×** | **1.68×** | **1.38×** |
-| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.29×** | **2.13×** | **2.55×** | **2.80×** | **2.26×** |
-| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.01×** | **1.75×** | **2.46×** | **2.64×** | **2.44×** |
-| q19 | `ROW_NUMBER` topN (≤ 10) | **1.31×** | **1.44×** | **1.92×** | **1.90×** | **1.90×** |
-| q20 | updating join (`category = 10`) | 0.77× | **2.96×** | **2.32×** | **3.51×** | **2.96×** |
-| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.75× | **1.46×** | **2.09×** | **2.17×** | **1.73×** |
-| q21 † | …opt-in native regex/case (`allowIncompatible`) | **1.56×** | **5.10×** | **2.42×** | **2.91×** | **2.49×** |
-| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.15×** | **3.61×** | **2.38×** | **2.96×** | **2.50×** |
-| q23 | three-way join `bid ⋈ person ⋈ auction` | 0.98× | **3.35×** | **2.20×** | **2.90×** | **2.36×** |
+| q0 | pass-through projection of `bid` | **1.31×** | **3.32×** | **2.61×** | **3.30×** | **2.69×** |
+| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.20×** | **3.84×** | **2.44×** | **3.08×** | **2.50×** |
+| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.31×** | **2.85×** | **2.11×** | **2.37×** | **1.98×** |
+| q3 | updating join `auction ⋈ person` | 0.97× | **3.81×** | **2.02×** | **2.20×** | **1.80×** |
+| q4 | regular join → `MAX` → `AVG` per category | **1.50×** | **2.88×** | **2.13×** | **2.90×** | **2.37×** |
+| q5 | Hot Items (window re-agg + window join) | **1.32×** | **2.94×** | **2.30×** | **3.52×** | **2.73×** |
+| q7 | tumble `MAX` ⋈ bid | **1.33×** | **4.04×** | **2.78×** | **3.39×** | **3.13×** |
+| q8 | tumble windowed-distinct ⋈ join | 0.89× | **4.15×** | **1.94×** | **2.68×** | **2.35×** |
+| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.17×** | **1.60×** | **2.03×** | **2.02×** | **1.88×** |
+| q10 § | `DATE_FORMAT` projection | **1.16×** | **3.48×** | **2.84×** | **2.50×** | **2.08×** |
+| q11 | session-window `COUNT` per bidder | **2.67×** | **5.44×** | **3.82×** | **5.03×** | **5.12×** |
+| q12 | proctime tumble `COUNT` per bidder | **1.45×** | **3.21×** | **2.10×** | **2.54×** | **2.12×** |
+| q13 | lookup join (bounded dimension) | **1.18×** | **2.49×** | **2.18×** | **2.65×** | **2.14×** |
+| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | 0.95× | **3.00×** | **2.55×** | **3.03×** | **2.50×** |
+| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.42×** | **1.82×** | **2.65×** | **2.55×** | **2.21×** |
+| q16 § | multi-`DISTINCT` per channel/day | **1.33×** | **1.10×** | **1.72×** | **1.65×** | **1.34×** |
+| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.27×** | **1.67×** | **2.44×** | **2.50×** | **2.08×** |
+| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.02×** | **1.67×** | **2.41×** | **2.60×** | **2.33×** |
+| q19 | `ROW_NUMBER` topN (≤ 10) | **1.46×** | **1.56×** | **1.88×** | **1.87×** | **1.83×** |
+| q20 | updating join (`category = 10`) | 0.81× | **3.66×** | **2.47×** | **3.51×** | **2.81×** |
+| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.86× | **1.90×** | **2.39×** | **2.59×** | **2.12×** |
+| q21 † | …opt-in native regex/case (`allowIncompatible`) | **1.55×** | **4.90×** | **2.42×** | **2.84×** | **2.44×** |
+| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.19×** | **3.61×** | **2.31×** | **2.86×** | **2.31×** |
+| q23 | three-way join `bid ⋈ person ⋈ auction` | **1.29×** | **3.79×** | **1.94×** | **2.71×** | **2.17×** |
 
-From `RowData`, projection/filter/scalar, the windowed and group aggregates, and (with the `mimalloc`
-build's allocator rebind) the multi-`DISTINCT` aggregates and Top-N win outright; what still trails 1×
-there is the wide updating joins (q3/q20) and the transpose-bound window join (q8), whose remaining
-cost is the per-row state store that Flink pools.
+From `RowData`, 18 of 23 queries win outright — the joins and Top-N/dedup family joined the
+projections and aggregates after the 2026-07 profiling round (shared rowwise prefix, allocation-free
+state probes, cached changelog emit, decode-deduplicated Top-N). What still trails 1× there: the
+widest updating join (q20), the transpose-bound window join (q8), and q21's byte-parity regex upcall
+— with q3 (0.97×) and q14 (0.95×) at the line.
 
 **From a local Parquet file the native island reads Arrow straight from the scan** — no `RowData →
-Arrow` ingest transpose — so **every query clears the bar**, most by **2–5.1×** across projection,
-filter, window, and join (the floor is q16 at 1.18×). This is the columnar-source case the engine is
+Arrow` ingest transpose — so **every query clears the bar**, most by **2–5.4×** across projection,
+filter, window, and join (the floor is q16 at 1.10×). This is the columnar-source case the engine is
 built for, and the gap between it and the `RowData` column is how much of that column's cost is the
 perimeter transpose rather than the operator.
 
@@ -144,8 +145,8 @@ bottleneck — so parity is free (unlike q21's regex). On `RowData`/Parquet thos
 [divergences/17](divergences/17-ltz-datetime-session-zone.md).
 
 **From a Kafka source, owning the consume in Rust compounds the operator verdict**: with the native
-rdkafka source every query on every format clears **1.38×**, all but a handful clear **2×**, and the
-peak is q11's **4.3–4.8×**. Queries whose operators trail on the bare generator (the updating joins,
+rdkafka source every query on every format clears **1.34×**, all but a handful clear **2×**, and the
+peak is q11's **3.8–5.1×**. Queries whose operators trail on the bare generator (the updating joins,
 q21's parity upcall) are pulled well past 1× by the consume+decode saving — even the changelog-bound
 q9/q19, which no earlier rung could lift, land at **1.8–2.1×**. The full per-rung ladder, method,
 and end-to-end tables are in **[docs/benchmarks.md](docs/benchmarks.md)**.

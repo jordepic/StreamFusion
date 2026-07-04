@@ -321,30 +321,30 @@ twice — the byte-parity default and the opt-in native regex/case path, see †
 
 | Query | Shape | Native vs. Flink |
 |---|---|---|
-| q11 | session-window `COUNT` per bidder | **2.72×** |
+| q11 | session-window `COUNT` per bidder | **2.67×** |
+| q4 | regular join → `MAX` → `AVG` per category | **1.50×** |
+| q19 | `ROW_NUMBER` topN (≤ 10) | **1.46×** |
 | q12 | proctime tumble `COUNT` per bidder | **1.45×** |
-| q15 | multi-`DISTINCT` `COUNT`s per day | **1.38×** |
-| q0 | pass-through projection of `bid` | **1.38×** |
-| q7 | tumble `MAX` ⋈ bid | **1.34×** |
-| q19 | `ROW_NUMBER` topN (≤ 10) | **1.31×** |
-| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.30×** |
-| q17 | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.29×** |
-| q5 | Hot Items (window re-agg + window join) | **1.24×** |
-| q16 | multi-`DISTINCT` per channel/day | **1.19×** |
-| q4 | regular join → `MAX` → `AVG` per category | **1.17×** |
-| q1 | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.17×** |
-| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.15×** |
-| q10 | `DATE_FORMAT` projection | **1.12×** |
-| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.11×** |
-| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.01×** |
-| q14 | `HOUR`/`CASE` + `count_char` UDF + decimal | 0.99× |
-| q23 | three-way join `bid ⋈ person ⋈ auction` | 0.98× |
-| q13 | lookup join (bounded dimension) | 0.90× |
-| q8 | tumble windowed-distinct ⋈ join | 0.88× |
-| q3 | updating join `auction ⋈ person` | 0.80× |
-| q20 | updating join (`category = 10`) | 0.77× |
-| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.75× |
-| q21 † | …same, pure-native Rust regex/case (opt-in, non-parity) | **1.56×** |
+| q15 | multi-`DISTINCT` `COUNT`s per day | **1.42×** |
+| q7 | tumble `MAX` ⋈ bid | **1.33×** |
+| q16 | multi-`DISTINCT` per channel/day | **1.33×** |
+| q5 | Hot Items (window re-agg + window join) | **1.32×** |
+| q0 | pass-through projection of `bid` | **1.31×** |
+| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.31×** |
+| q23 | three-way join `bid ⋈ person ⋈ auction` | **1.29×** |
+| q17 | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.27×** |
+| q1 | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.20×** |
+| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.19×** |
+| q13 | lookup join (bounded dimension) | **1.18×** |
+| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.17×** |
+| q10 | `DATE_FORMAT` projection | **1.16×** |
+| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.02×** |
+| q3 | updating join `auction ⋈ person` | 0.97× |
+| q14 | `HOUR`/`CASE` + `count_char` UDF + decimal | 0.95× |
+| q8 | tumble windowed-distinct ⋈ join | 0.89× |
+| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.86× |
+| q20 | updating join (`category = 10`) | 0.81× |
+| q21 † | …same, pure-native Rust regex/case (opt-in, non-parity) | **1.55×**
 
 **Parquet file** — the columnar-source case: the native island reads Arrow straight from the
 `filesystem`/`parquet` scan, so there is no `RowData → Arrow` transpose at ingest (only the sink
@@ -352,21 +352,22 @@ transpose remains). Same queries, same order as the generator table above:
 
 | Query | Native vs. Flink | | Query | Native vs. Flink |
 |---|---|---|---|---|
-| q11 | **5.13×** | | q10 | **3.01×** |
-| q8 | **4.46×** | | q20 | **2.96×** |
-| q3 | **4.03×** | | q17 | **2.13×** |
-| q2 | **3.80×** | | q15 | **2.06×** |
-| q22 | **3.61×** | | q13 | **1.75×** |
-| q12 | **3.43×** | | q18 | **1.75×** |
-| q7 | **3.36×** | | q9 | **1.71×** |
-| q23 | **3.35×** | | q19 | **1.44×** |
-| q0 | **3.29×** | | q16 | **1.18×** |
-| q14 | **3.12×** | | | |
-| q4 | **3.11×** | | q21 | **1.46×** (5.10× native regex/case) |
+| q11 | **5.44×** | | q5 | **2.94×** |
+| q8 | **4.15×** | | q4 | **2.88×** |
+| q7 | **4.04×** | | q2 | **2.85×** |
+| q1 | **3.84×** | | q13 | **2.49×** |
+| q3 | **3.81×** | | q15 | **1.82×** |
+| q23 | **3.79×** | | q17 | **1.67×** |
+| q20 | **3.66×** | | q18 | **1.67×** |
+| q22 | **3.61×** | | q9 | **1.60×** |
+| q10 | **3.48×** | | q19 | **1.56×** |
+| q0 | **3.32×** | | q16 | **1.10×** |
+| q12 | **3.21×** | | | |
+| q14 | **3.00×** | | q21 | **1.90×** (4.90× native regex/case) |
 | q1 | **3.07×** | | | |
 | q5 | **3.05×** | | | |
 
-Every query clears 1× — most **2–5.1×**, the floor now q16 at 1.18× — because the ingest transpose is
+Every query clears 1× — most **2–5.4×**, the floor now q16 at 1.10× — because the ingest transpose is
 gone: the scan feeds Arrow batches directly into the operator, and only the `blackhole` sink pays a
 transpose. The queries that are transpose-bound on the generator (q8 at 0.88×, q3 at 0.80×, q20 at
 0.77×) are exactly the ones that jump the most here (q8 4.46×, q3 4.03×, q20 2.96×) — confirming their generator
@@ -376,8 +377,14 @@ natively too now — see the Kafka table's `§` note). q16 — long the one Parq
 multi-`DISTINCT` accumulator churns `ScalarValue`) — cleared it when the `mimalloc` build rebound the
 library's allocator: its cost was allocator-bound, not compute-bound.
 
-**Sixteen clear 1.0× even on this conservative combined run, and another two (q14/q23) sit within
-noise of parity.** The window-aggregate queries moved when the aggregators went to
+**Eighteen clear 1.0× even on this conservative combined run** (was sixteen before the 2026-07
+profiling round — the differential flame-graph pass recorded in
+`.claude/research/nexmark-operator-profiles-2026-07.md`, whose shipped levers are itemized in
+`docs/optimizations.md`: shared rowwise prefix under scoped sub-plan reuse, allocation-free join
+state probes, typed DISTINCT sets + cached changelog emit, decode-deduplicated Top-N emit, the
+transpose string single-copy, the lookup join's collect-time Arrow writes, and the cached regex in
+the parity upcall. The round's movers: q4 1.17→1.50, q23 0.98→1.29, q13 0.90→1.18, q19 1.31→1.46,
+q16 1.19→1.33, q3 0.80→0.97, q21 0.75→0.86.) The window-aggregate queries moved when the aggregators went to
 arrow-row keys and the session update went run-batched: **q5 1.00→1.32, q8 0.70→0.92, q11
 2.41→2.73**. The **updating-join family was the earlier big mover**: a CPU profile put ~40% of
 the worst query (q9) in the joiner. Making the INNER join batch its whole input — gather all candidate
@@ -390,17 +397,19 @@ changelog operator native spends 10–22% of CPU in the system allocator where F
 reuses pooled `BinaryRowData`, its cost landing in GC). Cutting those allocations, not swapping the
 allocator, closed the gap ([divergences/08](../divergences/08-columnar-flow-transitions.md)).
 
-What still trails 1× is three distinct residues: q8 is transpose-bound (a window join with only a ~9%
-native island — its windowed-distinct half got 0.70→0.92 from the arrow-row keys, the rest is the
-perimeter); q20/q3 are wide updating joins whose remaining cost is the per-row state store that Flink
-pools; and q13's lookup join is upcall-bound. (q16's multi-`DISTINCT` `ScalarValue` churn, the fourth
-residue here for a long time, cleared 1× when the `mimalloc` build rebound the allocator.)
+What still trails 1× on this rung: q8 is transpose-bound (a window join with only a ~9% native
+island); q20 is the widest updating join (its state probes are now allocation-free — the residual
+is candidate-decode volume, ticket 48's block-store question); q21's byte-parity regex upcall pays
+Java-string materialization (its compile cost is cached away; the pure-Rust opt-in runs 1.55×); and
+q3/q14 sit at the line (0.97×/0.95×). q13's lookup join, long below 1×, cleared it (1.18×) when its
+collector started writing straight into the Arrow builders.
 
 **† q21 is reported on both paths.** By default its `REGEXP_EXTRACT` and `LOWER` run through a
-byte-identical **JVM upcall** (one JNI crossing per batch) — the **0.75×** row, the price of staying
-exactly Flink-equal on functions whose Rust regex / case-folding can diverge at a locale/regex edge.
+byte-identical **JVM upcall** (one JNI crossing per batch) — the **0.86×** row, the price of staying
+exactly Flink-equal on functions whose Rust regex / case-folding can diverge at a locale/regex edge
+(the upcall's redundant per-call `Pattern.compile` is now cached away, which took it from 0.75×).
 `-Dstreamfusion.expression.allowIncompatible=true` runs them on the **pure-native Rust** path at
-**1.56×** — a 2× swing, and the honest cost of the guarantee. Both are documented in
+**1.55×** — still a ~2× swing, the honest cost of the guarantee. Both are documented in
 [divergences/07](../divergences/07-expression-encoding-and-compile-once.md).
 
 **‡ q1's approximate-decimal toggle buys nothing.** The exact `Decimal128` multiply (byte-parity) is not
@@ -420,32 +429,32 @@ Flink baseline), sorted by the JSON speedup:
 
 | Query | JSON | Avro | Protobuf |
 |---|---|---|---|
-| q11 | **4.29×** | **4.82×** | **4.58×** |
-| q0 | **3.03×** | **3.65×** | **2.81×** |
-| q10 § | **2.79×** | **2.89×** | **2.30×** |
-| q7 | **2.78×** | **3.70×** | **2.85×** |
-| q14 § | **2.75×** | **3.16×** | **2.71×** |
-| q15 § | **2.72×** | **2.54×** | **2.11×** |
-| q1 | **2.63×** | **3.35×** | **2.56×** |
-| q17 § | **2.55×** | **2.80×** | **2.26×** |
-| q4 | **2.48×** | **3.20×** | **2.66×** |
-| q18 | **2.46×** | **2.64×** | **2.44×** |
-| q5 | **2.42×** | **3.21×** | **2.93×** |
-| q22 | **2.38×** | **2.96×** | **2.50×** |
-| q20 | **2.32×** | **3.51×** | **2.96×** |
-| q8 | **2.32×** | **2.72×** | **2.38×** |
-| q12 | **2.31×** | **2.59×** | **2.28×** |
-| q13 | **2.29×** | **2.76×** | **2.19×** |
-| q3 | **2.23×** | **2.20×** | **1.94×** |
-| q23 | **2.20×** | **2.90×** | **2.36×** |
-| q2 | **2.16×** | **2.51×** | **2.13×** |
-| q9 | **2.12×** | **1.94×** | **1.84×** |
-| q21 | **2.09×** | **2.17×** | **1.73×** |
-| q21 † | **2.42×** | **2.91×** | **2.49×** |
-| q19 | **1.92×** | **1.90×** | **1.90×** |
-| q16 § | **1.61×** | **1.68×** | **1.38×** |
+| q11 | **3.82×** | **5.03×** | **5.12×** |
+| q10 § | **2.84×** | **2.50×** | **2.08×** |
+| q7 | **2.78×** | **3.39×** | **3.13×** |
+| q15 § | **2.65×** | **2.55×** | **2.21×** |
+| q0 | **2.61×** | **3.30×** | **2.69×** |
+| q14 § | **2.55×** | **3.03×** | **2.50×** |
+| q20 | **2.47×** | **3.51×** | **2.81×** |
+| q1 | **2.44×** | **3.08×** | **2.50×** |
+| q17 § | **2.44×** | **2.50×** | **2.08×** |
+| q18 | **2.41×** | **2.60×** | **2.33×** |
+| q21 | **2.39×** | **2.59×** | **2.12×** |
+| q21 † | **2.42×** | **2.84×** | **2.44×** |
+| q22 | **2.31×** | **2.86×** | **2.31×** |
+| q5 | **2.30×** | **3.52×** | **2.73×** |
+| q13 | **2.18×** | **2.65×** | **2.14×** |
+| q4 | **2.13×** | **2.90×** | **2.37×** |
+| q2 | **2.11×** | **2.37×** | **1.98×** |
+| q12 | **2.10×** | **2.54×** | **2.12×** |
+| q9 | **2.03×** | **2.02×** | **1.88×** |
+| q3 | **2.02×** | **2.20×** | **1.80×** |
+| q8 | **1.94×** | **2.68×** | **2.35×** |
+| q23 | **1.94×** | **2.71×** | **2.17×** |
+| q19 | **1.88×** | **1.87×** | **1.83×** |
+| q16 § | **1.72×** | **1.65×** | **1.34×** |
 
-**Every Kafka row clears 1.38×, all but a handful clear 2×, and the peak is q11 at 4.3–4.8×.**
+**Every Kafka row clears 1.34×, all but a handful clear 2×, and the peak is q11 at 3.8–5.1×.**
 These numbers include the source's per-partition watermark regeneration (the matrix tables declare a
 `WATERMARK`, pushed into the scan): windows fire incrementally mid-stream exactly as on stock Flink,
 and the per-batch max-rowtime scan that feeds it costs nothing measurable. The same watermark work

@@ -132,7 +132,8 @@ here when the ticket is deleted.
    cargo feature is a default build feature (probe-guarded for opt-out builds). Remaining tails in
    the ticket: `key.format`, SASL/SSL build features, Linux mimalloc link-alias verification,
    multi-broker measurement. The Kafka matrix was re-run with watermarks flowing mid-stream and the
-   readme/benchmarks Kafka numbers re-quoted (floor 1.38x, peak q11 4.3–4.8x — watermark
+   readme/benchmarks Kafka numbers re-quoted (after the 2026-07-04 optimization round: floor 1.34x,
+   peak q11 3.8–5.1x — watermark
    regeneration costs nothing measurable).
 2. **Mini-batch coverage** (ticket 41): `IncrementalGroupAggregate` (what any distinct aggregate
    plans to under mini-batch), two-phase decimal `SUM`, wider two-phase value types, row-time
