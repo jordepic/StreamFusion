@@ -122,7 +122,7 @@ Legend: ✅ ready (decoder exists, version-compatible) · ⚙️ ready decoder +
 🔧 decoder exists, we write the schema→Arrow mapping · 📁 file/bulk seam (not the Kafka edge).
 
 **Decoder status (2026-06-26): JSON, CSV, raw, bare-Avro, Confluent-Avro, and Protobuf decoders are all
-BUILT and unit-tested** in `MessageDecoder` (native/src/lib.rs). `createDecoder(format, …)` codes:
+BUILT and unit-tested** in `MessageDecoder` (native/src/formats.rs). `createDecoder(format, …)` codes:
 **0 = JSON, 1 = Confluent-Avro, 2 = CSV, 3 = raw, 4 = bare Avro**; Protobuf via `createProtobufDecoder`.
 The CDC family (Debezium/OGG/Maxwell/Canal) is also built, and the planner rule that auto-routes a SQL
 `format=…` table to the native decode operator is wired (`KafkaTables` → `NativeKafkaDecodeExecNode`)
@@ -132,12 +132,12 @@ tail (Maxwell/Canal auto-routing; CSV/JSON file sources; format-option parity au
 ### JSON — ✅ built (format 0)
 - Flink: `~/data/flink/flink-formats/flink-json/src/main/java/org/apache/flink/formats/json/JsonRowDataDeserializationSchema.java`
 - Rust: a simd-json tape walk into typed Arrow builders, schema-driven (arrow-json's raw-literal
-  path retained for decimal-bearing schemas — divergences/18). `JsonDecoder` in lib.rs.
+  path retained for decimal-bearing schemas — divergences/18). `JsonDecoder` in native/src/json.rs.
 
 ### CSV — ✅ built (format 2)
 - Flink: `~/data/flink/flink-formats/flink-csv/src/main/java/org/apache/flink/formats/csv/CsvRowDataDeserializationSchema.java`
 - Rust: `arrow::csv` `Decoder` (same push API as JSON), `with_header(false)`; each message is one record,
-  fed newline-terminated. `CsvDecoder` in lib.rs. (v1 uses default CSV options — delimiter/quote/escape/
+  fed newline-terminated. `CsvDecoder` in native/src/formats.rs. (v1 uses default CSV options — delimiter/quote/escape/
   null-literal parity with Flink's options is a follow-up.)
 
 ### Avro (bare) — ✅ built (format 4)
@@ -162,7 +162,7 @@ tail (Maxwell/Canal auto-routing; CSV/JSON file sources; format-option parity au
   Kafka container, two writer versions, projection).
 
 ### Debezium / OGG / Maxwell / Canal (CDC JSON) — ✅ all four built (formats 6, 7, 8, 9)
-- **Built (2026-06-26):** `CdcJsonDecoder` (native/src/lib.rs) decodes a CDC envelope straight to a
+- **Built (2026-06-26):** `CdcJsonDecoder` (native/src/formats.rs) decodes a CDC envelope straight to a
   **columnar changelog batch** — physical columns + trailing `$row_kind$` Int8. One JSON-decode pass decodes
   every body's envelope (the pre/post images as nested structs of the physical columns, made nullable; the op
   field per dialect; unknown envelope fields ignored), then each physical column is gathered with a single
@@ -292,7 +292,7 @@ tail (Maxwell/Canal auto-routing; CSV/JSON file sources; format-option parity au
   user-supplied schema in a SQL connector. (Also stale, 2024-03.) `ptars`'s runtime/descriptor model is
   the right fit; `prost` alone is wire-codec/codegen only (no Arrow); Arroyo does proto→`serde_json`→
   arrow-json (an extra hop); RisingWave hand-rolls DynamicMessage→its columns. ptars is the most direct.
-- **Built (2026-06-26):** `ProtobufDecoder` (native/src/lib.rs) = `prost_reflect::DescriptorPool::decode`
+- **Built (2026-06-26):** `ProtobufDecoder` (native/src/formats.rs) = `prost_reflect::DescriptorPool::decode`
   of a `FileDescriptorSet` → `MessageDescriptor` → `ptars::binary_array_to_record_batch_direct`; wired as
   `MessageDecoder::Protobuf`; JNI `createProtobufDecoder(byte[] descriptor, String messageName)`; Java
   `Native.createProtobufDecoder` declared; Rust unit test green (`protobuf_decode_emits_one_row_per_

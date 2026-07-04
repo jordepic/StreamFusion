@@ -1,0 +1,223 @@
+use super::*;
+
+/// A filter predicate compiled once (on the first `run`) and reused, as the operator uses it.
+pub struct Filter(FilterExpression);
+
+impl Filter {
+    pub fn new(
+        kinds: Vec<i64>,
+        payload: Vec<i64>,
+        child_counts: Vec<i64>,
+        longs: Vec<i64>,
+        doubles: Vec<f64>,
+        strings: Vec<Option<String>>,
+    ) -> Self {
+        Filter(FilterExpression {
+            kinds,
+            payload,
+            child_counts,
+            longs,
+            doubles,
+            strings,
+            compiled: None,
+        })
+    }
+
+    pub fn run(&mut self, batch: RecordBatch) -> RecordBatch {
+        self.0.filter(batch)
+    }
+}
+
+/// A tumbling-window aggregator driven by `update`/`flush`, as the stateful operator drives it.
+pub struct Tumbling(TumblingAggregator);
+
+impl Tumbling {
+    pub fn new(window_millis: i64, value_type: i64, kinds: Vec<i64>) -> Self {
+        let value_types = vec![value_type; kinds.len()];
+        Tumbling(TumblingAggregator::new(window_millis, window_millis, false, value_types, kinds))
+    }
+
+    /// The accounted variant: state is tracked against `budget_bytes`, measuring the
+    /// memory-accounting overhead against `new`.
+    pub fn with_budget(
+        window_millis: i64,
+        value_type: i64,
+        kinds: Vec<i64>,
+        budget_bytes: i64,
+    ) -> Self {
+        let value_types = vec![value_type; kinds.len()];
+        Tumbling(
+            TumblingAggregator::new(window_millis, window_millis, false, value_types, kinds)
+                .with_memory_budget(budget_bytes)
+                .expect("empty state fits any budget"),
+        )
+    }
+
+    pub fn update(&mut self, batch: &RecordBatch) {
+        self.0.update(batch).expect("budget exceeded");
+    }
+
+    pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.0.flush(watermark)
+    }
+}
+
+/// A session-window aggregator driven by `update`/`flush`.
+pub struct Session(SessionAggregator);
+
+impl Session {
+    pub fn new(gap_millis: i64, value_type: i64, kinds: Vec<i64>) -> Self {
+        let value_types = vec![value_type; kinds.len()];
+        Session(SessionAggregator::new(gap_millis, value_types, kinds))
+    }
+
+    pub fn update(&mut self, batch: &RecordBatch) {
+        self.0.update(batch).expect("budget exceeded");
+    }
+
+    pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.0.flush(watermark)
+    }
+}
+
+/// A columnar OVER operator driven by push/flush, as the stateful operator drives it.
+pub struct Over(OverWindowAggregator);
+
+impl Over {
+    pub fn new(
+        value_type: i64,
+        kinds: Vec<i64>,
+        rt_column: usize,
+        value_column: Option<usize>,
+        key_columns: Vec<usize>,
+    ) -> Self {
+        let value_types = vec![value_type; kinds.len()];
+        let value_columns = match value_column {
+            Some(column) => vec![column; kinds.len()],
+            None => Vec::new(),
+        };
+        Over(OverWindowAggregator::new(
+            value_types, kinds, rt_column, value_columns, key_columns, 0, 0, false,
+        ))
+    }
+
+    pub fn push(&mut self, batch: RecordBatch) {
+        self.0.push(batch).expect("budget exceeded");
+    }
+
+    pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.0.flush(watermark).expect("budget exceeded")
+    }
+}
+
+/// A source-edge JSON decoder (one document per input row -> a typed columnar batch).
+pub struct JsonDecode(JsonDecoder);
+
+impl JsonDecode {
+    pub fn new(schema: SchemaRef) -> Self {
+        JsonDecode(JsonDecoder::new(schema))
+    }
+
+    pub fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
+        self.0.decode(bodies)
+    }
+}
+
+/// A non-windowed GROUP BY aggregator (update emits the changelog), as the operator drives it.
+pub struct GroupBy(GroupAggregator);
+
+impl GroupBy {
+    pub fn new(
+        kinds: Vec<i64>,
+        value_types: Vec<i64>,
+        value_columns: Vec<i64>,
+        key_columns: Vec<usize>,
+    ) -> Self {
+        GroupBy(GroupAggregator::new(kinds, value_types, value_columns, key_columns, true))
+    }
+
+    pub fn update(&mut self, batch: &RecordBatch) -> RecordBatch {
+        self.0.update(batch).expect("budget exceeded")
+    }
+}
+
+/// An event-time interval joiner (push emits matches immediately), as the operator drives it.
+pub struct IntervalJoin(IntervalJoiner);
+
+impl IntervalJoin {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_time: usize,
+        right_time: usize,
+        lower: i64,
+        upper: i64,
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+    ) -> Self {
+        IntervalJoin(IntervalJoiner::new(
+            left_keys,
+            right_keys,
+            left_time,
+            right_time,
+            lower,
+            upper,
+            None,
+            JoinKind::Inner,
+            left_schema,
+            right_schema,
+        ))
+    }
+
+    pub fn push_left(&mut self, batch: RecordBatch) -> RecordBatch {
+        self.0.push_left(batch, None).expect("budget exceeded")
+    }
+
+    pub fn push_right(&mut self, batch: RecordBatch) -> RecordBatch {
+        self.0.push_right(batch, None).expect("budget exceeded")
+    }
+}
+
+/// An event-time window joiner (buffer on push, join on flush), as the operator drives it.
+pub struct WindowJoin(WindowJoiner);
+
+impl WindowJoin {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_window_start: usize,
+        left_window_end: usize,
+        right_window_start: usize,
+        right_window_end: usize,
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+    ) -> Self {
+        WindowJoin(WindowJoiner::new(
+            left_keys,
+            right_keys,
+            left_window_start,
+            left_window_end,
+            right_window_start,
+            right_window_end,
+            None,
+            JoinKind::Inner,
+            left_schema,
+            right_schema,
+        ))
+    }
+
+    pub fn push_left(&mut self, batch: RecordBatch) {
+        self.0.push_left(batch).expect("budget exceeded");
+    }
+
+    pub fn push_right(&mut self, batch: RecordBatch) {
+        self.0.push_right(batch).expect("budget exceeded");
+    }
+
+    pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.0.flush(watermark).expect("budget exceeded")
+    }
+}

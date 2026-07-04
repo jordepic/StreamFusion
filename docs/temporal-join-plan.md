@@ -51,7 +51,7 @@ exact check. A changelog left input uses `assertChangelogParity`.
 
 ## Layers (mirrors the interval/window join wiring)
 
-1. **Rust `TemporalJoiner`** (`native/src/lib.rs`), row-oriented over the existing
+1. **Rust `TemporalJoiner`** (`native/src/temporal_join.rs`), row-oriented over the existing
    `GroupKey`/`JoinRow`/`ScalarValue` primitives (same as `UpdatingJoiner`):
    `left_state: HashMap<GroupKey, Vec<LeftEntry>>`, `right_state: HashMap<GroupKey, BTreeMap<i64,
    (JoinRow, i8)>>`. Methods `push_left`/`push_right` (buffer, no output), `advance(watermark)` (emit
