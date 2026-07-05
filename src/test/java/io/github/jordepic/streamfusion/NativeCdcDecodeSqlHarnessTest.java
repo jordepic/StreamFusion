@@ -28,10 +28,11 @@ import org.testcontainers.utility.DockerImageName;
  *   <li><b>Debezium / OGG</b> (full pre/post images): route natively. {@link
  *       NativeParity#assertChangelogParity} runs the query on stock Flink and on the native decode and
  *       asserts the collapsed changelogs match — exact CDC-semantics parity.
- *   <li><b>Maxwell / Canal</b>: their partial-{@code old} pre-image can't be reproduced bit-identically
- *       from the decoded image alone (a field changed <em>to</em> null is indistinguishable from an
- *       unchanged one), so the planner must <em>not</em> route them. {@link NativeParity#assertFallback}
- *       asserts the query stays entirely on Flink and still produces Flink's result.
+ *   <li><b>Maxwell / Canal</b> (post-image + partial {@code old}): route natively too. Their
+ *       UPDATE_BEFORE follows Flink's findValue KEY-presence rule — an explicit null in {@code old}
+ *       stays null, an absent key copies {@code data} — reproduced by a native per-message key scan
+ *       of the raw {@code old} JSON, so the changelog is exact (the per-scenario envelope is pinned
+ *       by the container-free {@code CdcDecodeParityTest}).
  * </ul>
  *
  * <p>Each input sequence collapses to the same materialized result — only id=1 (name "a2") survives.
@@ -42,7 +43,7 @@ import org.testcontainers.utility.DockerImageName;
 class NativeCdcDecodeSqlHarnessTest {
 
   @Test
-  void debeziumAndOggRouteNativelyWithParity_maxwellAndCanalFallBack() throws Exception {
+  void allFourCdcDialectsRouteNativelyWithParity() throws Exception {
     try (KafkaContainer kafka =
         new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.6.1"))) {
       kafka.start();
@@ -107,19 +108,22 @@ class NativeCdcDecodeSqlHarnessTest {
               ", 'debezium-json.ignore-parse-errors' = 'true'"),
           "SELECT * FROM cdc");
 
-      // Maxwell: partial `old` merge — must fall back to Flink (not bit-identical natively).
-      assertFallback(
+      // Maxwell: partial `old` merge via the key-presence rule — routes natively, exact parity.
+      // The second update carries an explicit null in `old` (name changed FROM null): presence
+      // keeps the null where the pre-presence decode would have copied `data`.
+      assertParity(
           brokers,
           "cdc-maxwell",
           "maxwell-json",
           List.of(
               "{\"data\":{\"id\":1,\"name\":\"a\",\"score\":1.5},\"type\":\"insert\"}",
-              "{\"data\":{\"id\":2,\"name\":\"b\",\"score\":2.5},\"type\":\"insert\"}",
+              "{\"data\":{\"id\":2,\"name\":null,\"score\":2.5},\"type\":\"insert\"}",
               "{\"data\":{\"id\":1,\"name\":\"a2\",\"score\":1.5},\"old\":{\"name\":\"a\"},\"type\":\"update\"}",
+              "{\"data\":{\"id\":2,\"name\":\"b\",\"score\":2.5},\"old\":{\"name\":null},\"type\":\"update\"}",
               "{\"data\":{\"id\":2,\"name\":\"b\",\"score\":2.5},\"type\":\"delete\"}"));
 
-      // Canal: data/old arrays + partial old — must fall back to Flink.
-      assertFallback(
+      // Canal: data/old arrays fanning out per element, same presence rule — routes natively.
+      assertParity(
           brokers,
           "cdc-canal",
           "canal-json",
@@ -147,12 +151,6 @@ class NativeCdcDecodeSqlHarnessTest {
         environment(brokers, topic, format, columns), "SELECT * FROM cdc");
   }
 
-  private static void assertFallback(
-      String brokers, String topic, String format, List<String> messages) throws Exception {
-    produce(brokers, topic, messages);
-    NativeParity.assertFallback(
-        environment(brokers, topic, format, SCALAR_COLUMNS), "SELECT * FROM cdc");
-  }
 
   private static Supplier<TableEnvironment> environment(
       String brokers, String topic, String format, String columns) {

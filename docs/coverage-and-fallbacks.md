@@ -141,7 +141,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   upcall into the host connector — but it keeps the island unbroken, and the async path overlaps a
   batch's I/O. Still falls back: an **upsert-materialized** (keyed-state) lookup.
 - **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
-  (see below); CDC only Debezium/OGG JSON.
+  (see below); CDC covers the four JSON dialects (Debezium/OGG/Maxwell/Canal — the latter two for
+  flat scalar schemas).
 - **Proctime** support, by operator:
   - **Deduplication** and **`OVER`** (running / bounded-ROWS) — native; they emit eagerly in arrival
     order, no wall-clock timer needed.
@@ -421,7 +422,14 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   dropping the pushed strategy would stall every event-time timer on an unbounded stream (bounded
   runs masked this: the final MAX_WATERMARK closes all windows regardless) — so with the native
   source off or unbuilt, a watermarked Kafka table runs entirely on Flink, with the reason recorded.
-- **CDC** — anything other than Debezium/OGG full-image JSON: Maxwell/Canal (partial-`old` not
-  bit-identical), `schema-include` envelope, metadata/computed columns. (`ignore-parse-errors` is
-  native — the decoder skips an undecodable message per Flink's catch-everything-per-message
-  semantics.)
+- **CDC** — all four JSON dialects route natively: Debezium/OGG (full pre/post images, nested
+  columns included) and Maxwell/Canal (post-image + partial `old`, whose UPDATE_BEFORE follows
+  Flink's findValue key-presence rule via a native per-message key scan of the raw `old` — an
+  explicit null is kept, an absent key copies the post-image, and Canal's presence spans the whole
+  `old` array; envelope pinned by `CdcDecodeParityTest`). `ignore-parse-errors` is native with
+  Flink's exact granularity: a structurally bad message drops whole, a bad value inside an image
+  nulls just that field, and a failure mid-fan-out keeps the rows emitted before it. Still falling
+  back: the `schema-include` envelope wrapper; metadata/computed columns; **nested Maxwell/Canal
+  columns** (findValue's recursive search could false-match a column name inside another field —
+  flat scalar schemas only, up to 128 columns); Canal's `database.include`/`table.include` regex
+  filters; and `debezium-avro-confluent` (Avro-bodied envelope).

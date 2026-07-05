@@ -517,6 +517,67 @@ fn cdc_maxwell_merges_partial_old_image() {
     assert_eq!(kinds.values(), &[0, 1, 2, 3]);
 }
 
+// The DataOld pre-image follows KEY PRESENCE, not decoded nullability (Flink's findValue rule): a
+// field present in `old` as an explicit null was changed FROM null and UPDATE_BEFORE keeps the
+// null; an absent field is unchanged and copies from `data`.
+#[test]
+fn cdc_maxwell_keeps_explicit_null_in_old() {
+    let update =
+        br#"{"data":{"id":1,"name":"was-null","score":1.5},"old":{"name":null},"type":"update"}"#;
+    let body = bodies(vec![Some(update.as_slice())]);
+
+    let out = MessageDecoder::new(8, json_schema(), "", "", 0, false, "").decode(&body);
+
+    assert_eq!(out.num_rows(), 2);
+    let names = out.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+    assert!(names.is_null(0)); // UPDATE_BEFORE: name was explicitly null before the update
+    assert_eq!(names.value(1), "was-null");
+    let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(id.values(), &[1, 1]); // absent from `old` → unchanged → copied from `data`
+}
+
+// Flink reads `old` unchecked on an update (row.getRow / old.getRow(i)), so a missing `old` or a
+// Canal `old` array shorter than `data` is a corrupt message that fails the job — never a silent
+// fall-back to the post-image.
+#[test]
+#[should_panic(expected = "null \"old\"/pre image")]
+fn cdc_maxwell_update_without_old_fails() {
+    let update = br#"{"data":{"id":1,"name":"x","score":1.5},"type":"update"}"#;
+    let body = bodies(vec![Some(update.as_slice())]);
+    MessageDecoder::new(8, json_schema(), "", "", 0, false, "").decode(&body);
+}
+
+#[test]
+#[should_panic(expected = "\"old\" array is shorter")]
+fn cdc_canal_uneven_update_arrays_fail() {
+    let update = br#"{"data":[{"id":1,"name":"x","score":1.5},{"id":2,"name":"y","score":2.5}],"old":[{"name":"w"}],"type":"UPDATE"}"#;
+    let body = bodies(vec![Some(update.as_slice())]);
+    MessageDecoder::new(9, json_schema(), "", "", 0, false, "").decode(&body);
+}
+
+// Canal's findValue presence scan covers the WHOLE `old` array: a key present in any element
+// counts as present for every paired element, exactly as Flink's oldField.findValue over the
+// array node behaves.
+#[test]
+fn cdc_canal_presence_is_per_message_across_elements() {
+    let update = br#"{"data":[{"id":1,"name":"a2","score":1.5},{"id":2,"name":"b2","score":2.5}],"old":[{"name":"a"},{"id":2}],"type":"UPDATE"}"#;
+    let body = bodies(vec![Some(update.as_slice())]);
+
+    let out = MessageDecoder::new(9, json_schema(), "", "", 0, false, "").decode(&body);
+
+    assert_eq!(out.num_rows(), 4); // two elements, UB+UA each
+    let id = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let names = out.column(1).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+    // Element 0's UPDATE_BEFORE: `name` present in old[0] → "a"; `id` present in old[1] (message-
+    // wide presence!) but null in old[0] → keeps old[0]'s null, not data's 1 — Flink's exact quirk.
+    assert!(id.is_null(0));
+    assert_eq!(names.value(0), "a");
+    // Element 1's UPDATE_BEFORE: `id` from old[1] = 2; `name` null in old[1] but present message-
+    // wide → keeps the null.
+    assert_eq!(id.value(2), 2);
+    assert!(names.is_null(2));
+}
+
 // Canal JSON (format 9): `data`/`old` are arrays, so one message fans out per element. An INSERT
 // with a two-row `data` emits two INSERTs; an UPDATE pairs `data[i]` with `old[i]` and merges the
 // partial `old` like Maxwell (UPDATE_BEFORE coalesces old over data).

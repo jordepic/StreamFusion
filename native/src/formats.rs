@@ -211,6 +211,16 @@ pub(crate) enum CdcAction {
     Delete,
 }
 
+impl CdcAction {
+    fn name(&self) -> &'static str {
+        match self {
+            CdcAction::Insert => "INSERT",
+            CdcAction::Update => "UPDATE",
+            CdcAction::Delete => "DELETE",
+        }
+    }
+}
+
 /// What to do with one envelope row's operation. `Skip` is a deliberate no-op Flink also drops (Canal's
 /// `CREATE` DDL); `Unknown` is an unrecognized op, which Flink *fails the job* on by default — we match
 /// that (rather than silently dropping the row) so the result is identical, and only the planner's
@@ -230,10 +240,11 @@ pub(crate) enum CdcShape {
     /// (Flink throws; we match `ignore-parse-errors`).
     BeforeAfter,
     /// Maxwell/Canal: `data` is the full post-image and `old` a *partial* pre-image (only changed
-    /// fields). DELETE reads `data` (it holds the deleted row); an update's UPDATE_BEFORE is
-    /// `coalesce(old, data)` per field — a field absent from `old` is unchanged, so it falls back to
-    /// `data`. (Divergence: a field deliberately changed *to* null can't be told apart from an absent
-    /// one once decoded, so it falls back to `data`; Flink keeps the null. Rare; documented.)
+    /// fields). DELETE reads `data` (it holds the deleted row); an update's UPDATE_BEFORE reads a
+    /// field from `old` when its KEY is present there (even as an explicit null — a field changed
+    /// *to* null keeps the null) and copies `data` otherwise — Flink's `findValue` presence check,
+    /// reproduced by a per-message key scan of the raw `old` JSON (the decoded image alone can't
+    /// distinguish present-null from absent).
     DataOld,
 }
 
@@ -321,52 +332,73 @@ impl CdcDialect {
 /// Appends the output row(s) for one change-event unit (one envelope row, or one array element for
 /// Canal): `before_idx`/`after_idx` are the rows to read in the pre/post-image struct arrays (equal for
 /// scalar dialects; distinct flattened indices for Canal). An update fans out to UPDATE_BEFORE +
-/// UPDATE_AFTER; a `BeforeAfter` dialect with a null pre-image skips the update/delete (Flink throws).
+/// UPDATE_AFTER. A null image where the dialect requires one fails the job, exactly where Flink's
+/// deserializer hits a NullPointerException and reports a corrupt message: a null pre-image on a
+/// `BeforeAfter` update/delete (the REPLICA IDENTITY case), a null `old` on a `DataOld` update, and a
+/// null row wherever the emitted row would read from.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cdc_emit(
     action: &CdcAction,
     before_idx: usize,
     after_idx: usize,
     shape: CdcShape,
+    old_presence: u128,
     before: &StructArray,
+    after: &StructArray,
     out: &mut Vec<(i8, usize, usize, RowSource)>,
 ) {
-    // Debezium/OGG fail the job on a null pre-image for an update/delete (Flink's REPLICA_IDENTITY
-    // error); we match that rather than silently dropping the row, so the result is identical.
+    let require = |image: &StructArray, idx: usize, name: &str| {
+        if !image.is_valid(idx) {
+            panic!("CDC {action} has a null {name} image", action = action.name());
+        }
+    };
     match action {
-        CdcAction::Insert => out.push((0, before_idx, after_idx, RowSource::After)),
+        CdcAction::Insert => {
+            require(after, after_idx, "post");
+            out.push((0, before_idx, after_idx, RowSource::After));
+        }
         CdcAction::Update => {
             let before_source = match shape {
-                CdcShape::BeforeAfter if !before.is_valid(before_idx) => {
-                    panic!("CDC UPDATE has a null \"before\"/pre-image (REPLICA IDENTITY not FULL?)")
+                CdcShape::BeforeAfter => {
+                    require(before, before_idx, "\"before\"/pre (REPLICA IDENTITY not FULL?)");
+                    RowSource::Before
                 }
-                CdcShape::BeforeAfter => RowSource::Before,
-                CdcShape::DataOld => RowSource::Coalesce,
+                CdcShape::DataOld => {
+                    require(before, before_idx, "\"old\"/pre");
+                    RowSource::Coalesce(old_presence)
+                }
             };
+            require(after, after_idx, "post");
             out.push((1, before_idx, after_idx, before_source));
             out.push((2, before_idx, after_idx, RowSource::After));
         }
         CdcAction::Delete => match shape {
-            CdcShape::BeforeAfter if !before.is_valid(before_idx) => {
-                panic!("CDC DELETE has a null \"before\"/pre-image (REPLICA IDENTITY not FULL?)")
+            CdcShape::BeforeAfter => {
+                require(before, before_idx, "\"before\"/pre (REPLICA IDENTITY not FULL?)");
+                out.push((3, before_idx, after_idx, RowSource::Before));
             }
-            CdcShape::BeforeAfter => out.push((3, before_idx, after_idx, RowSource::Before)),
             // Maxwell/Canal: the deleted row lives in the post-image (`data`).
-            CdcShape::DataOld => out.push((3, before_idx, after_idx, RowSource::After)),
+            CdcShape::DataOld => {
+                require(after, after_idx, "post");
+                out.push((3, before_idx, after_idx, RowSource::After));
+            }
         },
     }
 }
 
-/// Which image an output row reads its columns from. `Coalesce` (Maxwell/Canal UPDATE_BEFORE) reads the
-/// pre-image where that field is present and falls back to the post-image otherwise — a per-field choice,
-/// so it can't share one gather index across columns.
+/// Which image an output row reads its columns from. `Coalesce` (Maxwell/Canal UPDATE_BEFORE) reads a
+/// field from the pre-image when its key appears under the message's `old` (Flink's `findValue`
+/// presence rule — an explicit null is present, an absent key copies the post-image) — a per-field
+/// choice, so it can't share one gather index across columns. The bitmask holds bit `i` for physical
+/// field `i` present in `old` (the arity is capped at 128, enforced at construction).
 #[derive(Clone, Copy)]
 pub(crate) enum RowSource {
     /// The pre-image (`before` / `old`), envelope column 0.
     Before,
     /// The post-image (`after` / `data`), envelope column 1.
     After,
-    /// Per field: pre-image where present, else post-image.
-    Coalesce,
+    /// Per field: pre-image where its key is present in `old`, else post-image.
+    Coalesce(u128),
 }
 
 /// Decodes a scalar CDC changelog JSON format (Debezium/OGG/Maxwell) straight to a columnar changelog
@@ -391,11 +423,24 @@ pub(crate) struct CdcJsonDecoder {
     output: SchemaRef,
     /// Number of physical columns (envelope/output arity excludes op and `$row_kind$`).
     arity: usize,
+    /// Physical column names, for the `old`-key presence scan of the `DataOld` dialects.
+    field_names: Vec<String>,
     dialect: CdcDialect,
+    /// Flink's `ignore-parse-errors`, handled here (not by a generic wrapper) because the CDC skip
+    /// has three granularities at once: a structurally bad message drops whole, a bad value inside
+    /// an image nulls just that field (the inner JSON schema gets the flag), and a failure while
+    /// fanning a message out KEEPS the rows emitted before it — Flink's deserializers accumulate
+    /// into a list and collect whatever it holds after the catch.
+    skip_errors: bool,
 }
 
 impl CdcJsonDecoder {
-    fn new(physical: SchemaRef, dialect: CdcDialect, env: crate::json::JsonEnv) -> CdcJsonDecoder {
+    fn new(
+        physical: SchemaRef,
+        dialect: CdcDialect,
+        env: crate::json::JsonEnv,
+        skip_errors: bool,
+    ) -> CdcJsonDecoder {
         let spec = dialect.spec();
         // The images are null on the absent side / for unchanged fields, so the nested physical fields
         // must be nullable regardless of the table's declared nullability.
@@ -420,12 +465,149 @@ impl CdcJsonDecoder {
         let mut output_fields: Vec<FieldRef> = nullable.iter().cloned().collect();
         output_fields.push(Arc::new(Field::new(ROW_KIND_COLUMN, DataType::Int8, false)));
         let output = Arc::new(Schema::new(output_fields));
+        if spec.shape == CdcShape::DataOld {
+            assert!(nullable.len() <= 128, "the old-key presence bitmask carries up to 128 columns");
+        }
         CdcJsonDecoder {
-            envelope: JsonDecoder::new(envelope, env),
+            envelope: JsonDecoder::new(
+                envelope,
+                crate::json::JsonEnv { mode: env.mode, lenient: skip_errors },
+            ),
             output,
             arity: nullable.len(),
+            field_names: physical.fields().iter().map(|f| f.name().clone()).collect(),
             dialect,
+            skip_errors,
         }
+    }
+
+    /// Emits one envelope row's — one message's — output rows. Any failure in here is the
+    /// message's own corruption (unknown op, null image, uneven Canal arrays), which fails the job
+    /// in default mode and is caught per message in skip mode, keeping the rows already emitted.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_message(
+        &self,
+        row: usize,
+        spec: &CdcSpec,
+        presence: &[u128],
+        envelope: &RecordBatch,
+        before: &StructArray,
+        after: &StructArray,
+        out_rows: &mut Vec<(i8, usize, usize, RowSource)>,
+    ) {
+        use arrow::array::ListArray;
+        let ops = envelope.column(2).as_any().downcast_ref::<StringArray>().expect("op string");
+        // A missing op field is malformed; Flink fails on it (NPE caught → rethrown). Match that.
+        let op = if ops.is_valid(row) {
+            ops.value(row)
+        } else {
+            panic!("CDC message has no operation field");
+        };
+        let action = match self.dialect.classify(op) {
+            CdcOp::Change(action) => action,
+            CdcOp::Skip => return,
+            // Flink throws on an unrecognized op by default; we fail too (never drop it silently).
+            CdcOp::Unknown => panic!("unknown CDC operation \"{op}\""),
+        };
+        let mask = presence.get(row).copied().unwrap_or(0);
+        if spec.arrays {
+            let after_list = envelope.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+            let before_list = envelope.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+            if after_list.is_null(row) {
+                // Flink reads row.getArray(0) unconditionally for a change op — a null `data`
+                // is a corrupt message, not an empty fan-out.
+                panic!("CDC {} has no \"data\" array", action.name());
+            }
+            let (after_off, after_len) =
+                (after_list.value_offsets()[row] as usize, after_list.value_length(row) as usize);
+            let (before_off, before_len) =
+                (before_list.value_offsets()[row] as usize, before_list.value_length(row) as usize);
+            for i in 0..after_len {
+                // Canal pairs data[i] with old[i]. Flink indexes `old` unchecked for an UPDATE, so
+                // a shorter (or absent) `old` array is a corrupt message there; other ops never
+                // read it.
+                let before_idx = match action {
+                    CdcAction::Update if i >= before_len => {
+                        panic!("CDC UPDATE \"old\" array is shorter than \"data\"")
+                    }
+                    _ if i < before_len => before_off + i,
+                    _ => after_off + i,
+                };
+                cdc_emit(
+                    &action,
+                    before_idx,
+                    after_off + i,
+                    spec.shape,
+                    mask,
+                    before,
+                    after,
+                    out_rows,
+                );
+            }
+        } else {
+            cdc_emit(&action, row, row, spec.shape, mask, before, after, out_rows);
+        }
+    }
+
+    /// The `DataOld` presence scan: per surviving body (same null/whitespace skips as the envelope
+    /// decode, asserted below), the set of physical field keys present under `old` — for Canal, the
+    /// union across the array's elements, which is exactly what Flink's `findValue` over the array
+    /// node sees. A message without a usable `old` contributes an empty mask (only updates read it,
+    /// and a null `old` on an update already failed in `cdc_emit`).
+    fn old_key_presence(&self, bodies: &RecordBatch) -> Vec<u128> {
+        use simd_json::prelude::*;
+        let spec = self.dialect.spec();
+        let column = bodies.column(0);
+        let mut masks = Vec::with_capacity(bodies.num_rows());
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut buffers = simd_json::Buffers::default();
+        let mask_of = |object: &simd_json::tape::Object<'_, '_>| -> u128 {
+            let mut mask = 0u128;
+            for (key, _) in object {
+                if let Some(i) = self.field_names.iter().position(|name| name == key) {
+                    mask |= 1 << i;
+                }
+            }
+            mask
+        };
+        for row in 0..bodies.num_rows() {
+            let Some(bytes) = binary_body(column, row) else { continue };
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            scratch.clear();
+            scratch.extend_from_slice(bytes);
+            let Ok(tape) = simd_json::to_tape_with_buffers(&mut scratch, &mut buffers) else {
+                if self.skip_errors {
+                    continue; // the lenient envelope decode dropped this message too
+                }
+                masks.push(0); // the strict envelope decode fails this body first
+                continue;
+            };
+            let root = tape.as_value();
+            if self.skip_errors && root.as_object().is_none() {
+                continue; // ditto: a non-object root is dropped by the lenient envelope decode
+            }
+            let old = root
+                .as_object()
+                .and_then(|envelope| envelope.iter().find(|(key, _)| *key == spec.before_field))
+                .map(|(_, value)| value);
+            let mask = match old {
+                Some(value) if spec.arrays => value
+                    .as_array()
+                    .map(|elements| {
+                        elements
+                            .iter()
+                            .filter_map(|e| e.as_object().map(|o| mask_of(&o)))
+                            .fold(0u128, |acc, m| acc | m)
+                    })
+                    .unwrap_or(0),
+                Some(value) => value.as_object().map(|o| mask_of(&o)).unwrap_or(0),
+                None => 0,
+            };
+            masks.push(mask);
+        }
+        masks
     }
 
     fn decode(&self, bodies: &RecordBatch) -> RecordBatch {
@@ -451,43 +633,39 @@ impl CdcJsonDecoder {
         let before = before.as_any().downcast_ref::<StructArray>().expect("pre-image struct");
         let after = after.as_any().downcast_ref::<StructArray>().expect("post-image struct");
 
+        // The DataOld dialects need per-message key presence in `old` (Flink's findValue rule);
+        // the scan mirrors the envelope decode's skip conditions, asserted here.
+        let presence = if spec.shape == CdcShape::DataOld {
+            let masks = self.old_key_presence(bodies);
+            assert_eq!(masks.len(), envelope.num_rows(), "old-key presence misaligned");
+            masks
+        } else {
+            Vec::new()
+        };
+
         // Per output row: its RowKind byte (0 +I, 1 -U, 2 +U, 3 -D — `RowKind.toByteValue()`), and the
         // rows to read in the pre/post-image struct arrays, and which image to read each column from.
         let mut out_rows: Vec<(i8, usize, usize, RowSource)> = Vec::with_capacity(envelope.num_rows());
         for row in 0..envelope.num_rows() {
-            // A missing op field is malformed; Flink fails on it (NPE caught → rethrown). Match that.
-            let op = if ops.is_valid(row) {
-                ops.value(row)
+            if self.skip_errors {
+                // Flink's skip keeps whatever a message emitted before its failure: the
+                // deserializer accumulates rows into a list and collects it after the catch, so a
+                // Canal fan-out that dies mid-array still emits the earlier elements. out_rows is
+                // append-only, so the partial state is exactly that list.
+                use std::panic::{catch_unwind, AssertUnwindSafe};
+                let _ = silence_expected_decode_panics(|| {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        self.emit_message(row, &spec, &presence, &envelope, before, after, &mut out_rows)
+                    }))
+                });
             } else {
-                panic!("CDC message has no operation field");
-            };
-            let action = match self.dialect.classify(op) {
-                CdcOp::Change(action) => action,
-                CdcOp::Skip => continue,
-                // Flink throws on an unrecognized op by default; we fail too (never drop it silently).
-                CdcOp::Unknown => panic!("unknown CDC operation \"{op}\""),
-            };
-            if spec.arrays {
-                let after_list = envelope.column(1).as_any().downcast_ref::<ListArray>().unwrap();
-                let before_list = envelope.column(0).as_any().downcast_ref::<ListArray>().unwrap();
-                let (after_off, after_len) =
-                    (after_list.value_offsets()[row] as usize, after_list.value_length(row) as usize);
-                let (before_off, before_len) =
-                    (before_list.value_offsets()[row] as usize, before_list.value_length(row) as usize);
-                for i in 0..after_len {
-                    // Canal pairs data[i] with old[i]; if `old` is shorter (or absent) for this element,
-                    // there is no paired pre-image, so fall back to the post-image (coalesce → no change).
-                    let before_idx = if i < before_len { before_off + i } else { after_off + i };
-                    cdc_emit(&action, before_idx, after_off + i, spec.shape, before, &mut out_rows);
-                }
-            } else {
-                cdc_emit(&action, row, row, spec.shape, before, &mut out_rows);
+                self.emit_message(row, &spec, &presence, &envelope, before, after, &mut out_rows);
             }
         }
 
         // Gather each physical column, choosing the pre/post-image child per output row. The source is
-        // the same across columns except for `Coalesce`, which picks per field by the pre-image's
-        // validity there — so the gather index is built per field.
+        // the same across columns except for `Coalesce`, which picks per field by the key's presence
+        // in the message's `old` — so the gather index is built per field.
         const BEFORE: usize = 0;
         const AFTER: usize = 1;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.arity + 1);
@@ -499,8 +677,8 @@ impl CdcJsonDecoder {
                 .map(|&(_, before_idx, after_idx, source)| match source {
                     RowSource::Before => (BEFORE, before_idx),
                     RowSource::After => (AFTER, after_idx),
-                    RowSource::Coalesce => {
-                        if before_child.is_valid(before_idx) {
+                    RowSource::Coalesce(present) => {
+                        if present & (1u128 << field) != 0 {
                             (BEFORE, before_idx)
                         } else {
                             (AFTER, after_idx)
@@ -664,9 +842,9 @@ impl MessageDecoder {
             Some(arrow_avro::schema::AvroSchema::new(reader_avro_schema.to_string()))
         };
         let options = parse_format_options(format_options);
-        // CDC skip mode stays per-MESSAGE (Flink's CDC deserializers wrap the whole message in one
-        // catch), handled by the retry in decode(); plain JSON's skip is per-FIELD, handled by the
-        // lenient appenders, so its MessageDecoder-level retry is off.
+        // Every JSON-decoded format handles its own skip granularity (CdcJsonDecoder /
+        // JsonDecoder's lenient appenders / CsvDecoder), so the generic per-message retry below
+        // only serves a CDC batch whose ENVELOPE decode fails structurally.
         let cdc_env = crate::json::JsonEnv { mode: options.timestamp_mode, lenient: false };
         let decoder = match format {
             1 => FormatDecoder::Avro(avro_store(avro_schema, schema_id as u32), reader),
@@ -685,10 +863,30 @@ impl MessageDecoder {
                 }
             }
             3 => FormatDecoder::Raw(RawDecoder::new(output_schema)),
-            6 => FormatDecoder::Cdc(CdcJsonDecoder::new(output_schema, CdcDialect::Debezium, cdc_env)),
-            7 => FormatDecoder::Cdc(CdcJsonDecoder::new(output_schema, CdcDialect::Ogg, cdc_env)),
-            8 => FormatDecoder::Cdc(CdcJsonDecoder::new(output_schema, CdcDialect::Maxwell, cdc_env)),
-            9 => FormatDecoder::Cdc(CdcJsonDecoder::new(output_schema, CdcDialect::Canal, cdc_env)),
+            6 => FormatDecoder::Cdc(CdcJsonDecoder::new(
+                output_schema,
+                CdcDialect::Debezium,
+                cdc_env,
+                skip_errors,
+            )),
+            7 => FormatDecoder::Cdc(CdcJsonDecoder::new(
+                output_schema,
+                CdcDialect::Ogg,
+                cdc_env,
+                skip_errors,
+            )),
+            8 => FormatDecoder::Cdc(CdcJsonDecoder::new(
+                output_schema,
+                CdcDialect::Maxwell,
+                cdc_env,
+                skip_errors,
+            )),
+            9 => FormatDecoder::Cdc(CdcJsonDecoder::new(
+                output_schema,
+                CdcDialect::Canal,
+                cdc_env,
+                skip_errors,
+            )),
             _ => {
                 return MessageDecoder {
                     decoder: FormatDecoder::Json(JsonDecoder::new(

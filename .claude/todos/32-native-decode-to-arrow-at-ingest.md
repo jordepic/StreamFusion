@@ -8,8 +8,13 @@ the operator fetches each frame's writer schema from the registry by id on first
 `GET /schemas/ids/<id>`, no Confluent client dependency), patches the reader's record names onto it as
 aliases (arrow-avro enforces the spec's name check; Avro Java skips it), and registers it into the
 native store — following mid-stream schema evolution like Flink's own deserializer; auth/SSL/explicit-
-schema registry options fall back (coverage doc §5). **Remaining tail only:** (a) **Maxwell/Canal**
-exact-parity auto-routing (decoded, but parity-gated to fallback today); (b) **CSV/JSON *file*** sources
+schema registry options fall back (coverage doc §5). **Remaining tail only:** (a) ~~Maxwell/Canal
+exact-parity auto-routing~~ — **SHIPPED (2026-07-05)**: UPDATE_BEFORE follows Flink's findValue
+key-presence rule via a native per-message key scan of the raw `old` (explicit null kept, absent key
+copies `data`, Canal presence message-wide across the array — the exact quirk), null-image/uneven-array
+corruption fails like Flink's NPE path, and skip mode keeps a failing message's already-emitted rows;
+routed for flat scalar schemas (nested gated — findValue's recursive search; Canal include regexes
+gated), pinned by `CdcDecodeParityTest` + the flipped e2e harness; (b) **CSV/JSON *file*** sources
 (the lower-priority file formats — Avro OCF was dropped, arrow-avro can't read Flink's top-level-union);
 (c) ~~the JSON half of the format-option parity audit~~ — **SHIPPED (2026-07-05)**: both
 `timestamp-format.standard` modes native on every JSON path (decode operator, native source, CDC
@@ -229,15 +234,17 @@ tail (Maxwell/Canal auto-routing; CSV/JSON file sources; format-option parity au
   container, a topic per dialect): debezium/ogg use `NativeParity.assertChangelogParity` (route + collapsed
   changelog matches stock Flink's `*JsonDeserializationSchema`); maxwell/canal use `NativeParity.assertFallback`
   (asserts the query stays on Flink and still matches Flink's result).
-- **Remaining CDC follow-ups (each would lift one fallback restriction):** (a) **Maxwell/Canal exact parity** —
-  needs JSON key-presence in `old` (a light per-message scan, or carry presence out of the decode) to match
-  Flink's "absent ⇒ copy data, present-null ⇒ keep null"; then route them. (b) **`schema-include`**
-  (`{schema, payload}` wrapper) + CDC **metadata columns** (ts_ms, source.*) — decode the wrapper / project
-  metadata, then drop those fallback gates. (c) **debezium-avro-confluent** — same envelope shape, Avro
-  decoder inside (arrow-avro against a `ROW<before,after,op>` reader schema). (d) **primary-key/upsert**
-  CDC tables get a `ChangelogNormalize` above the scan — verify/handle the wrapper. (e) Canal uneven
-  `data`/`old` arrays (length mismatch) — current decoder falls back to post-image; reconcile with Flink's
-  `getRow(i)` throw. (`ignore-parse-errors` shipped 2026-07-03 — see the planner-wiring bullet.)
+- **Remaining CDC follow-ups (each would lift one fallback restriction):** (a) ~~Maxwell/Canal exact
+  parity~~ — SHIPPED 2026-07-05 via the per-message `old`-key presence scan (see the Status line);
+  what remains of it: **nested Maxwell/Canal schemas** (findValue's recursive search — needs
+  path-aware presence) and Canal's **`database.include`/`table.include`** regex filters. (b)
+  **`schema-include`** (`{schema, payload}` wrapper) + CDC **metadata columns** (ts_ms, source.*) —
+  decode the wrapper / project metadata, then drop those fallback gates. (c)
+  **debezium-avro-confluent** — same envelope shape, Avro decoder inside (arrow-avro against a
+  `ROW<before,after,op>` reader schema). (d) **primary-key/upsert** CDC tables get a
+  `ChangelogNormalize` above the scan — verify/handle the wrapper. (~~e~~ Canal uneven arrays now
+  fail like Flink's `getRow(i)` throw; `ignore-parse-errors` shipped 2026-07-03 and was re-done
+  2026-07-05 at Flink's exact granularity — field-null inside images, partial emit mid-fan-out.)
 
 #### Original design notes (retained)
 - Flink (all emit a 4-way `RowKind` changelog via the `Collector` variant):

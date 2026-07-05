@@ -66,7 +66,9 @@ value — a job that runs on both engines produces identical results.
 - **Skip granularity on a decimal-bearing JSON schema is per message for non-decimal errors.**
   arrow-json is all-or-nothing per document, so a bad non-decimal value drops the whole message
   where Flink nulls the field; the decimal cells themselves skip per field. The simd path (every
-  schema without a DECIMAL) has Flink's exact per-field granularity.
+  schema without a DECIMAL) has Flink's exact per-field granularity. On a decimal-bearing
+  **Maxwell/Canal** table the same all-or-nothing behavior can trip the `old`-presence alignment
+  check under skip mode — a loud failure where Flink skips, never a silent divergence.
 
 ## Options gated to fallback (not divergences — the query runs on Flink)
 

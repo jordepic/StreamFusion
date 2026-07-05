@@ -439,13 +439,14 @@ final class KafkaTables {
   }
 
   /** Whether this scan is a CDC changelog format the native decode reproduces <em>identically</em> to
-   * Flink. Only Debezium/OGG JSON (full pre/post images) qualify, and only when the table uses the
-   * options whose semantics we match exactly. {@code ignore-parse-errors} is supported both ways — the
+   * Flink. Debezium/OGG JSON (full pre/post images) route for any converter-supported schema;
+   * Maxwell/Canal (post-image + partial {@code old}) route for flat scalar schemas — their
+   * UPDATE_BEFORE follows Flink's findValue key-presence rule, reproduced by a native per-message
+   * key scan of the raw {@code old}. {@code ignore-parse-errors} is supported both ways — the
    * native decoder skips an undecodable message per Flink's catch-everything-per-message semantics.
-   * Anything else — Maxwell/Canal (their partial-{@code old} merge can't be reproduced from the decoded
-   * image alone), a {@code schema-include} wrapper, or metadata/computed columns the value decode
-   * doesn't produce — falls back to Flink. See ticket 32 for the follow-ups that would lift each
-   * restriction. */
+   * Still falling back: a {@code schema-include} wrapper, metadata/computed columns the value decode
+   * doesn't produce, Canal's database/table include regexes, and nested Maxwell/Canal schemas. See
+   * ticket 32 for the follow-ups. */
   static boolean isCdcDecode(RelNode node) {
     if (!(node instanceof StreamPhysicalTableSourceScan)) {
       return false;
@@ -460,8 +461,23 @@ final class KafkaTables {
       return false;
     }
     int code = decodeFormatCode(options);
-    if (code != 6 && code != 7) {
-      return false; // Debezium/OGG only; Maxwell/Canal partial-old merge isn't bit-identical (ticket 32)
+    if (code < 6 || code > 9) {
+      return false;
+    }
+    if (code == 8 || code == 9) {
+      // Maxwell/Canal: the partial-`old` pre-image follows Flink's findValue KEY-presence rule,
+      // reproduced natively by a per-message key scan — but findValue searches the `old` subtree
+      // recursively, so a nested column's name could false-match inside another field's object.
+      // Route only flat scalar schemas (capped at the presence bitmask's 128 columns); Canal's
+      // database/table include filters are Java regexes the native decode doesn't run.
+      if (!flatScalarColumns(scan)) {
+        return false;
+      }
+      if (code == 9
+          && (formatOption(options, "database.include") != null
+              || formatOption(options, "table.include") != null)) {
+        return false;
+      }
     }
     if ("true".equalsIgnoreCase(formatOption(options, "schema-include"))) {
       return false; // the {schema, payload} envelope wrapper isn't handled
@@ -470,6 +486,27 @@ final class KafkaTables {
       return false; // an unreproducible format option
     }
     return FilesystemTables.allPhysicalColumns(scan); // metadata/computed columns aren't decoded natively
+  }
+
+  /** Whether every physical column is non-nested (and the arity fits the native presence bitmask). */
+  private static boolean flatScalarColumns(StreamPhysicalTableSourceScan scan) {
+    org.apache.flink.table.types.logical.RowType rowType = FilesystemTables.physicalRowType(scan);
+    if (rowType == null || rowType.getFieldCount() > 128) {
+      return false;
+    }
+    return rowType.getChildren().stream()
+        .noneMatch(
+            type -> {
+              switch (type.getTypeRoot()) {
+                case ROW:
+                case ARRAY:
+                case MAP:
+                case MULTISET:
+                  return true;
+                default:
+                  return false;
+              }
+            });
   }
 
   /**
@@ -500,7 +537,7 @@ final class KafkaTables {
       return false;
     }
     int code = decodeFormatCode(options);
-    return cdc ? code == 6 || code == 7 : code >= 0 && code <= 5;
+    return cdc ? code >= 6 && code <= 9 : code >= 0 && code <= 5;
   }
 
   /** Builds Flink's own {@link KafkaSource} producing each record's raw value as a {@code byte[]} (no

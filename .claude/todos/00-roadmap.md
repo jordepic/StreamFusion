@@ -108,9 +108,11 @@ here when the ticket is deleted.
 - **Native decode-to-Arrow at ingest — done.** File sources (Parquet + ORC) read through DataFusion's
   file scan with the framework owning enumeration/splits/checkpointing, splittable at row-group/stripe
   granularity with projection pushdown; and a streaming decode operator (`NativeBytesDecodeOperator`)
-  decodes Kafka bytes → Arrow for JSON, Confluent/bare Avro, CSV, protobuf, and Debezium/OGG CDC
-  envelopes (→ our `$row_kind$` changelog). The residual tail lives in ticket 32 (a time-based flush for
-  sub-batch unbounded streams; Maxwell/Canal auto-routing; CSV/JSON *file* sources).
+  decodes Kafka bytes → Arrow for JSON, Confluent/bare Avro, CSV, protobuf, and all four CDC JSON
+  envelopes — Debezium/OGG, and Maxwell/Canal via the findValue key-presence scan (→ our
+  `$row_kind$` changelog); the format-option audit matched the CSV and JSON decode envelopes to
+  Flink's converters exactly (divergences/21). The residual tail lives in ticket 32 (CSV/JSON
+  *file* sources and the smaller CDC follow-ups).
 - **Nexmark matrix vs Flink — running.** The full q0–q22 suite (q6 excluded, wontdos/39) runs
   native-substituted vs stock Flink across four source rungs (generator, Kafka JSON/Avro/Protobuf);
   per-query routed-fraction/fallback reasons via `NexmarkExplainTest`, throughput matrix in the readme.
