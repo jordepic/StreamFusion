@@ -84,6 +84,31 @@ class NativePlannerTest {
             + explain);
   }
 
+  /**
+   * The mini-batch assigner is a pass-through that must not hide a rowwise input from the calc's
+   * projection pruning: with mini-batch on, the entry transpose below the assigner still converts
+   * only the read columns (here 2 of 3 — the wide unread string never becomes an Arrow column).
+   * Regression test for the unpruned-transpose tax measured at 7x on Nexmark q3.
+   */
+  @Test
+  void prunesEntryTransposeThroughMiniBatchAssigner() {
+    TableEnvironment tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+    tEnv.getConfig().set("table.exec.mini-batch.enabled", "true");
+    tEnv.getConfig().set("table.exec.mini-batch.allow-latency", "1 s");
+    tEnv.getConfig().set("table.exec.mini-batch.size", "100");
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "TWO_PHASE");
+    tEnv.executeSql(
+        "CREATE TABLE wide (k BIGINT, v BIGINT, unread STRING) WITH ('connector' = 'datagen', "
+            + "'number-of-rows' = '10')");
+    String explain = NativePlanner.explain(tEnv, "SELECT k, SUM(v) FROM wide GROUP BY k");
+    assertTrue(
+        explain.contains("NativeMiniBatchAssigner"),
+        "the mini-batch assigner should be native:\n" + explain);
+    assertTrue(
+        explain.contains("RowDataToArrow(fields=[2]"),
+        "the entry transpose should be pruned to the 2 read columns:\n" + explain);
+  }
+
   private static void createSequenceTable(TableEnvironment tEnv) {
     tEnv.executeSql(
         "CREATE TABLE src (k BIGINT, v BIGINT) WITH ('connector' = 'datagen', "

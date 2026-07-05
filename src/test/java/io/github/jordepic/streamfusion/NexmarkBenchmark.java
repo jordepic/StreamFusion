@@ -187,6 +187,10 @@ class NexmarkBenchmark {
   }
 
   static TableEnvironment environment(long rows) {
+    // Runs on SharedFlinkCluster (the auto-registered extension redirects
+    // getExecutionEnvironment() there); its managed-memory size is what bounds the accounted
+    // stateful operators — sized there for multi-million-event runs (the tuned mini-batch column
+    // uses 5M events so flush latency amortizes). Per-test cluster Configurations are ignored.
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     // Object reuse (a standard tuned-prod setting, enabled for both the Flink baseline and the native

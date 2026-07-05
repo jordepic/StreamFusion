@@ -56,6 +56,16 @@ public class StreamPhysicalNativeMiniBatchAssigner extends SingleRel
         getCluster(), traitSet, inputs.get(0), outputRowType, intervalMs, rowTime);
   }
 
+  /**
+   * A copy over a different (narrower) input — the assigner forwards batches untouched, so a calc
+   * above it can push its projection pruning through to the entry transpose below (the assigner's
+   * row type just follows the pruned input).
+   */
+  StreamPhysicalNativeMiniBatchAssigner withInput(RelNode input, RelDataType prunedRowType) {
+    return new StreamPhysicalNativeMiniBatchAssigner(
+        getCluster(), getTraitSet(), input, prunedRowType, intervalMs, rowTime);
+  }
+
   @Override
   public ExecNode<?> translateToExecNode() {
     return new NativeMiniBatchAssignerExecNode(

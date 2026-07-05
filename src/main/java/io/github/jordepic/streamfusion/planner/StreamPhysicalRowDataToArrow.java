@@ -81,7 +81,13 @@ public class StreamPhysicalRowDataToArrow extends SingleRel
 
   @Override
   public RelWriter explainTerms(RelWriter pw) {
-    return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
+    // The rendered field count makes pruning visible in an explain ("why is my transpose wide?");
+    // display-only — the digest already carries the full row type.
+    return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier)
+        .itemIf(
+            "fields",
+            getRowType().getFieldCount(),
+            pw.getDetailLevel() != org.apache.calcite.sql.SqlExplainLevel.DIGEST_ATTRIBUTES);
   }
 }
 

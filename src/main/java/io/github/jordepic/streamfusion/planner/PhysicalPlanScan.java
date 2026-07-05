@@ -499,6 +499,29 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             calc.getRowType(),
             encoded.remapInputs(pruned.remap));
       }
+      // The mini-batch assigner is a pass-through (it forwards batches untouched), so it must not
+      // hide a rowwise input from the pruning above: push the pruned entry transpose through it.
+      // Without this, a mini-batch plan pays an UNPRUNED transpose of the full wide source row —
+      // measured at 7x the transpose work on Nexmark q3.
+      if (pruned != null && input instanceof StreamPhysicalNativeMiniBatchAssigner) {
+        StreamPhysicalNativeMiniBatchAssigner assigner =
+            (StreamPhysicalNativeMiniBatchAssigner) input;
+        RelNode below = assigner.getInput(0);
+        if (!emitsColumnar(below)) {
+          boolean carryRowKind =
+              below instanceof StreamPhysicalRel
+                  && !ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) below);
+          RelNode prunedTranspose =
+              new StreamPhysicalRowDataToArrow(
+                  below.getCluster(), below.getTraitSet(), below, carryRowKind, pruned.inputType);
+          return new StreamPhysicalNativeCalc(
+              calc.getCluster(),
+              calc.getTraitSet(),
+              assigner.withInput(prunedTranspose, pruned.inputType),
+              calc.getRowType(),
+              encoded.remapInputs(pruned.remap));
+        }
+      }
       return new StreamPhysicalNativeCalc(
           calc.getCluster(), calc.getTraitSet(), input, calc.getRowType(), encoded);
     }
