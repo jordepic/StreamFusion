@@ -34,7 +34,7 @@ These have no matcher; any query containing one falls back entirely.
 | `Correlate` | lateral table functions, and `UNNEST` with a pushed condition the expression engine can't encode (or any condition over a LEFT unnest). INNER **or LEFT** `UNNEST` of a single `ARRAY` (scalar or `ROW` element, flattened), `MAP` (key+value), or `MULTISET` (element by count) column — optionally `WITH ORDINALITY`, INNER including a pushed element filter — **is** supported (see the chart). |
 | `Match` | `MATCH_RECOGNIZE` (CEP / row-pattern) |
 | `GroupWindowAggregate` (most), `GroupWindowTableAggregate` | the legacy group-window syntax — `GROUP BY TUMBLE(...)`/`HOP(...)`, and proctime group windows. **Exception:** a legacy event-time `SESSION(...)` group-window routes natively (reusing the session operator), when its only window properties are `(window_start, window_end[, rowtime][, proctime])` in that order |
-| `IncrementalGroupAggregate` | the five-node chain a distinct aggregate plans to **only when `table.optimizer.distinct-agg.split.enabled` is on** (partial local → incremental → final global over a bucket key). The default mini-batch plan for distinct aggregates — `LocalGroupAggregate` + `GlobalGroupAggregate` with a distinct MapView partial — **is** native, as is the whole ordinary two-phase family (+ `MiniBatchAssigner`); see the feature gaps and §2 below |
+| `IncrementalGroupAggregate` | the five-node chain a distinct aggregate plans to **only when `table.optimizer.distinct-agg.split.enabled` is on** (partial local → incremental → final global over a bucket key) — a deliberate non-goal: the knob mitigates state-backend hot-key skew our in-process distinct set doesn't exhibit (`wontdos/52-distinct-split-chain.md`). The default mini-batch plan for distinct aggregates — `LocalGroupAggregate` + `GlobalGroupAggregate` with a distinct MapView partial — **is** native, as is the whole ordinary two-phase family (+ `MiniBatchAssigner`); see the feature gaps and §2 below |
 | `GroupTableAggregate` | `TableAggregateFunction` |
 | `DropUpdateBefore`, `Values` | misc (a non-temporal `Sort` is parity — Flink rejects it in streaming) |
 | `LegacyTableSourceScan`, `LegacySink` | legacy connectors |
@@ -95,8 +95,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   local subtracts -U/-D rows, and the appended (or reused) count1 COUNT(*) partial drives per-key
   liveness in the global (`-D` and state drop when the merged count reaches zero, Flink's
   RecordCounter semantics).
-  Still falling back: the opt-in `distinct-agg.split.enabled` incremental chain (see
-  `IncrementalGroupAggregate` above), MIN/MAX/AVG over DISTINCT under two-phase,
+  Still falling back: the opt-in `distinct-agg.split.enabled` incremental chain (a deliberate
+  non-goal — `IncrementalGroupAggregate` above), MIN/MAX/AVG over DISTINCT under two-phase,
   smallint/tinyint/float SUM/MIN/MAX partials, and — under a retracting input — any aggregate
   other than COUNT/AVG (Flink's SUM/MIN/MAX retract variants declare extra accumulator fields,
   and a monotonicity-exempt MIN/MAX ignores retractions in ways the native fold would not) plus

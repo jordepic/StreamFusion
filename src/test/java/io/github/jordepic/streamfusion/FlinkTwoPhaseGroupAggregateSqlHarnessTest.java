@@ -287,8 +287,9 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
   void distinctSplitChainFallsBackToHost() throws Exception {
     // With table.optimizer.distinct-agg.split.enabled the plan becomes the five-node incremental
     // chain (PartialLocal → Exchange → IncrementalGroupAggregate → Exchange → FinalGlobal) over a
-    // Calc computing the bucket key; the incremental node has no native path, so the whole query
-    // stays on the host. (The default no-split plan for the same query runs natively above.)
+    // Calc computing the bucket key; the incremental node deliberately has no native path
+    // (wontdos/52-distinct-split-chain.md), so the whole query stays on the host. (The default
+    // no-split plan for the same query runs natively above.)
     Path input = Files.createTempDirectory("twophase-distinct-split-in");
     writeInput(input);
     Supplier<TableEnvironment> environment =
