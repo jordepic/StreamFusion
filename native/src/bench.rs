@@ -110,6 +110,71 @@ impl Over {
     }
 }
 
+/// The bounded-frame variant of {@link Over} (`ROWS`/`RANGE … PRECEDING`), which buffers rows per
+/// key and recomputes each row's frame.
+impl Over {
+    pub fn bounded(
+        value_type: i64,
+        kinds: Vec<i64>,
+        rt_column: usize,
+        value_column: usize,
+        key_columns: Vec<usize>,
+        rows_frame: bool,
+        frame_offset: i64,
+    ) -> Self {
+        let value_types = vec![value_type; kinds.len()];
+        let value_columns = vec![value_column; kinds.len()];
+        let frame_kind = if rows_frame { 1 } else { 2 };
+        Over(OverWindowAggregator::new(
+            value_types, kinds, rt_column, value_columns, key_columns, frame_kind, frame_offset, false,
+        ))
+    }
+}
+
+/// A retracting Top-N ranker (changelog input, full per-partition buffers), as the operator drives it.
+pub struct RetractTopN(RetractableTopNRanker);
+
+impl RetractTopN {
+    /// `sort_columns` are (index, ascending) pairs (nulls-last).
+    pub fn new(partition_columns: Vec<usize>, sort_columns: Vec<(usize, bool)>, limit: i64) -> Self {
+        let sort = sort_columns
+            .into_iter()
+            .map(|(index, ascending)| SortColumn { index, ascending, nulls_first: false })
+            .collect();
+        RetractTopN(RetractableTopNRanker::new(partition_columns, sort, 0, limit, false))
+    }
+
+    pub fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
+        self.0.push(batch).expect("budget exceeded")
+    }
+}
+
+/// The watermark-buffered event-time keep-first deduplicator, as the operator drives it.
+pub struct KeepFirstDedup(KeepFirstDeduplicator);
+
+impl KeepFirstDedup {
+    pub fn new(partition_columns: Vec<usize>, rt_column: usize) -> Self {
+        KeepFirstDedup(KeepFirstDeduplicator::new(partition_columns, rt_column))
+    }
+
+    pub fn push(&mut self, batch: &RecordBatch) {
+        self.0.push(batch).expect("budget exceeded");
+    }
+
+    pub fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.0.flush(watermark).expect("budget exceeded")
+    }
+}
+
+/// The columnar exchange's by-key split (one call per batch, as the shuffle drives it).
+pub fn split_by_key(
+    batch: &RecordBatch,
+    key_columns: &[usize],
+    num_partitions: usize,
+) -> Vec<(usize, RecordBatch)> {
+    partition_batch(batch, key_columns, num_partitions)
+}
+
 /// A source-edge JSON decoder (one document per input row -> a typed columnar batch).
 pub struct JsonDecode(JsonDecoder);
 

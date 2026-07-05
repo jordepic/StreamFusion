@@ -194,6 +194,22 @@ stored bytes via the converter's parser (wire format unchanged). q20 +4% on the 
 Proton-style block store (state as columnar blocks + row refs, emit by `take`) stays ticketed
 behind a post-round profile (ticket 48).
 
+**The ScalarValue-vintage keyed loops retired** (2026-07-05, closing ticket 49). The last operators
+still building a `Vec<ScalarValue>` key (or whole row) per input row moved to the same arrow-row
+byte state as the rest: all three keyed `OVER` loops (running fold, bounded-frame buffers,
+ROW_NUMBER/RANK counters) probe by borrowed key bytes; the **retracting Top-N** adopted the
+append-only ranker's whole structure — memcomparable sort-key bytes replace the scalar comparator,
+`Arc`-shared payload rows make the per-row before/after top-N snapshots refcount bumps instead of
+row deep-clones, and the shared distinct-row emit decode applies; keep-first dedup's emitted-key
+set probes borrowed bytes; and the exchange split hashes each row's encoded key bytes from one
+vectorized pass. Criterion (4096-row batches, 64–256 keys): OVER running sum 422→183 µs (+121%
+throughput), ROW_NUMBER 342→131 µs (+162%), bounded frame 688→452 µs (+52%), retracting Top-N
+10.2→3.1 ms (+228%), exchange split 174→57 µs (+208%), keep-first probe +6%. The exchange's
+concrete key→channel assignment changed with the hashed representation — permitted by
+divergences/10 (co-location is the only contract). Still scalar-keyed, pending a bench that says
+they matter: the window Top-N ranker, the changelog normalizer, the temporal join, and the
+mini-batch local aggregate (ticket 20's backlog).
+
 **Top-N emit decodes distinct rows, not emitted rows.** The with-rank cascade emits the same
 `Arc`-shared buffered rows at many rank positions — in a hot partition, the same top-N rows over
 and over across the batch's cascades — while emit decoded arrow-row state bytes per *emitted* row

@@ -7,7 +7,10 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use streamfusion::bench::{Filter, IntervalJoin, Over, Session, Tumbling, WindowJoin};
+use streamfusion::bench::{
+    split_by_key, Filter, IntervalJoin, KeepFirstDedup, Over, RetractTopN, Session, Tumbling,
+    WindowJoin,
+};
 
 const ROWS: usize = 4096;
 
@@ -304,6 +307,110 @@ fn bench_over(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+    // Bounded ROWS frame (SUM over the 10 preceding rows): the per-key buffer append plus the
+    // per-row frame recompute — the third keyed OVER loop, not covered by the two above.
+    group.bench_function("bounded_rows_sum_keyed", |b| {
+        b.iter_batched(
+            || Over::bounded(0, vec![0], 2, 1, vec![0], true, 10),
+            |mut over| {
+                over.push(black_box(batch.clone()));
+                black_box(over.flush(i64::MAX));
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// Retracting Top-N (changelog input, full per-partition buffers): 64 partitions, top 10 by value
+// descending. Steady state is a batch of inserts into already-populated buffers — every row pays
+// the partition probe, the ordered insert, and the before/after top-N diff.
+fn bench_retract_topn(c: &mut Criterion) {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).map(|i| i % 64).collect::<Vec<_>>()));
+    let v: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).map(|i| (i * 37) % 8192).collect::<Vec<_>>()));
+    let s: ArrayRef = Arc::new(StringArray::from(
+        (0..ROWS).map(|i| format!("payload-{i}")).collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ])),
+        vec![k, v, s],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("retract_topn");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("insert_top10_of_64", |b| {
+        b.iter_batched(
+            || {
+                let mut ranker = RetractTopN::new(vec![0], vec![(1, false)], 10);
+                ranker.push(&batch); // pre-populate the buffers; the measured push is steady-state
+                ranker
+            },
+            |mut ranker| black_box(ranker.push(black_box(&batch))),
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// Keep-first dedup: 256 keys over 4096 rows. Steady state is the post-emit phase — every key has
+// already fired, so each row is one emitted-set probe and a drop; the push+flush pair measures
+// both the per-batch reduction and the emitted-set growth path.
+fn bench_dedup_keep_first(c: &mut Criterion) {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).map(|i| i % 256).collect::<Vec<_>>()));
+    let rt: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("rt", DataType::Int64, false),
+        ])),
+        vec![k, rt],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("dedup");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("keep_first_emitted_probe", |b| {
+        b.iter_batched(
+            || {
+                let mut dedup = KeepFirstDedup::new(vec![0], 1);
+                dedup.push(&batch);
+                dedup.flush(i64::MAX); // all 256 keys emitted; the measured push probes them
+                dedup
+            },
+            |mut dedup| {
+                dedup.push(black_box(&batch));
+                black_box(dedup.flush(i64::MAX));
+            },
+            BatchSize::SmallInput,
+        )
+    });
+    group.finish();
+}
+
+// The columnar exchange's by-key split: hash every row's key to a partition and gather the
+// sub-batches — the whole per-batch cost of the native shuffle's split side.
+fn bench_exchange_split(c: &mut Criterion) {
+    let k: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).map(|i| i % 64).collect::<Vec<_>>()));
+    let v: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ])),
+        vec![k, v],
+    )
+    .unwrap();
+
+    let mut group = c.benchmark_group("exchange");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function("split_by_key_8", |b| {
+        b.iter(|| black_box(split_by_key(black_box(&batch), &[0], 8)))
+    });
     group.finish();
 }
 
@@ -390,6 +497,9 @@ criterion_group!(
     bench_json_decode,
     bench_session_keyed,
     bench_over,
+    bench_retract_topn,
+    bench_dedup_keep_first,
+    bench_exchange_split,
     bench_interval_join,
     bench_window_join
 );

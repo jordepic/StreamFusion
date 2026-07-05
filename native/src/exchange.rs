@@ -1,29 +1,34 @@
 use crate::*;
 
-/// The partition a key maps to, by a consistent hash of the key values. The hash is internal — it
-/// only distributes rows across partitions and need not match Flink's, because the downstream keyed
-/// consumer is our own native operator that re-groups internally (see todo 10). A fixed-seed hasher
-/// keeps the mapping identical across subtasks/processes.
-pub(crate) fn partition_for_key(key: &GroupKey, num_partitions: usize) -> usize {
-    use std::hash::{Hash, Hasher};
+/// The partition a key's arrow-row bytes map to, by a consistent hash of the encoded key values.
+/// The hash is internal — it only distributes rows across partitions and need not match Flink's,
+/// because the downstream keyed consumer is our own native operator that re-groups internally (see
+/// todo 10). A fixed-seed hasher keeps the mapping identical across subtasks/processes, and the
+/// arrow-row encoding is a pure function of the key's type and value, so the two sides of a join
+/// co-locate equal keys exactly as the scalar hash did (divergences/10).
+pub(crate) fn partition_for_key(key: &[u8], num_partitions: usize) -> usize {
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
+    hasher.write(key);
     (hasher.finish() % num_partitions as u64) as usize
 }
 
 /// Splits a batch into up to `num_partitions` sub-batches by a consistent hash of the given key
 /// columns, so every row with the same key lands in the same partition. Each sub-batch keeps the
 /// full input schema (a row subset); empty partitions are omitted. This is the by-key split the
-/// columnar shuffle routes to channels.
+/// columnar shuffle routes to channels. The keys encode to arrow-row bytes in one vectorized pass;
+/// no per-row scalar materialization.
 pub(crate) fn partition_batch(
     batch: &RecordBatch,
     key_columns: &[usize],
     num_partitions: usize,
 ) -> Vec<(usize, RecordBatch)> {
     let key_arrays: Vec<&ArrayRef> = key_columns.iter().map(|&i| batch.column(i)).collect();
+    let mut converter = None;
+    let keys_encoded = encode_keys(&mut converter, &key_arrays, batch.num_rows());
     let mut rows_by_partition: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
     for row in 0..batch.num_rows() {
-        let partition = partition_for_key(&read_key(&key_arrays, row), num_partitions);
+        let partition = partition_for_key(keys_encoded.row(row).data(), num_partitions);
         rows_by_partition[partition].push(row as u32);
     }
     let mut out = Vec::new();

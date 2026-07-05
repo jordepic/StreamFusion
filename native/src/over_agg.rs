@@ -17,7 +17,10 @@ pub(crate) struct OverAggregator {
     kinds: Vec<i64>,
     /// One value type per aggregate (aggregates may read different value columns of different types).
     value_types: Vec<DataType>,
-    keys: HashMap<GroupKey, Vec<RunningAgg>>,
+    // Keyed by arrow-row bytes, probed borrowed (see the group aggregate): a row whose partition
+    // already exists — the steady state — allocates nothing; the key is copied on first touch only.
+    keys: HashMap<ByteKey, Vec<RunningAgg>>,
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     // Managed-memory accounting (driven by the owning OVER operator): per-key state is fixed-size,
     // so the tracked bytes move only when a key is created.
@@ -31,6 +34,7 @@ impl OverAggregator {
             value_types: value_types.iter().map(|&code| value_data_type(code)).collect(),
             kinds,
             keys: HashMap::default(),
+            key_converter: None,
             key_types: Vec::new(),
             track: false,
             bytes: 0,
@@ -38,20 +42,26 @@ impl OverAggregator {
     }
 
     /// One key's fixed state footprint (the running aggregates plus the map entry).
-    fn key_state_bytes(&self, key: &GroupKey) -> usize {
-        group_key_bytes(key) + self.kinds.len() * std::mem::size_of::<RunningAgg>()
+    fn key_state_bytes(&self, key: &[u8]) -> usize {
+        byte_key_bytes(key) + self.kinds.len() * std::mem::size_of::<RunningAgg>()
     }
 
     fn recompute_bytes(&mut self) {
-        self.bytes = self.keys.keys().map(|key| self.key_state_bytes(key)).sum();
+        self.bytes = self.keys.keys().map(|key| self.key_state_bytes(&key.0)).sum();
     }
 
-    /// The running aggregate state for a key, created on first touch.
-    fn states(&mut self, key: GroupKey) -> &mut Vec<RunningAgg> {
-        let (kinds, value_types) = (&self.kinds, &self.value_types);
-        self.keys.entry(key).or_insert_with(|| {
-            kinds.iter().zip(value_types).map(|(&kind, vt)| RunningAgg::new(kind, vt)).collect()
-        })
+    /// The running aggregate state for a key, created (copying the key bytes) on first touch.
+    fn states(&mut self, key: &[u8]) -> &mut Vec<RunningAgg> {
+        if !self.keys.contains_key(key) {
+            let fresh: Vec<RunningAgg> = self
+                .kinds
+                .iter()
+                .zip(&self.value_types)
+                .map(|(&kind, vt)| RunningAgg::new(kind, vt))
+                .collect();
+            self.keys.insert(ByteKey::from(key), fresh);
+        }
+        self.keys.get_mut(key).expect("state just ensured")
     }
 
     /// Folds the batch (`rt` i64, `value0..`, optional `key0..`) into the per-key running state in
@@ -69,7 +79,7 @@ impl OverAggregator {
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
         let n = batch.num_rows();
-        let row_keys: Vec<GroupKey> = (0..n).map(|row| read_key(&key_arrays, row)).collect();
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, n);
 
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&row| rt.value(row));
@@ -84,19 +94,21 @@ impl OverAggregator {
             // key share the post-fold value); a null value is skipped, but the key's state is touched
             // so the row still emits the running value.
             for &row in &order[start..end] {
+                let key = keys_encoded.row(row).data();
                 let keys_before = self.keys.len();
-                let states = self.states(row_keys[row].clone());
+                let states = self.states(key);
                 for (a, state) in states.iter_mut().enumerate() {
                     if let Some(num) = value_columns[a].at(row) {
                         state.fold(num);
                     }
                 }
                 if self.track && self.keys.len() > keys_before {
-                    self.bytes += self.key_state_bytes(&row_keys[row]);
+                    self.bytes += self.key_state_bytes(key);
                 }
             }
             for &row in &order[start..end] {
-                let states = self.keys.get(&row_keys[row]).expect("key present");
+                let states =
+                    self.keys.get(keys_encoded.row(row).data()).expect("key present");
                 for (a, state) in states.iter().enumerate() {
                     results[a][row] = state.emit();
                 }
@@ -124,16 +136,16 @@ impl OverAggregator {
             .zip(&self.value_types)
             .map(|(&k, vt)| RunningAgg::new(k, vt).result_type())
             .collect();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<&[u8]> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); self.kinds.len()];
         for (key, states) in self.keys.iter() {
-            keys.push(key.clone());
+            keys.push(&key.0);
             for (i, state) in states.iter().enumerate() {
                 state_columns[i].push(state.emit());
             }
         }
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         for (index, result_type) in result_types.iter().enumerate() {
             fields.push(Field::new(format!("state{index}"), result_type.clone(), true));
         }
@@ -151,8 +163,10 @@ impl OverAggregator {
             let arity = batch.num_columns() - num_agg;
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
             aggregator.key_types = key_types(&key_arrays);
+            let keys_encoded =
+                encode_keys(&mut aggregator.key_converter, &key_arrays, batch.num_rows());
             for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
+                let key = keys_encoded.row(row).data();
                 for (i, state) in aggregator.states(key).iter_mut().enumerate() {
                     let scalar = ScalarValue::try_from_array(batch.column(arity + i), row)
                         .expect("over state scalar");
@@ -188,8 +202,10 @@ pub(crate) struct BoundedOverAggregator {
     rows_frame: bool,
     /// n preceding rows (ROWS) or the preceding interval in millis (RANGE).
     offset: i64,
-    /// Per key, the buffered rows sorted ascending by rowtime (stable for ties).
-    keys: HashMap<GroupKey, Vec<BufferedRow>>,
+    /// Per key (arrow-row bytes, probed borrowed), the buffered rows sorted ascending by rowtime
+    /// (stable for ties).
+    keys: HashMap<ByteKey, Vec<BufferedRow>>,
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     // Managed-memory accounting: buffered rows are fixed-size, tracked on append and eviction.
     track: bool,
@@ -204,6 +220,7 @@ impl BoundedOverAggregator {
             rows_frame,
             offset,
             keys: HashMap::default(),
+            key_converter: None,
             key_types: Vec::new(),
             track: false,
             bytes: 0,
@@ -221,7 +238,7 @@ impl BoundedOverAggregator {
         self.bytes = self
             .keys
             .iter()
-            .map(|(key, buffer)| group_key_bytes(key) + buffer.len() * row)
+            .map(|(key, buffer)| byte_key_bytes(&key.0) + buffer.len() * row)
             .sum();
     }
 
@@ -240,7 +257,7 @@ impl BoundedOverAggregator {
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
         let n = batch.num_rows();
-        let row_keys: Vec<GroupKey> = (0..n).map(|row| read_key(&key_arrays, row)).collect();
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, n);
 
         // Append the new rows to their per-key buffers in rowtime order (stable for ties). Every new
         // row's rowtime is past the prior watermark, hence at or after all already-buffered rows, so
@@ -253,21 +270,27 @@ impl BoundedOverAggregator {
             let row_rt = rt.value(row);
             max_rt = max_rt.max(row_rt);
             let values: Vec<Option<Num>> = value_columns.iter().map(|c| c.at(row)).collect();
-            let keys_before = self.keys.len();
-            let buffer = self.keys.entry(row_keys[row].clone()).or_default();
+            let key = keys_encoded.row(row).data();
+            let (row_bytes, track) = (self.row_bytes(), self.track);
+            let buffer = match self.keys.get_mut(key) {
+                Some(buffer) => buffer,
+                None => {
+                    if track {
+                        self.bytes += byte_key_bytes(key);
+                    }
+                    self.keys.entry(ByteKey::from(key)).or_default()
+                }
+            };
             buffer.push(BufferedRow { rt: row_rt, values });
             buffer_index[row] = buffer.len() - 1;
-            if self.track {
-                self.bytes += self.row_bytes();
-                if self.keys.len() > keys_before {
-                    self.bytes += group_key_bytes(&row_keys[row]);
-                }
+            if track {
+                self.bytes += row_bytes;
             }
         }
 
         let mut results: Vec<Vec<ScalarValue>> = vec![vec![ScalarValue::Null; n]; num_agg];
         for row in 0..n {
-            let buffer = &self.keys[&row_keys[row]];
+            let buffer = &self.keys[keys_encoded.row(row).data()];
             let i = buffer_index[row];
             let cur_rt = buffer[i].rt;
             // ROWS counts physical rows up to and including this one; RANGE covers all rows within the
@@ -333,7 +356,7 @@ impl BoundedOverAggregator {
             if track {
                 freed += dropped * row_bytes;
                 if buffer.is_empty() {
-                    freed += group_key_bytes(key);
+                    freed += byte_key_bytes(&key.0);
                 }
             }
             !buffer.is_empty()
@@ -345,12 +368,12 @@ impl BoundedOverAggregator {
     /// column per aggregate).
     fn snapshot(&mut self) -> Vec<u8> {
         let num_agg = self.kinds.len();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<&[u8]> = Vec::new();
         let mut rts: Vec<ScalarValue> = Vec::new();
         let mut value_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         for (key, buffer) in self.keys.iter() {
             for row in buffer {
-                keys.push(key.clone());
+                keys.push(&key.0);
                 rts.push(ScalarValue::Int64(Some(row.rt)));
                 for a in 0..num_agg {
                     value_columns[a].push(num_to_scalar(&self.value_types[a], row.values[a]));
@@ -358,7 +381,7 @@ impl BoundedOverAggregator {
             }
         }
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         fields.push(Field::new("rt", DataType::Int64, false));
         columns.push(scalars_to_array(rts, &DataType::Int64));
         for (a, scalars) in value_columns.into_iter().enumerate() {
@@ -376,9 +399,11 @@ impl BoundedOverAggregator {
             let arity = batch.num_columns() - 1 - num_agg; // trailing rt + one value column per agg
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
             aggregator.key_types = key_types(&key_arrays);
+            let keys_encoded =
+                encode_keys(&mut aggregator.key_converter, &key_arrays, batch.num_rows());
             let rt = column_i64(&batch, "rt");
             for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
+                let key = ByteKey::from(keys_encoded.row(row).data());
                 let values: Vec<Option<Num>> = (0..num_agg)
                     .map(|a| {
                         let column = batch.column_by_name(&format!("value{a}")).expect("value column");
@@ -497,7 +522,9 @@ impl WindowFnState {
 /// function out, but driven by per-key {@link WindowFnState} rather than DataFusion accumulators.
 pub(crate) struct WindowFunctionOver {
     kinds: Vec<i64>,
-    keys: HashMap<GroupKey, Vec<WindowFnState>>,
+    // Keyed by arrow-row bytes, probed borrowed (see OverAggregator).
+    keys: HashMap<ByteKey, Vec<WindowFnState>>,
+    key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     // Managed-memory accounting (see OverAggregator): fixed per-key state, tracked on key creation.
     track: bool,
@@ -509,6 +536,7 @@ impl WindowFunctionOver {
         WindowFunctionOver {
             kinds,
             keys: HashMap::default(),
+            key_converter: None,
             key_types: Vec::new(),
             track: false,
             bytes: 0,
@@ -516,17 +544,21 @@ impl WindowFunctionOver {
     }
 
     /// One key's fixed state footprint (the window-function states plus the map entry).
-    fn key_state_bytes(&self, key: &GroupKey) -> usize {
-        group_key_bytes(key) + self.kinds.len() * std::mem::size_of::<WindowFnState>()
+    fn key_state_bytes(&self, key: &[u8]) -> usize {
+        byte_key_bytes(key) + self.kinds.len() * std::mem::size_of::<WindowFnState>()
     }
 
     fn recompute_bytes(&mut self) {
-        self.bytes = self.keys.keys().map(|key| self.key_state_bytes(key)).sum();
+        self.bytes = self.keys.keys().map(|key| self.key_state_bytes(&key.0)).sum();
     }
 
-    fn states(&mut self, key: GroupKey) -> &mut Vec<WindowFnState> {
-        let kinds = &self.kinds;
-        self.keys.entry(key).or_insert_with(|| kinds.iter().map(|&k| WindowFnState::new(k)).collect())
+    fn states(&mut self, key: &[u8]) -> &mut Vec<WindowFnState> {
+        if !self.keys.contains_key(key) {
+            let fresh: Vec<WindowFnState> =
+                self.kinds.iter().map(|&k| WindowFnState::new(k)).collect();
+            self.keys.insert(ByteKey::from(key), fresh);
+        }
+        self.keys.get_mut(key).expect("state just ensured")
     }
 
     /// Advances each function per row in rowtime order and returns `[result0..]` in input order.
@@ -536,19 +568,20 @@ impl WindowFunctionOver {
         self.key_types = key_types(&key_arrays);
         let n = batch.num_rows();
         let num = self.kinds.len();
-        let row_keys: Vec<GroupKey> = (0..n).map(|row| read_key(&key_arrays, row)).collect();
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, n);
         // Stable sort by rowtime: rows of equal rowtime keep input (arrival) order, matching Flink's
         // ROWS-frame tie order.
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by_key(|&row| rt.value(row));
         let mut results: Vec<Vec<ScalarValue>> = vec![vec![ScalarValue::Null; n]; num];
         for &row in &order {
+            let key = keys_encoded.row(row).data();
             let keys_before = self.keys.len();
-            for (i, state) in self.states(row_keys[row].clone()).iter_mut().enumerate() {
+            for (i, state) in self.states(key).iter_mut().enumerate() {
                 results[i][row] = state.next(rt.value(row));
             }
             if self.track && self.keys.len() > keys_before {
-                self.bytes += self.key_state_bytes(&row_keys[row]);
+                self.bytes += self.key_state_bytes(key);
             }
         }
         let mut fields = Vec::with_capacity(num);
@@ -566,10 +599,10 @@ impl WindowFunctionOver {
     fn snapshot(&mut self) -> Vec<u8> {
         let state_types: Vec<DataType> =
             self.kinds.iter().flat_map(|&k| WindowFnState::new(k).state_types()).collect();
-        let mut keys: Vec<GroupKey> = Vec::new();
+        let mut keys: Vec<&[u8]> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); state_types.len()];
         for (key, states) in self.keys.iter() {
-            keys.push(key.clone());
+            keys.push(&key.0);
             let mut column = 0;
             for state in states {
                 for scalar in state.state() {
@@ -579,7 +612,7 @@ impl WindowFunctionOver {
             }
         }
         let mut fields = key_fields(&self.key_types);
-        let mut columns = key_columns(&keys, &self.key_types);
+        let mut columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         for (index, state_type) in state_types.iter().enumerate() {
             fields.push(Field::new(format!("state{index}"), state_type.clone(), true));
         }
@@ -599,8 +632,9 @@ impl WindowFunctionOver {
             let arity = batch.num_columns() - state_total;
             let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| batch.column(j)).collect();
             over.key_types = key_types(&key_arrays);
+            let keys_encoded = encode_keys(&mut over.key_converter, &key_arrays, batch.num_rows());
             for row in 0..batch.num_rows() {
-                let key = read_key(&key_arrays, row);
+                let key = keys_encoded.row(row).data();
                 let mut column = arity;
                 for (i, state) in over.states(key).iter_mut().enumerate() {
                     let count = state_counts[i];

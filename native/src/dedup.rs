@@ -17,20 +17,25 @@ pub(crate) struct KeepFirstDeduplicator {
     current_watermark: i64,
     /// One row per pending key — that key's minimum-rowtime candidate — awaiting its release.
     pending: Option<RecordBatch>,
-    /// Keys whose first row has already been emitted; later rows for them are ignored.
-    emitted: HashSet<GroupKey>,
+    /// Keys whose first row has already been emitted, as arrow-row bytes probed by borrowed slice
+    /// (the steady-state row — a key already emitted — allocates nothing); later rows are ignored.
+    emitted: HashSet<ByteKey>,
+    key_converter: Option<RowConverter>,
+    key_types: Vec<DataType>,
     schema: Option<SchemaRef>,
     memory: OperatorMemory,
 }
 
 impl KeepFirstDeduplicator {
-    fn new(partition_columns: Vec<usize>, rt_column: usize) -> Self {
+    pub(crate) fn new(partition_columns: Vec<usize>, rt_column: usize) -> Self {
         KeepFirstDeduplicator {
             partition_columns,
             rt_column,
             current_watermark: i64::MIN,
             pending: None,
             emitted: HashSet::default(),
+            key_converter: None,
+            key_types: Vec::new(),
             schema: None,
             memory: OperatorMemory::unaccounted(),
         }
@@ -40,12 +45,12 @@ impl KeepFirstDeduplicator {
     /// operator's managed-memory budget (negative = unaccounted).
     fn with_memory_budget(mut self, budget_bytes: i64) -> Result<Self, DataFusionError> {
         let state = self.pending.as_ref().map_or(0, |b| b.get_array_memory_size())
-            + self.emitted.iter().map(group_key_bytes).sum::<usize>();
+            + self.emitted.iter().map(|k| byte_key_bytes(&k.0)).sum::<usize>();
         self.memory.attach("keep-first-deduplicate", budget_bytes, state)?;
         Ok(self)
     }
 
-    fn push(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
+    pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         let schema = batch.schema();
         self.schema = Some(schema.clone());
         // Drop late rows (rowtime already below the watermark) with a columnar filter.
@@ -78,18 +83,23 @@ impl KeepFirstDeduplicator {
     /// the earlier position (candidates precede new rows in `combined`, so a tie keeps the incumbent —
     /// Flink's keep-first rule of replacing only on a strictly smaller rowtime). The winning rows are
     /// gathered with `take`; the row data is never materialized into scalars.
-    fn min_per_key(&self, batch: &RecordBatch) -> RecordBatch {
+    fn min_per_key(&mut self, batch: &RecordBatch) -> RecordBatch {
         let key_arrays: Vec<&ArrayRef> =
             self.partition_columns.iter().map(|&i| batch.column(i)).collect();
+        self.key_types = key_types(&key_arrays);
+        let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, batch.num_rows());
         let rt = rt_to_millis(batch.column(self.rt_column));
-        let mut best: HashMap<GroupKey, (i64, u32)> = HashMap::default();
+        // Both maps probe by borrowed key bytes: the per-batch reduction borrows straight from the
+        // encoded batch, and the emitted-set probe (the steady-state path — every row of an
+        // already-fired key) allocates nothing.
+        let mut best: HashMap<&[u8], (i64, u32)> = HashMap::default();
         for row in 0..batch.num_rows() {
-            let key = read_key(&key_arrays, row);
-            if self.emitted.contains(&key) {
+            let key = keys_encoded.row(row).data();
+            if self.emitted.contains(key) {
                 continue; // this key's first row already emitted
             }
             let rowtime = rt.value(row);
-            match best.get(&key) {
+            match best.get(key) {
                 Some((existing, _)) if *existing <= rowtime => {}
                 _ => {
                     best.insert(key, (rowtime, row as u32));
@@ -106,7 +116,7 @@ impl KeepFirstDeduplicator {
 
     /// Emits each pending key's candidate whose rowtime the watermark has now reached (insert-only),
     /// records those keys as emitted, and keeps the rest. Both partitions are columnar filters.
-    fn flush(&mut self, watermark: i64) -> Result<RecordBatch, DataFusionError> {
+    pub(crate) fn flush(&mut self, watermark: i64) -> Result<RecordBatch, DataFusionError> {
         self.current_watermark = watermark;
         let Some(pending) = self.pending.take() else {
             return Ok(self.empty());
@@ -129,12 +139,16 @@ impl KeepFirstDeduplicator {
         if ready.num_rows() > 0 {
             let key_arrays: Vec<&ArrayRef> =
                 self.partition_columns.iter().map(|&i| ready.column(i)).collect();
+            self.key_types = key_types(&key_arrays);
+            let keys_encoded = encode_keys(&mut self.key_converter, &key_arrays, ready.num_rows());
             for row in 0..ready.num_rows() {
-                let key = read_key(&key_arrays, row);
-                let key_bytes = if track { group_key_bytes(&key) } else { 0 };
+                let key = keys_encoded.row(row).data();
                 // The emitted-key set grows for the operator's lifetime, so a flush can grow state.
-                if self.emitted.insert(key) {
-                    delta += key_bytes as isize;
+                if !self.emitted.contains(key) {
+                    self.emitted.insert(ByteKey::from(key));
+                    if track {
+                        delta += byte_key_bytes(key) as isize;
+                    }
                 }
             }
         }
@@ -162,19 +176,14 @@ impl KeepFirstDeduplicator {
         out
     }
 
-    /// The emitted keys as an IPC batch of just the key columns (their types taken from the scalars).
+    /// The emitted keys as an IPC batch of just the key columns (decoded from the stored key bytes).
     fn snapshot_emitted(&self) -> Vec<u8> {
         if self.emitted.is_empty() {
             return Vec::new();
         }
-        let keys: Vec<&GroupKey> = self.emitted.iter().collect();
-        let arity = keys[0].len();
-        let fields: Vec<Field> = (0..arity)
-            .map(|j| Field::new(format!("key{j}"), keys[0][j].data_type(), true))
-            .collect();
-        let columns: Vec<ArrayRef> = (0..arity)
-            .map(|j| scalars_to_array(keys.iter().map(|k| k[j].clone()).collect(), fields[j].data_type()))
-            .collect();
+        let keys: Vec<&[u8]> = self.emitted.iter().map(|k| k.0.as_ref()).collect();
+        let fields = key_fields(&self.key_types);
+        let columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("dedup emitted"))
     }
 
@@ -191,8 +200,10 @@ impl KeepFirstDeduplicator {
         }
         for batch in read_ipc_if_present(&bytes[12 + pending_len..]) {
             let key_arrays: Vec<&ArrayRef> = (0..batch.num_columns()).map(|i| batch.column(i)).collect();
+            dedup.key_types = key_types(&key_arrays);
+            let keys_encoded = encode_keys(&mut dedup.key_converter, &key_arrays, batch.num_rows());
             for row in 0..batch.num_rows() {
-                dedup.emitted.insert(read_key(&key_arrays, row));
+                dedup.emitted.insert(ByteKey::from(keys_encoded.row(row).data()));
             }
         }
         dedup

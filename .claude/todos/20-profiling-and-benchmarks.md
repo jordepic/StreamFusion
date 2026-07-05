@@ -20,7 +20,9 @@ vs. Flink fallback, tracked over time so a regression is visible.
 1. **Native micro-benchmarks** (Criterion, in `native/benches/`). ✅ DONE —
    `native/benches/operators.rs` covers `filter/gt_literal`, `tumbling/{sum_update_flush,
    sum_keyed_update_flush}`, `session/sum_keyed_update_flush`, `over/{running_sum_keyed,
-   row_number_keyed}`, `interval_join/equi_key_push`, and `window_join/equi_key_flush`, run via
+   row_number_keyed, bounded_rows_sum_keyed}`, `retract_topn/insert_top10_of_64`,
+   `dedup/keep_first_emitted_probe`, `exchange/split_by_key_8`, `interval_join/equi_key_push`, and
+   `window_join/equi_key_flush`, run via
    `cargo bench`, with a committed results table in [docs/benchmarks.md](../../docs/benchmarks.md) and
    the readme. Remaining: two-phase local/global benches.
 2. **A lightweight native timing/counter hook** behind a feature flag — per-operator
@@ -52,13 +54,16 @@ vs. Flink fallback, tracked over time so a regression is visible.
     maps hold `OwnedRow`, and flush decodes keys straight back into output columns via the
     shared converter. Keyed tumbling 245 → 110 µs (2.2×, ~37 Melem/s), dense session
     217 → 101 µs, unkeyed tumbling −12%, accounted variant identical.
-  - Remaining: the scalar `GroupKey` survives in the smaller keyed loops — dedup keep-first,
-    `OVER` partitions, the retractable Top-N, the exchange by-key split. The hash half shipped
-    2026-07-04 (crate-wide ahash default, after the q18 profile showed ~35% of the dedup island in
-    SipHash); the work list for the key/row migrations — plus the borrowed-byte (`ByteKey`) probe
-    extension to the remaining `OwnedRow` maps — now lives in **ticket 49**, keeping this ticket's
-    rule (swap only with a bench showing it pays; the exchange swap changes the internal
-    key→partition mapping, note it when touched).
+  - **[done]** The smaller keyed loops followed (2026-07-05, ticket 49 — now retired): the three
+    `OVER` loops, the retractable Top-N (full arrow-row adoption: byte sort keys, `Arc`-shared
+    payloads, shared distinct-row emit), dedup keep-first's emitted set, and the exchange by-key
+    split (hash over the encoded key bytes — the internal key→partition mapping changed, noted in
+    divergences/10). Bench wins in `docs/optimizations.md` §4 (OVER +121–162%, retracting Top-N
+    +228%, exchange +208%). The hash half had shipped 2026-07-04 (crate-wide ahash default).
+  - Remaining, under this ticket's rule (swap only with a bench showing it pays): the last
+    scalar-keyed maps — the window Top-N ranker (`WindowRanker`), the changelog normalizer, the
+    temporal join, and the mini-batch `LocalGroupAggregator` (hot only under tuned mini-batch
+    mode — revisit when the tuned column becomes a standing benchmark).
 - **[fixed]** `windows_for` allocated a `Vec` per row in the update loop. Reusing one
   buffer across rows cut the tumbling bench ~26% (244 → 181 µs / 17 → 22.6 Melem/s).
 - **[fixed]** Session `update` sliced one row at a time. Now grouped per key and segmented into

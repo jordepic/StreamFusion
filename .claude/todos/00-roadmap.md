@@ -128,10 +128,12 @@ here when the ticket is deleted.
    divergences/20; ticket 47 — typed DISTINCT sets + cached changelog emit, q16 +17%/q17 +4%/q15
    +3%; the
    dedup SipHash item on ticket 20 via the crate-wide ahash default; the q21 upcall regex cache,
-   +12.5%; 2026-07-05: ticket 49's borrowed-byte probes for the group-agg/dedup/Top-N maps, and the
-   upcall builtins handing off bytes not `String` — q21's residual — both pending the round's
-   matrix re-quote): what remains, in recommended order — ticket 49's bench-gated
-   `ScalarValue`-vintage retirements, and ticket 40's bounded-dim preload (deprioritized on the
+   +12.5%; 2026-07-05: the borrowed-byte probes for the group-agg/dedup/Top-N maps, the
+   upcall builtins handing off bytes not `String` — q21's residual — and the full
+   `ScalarValue`-vintage retirement (the keyed OVER loops +121–162%, retracting Top-N +228%,
+   exchange split +208%, keep-first probe +6% on Criterion; ticket 49 retired, residual
+   scalar-keyed maps listed on ticket 20) — all pending the round's
+   matrix re-quote): what remains — ticket 40's bounded-dim preload (deprioritized on the
    2026-07-05 q13 profile — the Nexmark dim is an in-memory test connector, so the win only shows
    on real external dims). Closed on the 2026-07-05 profiles: the join block store (wontdos/48 —
    the joiner's stored-row decode no longer registers) and paned HOP (wontdos/51 — the two-phase
@@ -156,9 +158,12 @@ here when the ticket is deleted.
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (the ticket 11
    operators and any remaining expression tail) before broadening where we read/write.
-5. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
-   keyed loops (dedup, `OVER` partitions, Top-N, exchange split) — swap to arrow-row keys only
-   with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
+5. **Operator-level perf** (ticket 20 backlog): the last scalar-keyed maps — the window Top-N
+   ranker, the changelog normalizer, the temporal join, and the mini-batch local aggregate — swap
+   to arrow-row keys only with a bench showing it pays. (Everything else now uses arrow-row keys:
+   all aggregators — keyed tumbling 2.2×;
+   the 2026-07-05 retirement moved the keyed OVER loops, retracting Top-N, keep-first dedup, and
+   the exchange split — OVER +121–162%, retracting Top-N +228%, exchange +208% on Criterion;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
    rejected on benchmark grounds — wontdos/28.)

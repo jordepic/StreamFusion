@@ -9,10 +9,16 @@ partitions) — applied in reverse: here nothing host-side reads them, so we don
 
 ## The decision
 The columnar exchange splits a batch by key and routes each key's rows to a
-channel using an internal hash (Rust `DefaultHasher`), **not** Flink's key-group
-assignment. It guarantees only that *all rows of a given key land on the same
-channel* — it makes no promise about *which* channel, and the channel does not
-match what Flink's keyed exchange would pick.
+channel using an internal hash (Rust `DefaultHasher` over the key's arrow-row
+byte encoding — one vectorized encode per batch, no per-row scalar
+materialization), **not** Flink's key-group assignment. It guarantees only that
+*all rows of a given key land on the same channel* — it makes no promise about
+*which* channel, and the channel does not match what Flink's keyed exchange would
+pick. (The hashed representation switched from `Vec<ScalarValue>` to the
+arrow-row bytes on 2026-07-05 — a 3.1× split throughput win. That changed the
+*concrete* key→channel assignment, which nothing may depend on per this
+divergence; the co-location contract is unchanged, since the encoding is a pure
+function of key type and value.)
 
 ## Why this is parity-safe
 The downstream native window operator is **not a Flink keyed operator**. It holds

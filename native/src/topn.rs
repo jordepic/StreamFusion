@@ -70,6 +70,47 @@ pub(crate) struct TopNConverters {
     payload: RowConverter,
 }
 
+impl TopNConverters {
+    /// Builds the three arrow-row converters from a batch's column types.
+    fn build(
+        batch: &RecordBatch,
+        arity: usize,
+        partition_columns: &[usize],
+        sort_columns: &[SortColumn],
+    ) -> Self {
+        let payload = RowConverter::new(
+            (0..arity).map(|i| SortField::new(batch.column(i).data_type().clone())).collect(),
+        )
+        .expect("top-n payload converter");
+        // A plain LIMIT (no ORDER BY) has zero sort columns; like the empty partition key, encode a
+        // constant dummy so all rows compare equal and the buffer preserves arrival order (Flink's
+        // first-n by arrival). With sort columns present, encode them memcomparable with their options.
+        let sort = if sort_columns.is_empty() {
+            RowConverter::new(vec![SortField::new(DataType::Boolean)]).expect("top-n empty sort converter")
+        } else {
+            RowConverter::new(
+                sort_columns
+                    .iter()
+                    .map(|s| {
+                        SortField::new_with_options(
+                            batch.column(s.index).data_type().clone(),
+                            SortOptions { descending: !s.ascending, nulls_first: s.nulls_first },
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("top-n sort converter")
+        };
+        // A global Top-N (LIMIT / SortLimit with no PARTITION BY) has zero partition columns; arrow-row
+        // can't encode N rows of no columns, so key on a constant dummy column (all rows → one group),
+        // exactly as the group-aggregate keying does.
+        let partition_refs: Vec<&ArrayRef> =
+            partition_columns.iter().map(|&i| batch.column(i)).collect();
+        let partition = key_row_converter(&partition_refs);
+        TopNConverters { partition, sort, payload }
+    }
+}
+
 /// A buffered Top-N row as compact arrow-row bytes: its memcomparable sort key and the value-encoded
 /// full row. No per-cell `ScalarValue`, so a buffer insert and the rank cascade move/clone a single
 /// byte buffer rather than deep-cloning every column (notably the heap strings that dominated the
@@ -142,39 +183,10 @@ impl TopNRanker {
 
     /// Builds the three arrow-row converters from a batch's column types, once.
     fn ensure_converters(&mut self, batch: &RecordBatch, arity: usize) {
-        if self.converters.is_some() {
-            return;
+        if self.converters.is_none() {
+            self.converters =
+                Some(TopNConverters::build(batch, arity, &self.partition_columns, &self.sort_columns));
         }
-        let payload = RowConverter::new(
-            (0..arity).map(|i| SortField::new(batch.column(i).data_type().clone())).collect(),
-        )
-        .expect("top-n payload converter");
-        // A plain LIMIT (no ORDER BY) has zero sort columns; like the empty partition key, encode a
-        // constant dummy so all rows compare equal and the buffer preserves arrival order (Flink's
-        // first-n by arrival). With sort columns present, encode them memcomparable with their options.
-        let sort = if self.sort_columns.is_empty() {
-            RowConverter::new(vec![SortField::new(DataType::Boolean)]).expect("top-n empty sort converter")
-        } else {
-            RowConverter::new(
-                self.sort_columns
-                    .iter()
-                    .map(|s| {
-                        SortField::new_with_options(
-                            batch.column(s.index).data_type().clone(),
-                            SortOptions { descending: !s.ascending, nulls_first: s.nulls_first },
-                        )
-                    })
-                    .collect(),
-            )
-            .expect("top-n sort converter")
-        };
-        // A global Top-N (LIMIT / SortLimit with no PARTITION BY) has zero partition columns; arrow-row
-        // can't encode N rows of no columns, so key on a constant dummy column (all rows → one group),
-        // exactly as the group-aggregate keying does.
-        let partition_refs: Vec<&ArrayRef> =
-            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
-        let partition = key_row_converter(&partition_refs);
-        self.converters = Some(TopNConverters { partition, sort, payload });
     }
 
     pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
@@ -406,44 +418,14 @@ impl TopNRanker {
     }
 
     fn emit(&self, out_rows: Vec<Arc<OwnedRow>>, out_kinds: Vec<i8>, out_ranks: Vec<i64>) -> RecordBatch {
-        if out_rows.is_empty() {
-            return RecordBatch::new_empty(Arc::new(Schema::empty()));
-        }
-        let schema = self.schema.as_ref().expect("schema set once a row was processed");
-        let conv = self.converters.as_ref().expect("converters set");
-        // The rank cascade emits the same buffered (Arc-shared) row at many positions — often the
-        // same hot top-N rows across every cascade in the batch — so decode each distinct row once
-        // and rebuild the emitted positions with a take. The output batch is unchanged; only the
-        // row->columnar decode (the operator's dominant cost in the q19 profile) shrinks from
-        // O(emitted) to O(distinct).
-        let mut index_of: HashMap<*const OwnedRow, u32> = HashMap::default();
-        let mut distinct: Vec<&Arc<OwnedRow>> = Vec::new();
-        let mut positions: Vec<u32> = Vec::with_capacity(out_rows.len());
-        for row in &out_rows {
-            let idx = *index_of.entry(Arc::as_ptr(row)).or_insert_with(|| {
-                distinct.push(row);
-                (distinct.len() - 1) as u32
-            });
-            positions.push(idx);
-        }
-        let decoded: Vec<ArrayRef> = conv
-            .payload
-            .convert_rows(distinct.iter().map(|r| r.row()))
-            .expect("decode top-n payloads");
-        let indices = UInt32Array::from(positions);
-        let mut columns: Vec<ArrayRef> = decoded
-            .iter()
-            .map(|c| take(c, &indices, None).expect("gather top-n payloads"))
-            .collect();
-        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        if self.output_rank_number {
-            fields.push(Field::new("w0$o0", DataType::Int64, false));
-            columns.push(Arc::new(Int64Array::from(out_ranks)));
-        }
-        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
-        columns.push(Arc::new(Int8Array::from(out_kinds)));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("failed to build top-n changelog batch")
+        emit_changelog(
+            self.schema.as_ref(),
+            self.converters.as_ref(),
+            self.output_rank_number,
+            out_rows,
+            out_kinds,
+            out_ranks,
+        )
     }
 
     /// Serializes the buffered rows in per-partition buffer order (partition derivable from the row).
@@ -493,6 +475,54 @@ impl TopNRanker {
     }
 }
 
+/// Decodes an emitted Top-N changelog — rows as Arc-shared payload byte rows — into the output
+/// batch. A cascade/diff emits the same buffered row at many positions (often the same hot top-N
+/// rows across every mutation in the batch), so each distinct row decodes once and the emitted
+/// positions are rebuilt with a take: the row->columnar decode (the dominant cost in the q19
+/// profile) shrinks from O(emitted) to O(distinct).
+fn emit_changelog(
+    schema: Option<&SchemaRef>,
+    converters: Option<&TopNConverters>,
+    output_rank_number: bool,
+    out_rows: Vec<Arc<OwnedRow>>,
+    out_kinds: Vec<i8>,
+    out_ranks: Vec<i64>,
+) -> RecordBatch {
+    if out_rows.is_empty() {
+        return RecordBatch::new_empty(Arc::new(Schema::empty()));
+    }
+    let schema = schema.expect("schema set once a row was processed");
+    let conv = converters.expect("converters set");
+    let mut index_of: HashMap<*const OwnedRow, u32> = HashMap::default();
+    let mut distinct: Vec<&Arc<OwnedRow>> = Vec::new();
+    let mut positions: Vec<u32> = Vec::with_capacity(out_rows.len());
+    for row in &out_rows {
+        let idx = *index_of.entry(Arc::as_ptr(row)).or_insert_with(|| {
+            distinct.push(row);
+            (distinct.len() - 1) as u32
+        });
+        positions.push(idx);
+    }
+    let decoded: Vec<ArrayRef> = conv
+        .payload
+        .convert_rows(distinct.iter().map(|r| r.row()))
+        .expect("decode top-n payloads");
+    let indices = UInt32Array::from(positions);
+    let mut columns: Vec<ArrayRef> = decoded
+        .iter()
+        .map(|c| take(c, &indices, None).expect("gather top-n payloads"))
+        .collect();
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    if output_rank_number {
+        fields.push(Field::new("w0$o0", DataType::Int64, false));
+        columns.push(Arc::new(Int64Array::from(out_ranks)));
+    }
+    fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
+    columns.push(Arc::new(Int8Array::from(out_kinds)));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("failed to build top-n changelog batch")
+}
+
 /// Retracting streaming Top-N — Flink's `RetractableTopNFunction`: a `ROW_NUMBER() OVER (PARTITION BY
 /// … ORDER BY …) <= N` over a **changelog** input (e.g. a Top-N of a GROUP BY result). Unlike the
 /// append-only ranker it keeps the **full** sorted buffer per key (never truncated to N), so when a
@@ -514,12 +544,16 @@ pub(crate) struct RetractableTopNRanker {
     limit: i64,
     output_rank_number: bool,
     schema: Option<SchemaRef>,
-    groups: HashMap<GroupKey, Vec<JoinRow>>,
+    converters: Option<TopNConverters>,
+    // The append-only ranker's byte-row state (see TopNRow): partition probes by borrowed bytes,
+    // rows as (memcomparable sort key, Arc-shared payload) — no per-cell `ScalarValue`, and the
+    // before/after top-N snapshots the diff reads are refcount bumps, not row deep-clones.
+    groups: HashMap<ByteKey, Vec<TopNRow>>,
     memory: OperatorMemory,
 }
 
 impl RetractableTopNRanker {
-    fn new(
+    pub(crate) fn new(
         partition_columns: Vec<usize>,
         sort_columns: Vec<SortColumn>,
         offset: i64,
@@ -533,6 +567,7 @@ impl RetractableTopNRanker {
             limit,
             output_rank_number,
             schema: None,
+            converters: None,
             groups: HashMap::default(),
             memory: OperatorMemory::unaccounted(),
         }
@@ -545,164 +580,114 @@ impl RetractableTopNRanker {
             .groups
             .iter()
             .map(|(key, buffer)| {
-                group_key_bytes(key)
-                    + buffer.iter().map(|r| scalar_row_bytes(r) + GROUP_ENTRY_OVERHEAD).sum::<usize>()
+                byte_key_bytes(&key.0) + buffer.iter().map(topn_entry_bytes).sum::<usize>()
             })
             .sum();
         self.memory.attach("retracting-top-n", budget_bytes, state)?;
         Ok(self)
     }
 
-    fn push(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+    pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
         let arity = data_arity(batch);
         self.schema = Some(data_schema(batch));
-        let partition_arrays: Vec<&ArrayRef> =
-            self.partition_columns.iter().map(|&i| batch.column(i)).collect();
-        let data_arrays: Vec<&ArrayRef> = (0..arity).map(|i| batch.column(i)).collect();
+        if self.converters.is_none() {
+            self.converters =
+                Some(TopNConverters::build(batch, arity, &self.partition_columns, &self.sort_columns));
+        }
+        let conv = self.converters.as_ref().expect("converters set");
+        // Encode the whole batch columnar->row in three vectorized passes (partition key, sort key,
+        // full-row payload), instead of materializing a `ScalarValue` per cell.
+        let partition_arrays: Vec<ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i).clone()).collect();
+        let sort_arrays: Vec<ArrayRef> =
+            self.sort_columns.iter().map(|s| batch.column(s.index).clone()).collect();
+        let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
+        let parts = encode_group_keys(&conv.partition, &partition_arrays, batch.num_rows());
+        let keys = encode_group_keys(&conv.sort, &sort_arrays, batch.num_rows());
+        let payloads = conv.payload.convert_columns(&data_arrays).expect("encode payload");
+
         let row_kinds = row_kind_column(batch);
         // Output window: buffer indices [offset, limit) = ranks [offset+1, limit], clamped to len.
         let (offset, limit) = (self.offset as usize, self.limit as usize);
+        let (rank_output, rank_base) = (self.output_rank_number, self.offset);
         let track = self.memory.tracking();
         let mut delta = 0isize;
+        let groups = &mut self.groups;
 
-        let mut out_rows: Vec<JoinRow> = Vec::new();
+        let mut out_rows: Vec<Arc<OwnedRow>> = Vec::new();
         let mut out_kinds: Vec<i8> = Vec::new();
         let mut out_ranks: Vec<i64> = Vec::new();
 
         for row in 0..batch.num_rows() {
-            let key = read_key(&partition_arrays, row);
-            if track && !self.groups.contains_key(&key) {
-                delta += group_key_bytes(&key) as isize;
-            }
-            let full: JoinRow = data_arrays
+            // Borrowed partition-key probe; the key bytes are copied only when a partition first
+            // appears (a full retracting buffer never removes its partition entry).
+            let part = parts.row(row).data();
+            let buffer = match groups.get_mut(part) {
+                Some(buffer) => buffer,
+                None => {
+                    if track {
+                        delta += (part.len() + GROUP_ENTRY_OVERHEAD) as isize;
+                    }
+                    groups.entry(ByteKey::from(part)).or_default()
+                }
+            };
+            // The top-N window before the mutation: Arc bumps of the payloads, not row clones.
+            let old_top: Vec<Arc<OwnedRow>> = buffer
+                [offset.min(buffer.len())..limit.min(buffer.len())]
                 .iter()
-                .map(|a| ScalarValue::try_from_array(a, row).expect("retract top-n row scalar"))
+                .map(|(_, p)| Arc::clone(p))
                 .collect();
             // +I(0)/+U(2) accumulate; -U(1)/-D(3) retract.
             let retract = matches!(row_kinds.map(|k| k.value(row)).unwrap_or(0), 1 | 3);
-            let sort = &self.sort_columns;
-            let buffer = self.groups.entry(key).or_default();
-            let old_top: Vec<JoinRow> =
-                buffer[offset.min(buffer.len())..limit.min(buffer.len())].to_vec();
             if retract {
-                if let Some(pos) = buffer.iter().position(|r| *r == full) {
+                // Remove the first full-row-equal match — a byte compare of the value-encoded
+                // payload (the append-only ranker's equality trade).
+                let full = payloads.row(row);
+                if let Some(pos) = buffer.iter().position(|(_, p)| p.row() == full) {
                     if track {
-                        delta -= (scalar_row_bytes(&buffer[pos]) + GROUP_ENTRY_OVERHEAD) as isize;
+                        delta -= topn_entry_bytes(&buffer[pos]) as isize;
                     }
                     buffer.remove(pos);
                 }
             } else {
-                let pos = buffer
-                    .partition_point(|r| compare_rows(r, &full, sort) != std::cmp::Ordering::Greater);
+                // Insert after any rows that order equal-or-before, preserving arrival order for
+                // ties (byte compare of the memcomparable sort key).
+                let key_row = keys.row(row);
+                let pos = buffer.partition_point(|(k, _)| k.row() <= key_row);
+                buffer.insert(pos, (key_row.owned(), Arc::new(payloads.row(row).owned())));
                 if track {
-                    delta += (scalar_row_bytes(&full) + GROUP_ENTRY_OVERHEAD) as isize;
+                    delta += topn_entry_bytes(&buffer[pos]) as isize;
                 }
-                buffer.insert(pos, full.clone());
             }
-            let new_top: Vec<JoinRow> =
-                buffer[offset.min(buffer.len())..limit.min(buffer.len())].to_vec();
-            self.diff(&old_top, &new_top, &mut out_rows, &mut out_kinds, &mut out_ranks);
+            let new_top: Vec<Arc<OwnedRow>> = buffer
+                [offset.min(buffer.len())..limit.min(buffer.len())]
+                .iter()
+                .map(|(_, p)| Arc::clone(p))
+                .collect();
+            diff_top(rank_output, rank_base, &old_top, &new_top, &mut out_rows, &mut out_kinds, &mut out_ranks);
         }
         self.memory.record(delta);
         self.memory.account()?;
-        Ok(self.emit(out_rows, out_kinds, out_ranks))
+        Ok(emit_changelog(
+            self.schema.as_ref(),
+            self.converters.as_ref(),
+            self.output_rank_number,
+            out_rows,
+            out_kinds,
+            out_ranks,
+        ))
     }
 
-    /// Appends the changelog transitioning the top-N from `old_top` to `new_top` (see the struct doc).
-    fn diff(
-        &self,
-        old_top: &[JoinRow],
-        new_top: &[JoinRow],
-        out_rows: &mut Vec<JoinRow>,
-        out_kinds: &mut Vec<i8>,
-        out_ranks: &mut Vec<i64>,
-    ) {
-        if self.output_rank_number {
-            for i in 0..old_top.len().max(new_top.len()) {
-                let rank = self.offset + i as i64 + 1; // window position i is rank offset+i+1
-                match (old_top.get(i), new_top.get(i)) {
-                    (Some(o), Some(n)) if o != n => {
-                        out_rows.push(o.clone());
-                        out_kinds.push(1); // -U the old occupant of this rank
-                        out_ranks.push(rank);
-                        out_rows.push(n.clone());
-                        out_kinds.push(2); // +U the new occupant
-                        out_ranks.push(rank);
-                    }
-                    (Some(_), Some(_)) => {} // rank unchanged
-                    (Some(o), None) => {
-                        out_rows.push(o.clone());
-                        out_kinds.push(3); // -D a rank that lost its occupant
-                        out_ranks.push(rank);
-                    }
-                    (None, Some(n)) => {
-                        out_rows.push(n.clone());
-                        out_kinds.push(0); // +I a newly-occupied rank
-                        out_ranks.push(rank);
-                    }
-                    (None, None) => {}
-                }
-            }
-        } else {
-            // No rank column — only membership matters; diff the two row multisets.
-            let mut old_counts: HashMap<&JoinRow, i32> = HashMap::default();
-            for r in old_top {
-                *old_counts.entry(r).or_insert(0) += 1;
-            }
-            for r in new_top {
-                match old_counts.get_mut(r) {
-                    Some(c) if *c > 0 => *c -= 1, // still present — no change
-                    _ => {
-                        out_rows.push(r.clone());
-                        out_kinds.push(0); // +I a row that entered the top-N
-                    }
-                }
-            }
-            for (r, count) in old_counts {
-                for _ in 0..count {
-                    out_rows.push(r.clone());
-                    out_kinds.push(3); // -D a row that left the top-N
-                }
-            }
-        }
-    }
-
-    fn emit(&self, out_rows: Vec<JoinRow>, out_kinds: Vec<i8>, out_ranks: Vec<i64>) -> RecordBatch {
-        if out_rows.is_empty() {
-            return RecordBatch::new_empty(Arc::new(Schema::empty()));
-        }
-        let schema = self.schema.as_ref().expect("schema set once a row was processed");
-        let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        let mut columns: Vec<ArrayRef> = (0..fields.len())
-            .map(|j| {
-                scalars_to_array(out_rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
-            })
-            .collect();
-        if self.output_rank_number {
-            fields.push(Field::new("w0$o0", DataType::Int64, false));
-            columns.push(Arc::new(Int64Array::from(out_ranks)));
-        }
-        fields.push(Field::new(ROW_KIND_COLUMN, DataType::Int8, false));
-        columns.push(Arc::new(Int8Array::from(out_kinds)));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("failed to build retract top-n changelog batch")
-    }
-
+    /// Serializes the buffered rows in per-partition buffer order (partition derivable from the row).
     fn snapshot(&self) -> Vec<u8> {
         let Some(schema) = &self.schema else { return Vec::new() };
-        let rows: Vec<&JoinRow> = self.groups.values().flatten().collect();
+        let Some(conv) = &self.converters else { return Vec::new() };
+        let rows: Vec<Row> = self.groups.values().flatten().map(|(_, p)| p.row()).collect();
         if rows.is_empty() {
             return Vec::new();
         }
-        let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-        let columns: Vec<ArrayRef> = (0..fields.len())
-            .map(|j| {
-                scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type())
-            })
-            .collect();
-        write_ipc(
-            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("retract top-n snapshot"),
-        )
+        let columns = conv.payload.convert_rows(rows).expect("decode retract top-n snapshot");
+        write_ipc(&RecordBatch::try_new(schema.clone(), columns).expect("retract top-n snapshot"))
     }
 
     fn restore(
@@ -716,18 +701,98 @@ impl RetractableTopNRanker {
         let mut ranker =
             RetractableTopNRanker::new(partition_columns, sort_columns, offset, limit, output_rank_number);
         for batch in read_ipc_if_present(bytes) {
+            let arity = batch.num_columns();
             ranker.schema = Some(batch.schema());
-            let partition_arrays: Vec<&ArrayRef> =
-                ranker.partition_columns.iter().map(|&i| batch.column(i)).collect();
+            if ranker.converters.is_none() {
+                ranker.converters = Some(TopNConverters::build(
+                    &batch,
+                    arity,
+                    &ranker.partition_columns,
+                    &ranker.sort_columns,
+                ));
+            }
+            let conv = ranker.converters.as_ref().expect("converters set");
+            let partition_arrays: Vec<ArrayRef> =
+                ranker.partition_columns.iter().map(|&i| batch.column(i).clone()).collect();
+            let sort_arrays: Vec<ArrayRef> =
+                ranker.sort_columns.iter().map(|s| batch.column(s.index).clone()).collect();
+            let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
+            let parts = encode_group_keys(&conv.partition, &partition_arrays, batch.num_rows());
+            let keys = encode_group_keys(&conv.sort, &sort_arrays, batch.num_rows());
+            let payloads = conv.payload.convert_columns(&data_arrays).expect("encode payload");
+            let groups = &mut ranker.groups;
             for row in 0..batch.num_rows() {
-                let key = read_key(&partition_arrays, row);
-                let full: JoinRow = (0..batch.num_columns())
-                    .map(|i| ScalarValue::try_from_array(batch.column(i), row).expect("retract top-n scalar"))
-                    .collect();
-                ranker.groups.entry(key).or_default().push(full); // stored in buffer (sorted) order
+                groups
+                    .entry(ByteKey::from(parts.row(row).data()))
+                    .or_default()
+                    .push((keys.row(row).owned(), Arc::new(payloads.row(row).owned()))); // buffer order
             }
         }
         ranker
+    }
+}
+
+/// Appends the changelog transitioning a partition's top-N from `old_top` to `new_top` (see the
+/// retracting ranker's doc). Row identity is payload-byte equality, with an `Arc` pointer check as
+/// the fast path (an unchanged rank is usually the same buffered row).
+fn diff_top(
+    output_rank_number: bool,
+    rank_base: i64,
+    old_top: &[Arc<OwnedRow>],
+    new_top: &[Arc<OwnedRow>],
+    out_rows: &mut Vec<Arc<OwnedRow>>,
+    out_kinds: &mut Vec<i8>,
+    out_ranks: &mut Vec<i64>,
+) {
+    if output_rank_number {
+        for i in 0..old_top.len().max(new_top.len()) {
+            let rank = rank_base + i as i64 + 1; // window position i is rank offset+i+1
+            match (old_top.get(i), new_top.get(i)) {
+                (Some(o), Some(n)) if !Arc::ptr_eq(o, n) && o.row() != n.row() => {
+                    out_rows.push(Arc::clone(o));
+                    out_kinds.push(1); // -U the old occupant of this rank
+                    out_ranks.push(rank);
+                    out_rows.push(Arc::clone(n));
+                    out_kinds.push(2); // +U the new occupant
+                    out_ranks.push(rank);
+                }
+                (Some(_), Some(_)) => {} // rank unchanged
+                (Some(o), None) => {
+                    out_rows.push(Arc::clone(o));
+                    out_kinds.push(3); // -D a rank that lost its occupant
+                    out_ranks.push(rank);
+                }
+                (None, Some(n)) => {
+                    out_rows.push(Arc::clone(n));
+                    out_kinds.push(0); // +I a newly-occupied rank
+                    out_ranks.push(rank);
+                }
+                (None, None) => {}
+            }
+        }
+    } else {
+        // No rank column — only membership matters; diff the two row multisets by payload bytes.
+        let mut old_counts: HashMap<&[u8], i32> = HashMap::default();
+        for r in old_top {
+            *old_counts.entry(r.row().data()).or_insert(0) += 1;
+        }
+        for r in new_top {
+            match old_counts.get_mut(r.row().data()) {
+                Some(c) if *c > 0 => *c -= 1, // still present — no change
+                _ => {
+                    out_rows.push(Arc::clone(r));
+                    out_kinds.push(0); // +I a row that entered the top-N
+                }
+            }
+        }
+        for r in old_top {
+            let count = old_counts.get_mut(r.row().data()).expect("counted");
+            if *count > 0 {
+                *count -= 1;
+                out_rows.push(Arc::clone(r));
+                out_kinds.push(3); // -D a row that left the top-N
+            }
+        }
     }
 }
 
