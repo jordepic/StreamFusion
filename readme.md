@@ -83,7 +83,9 @@ StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively 
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
 ([analysis](.claude/wontdos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, on the
 recommended `mimalloc` native build (the Kafka feature is a default), from a rowwise `RowData` source, a local Parquet file, and
-each Kafka value format, ordered by query number:
+each Kafka value format, ordered by query number. Both engines run Flink's **default configuration**
+(mini-batch off) apart from the object reuse noted above; the mini-batch-tuned comparison is a
+separate table in [docs/benchmarks.md](docs/benchmarks.md):
 
 Each Kafka cell is the fully native rdkafka source — Rust owns the consume *and* the decode. Since
 the consume fast path ([divergences/19](divergences/19-kafka-consume-fast-path.md)) it beats the
