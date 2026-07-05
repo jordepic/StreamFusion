@@ -35,3 +35,21 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
 **Acceptance:** each shape parity-verified against the host (the existing two-phase harness tests
 are the template), `docs/coverage-and-fallbacks.md` updated in the same commit, and a Nexmark run
 with mini-batch enabled to confirm routed fractions improve.
+
+## Follow-through once coverage lands: the tuned-Flink benchmark column
+
+Decided 2026-07-04: the matrix gains a **"tuned Flink" mode** — `table.exec.mini-batch.*` (+
+`table.optimizer.distinct-agg.split.enabled`), the same config on BOTH engines per the steelman
+rule, run for the changelog-family queries only (group aggregates, updating joins, dedup, Top-N —
+the windowed aggregates have no mini-batch plan variants and would just duplicate rows). Why: the
+matrix already runs object reuse as "standard tuned-prod"; mini-batch is the other standard
+tuning for exactly the stateful queries where we claim the biggest wins — today's numbers are
+honest vs *default* Flink but unpublished vs *tuned* Flink, whose per-record GC churn (the
+dominant cost our differential profiles measured on q9/q18/q23) mini-batch largely removes. It is
+also the apples-to-apples config for the only public per-query Alibaba table (mini-batch 2s +
+distinct split). Do NOT run it before the coverage above lands — with the mini-batch exec nodes
+still falling back it measures our fallback, not our engine.
+
+This benchmark mode doubles as ticket 46's harness: if net-diff Top-N emission ships gated on
+mini-batch plans, its parity check (collapsed changelog vs mini-batch Flink) and its performance
+claim both live here.
