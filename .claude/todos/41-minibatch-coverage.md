@@ -50,20 +50,22 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
 are the template), `docs/coverage-and-fallbacks.md` updated in the same commit, and a Nexmark run
 with mini-batch enabled to confirm routed fractions improve.
 
-## Follow-through once coverage lands: the tuned-Flink benchmark column
+- **Two-phase FILTER clauses** — surfaced by the tuned column's first run (2026-07-05): under
+  mini-batch two-phase, q15/q16/q17 plan `COUNT(*) FILTER (...)` / distinct-with-filter into the
+  local aggregate, whose matcher declines `filterArg >= 0` — the whole query falls back exactly
+  when the user tunes for it. The single-phase operator already folds per-aggregate filter
+  columns; the local/global split needs the same filter plumbing (and filtered distinct views need
+  Flink's shared-view filter semantics — dedup by arg set carries a filter list).
+- **Retraction-bearing partial layouts** — q4's inner MAX-over-join aggregates a changelog, so its
+  mini-batch local declares retraction count columns the positional walk doesn't model; the
+  defensive layout check declines it (correctly). Modeling `aggCallNeedRetractions` in the
+  local/global matchers is what fills q4's tuned cell.
 
-Decided 2026-07-04: the matrix gains a **"tuned Flink" mode** — `table.exec.mini-batch.*` (+
-`table.optimizer.distinct-agg.split.enabled`), the same config on BOTH engines per the steelman
-rule, run for the changelog-family queries only (group aggregates, updating joins, dedup, Top-N —
-the windowed aggregates have no mini-batch plan variants and would just duplicate rows). Why: the
-matrix already runs object reuse as "standard tuned-prod"; mini-batch is the other standard
-tuning for exactly the stateful queries where we claim the biggest wins — today's numbers are
-honest vs *default* Flink but unpublished vs *tuned* Flink, whose per-record GC churn (the
-dominant cost our differential profiles measured on q9/q18/q23) mini-batch largely removes. It is
-also the apples-to-apples config for the only public per-query Alibaba table (mini-batch 2s +
-distinct split). Do NOT run it before the coverage above lands — with the mini-batch exec nodes
-still falling back it measures our fallback, not our engine.
+## The tuned-Flink benchmark column: SHIPPED 2026-07-05
 
-This benchmark mode is also where net-diff Top-N emission (shipped 2026-07-05 gated on mini-batch
-plans, divergences/20) makes its performance claim: the collapsed-changelog parity check and the
-tuned numbers both live here.
+`NexmarkMatrixBenchmark#tunedMiniBatchMatrix` (SF_MATRIX_TUNED, 5M events so flush latency
+amortizes; distinct split stays default-off — skew mitigation for parallelism, and its chain has
+no native path). First results (docs/benchmarks.md carries the table): q23 2.81×, q19 2.59×
+(net-diff Top-N, divergences/20), q9 1.93×, q18 1.74×, q20 1.27×, q3 0.71× (its untuned residual
+at scale, not a mini-batch cost — the run exposed and fixed an unpruned-transpose tax first);
+q4/q15/q16/q17 fall back per the two gaps above, which are now the ticket's remaining work.

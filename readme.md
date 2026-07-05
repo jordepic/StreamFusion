@@ -150,8 +150,12 @@ bottleneck — so parity is free (unlike q21's regex). On `RowData`/Parquet thos
 rdkafka source every query on every format clears **1.46×**, all but a handful clear **2×**, and the
 peak is q11's **3.8–5.2×**. Queries whose operators trail on the bare generator (the updating joins,
 q21's parity upcall) are pulled well past 1× by the consume+decode saving — even the changelog-bound
-q9/q19, which no earlier rung could lift, land at **1.8–2.1×**. The full per-rung ladder, method,
-and end-to-end tables are in **[docs/benchmarks.md](docs/benchmarks.md)**.
+q9/q19, which no earlier rung could lift, land at **1.8–2.1×**. And **under production tuning the
+margins widen**: with `table.exec.mini-batch.*` enabled on both engines (5M events, the
+changelog-family queries), native runs the tuned Flink baseline at **1.3–2.8×** — q23 2.81×,
+q19 2.59×, q9 1.93×, q18 1.74× — because the native Top-N emits the net per-batch diff under
+mini-batch plans while stateless perimeter costs amortize away. The full per-rung ladder, method,
+tuned table, and end-to-end tables are in **[docs/benchmarks.md](docs/benchmarks.md)**.
 
 _Apple M1 Max; numbers are comparable only within a machine._
 

@@ -471,4 +471,40 @@ q3/q14/q18/q21, whose JSON rows were below 1× on their old best rung and now si
 of the table is q16 and the changelog-bound q3/q19 — operator-bound queries where the consume saving
 is diluted, not reversed.
 
+### The tuned (mini-batch) column
+
+Production Flink deployments routinely enable mini-batch for stateful queries, so the matrix has a
+**tuned mode**: `table.exec.mini-batch.*` (2s allow-latency, size 50000) on **both** engines — the
+steelman rule, and the config behind the only public per-query Alibaba comparison. Generator source
+(the tuned question is engine-vs-engine, not the perimeter), the changelog-family queries, and
+**5M events** so the flush cadence amortizes (at 500K the run is shorter than one flush interval
+and measures latency artifacts). `table.optimizer.distinct-agg.split.enabled` stays default-off: it
+is a skew mitigation for parallel deployments (these runs are parallelism 1) and its incremental
+plan chain has no native path yet. `SF_BENCHMARK=true SF_MATRIX_TUNED=true SF_ROWS=5000000 mvn
+test -Pbench -Dnative.cargo.args="build --release --features mimalloc"
+-Dtest=NexmarkMatrixBenchmark#tunedMiniBatchMatrix`.
+
+| Query | Shape | Native vs. tuned Flink |
+|---|---|---|
+| q23 | three-way join `bid ⋈ person ⋈ auction` | **2.81×** |
+| q19 | `ROW_NUMBER` topN (≤ 10) | **2.59×** |
+| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.93×** |
+| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.74×** |
+| q20 | updating join (`category = 10`) | **1.27×** |
+| q3 | updating join `auction ⋈ person` | 0.71× |
+| q4, q15, q16, q17 | | _fall back (see below)_ |
+
+The tuned margins are **wider** than the default-config generator column, not narrower: at 5M
+events the state-heavy queries dominate their runtime with operator work (the per-event JIT/setup
+share shrinks), and under mini-batch the native side emits the net per-batch Top-N diff
+(divergences/20) where Flink's rank — which has no mini-batch variant — still pays the per-record
+cascade (q19 2.59× tuned vs 1.48× default). q3 trails for the same reason it does untuned at this
+scale (a thin island over a wide transposed perimeter); the mini-batch config itself costs the
+native side nothing since calc pruning pushes through the assigner.
+
+The four fallbacks are the tuned mode's honest coverage report: under mini-batch two-phase,
+q15/q16/q17's `FILTER` clauses and q4's retraction-bearing partial layout decline the local
+aggregate (both on the mini-batch ticket). Their cells will fill in as that coverage lands; until
+then the tuned column doubles as the mini-batch coverage check.
+
 _Apple M1 Max; numbers are comparable only within a machine._

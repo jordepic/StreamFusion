@@ -101,7 +101,11 @@ reused row object is still valid.
 **Projection pruning into the entry transpose** (`8523187`). When a native calc reads a few
 columns/nested struct fields of a wide row, the planner narrows the transpose to exactly those
 leaves and remaps the calc, so the unread person/auction structs of the Nexmark wide event are
-never materialized into Arrow at all.
+never materialized into Arrow at all. Pass-through columnar nodes must not hide the rowwise input
+from this: the mini-batch assigner sitting between a calc and the source silently disabled the
+pruning — an unpruned transpose measured at 7x the transpose work, native q3 2.4x slower with
+mini-batch on — so the pruning pushes through it (`ddc4f25`; a planner test pins the pruned
+arity). Any future pass-through columnar rel needs the same treatment.
 
 ## 3. Ingest: sources and decode
 
