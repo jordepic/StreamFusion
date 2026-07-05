@@ -224,14 +224,13 @@
             <version>1.21.4</version>
             <scope>test</scope>
         </dependency>
-        <!-- Apache Fluss baseline for the Nexmark source matrix. Test-only for now: the first Fluss
-             PR measures stock Flink-on-Fluss and inspects the rowwise connector path; no StreamFusion
-             runtime dependency is introduced until a native columnar Fluss reader is designed. -->
+        <!-- Apache Fluss connector classes. Main code references the public split types for the native
+             proof seam; the dependency stays provided so StreamFusion does not bundle Fluss at runtime. -->
         <dependency>
             <groupId>org.apache.fluss</groupId>
             <artifactId>fluss-flink-2.2</artifactId>
             <version>${fluss.version}</version>
-            <scope>test</scope>
+            <scope>provided</scope>
         </dependency>
         <dependency>
             <groupId>org.apache.fluss</groupId>

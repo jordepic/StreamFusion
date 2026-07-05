@@ -63,6 +63,7 @@ mod expr;
 mod files;
 mod flatten;
 mod flink_text;
+mod fluss;
 mod formats;
 mod group_agg;
 mod interval_join;
@@ -88,7 +89,7 @@ mod window_join;
 #[allow(unused_imports)]
 pub(crate) use {
     aggregates::*, bridge::*, calc::*, changelog::*, dedup::*, exchange::*, expr::*, files::*,
-    flatten::*, formats::*, group_agg::*, interval_join::*, ipc::*, join_common::*, json::*,
+    flatten::*, fluss::*, formats::*, group_agg::*, interval_join::*, ipc::*, join_common::*, json::*,
     kafka::*, keys::*, memory::*, normalizer::*, over_agg::*, session_agg::*, sorter::*,
     temporal_join::*, topn::*, updating_join::*, window_agg::*, window_join::*,
 };

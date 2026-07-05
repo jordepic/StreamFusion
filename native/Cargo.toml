@@ -56,6 +56,8 @@ datafusion = "53.1.0"
 # without a system dependency. (SSL/SASL-GSSAPI for the Kerberos cluster would add the `ssl` +
 # `gssapi-vendored` features — a heavier build, deferred until needed.)
 rdkafka = { version = "0.36", default-features = false, features = ["libz-static"], optional = true }
+fluss_rs = { package = "fluss-rs", git = "https://github.com/apache/fluss-rust.git", rev = "5ac69f38fe0500d68d603167fce67acde5e3f261", default-features = true, optional = true }
+arrow57 = { package = "arrow", version = "57.0.0", features = ["ffi"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 # Fast hashing for the per-row grouping map (the same hasher arrow/datafusion use internally).
@@ -88,6 +90,7 @@ libmimalloc-sys = { version = "0.1", optional = true }
 default = ["kafka"]
 kafka = ["dep:rdkafka"]
 kafka-bench = ["kafka"]
+fluss = ["dep:fluss_rs", "dep:arrow57"]
 # Rebind the C allocator to mimalloc for everything linked into THIS library (librdkafka included),
 # via link-time symbol aliases emitted by build.rs. Library-scoped: the hosting JVM process keeps
 # its own allocator, so this carries none of the risk of a process-wide malloc override (a zone-swap
