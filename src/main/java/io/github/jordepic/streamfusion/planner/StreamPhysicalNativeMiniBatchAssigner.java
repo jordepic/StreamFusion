@@ -15,8 +15,9 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
  * Columnar form of Flink's {@code MiniBatchAssigner}: forwards Arrow batches ({@link ColumnarInput}
- * and {@link ColumnarOutput}) and emits processing-time mini-batch marker watermarks that the
- * downstream native local aggregate flushes on. Insert-only (it adds no rows and touches no
+ * and {@link ColumnarOutput}) and emits the mini-batch marker watermarks that the downstream native
+ * local aggregate flushes on — generated from processing time (proc-time mode) or filtered from the
+ * upstream event-time watermarks (row-time mode). Insert-only (it adds no rows and touches no
  * {@code $row_kind$}), so it requires no changelog handling.
  */
 public class StreamPhysicalNativeMiniBatchAssigner extends SingleRel
@@ -24,16 +25,19 @@ public class StreamPhysicalNativeMiniBatchAssigner extends SingleRel
 
   private final RelDataType outputRowType;
   private final long intervalMs;
+  private final boolean rowTime;
 
   public StreamPhysicalNativeMiniBatchAssigner(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
-      long intervalMs) {
+      long intervalMs,
+      boolean rowTime) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.intervalMs = intervalMs;
+    this.rowTime = rowTime;
   }
 
   @Override
@@ -49,7 +53,7 @@ public class StreamPhysicalNativeMiniBatchAssigner extends SingleRel
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeMiniBatchAssigner(
-        getCluster(), traitSet, inputs.get(0), outputRowType, intervalMs);
+        getCluster(), traitSet, inputs.get(0), outputRowType, intervalMs, rowTime);
   }
 
   @Override
@@ -59,7 +63,8 @@ public class StreamPhysicalNativeMiniBatchAssigner extends SingleRel
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
-        intervalMs);
+        intervalMs,
+        rowTime);
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */

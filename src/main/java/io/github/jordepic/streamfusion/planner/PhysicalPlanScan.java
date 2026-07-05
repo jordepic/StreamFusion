@@ -234,18 +234,21 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
-    // The MiniBatchAssigner emits the processing-time mini-batch marker that drives the local
-    // aggregate's bundle flush. Substitute a native columnar assigner that forwards Arrow and emits
-    // the same marker watermark, so the whole island shares one mini-batch cadence — matching Flink's
-    // ProcTimeMiniBatchAssignerOperator + MapBundleOperator wiring. (Row-time mini-batch falls back.)
+    // The MiniBatchAssigner emits the mini-batch marker that drives the local aggregate's bundle
+    // flush. Substitute a native columnar assigner that forwards Arrow and emits the same marker
+    // watermark, so the whole island shares one mini-batch cadence — matching Flink's
+    // ProcTimeMiniBatchAssignerOperator (proc-time: markers generated from the clock) or
+    // RowTimeMiniBatchAssginerOperator (row-time: upstream event-time watermarks filtered to the
+    // interval) + MapBundleOperator wiring.
     if (current instanceof StreamPhysicalMiniBatchAssigner) {
       MiniBatchInterval interval =
           current
               .getTraitSet()
               .getTrait(MiniBatchIntervalTraitDef$.MODULE$.INSTANCE())
               .getMiniBatchInterval();
-      if (interval.getMode() != MiniBatchMode.ProcTime) {
-        recordFallback("miniBatchAssigner: only processing-time mini-batch is supported");
+      if (interval.getMode() != MiniBatchMode.ProcTime
+          && interval.getMode() != MiniBatchMode.RowTime) {
+        recordFallback("miniBatchAssigner: unsupported mini-batch mode " + interval.getMode());
         return current;
       }
       if (!NativeConfig.operatorEnabled("miniBatchAssigner")) {
@@ -257,7 +260,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           current.getTraitSet(),
           current.getInputs().get(0),
           current.getRowType(),
-          interval.getInterval());
+          interval.getInterval(),
+          interval.getMode() == MiniBatchMode.RowTime);
     }
 
     // A regular (non-windowed) join emits a changelog and consumes one on either side, so it is

@@ -35,8 +35,9 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
   `(sum, count)` state, so decimal (and int/narrow, whose wrapping accumulators are also two-field)
   stay gated to bigint/double there; carrying them needs split-specific single-field partial
   accumulators with skip-NULL merge (Flink's own merge expression).
-- **Row-time mini-batch** — the mini-batch assigner over a rowtime (watermark-driven flush) falls
-  back; only the proc-time marker is native.
+- **Row-time mini-batch: DONE (2026-07-05).** The native assigner now has both modes: proc-time
+  (markers from the clock) and row-time (upstream watermarks filtered to the interval, mirroring
+  Flink's `RowTimeMiniBatchAssginerOperator` including the end-of-input flush).
 
 **Acceptance:** each shape parity-verified against the host (the existing two-phase harness tests
 are the template), `docs/coverage-and-fallbacks.md` updated in the same commit, and a Nexmark run

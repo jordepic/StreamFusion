@@ -73,6 +73,27 @@ class FlinkColumnarWindowSqlHarnessTest {
   }
 
   @Test
+  void rowTimeMiniBatchWindowMatchesHost() throws Exception {
+    Path input = Files.createTempDirectory("cwin-rowtime-mb-in");
+    writeInput(input);
+    // With mini-batch on and a watermark-requiring window downstream, the planner inserts a
+    // ROW-TIME MiniBatchAssigner: upstream event-time watermarks are filtered to the mini-batch
+    // interval instead of markers being generated from the clock. The filtered sequence is a pure
+    // function of the input watermarks, so the windowed result stays deterministic and must match.
+    NativeParity.assertParity(
+        () -> {
+          TableEnvironment tEnv = readEnvironment(input, "TWO_PHASE");
+          tEnv.getConfig().set("table.exec.mini-batch.enabled", "true");
+          tEnv.getConfig().set("table.exec.mini-batch.allow-latency", "1 s");
+          tEnv.getConfig().set("table.exec.mini-batch.size", "100");
+          return tEnv;
+        },
+        "SELECT k, window_start, window_end, SUM(v) AS total "
+            + "FROM TABLE(TUMBLE(TABLE t, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY k, window_start, window_end");
+  }
+
+  @Test
   void keyedSessionOverColumnarSourceMatchesHost() throws Exception {
     Path input = Files.createTempDirectory("csession-in");
     writeInput(input);

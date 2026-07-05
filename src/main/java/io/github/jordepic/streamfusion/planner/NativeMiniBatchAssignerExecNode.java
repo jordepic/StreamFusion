@@ -3,7 +3,9 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarMiniBatchAssignerOperator;
+import io.github.jordepic.streamfusion.operator.NativeColumnarRowTimeMiniBatchAssignerOperator;
 import java.util.Collections;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.table.planner.delegation.PlannerBase;
@@ -22,13 +24,15 @@ public class NativeMiniBatchAssignerExecNode extends ExecNodeBase<ArrowBatch>
   private static final String TRANSFORMATION = "native-columnar-mini-batch-assigner";
 
   private final long intervalMs;
+  private final boolean rowTime;
 
   public NativeMiniBatchAssignerExecNode(
       ReadableConfig tableConfig,
       InputProperty inputProperty,
       RowType outputType,
       String description,
-      long intervalMs) {
+      long intervalMs,
+      boolean rowTime) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-mini-batch-assigner_1"),
@@ -37,6 +41,7 @@ public class NativeMiniBatchAssignerExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.intervalMs = intervalMs;
+    this.rowTime = rowTime;
   }
 
   @Override
@@ -45,10 +50,14 @@ public class NativeMiniBatchAssignerExecNode extends ExecNodeBase<ArrowBatch>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
+    OneInputStreamOperator<ArrowBatch, ArrowBatch> operator =
+        rowTime
+            ? new NativeColumnarRowTimeMiniBatchAssignerOperator(intervalMs)
+            : new NativeColumnarMiniBatchAssignerOperator(intervalMs);
     return ExecNodeUtil.createOneInputTransformation(
         input,
         createTransformationMeta(TRANSFORMATION, config),
-        new NativeColumnarMiniBatchAssignerOperator(intervalMs),
+        operator,
         ArrowBatchTypeInformation.INSTANCE,
         input.getParallelism(),
         false);

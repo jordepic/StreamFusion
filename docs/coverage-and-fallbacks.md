@@ -75,9 +75,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   COUNT over the same column, and the global folds the pre-summed pair into the ordinary AVG state
   (the count partial bumps the non-null count), so the final divide/truncate/cast-back — including
   the cast back to a narrow integer or float result — is byte-identical to the single-phase AVG.
-  Decimal SUM/MIN/MAX/AVG carry through the split too (see the decimal bullet above). Still
-  falling back: distinct aggregates (they plan as `IncrementalGroupAggregate`),
-  smallint/tinyint/float SUM/MIN/MAX partials, and row-time mini-batch.
+  Decimal SUM/MIN/MAX/AVG carry through the split too (see the decimal bullet above). Both assigner
+  modes are native: proc-time (markers generated from the clock) and row-time (upstream event-time
+  watermarks filtered to the mini-batch interval — a pure function of the input watermarks, so
+  results stay deterministic). Still falling back: distinct aggregates (they plan as
+  `IncrementalGroupAggregate`) and smallint/tinyint/float SUM/MIN/MAX partials.
 - **`OVER`** — the unbounded `RANGE … CURRENT ROW` frame (running fold), the bounded
   `ROWS BETWEEN n PRECEDING AND CURRENT ROW` frame (recomputed over the row slice), **and** the
   bounded `RANGE BETWEEN INTERVAL n PRECEDING AND CURRENT ROW` frame (recomputed over the rowtime
