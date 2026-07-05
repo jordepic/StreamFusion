@@ -1,6 +1,8 @@
 use crate::*;
 
+#[cfg(feature = "fluss")]
 const NO_PARTITION: i64 = i64::MIN;
+#[cfg(feature = "fluss")]
 const NO_STOPPING_OFFSET: i64 = i64::MIN;
 
 /// Whether this native library was built with the native Fluss reader feature.
@@ -18,7 +20,7 @@ struct FlussSplitReader {
     scanner: fluss_rs::client::RecordBatchLogScanner,
     split_ids: HashMap<fluss_rs::metadata::TableBucket, String>,
     stopping_offsets: HashMap<fluss_rs::metadata::TableBucket, i64>,
-    pending: std::collections::VecDeque<(String, i64, arrow57::record_batch::RecordBatch)>,
+    pending: std::collections::VecDeque<(String, i64, RecordBatch)>,
 }
 
 #[cfg(feature = "fluss")]
@@ -32,23 +34,27 @@ impl FlussSplitReader {
         let config = fluss_config(config);
         let table_path =
             fluss_rs::metadata::TablePath::new(database_name.to_string(), table_name.to_string());
-        let connection = runtime()
-            .block_on(fluss_rs::client::FlussConnection::new(config))
-            .expect("failed to create Fluss connection");
-        let scanner = {
-            let table = runtime()
-                .block_on(connection.get_table(&table_path))
-                .expect("failed to get Fluss table");
-            let scan = table.new_scan();
-            let scan = if projected_fields.is_empty() {
-                scan
-            } else {
-                scan.project(projected_fields)
-                    .expect("failed to project Fluss scan")
+        let (connection, scanner) = runtime().block_on(async {
+            let connection = fluss_rs::client::FlussConnection::new(config)
+                .await
+                .expect("failed to create Fluss connection");
+            let scanner = {
+                let table = connection
+                    .get_table(&table_path)
+                    .await
+                    .expect("failed to get Fluss table");
+                let scan = table.new_scan();
+                let scan = if projected_fields.is_empty() {
+                    scan
+                } else {
+                    scan.project(projected_fields)
+                        .expect("failed to project Fluss scan")
+                };
+                scan.create_record_batch_log_scanner()
+                    .expect("failed to create Fluss RecordBatch log scanner")
             };
-            scan.create_record_batch_log_scanner()
-                .expect("failed to create Fluss RecordBatch log scanner")
-        };
+            (connection, scanner)
+        });
         Self {
             _connection: connection,
             scanner,
@@ -247,25 +253,15 @@ where
 }
 
 #[cfg(feature = "fluss")]
-fn export_record_batch57(
-    batch: arrow57::record_batch::RecordBatch,
-    array_address: jlong,
-    schema_address: jlong,
-) {
-    let struct_array = arrow57::array::StructArray::from(batch);
-    let out_data = <arrow57::array::StructArray as arrow57::array::Array>::into_data(struct_array);
-    let out_array = arrow57::ffi::FFI_ArrowArray::new(&out_data);
-    let out_schema = arrow57::ffi::FFI_ArrowSchema::try_from(out_data.data_type())
+fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address: jlong) {
+    let struct_array = StructArray::from(batch);
+    let out_data = <StructArray as Array>::into_data(struct_array);
+    let out_array = FFI_ArrowArray::new(&out_data);
+    let out_schema = FFI_ArrowSchema::try_from(out_data.data_type())
         .expect("failed to export Fluss Arrow schema");
     unsafe {
-        std::ptr::write(
-            array_address as *mut arrow57::ffi::FFI_ArrowArray,
-            out_array,
-        );
-        std::ptr::write(
-            schema_address as *mut arrow57::ffi::FFI_ArrowSchema,
-            out_schema,
-        );
+        std::ptr::write(array_address as *mut FFI_ArrowArray, out_array);
+        std::ptr::write(schema_address as *mut FFI_ArrowSchema, out_schema);
     }
 }
 
@@ -383,7 +379,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSpl
         .expect("failed to allocate Fluss split id string");
     env.set_object_array_element(&out_split_id, 0, &split_id)
         .expect("failed to write Fluss split id");
-    export_record_batch57(batch, out_array_address, out_schema_address);
+    export_record_batch(batch, out_array_address, out_schema_address);
     rows
 }
 
@@ -411,7 +407,10 @@ mod tests {
             ("scanner_remote_log_prefetch_num".into(), "8".into()),
             ("remote_file_download_thread_num".into(), "4".into()),
             ("scanner_log_fetch_max_bytes".into(), "16777216".into()),
-            ("scanner_log_fetch_max_bytes_for_bucket".into(), "1048576".into()),
+            (
+                "scanner_log_fetch_max_bytes_for_bucket".into(),
+                "1048576".into(),
+            ),
             ("scanner_log_fetch_min_bytes".into(), "1".into()),
             ("scanner_log_fetch_wait_max_time_ms".into(), "500".into()),
             ("writer_request_max_size".into(), "8388608".into()),
@@ -422,10 +421,7 @@ mod tests {
             ("writer_bucket_no_key_assigner".into(), "round_robin".into()),
             ("writer_batch_timeout_ms".into(), "250".into()),
             ("writer_enable_idempotence".into(), "false".into()),
-            (
-                "writer_max_inflight_requests_per_bucket".into(),
-                "3".into(),
-            ),
+            ("writer_max_inflight_requests_per_bucket".into(), "3".into()),
             ("writer_buffer_memory_size".into(), "67108864".into()),
             ("writer_buffer_wait_timeout_ms".into(), "1000".into()),
             ("connect_timeout_ms".into(), "30000".into()),
