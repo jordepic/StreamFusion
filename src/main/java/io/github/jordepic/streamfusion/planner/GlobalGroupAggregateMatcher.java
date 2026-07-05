@@ -116,8 +116,14 @@ final class GlobalGroupAggregateMatcher {
       }
       RelDataType partialRel = inputType.getFieldList().get(offset).getType();
       offset++;
+      // A MIN/MAX partial may be a string (the extreme merges byte-lexicographically, matching
+      // the local's fold); every other partial must be a numeric the merge folds.
+      if (LocalGroupAggregateMatcher.isStringExtreme(kind, partialRel.getSqlTypeName())) {
+        continue;
+      }
       if (partialCode(partialRel) < 0) {
-        return "global group aggregate: partial columns must be bigint/int/double/decimal";
+        return "global group aggregate: partial columns must be bigint/int/double/decimal, or a"
+            + " string under MIN/MAX";
       }
     }
     // The distinct views must be exactly the trailing input fields, one per unique distinct arg —
@@ -235,7 +241,12 @@ final class GlobalGroupAggregateMatcher {
                 ? partialCode(sumRel)
                 : avgResultCode(resultRel.getSqlTypeName()));
       } else {
-        codes.add(partialCode(inputType.getFieldList().get(offset).getType()));
+        RelDataType partialRel = inputType.getFieldList().get(offset).getType();
+        int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
+        codes.add(
+            LocalGroupAggregateMatcher.isStringExtreme(kind, partialRel.getSqlTypeName())
+                ? 3
+                : partialCode(partialRel));
       }
       offset += spanOf(agg, i);
     }

@@ -129,9 +129,8 @@ final class GroupAggregateMatcher {
   /** Native aggregate kind 9 (SUM(DISTINCT)); matches the convention in the Rust GroupAggState. */
   private static final int KIND_SUM_DISTINCT = 9;
 
-  /** Native MIN/MAX kinds (the Rust GroupAggState routes these to the Extremes multiset). */
-  private static final int KIND_MIN = 1;
-  private static final int KIND_MAX = 2;
+  private static final int KIND_MIN = WindowAggregateMatcher.KIND_MIN;
+  private static final int KIND_MAX = WindowAggregateMatcher.KIND_MAX;
 
   /** Character string types MIN/MAX admit (compared byte-lexicographically). */
   private static boolean isStringType(SqlTypeName type) {

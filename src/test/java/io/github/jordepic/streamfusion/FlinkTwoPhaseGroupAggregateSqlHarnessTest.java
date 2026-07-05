@@ -213,6 +213,19 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
   }
 
   @Test
+  void stringMinMaxTwoPhaseMatchesHost() throws Exception {
+    // Nexmark q16 plans MAX over a DATE_FORMAT string into the local: the string extreme rides the
+    // split as its own partial type, merged byte-lexicographically on both halves (divergences/07
+    // covers the comparison). Small bundles force cross-bundle extreme merges in the global.
+    Path input = Files.createTempDirectory("twophase-string-extreme-in");
+    writeInput(input);
+    NativeParity.assertChangelogParity(
+        readEnvironment(input, 2),
+        "SELECT k, MAX(us) AS mx, MIN(us) AS mn, MAX(us) FILTER (WHERE v < 15) AS mxf,"
+            + " COUNT(DISTINCT u) AS du, SUM(v) AS s FROM t GROUP BY k");
+  }
+
+  @Test
   void filteredDistinctTwoPhaseMatchesHost() throws Exception {
     // Nexmark q15/q16's shape: the same distinct arg under several filters. Flink shares one
     // MapView across the instances with a per-filter bitmask value; the native local instead keeps

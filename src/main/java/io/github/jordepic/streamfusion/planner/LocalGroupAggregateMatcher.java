@@ -127,10 +127,10 @@ final class LocalGroupAggregateMatcher {
         }
         continue;
       }
-      // SUM/MIN/MAX read a typed running value; it must be a running type or DECIMAL, and the
-      // partial Flink declares must equal what the native side emits — the value type itself,
-      // except a decimal SUM whose partial widens to DECIMAL(38, s) — so the emit and the global
-      // read agree.
+      // SUM/MIN/MAX read a typed running value; it must be a running type, DECIMAL, or (MIN/MAX
+      // only) a string, and the partial Flink declares must equal what the native side emits — the
+      // value type itself, except a decimal SUM whose partial widens to DECIMAL(38, s) — so the
+      // emit and the global read agree.
       RelDataType valueRel = inputType.getFieldList().get(call.getArgList().get(0)).getType();
       SqlTypeName valueType = valueRel.getSqlTypeName();
       if (valueType == SqlTypeName.DECIMAL) {
@@ -141,6 +141,14 @@ final class LocalGroupAggregateMatcher {
                     && partialRel.getPrecision() == valueRel.getPrecision()
                     && partialRel.getScale() == valueRel.getScale();
         if (!matches) {
+          return false;
+        }
+        continue;
+      }
+      // MIN/MAX over a string keep the extreme byte-lexicographically (matching Flink's
+      // BinaryStringData comparison, divergences/07) — the partial is the value's own type.
+      if (isStringExtreme(kind, valueType)) {
+        if (partialType != valueType) {
           return false;
         }
         continue;
@@ -249,6 +257,12 @@ final class LocalGroupAggregateMatcher {
         || type == SqlTypeName.DOUBLE;
   }
 
+  /** True for a MIN/MAX over CHAR/VARCHAR — the string-extremes multiset path. */
+  static boolean isStringExtreme(int kind, SqlTypeName valueType) {
+    return (kind == WindowAggregateMatcher.KIND_MIN || kind == WindowAggregateMatcher.KIND_MAX)
+        && (valueType == SqlTypeName.CHAR || valueType == SqlTypeName.VARCHAR);
+  }
+
   /** Native aggregate kind 7 (COUNT(DISTINCT)); matches the convention in the Rust GroupAggState. */
   static final int KIND_COUNT_DISTINCT = 7;
 
@@ -336,7 +350,9 @@ final class LocalGroupAggregateMatcher {
         codes.add(
             valueType == SqlTypeName.DECIMAL
                 ? decimalCode(valueRel)
-                : valueType == SqlTypeName.DOUBLE ? 1 : valueType == SqlTypeName.INTEGER ? 2 : 0);
+                : isStringExtreme(kind, valueType)
+                    ? 3
+                    : valueType == SqlTypeName.DOUBLE ? 1 : valueType == SqlTypeName.INTEGER ? 2 : 0);
       }
     }
     return toArray(codes);

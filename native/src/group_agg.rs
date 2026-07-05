@@ -1346,6 +1346,22 @@ impl LocalGroupAggregator {
                 distinct_cols[i].and_then(|c| batch.column(c).as_any().downcast_ref::<Int64Array>())
             })
             .collect();
+        // Per aggregate, a string MIN/MAX value column (kind 1/2 over Utf8) — folded as a scalar
+        // into the Extremes multiset, not through the numeric Num path.
+        let extreme_str_cols: Vec<Option<usize>> = (0..num_agg)
+            .map(|i| {
+                if matches!(self.kinds[i], 1 | 2) && self.value_columns[i] >= 0 {
+                    let col = self.value_columns[i] as usize;
+                    matches!(
+                        batch.column(col).data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                    .then_some(col)
+                } else {
+                    None
+                }
+            })
+            .collect();
         // Per aggregate, the FILTER boolean column (None = unfiltered). A row folds into aggregate i
         // only where this is TRUE — NULL or FALSE skips it, matching SQL FILTER / Flink's filterArg.
         let filter_cols: Vec<Option<&BooleanArray>> = (0..num_agg)
@@ -1385,6 +1401,15 @@ impl LocalGroupAggregator {
                     if filter.is_null(row) || !filter.value(row) {
                         continue;
                     }
+                }
+                if let Some(col_idx) = extreme_str_cols[i] {
+                    let column = batch.column(col_idx);
+                    if !column.is_null(row) {
+                        let scalar =
+                            ScalarValue::try_from_array(column, row).expect("extreme string scalar");
+                        entry[i].accumulate_extreme(scalar);
+                    }
+                    continue;
                 }
                 if let Some(col_idx) = distinct_cols[i] {
                     if let Some(ints) = distinct_i64_cols[i] {

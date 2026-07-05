@@ -230,7 +230,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   per-aggregate **`FILTER (WHERE …)`** is native — the operator folds a row into
   an aggregate only where that aggregate's filter (a boolean input column) is true.
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT/AVG;
-  a SUM/MIN/MAX value type outside bigint/int/double/decimal, or an AVG value type outside
+  a SUM/MIN/MAX value type outside bigint/int/double/decimal (MIN/MAX also admit a string, merged
+  byte-lexicographically on both halves), or an AVG value type outside
   bigint/int/smallint/tinyint/float/double/decimal; a `COUNT(DISTINCT)` value type outside
   bigint/int/smallint/tinyint/float/double/string/decimal or a `SUM(DISTINCT)` value outside
   bigint/int; `MIN`/`MAX`/`AVG` over DISTINCT; a partial
@@ -238,7 +239,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   — decimal SUM widens to `DECIMAL(38, s)` — bigint for COUNT, the widened `(sum, count)` pair for
   AVG — defensive, not seen from Flink's planner); an unsupported grouping-key/input column type.
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT/AVG; a
-  partial column outside bigint/int/double/decimal; an AVG whose partial pair isn't
+  partial column outside bigint/int/double/decimal (strings allowed under MIN/MAX); an AVG whose
+  partial pair isn't
   `(bigint, bigint)` for an integer (bigint/int/smallint/tinyint) average, `(double, bigint)` for a
   float/double one, or `(decimal(38, s), bigint)` for a decimal one; a distinct merge outside the
   local half's COUNT/SUM(DISTINCT) scope; a partial layout with retraction columns (a retracting

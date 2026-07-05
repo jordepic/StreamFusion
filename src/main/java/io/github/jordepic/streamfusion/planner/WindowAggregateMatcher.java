@@ -25,6 +25,9 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
 final class WindowAggregateMatcher {
 
   static final int KIND_SUM = 0;
+  /** MIN/MAX (the Rust GroupAggState routes these to the Extremes multiset). */
+  static final int KIND_MIN = 1;
+  static final int KIND_MAX = 2;
   static final int KIND_COUNT = 3;
   static final int KIND_AVG = 4;
   /** The local half of a two-phase AVG: the widened running sum alone (the count partial is a
