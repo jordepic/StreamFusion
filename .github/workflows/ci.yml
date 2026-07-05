@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_BACKTRACE: "1"
+
+jobs:
+  native-tests:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keyed on Cargo.lock; also disables incremental compilation, which keeps the
+      # debug target directory a fraction of a local dev build's size.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Run native test suite
+        working-directory: native
+        run: cargo test
+
+  java-tests:
+    name: Java tests (debug native build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+
+      # A cold debug build of the native library (DataFusion + Arrow + bundled
+      # librdkafka) plus the Maven repository outgrows the runner's default free
+      # space; drop the preinstalled toolchains we never touch.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      # Builds the debug native library through the Maven exec hook, then runs the
+      # full JUnit suite. The Kafka decode harnesses use Testcontainers, which the
+      # hosted runners' preinstalled Docker daemon serves directly.
+      - name: Run Java test suite
+        run: mvn -B -ntp test

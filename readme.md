@@ -3,6 +3,8 @@
 
 # StreamFusion
 
+[![CI](https://github.com/datafusion-contrib/StreamFusion/actions/workflows/ci.yml/badge.svg)](https://github.com/datafusion-contrib/StreamFusion/actions/workflows/ci.yml)
+
 Run Apache Flink SQL faster by executing supported operators natively (Rust + Apache
 Arrow/DataFusion over JNI) while Flink continues to own planning, coordination, and
 everything not yet supported. Substitution is transparent and conservative: a query is
