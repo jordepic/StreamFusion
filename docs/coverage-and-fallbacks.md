@@ -90,9 +90,17 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   Filtered distinct instances each get their own native view/set per (args, filter) pair — same
   final output as Flink's shared bitmask view, since a filtered distinct is an unfiltered distinct
   over the filtered row subset.
+  **A retracting local input** (the aggregate consumes another aggregate's changelog, q4's shape)
+  is native for COUNT and AVG — their accumulators are layout-invariant under retraction; the
+  local subtracts -U/-D rows, and the appended (or reused) count1 COUNT(*) partial drives per-key
+  liveness in the global (`-D` and state drop when the merged count reaches zero, Flink's
+  RecordCounter semantics).
   Still falling back: the opt-in `distinct-agg.split.enabled` incremental chain (see
-  `IncrementalGroupAggregate` above), MIN/MAX/AVG over DISTINCT under two-phase, and
-  smallint/tinyint/float SUM/MIN/MAX partials.
+  `IncrementalGroupAggregate` above), MIN/MAX/AVG over DISTINCT under two-phase,
+  smallint/tinyint/float SUM/MIN/MAX partials, and — under a retracting input — any aggregate
+  other than COUNT/AVG (Flink's SUM/MIN/MAX retract variants declare extra accumulator fields,
+  and a monotonicity-exempt MIN/MAX ignores retractions in ways the native fold would not) plus
+  DISTINCT (its view value switches to per-filter live counts).
 - **`OVER`** — the unbounded `RANGE … CURRENT ROW` frame (running fold), the bounded
   `ROWS BETWEEN n PRECEDING AND CURRENT ROW` frame (recomputed over the row slice), **and** the
   bounded `RANGE BETWEEN INTERVAL n PRECEDING AND CURRENT ROW` frame (recomputed over the rowtime
@@ -237,15 +245,17 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   bigint/int; `MIN`/`MAX`/`AVG` over DISTINCT; a partial
   whose declared type differs from what the native side emits (the value's own type for SUM/MIN/MAX
   — decimal SUM widens to `DECIMAL(38, s)` — bigint for COUNT, the widened `(sum, count)` pair for
-  AVG — defensive, not seen from Flink's planner); an unsupported grouping-key/input column type.
+  AVG — defensive, not seen from Flink's planner); a retracting input with any aggregate other
+  than plain COUNT/AVG; an unsupported grouping-key/input column type.
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT/AVG; a
   partial column outside bigint/int/double/decimal (strings allowed under MIN/MAX); an AVG whose
   partial pair isn't
   `(bigint, bigint)` for an integer (bigint/int/smallint/tinyint) average, `(double, bigint)` for a
   float/double one, or `(decimal(38, s), bigint)` for a decimal one; a distinct merge outside the
-  local half's COUNT/SUM(DISTINCT) scope; a partial layout with retraction columns (a retracting
-  local input); an unsupported grouping-key/output column type. (Both halves must match for the
-  query to accelerate — one staying on the host drags the whole query back via the gate.)
+  local half's COUNT/SUM(DISTINCT) scope; a retracting merge with any aggregate other than plain
+  COUNT/AVG (those merge natively, with the count1 partial driving per-key liveness); an
+  unsupported grouping-key/output column type. (Both halves must match for the query to
+  accelerate — one staying on the host drags the whole query back via the gate.)
 - **Top-N** — a non-constant (variable) rank range; a row type the converter can't carry. (Insert-only
   and changelog input, an `OFFSET`, and a projected rank number are all handled. `RANK`/`DENSE_RANK`
   never reach us — Flink rejects them in streaming.)

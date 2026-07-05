@@ -47,12 +47,26 @@ final class GlobalGroupAggregateMatcher {
             + "timestamp/decimal";
       }
     }
+    // A retracting local input: only COUNT and AVG keep their append-only accumulator layout under
+    // retraction (Flink's SUM/MIN/MAX retract variants add fields the positional walk doesn't
+    // model, and MIN/MAX may even be monotonicity-exempt from retracting — semantics the native
+    // fold would diverge from), and the per-key liveness must come from the count1 partial.
+    boolean needRetraction = agg.needRetraction();
+    if (needRetraction && agg.localAggInfoList().getIndexOfCountStar() < 0) {
+      return "global group aggregate: a retracting merge without a count1 record counter";
+    }
     int offset = grouping.length;
     for (int i = 0; i < agg.aggCalls().size(); i++) {
       AggregateCall call = agg.aggCalls().apply(i);
       int kind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
       if (kind < 0 || call.getArgList().size() > 1) {
         return "global group aggregate: only single-field SUM/MIN/MAX/COUNT/AVG merges";
+      }
+      if (needRetraction
+          && (call.isDistinct()
+              || (kind != WindowAggregateMatcher.KIND_COUNT
+                  && kind != WindowAggregateMatcher.KIND_AVG))) {
+        return "global group aggregate: a retracting merge admits COUNT and AVG only";
       }
       // COUNT/SUM(DISTINCT x): the merge folds the local bundles' (value, count) view entries into
       // the per-key distinct set — the positional partial (the bundle's count/sum) is carried but
@@ -126,12 +140,36 @@ final class GlobalGroupAggregateMatcher {
             + " string under MIN/MAX";
       }
     }
+    // Under retraction Flink appends a count1 COUNT(*) accumulator (unless a bare COUNT(*) is
+    // reused): one extra bigint partial after the real aggregates', which drives per-key liveness
+    // in the merge rather than being emitted.
+    if (agg.localAggInfoList().countStarInserted()) {
+      if (offset >= inputType.getFieldCount()
+          || inputType.getFieldList().get(offset).getType().getSqlTypeName()
+              != SqlTypeName.BIGINT) {
+        return "global group aggregate: the inserted count1 partial must be a trailing bigint";
+      }
+      offset++;
+    }
     // The distinct views must be exactly the trailing input fields, one per unique distinct arg —
     // the positional contract behind distinctViewColumns().
     if (offset + distinctViewCount(agg) != inputType.getFieldCount()) {
-      return "global group aggregate: unexpected partial layout (retracting local input?)";
+      return "global group aggregate: unexpected partial layout";
     }
     return null;
+  }
+
+  /**
+   * The partial column of the count1 record counter under a retracting merge (-1 otherwise): the
+   * merged per-key sum of these partials is the live record count — zero deletes the key and emits
+   * {@code -D}, exactly Flink's RecordCounter over indexOfCountStar. When the count1 was inserted
+   * (not a reused bare COUNT(*)) it is liveness-only and never emitted.
+   */
+  static int recordCountColumn(StreamPhysicalGlobalGroupAggregate agg) {
+    if (!agg.needRetraction()) {
+      return -1;
+    }
+    return agg.grouping().length + agg.localAggInfoList().getIndexOfCountStar();
   }
 
   /** Native value-type code for a partial column, or -1 if unsupported. */

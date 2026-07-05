@@ -8,6 +8,7 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalLocalGroupAggregate;
+import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import scala.collection.Seq;
 
 /**
@@ -50,10 +51,23 @@ final class LocalGroupAggregateMatcher {
     }
     RelDataType outputType = agg.getRowType(); // [grouping.., partial0..]
     Seq<AggregateCall> aggCalls = agg.aggCalls();
+    // A retracting input (the aggregate consumes another aggregate's changelog, Nexmark q4's
+    // shape): the local folds -U/-D rows by subtracting, which only COUNT and AVG do with the
+    // same accumulator layout as their append-only forms — Flink's retract variants of
+    // SUM/MIN/MAX declare extra accumulator fields (a live count, a value map) the positional
+    // walk doesn't model, and a distinct view's map value switches to per-filter counts.
+    boolean needRetraction = needRetraction(agg);
     int offset = grouping.length;
     for (int i = 0; i < aggCalls.size(); i++) {
       AggregateCall call = aggCalls.apply(i);
       if (call.isApproximate()) {
+        return false;
+      }
+      int retractKind = WindowAggregateMatcher.aggregateKind(call.getAggregation().getKind());
+      if (needRetraction
+          && (call.isDistinct()
+              || (retractKind != WindowAggregateMatcher.KIND_COUNT
+                  && retractKind != WindowAggregateMatcher.KIND_AVG))) {
         return false;
       }
       // A FILTER is a boolean input column (the planner materializes `IS TRUE(p)` in the Calc
@@ -157,6 +171,17 @@ final class LocalGroupAggregateMatcher {
         return false;
       }
     }
+    // Under retraction Flink appends a COUNT(*) accumulator ("count1", the global's per-key record
+    // counter) unless a bare COUNT(*) already exists to reuse — one extra bigint partial after the
+    // real aggregates'.
+    if (countStarInserted(agg)) {
+      if (offset >= outputType.getFieldCount()
+          || outputType.getFieldList().get(offset).getType().getSqlTypeName()
+              != SqlTypeName.BIGINT) {
+        return false;
+      }
+      offset++;
+    }
     // Flink's declared trailing view columns: one per unique distinct arg list (instances with
     // different filters SHARE a declared view whose map value is a per-filter bitmask). The native
     // side instead emits one view per unique (arg list, filter) pair — each backed by a set that
@@ -165,6 +190,34 @@ final class LocalGroupAggregateMatcher {
     // validated here; the emitted layout is a native-internal contract with the global (the
     // partial row never crosses to the host — the island is all-or-nothing).
     return offset + declaredViewCount(agg) == outputType.getFieldCount();
+  }
+
+  /** Whether the local consumes a retracting changelog (Flink's needRetraction on this rel). */
+  static boolean needRetraction(StreamPhysicalLocalGroupAggregate agg) {
+    return !ChangelogPlanUtils.inputInsertOnly(agg);
+  }
+
+  /**
+   * Whether Flink appended the count1 COUNT(*) accumulator: a retracting input with no reusable
+   * bare COUNT(*) among the calls (Flink's insertCountStarAggCall reuse rule — plain, unfiltered,
+   * non-distinct). Its bigint partial trails the real aggregates', before any distinct views.
+   */
+  static boolean countStarInserted(StreamPhysicalLocalGroupAggregate agg) {
+    if (!needRetraction(agg)) {
+      return false;
+    }
+    Seq<AggregateCall> aggCalls = agg.aggCalls();
+    for (int i = 0; i < aggCalls.size(); i++) {
+      AggregateCall call = aggCalls.apply(i);
+      if (call.getAggregation().getKind() == org.apache.calcite.sql.SqlKind.COUNT
+          && call.getArgList().isEmpty()
+          && call.filterArg < 0
+          && !call.isDistinct()
+          && !call.isApproximate()) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** Flink's declared trailing view-column count: one per unique distinct arg list. */
@@ -286,6 +339,9 @@ final class LocalGroupAggregateMatcher {
         kinds.add(kind);
       }
     }
+    if (countStarInserted(agg)) {
+      kinds.add(WindowAggregateMatcher.KIND_COUNT); // the appended count1 record counter
+    }
     return toArray(kinds);
   }
 
@@ -300,6 +356,9 @@ final class LocalGroupAggregateMatcher {
           == WindowAggregateMatcher.KIND_AVG) {
         columns.add(call.filterArg);
       }
+    }
+    if (countStarInserted(agg)) {
+      columns.add(-1); // count1 counts every row unfiltered
     }
     return toArray(columns);
   }
@@ -316,6 +375,9 @@ final class LocalGroupAggregateMatcher {
       if (kind == WindowAggregateMatcher.KIND_AVG) {
         columns.add(column);
       }
+    }
+    if (countStarInserted(agg)) {
+      columns.add(-1); // count1 is a COUNT(*): no argument column
     }
     return toArray(columns);
   }
@@ -354,6 +416,9 @@ final class LocalGroupAggregateMatcher {
                     ? 3
                     : valueType == SqlTypeName.DOUBLE ? 1 : valueType == SqlTypeName.INTEGER ? 2 : 0);
       }
+    }
+    if (countStarInserted(agg)) {
+      codes.add(0); // count1's bigint running count
     }
     return toArray(codes);
   }

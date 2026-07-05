@@ -242,6 +242,48 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
   }
 
   @Test
+  void retractingInputTwoPhaseMatchesHost() throws Exception {
+    // Nexmark q4's shape: an aggregate over another aggregate's changelog. The outer local folds
+    // -U/+U rows by subtracting, and — with no bare COUNT(*) to reuse — Flink appends a count1
+    // COUNT(*) partial ("_$count1$_") whose merged per-key sum drives liveness in the global. The
+    // AVG accumulator is layout-invariant under retraction, so the walk models only the extra
+    // trailing bigint.
+    Path input = Files.createTempDirectory("twophase-retract-avg-in");
+    writeInput(input);
+    NativeParity.assertChangelogParity(
+        readEnvironment(input, 2),
+        "SELECT u, AVG(mx) AS av FROM"
+            + " (SELECT k, u, MAX(v) AS mx FROM t GROUP BY k, u) GROUP BY u");
+  }
+
+  @Test
+  void retractingInputCountStarReuseMatchesHost() throws Exception {
+    // Grouping by the inner aggregate's value makes rows MIGRATE between outer keys as the inner
+    // MAX moves, so a vacated key's merged count1 reaches zero — the global must emit -D and drop
+    // the state (Flink's RecordCounter path). The bare COUNT(*) is reused as the count1 (no
+    // inserted partial), and the filtered COUNT exercises FILTER under retraction (the filter
+    // gates the local's subtracts too).
+    Path input = Files.createTempDirectory("twophase-retract-count-in");
+    writeInput(input);
+    NativeParity.assertChangelogParity(
+        readEnvironment(input, 2),
+        "SELECT mx, COUNT(*) AS c, COUNT(*) FILTER (WHERE mx > 10) AS cf, AVG(mx) AS av FROM"
+            + " (SELECT k, MAX(v) AS mx FROM t GROUP BY k) GROUP BY mx");
+  }
+
+  @Test
+  void retractingSumTwoPhaseFallsBackToHost() throws Exception {
+    // SUM under retraction declares Flink's two-field (sum, count) retract accumulator, which the
+    // positional walk does not model — the whole query stays on the host.
+    Path input = Files.createTempDirectory("twophase-retract-sum-in");
+    writeInput(input);
+    NativeParity.assertFallback(
+        readEnvironment(input, 2),
+        "SELECT u, SUM(mx) AS s FROM"
+            + " (SELECT k, u, MAX(v) AS mx FROM t GROUP BY k, u) GROUP BY u");
+  }
+
+  @Test
   void distinctSplitChainFallsBackToHost() throws Exception {
     // With table.optimizer.distinct-agg.split.enabled the plan becomes the five-node incremental
     // chain (PartialLocal → Exchange → IncrementalGroupAggregate → Exchange → FinalGlobal) over a

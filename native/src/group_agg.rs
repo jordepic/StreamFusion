@@ -559,6 +559,10 @@ pub(crate) struct GroupAggregator {
     // carries the local bundle's (value, count) entries as a list of structs, folded into the
     // per-key distinct set with multiplicities instead of one value per row.
     distinct_view_columns: Vec<i64>,
+    // The count1 partial column of a retracting two-phase merge (-1 otherwise): each row bumps the
+    // key's record count by this column's value instead of ±1, so liveness (the -D on zero) follows
+    // the local's netted retractions — Flink's RecordCounter over indexOfCountStar.
+    record_count_column: i64,
     key_columns: Vec<usize>,
     generate_update_before: bool,
     // The group map is keyed by the arrow-row memcomparable encoding of the key columns, not a
@@ -643,6 +647,7 @@ impl GroupAggregator {
             filter_columns,
             count_columns,
             distinct_view_columns,
+            record_count_column: -1,
             memory: OperatorMemory::unaccounted(),
         }
     }
@@ -683,6 +688,13 @@ impl GroupAggregator {
         if !distinct_view_columns.is_empty() {
             self.distinct_view_columns = distinct_view_columns;
         }
+        self
+    }
+
+    /// Sets the count1 record-counter partial column of a retracting two-phase merge (-1 = count
+    /// rows ±1). A builder for the same reason as {@link with_filter_columns}.
+    fn with_record_count_column(mut self, record_count_column: i64) -> Self {
+        self.record_count_column = record_count_column;
         self
     }
 
@@ -833,6 +845,15 @@ impl GroupAggregator {
                 })
             })
             .collect();
+        // A retracting two-phase merge: each row's contribution to the key's record count is the
+        // count1 partial (the local's netted ±rows), not ±1.
+        let record_counts: Option<&Int64Array> = (self.record_count_column >= 0).then(|| {
+            batch
+                .column(self.record_count_column as usize)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("record count partial column must be bigint")
+        });
 
         let mut out_keys: Vec<&[u8]> = Vec::new();
         let mut out_results: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
@@ -990,7 +1011,22 @@ impl GroupAggregator {
                         }
                     }
                 }
-                state.records += if retract { -1 } else { 1 };
+                state.records += match record_counts {
+                    Some(counts) => {
+                        if counts.is_null(row) {
+                            0
+                        } else {
+                            counts.value(row)
+                        }
+                    }
+                    None => {
+                        if retract {
+                            -1
+                        } else {
+                            1
+                        }
+                    }
+                };
             }
 
             if self.keys.get(key).unwrap().records > 0 {
@@ -1014,8 +1050,12 @@ impl GroupAggregator {
                     }
                 }
             } else {
-                // The last record for the key was retracted: delete the group.
-                push(3, key, prev.expect("a retraction implies the key existed")); // -D
+                // The last record for the key was retracted: delete the group, emitting -D only if
+                // the key ever emitted (a new key whose first merged count1 nets to zero — Flink's
+                // firstRow-and-empty case — is dropped silently).
+                if let Some(prev) = prev {
+                    push(3, key, prev); // -D
+                }
                 self.keys.remove(key);
             }
             if track {
@@ -1308,8 +1348,11 @@ impl LocalGroupAggregator {
         Ok(self)
     }
 
-    /// Folds the batch's rows into the buffered per-key accumulators (append-only — the local's input
-    /// is insert-only, so there is no retraction). Nothing is emitted until a flush.
+    /// Folds the batch's rows into the buffered per-key accumulators, honoring each row's `RowKind`
+    /// when the input is a retracting changelog (a -U/-D subtracts, exactly Flink's local retract
+    /// path — the admitted COUNT/AVG accumulators are layout-invariant under retraction, so a
+    /// bundle's partial can go negative and the global's merge folds it back out). Nothing is
+    /// emitted until a flush.
     pub(crate) fn update(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
         let n = batch.num_rows();
         let num_agg = self.kinds.len();
@@ -1375,9 +1418,12 @@ impl LocalGroupAggregator {
                 })
             })
             .collect();
+        let row_kinds = row_kind_column(batch);
         let track = self.memory.tracking();
         for row in 0..n {
             let key = read_key(&key_arrays, row);
+            // RowKind: 0 +I, 1 -U, 2 +U, 3 -D (absent column ⇒ INSERT). UB/delete retract; I/UA add.
+            let retract = row_kinds.map_or(false, |kinds| matches!(kinds.value(row), 1 | 3));
             let mut delta = 0isize;
             if !self.states.contains_key(&key) {
                 let init: Vec<GroupAggState> = self
@@ -1407,14 +1453,22 @@ impl LocalGroupAggregator {
                     if !column.is_null(row) {
                         let scalar =
                             ScalarValue::try_from_array(column, row).expect("extreme string scalar");
-                        entry[i].accumulate_extreme(scalar);
+                        if retract {
+                            entry[i].retract_extreme(scalar);
+                        } else {
+                            entry[i].accumulate_extreme(scalar);
+                        }
                     }
                     continue;
                 }
                 if let Some(col_idx) = distinct_cols[i] {
                     if let Some(ints) = distinct_i64_cols[i] {
                         if !ints.is_null(row) {
-                            entry[i].accumulate_distinct_i64(ints.value(row));
+                            if retract {
+                                entry[i].retract_distinct_i64(ints.value(row));
+                            } else {
+                                entry[i].accumulate_distinct_i64(ints.value(row));
+                            }
                         }
                         continue;
                     }
@@ -1422,15 +1476,29 @@ impl LocalGroupAggregator {
                     if !column.is_null(row) {
                         let scalar =
                             ScalarValue::try_from_array(column, row).expect("distinct value scalar");
-                        entry[i].accumulate_distinct(scalar);
+                        if retract {
+                            entry[i].retract_distinct(scalar);
+                        } else {
+                            entry[i].accumulate_distinct(scalar);
+                        }
                     }
                     continue;
                 }
                 match &cols[i] {
-                    None => entry[i].accumulate(Num::I64(0)),
+                    None => {
+                        if retract {
+                            entry[i].retract(Num::I64(0));
+                        } else {
+                            entry[i].accumulate(Num::I64(0));
+                        }
+                    }
                     Some(column) => {
                         if let Some(num) = column.at(row) {
-                            entry[i].accumulate(num);
+                            if retract {
+                                entry[i].retract(num);
+                            } else {
+                                entry[i].accumulate(num);
+                            }
                         }
                     }
                 }
@@ -1590,6 +1658,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createGroupAg
     filter_columns: JIntArray<'local>,
     count_columns: JIntArray<'local>,
     distinct_view_columns: JIntArray<'local>,
+    record_count_column: jint,
     generate_update_before: jboolean,
     memory_budget_bytes: jlong,
 ) -> jlong {
@@ -1605,6 +1674,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createGroupAg
             .with_filter_columns(filter_columns)
             .with_count_columns(count_columns)
             .with_distinct_view_columns(distinct_view_columns)
+            .with_record_count_column(record_count_column as i64)
             .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)
 }
@@ -1658,6 +1728,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupA
     filter_columns: JIntArray<'local>,
     count_columns: JIntArray<'local>,
     distinct_view_columns: JIntArray<'local>,
+    record_count_column: jint,
     generate_update_before: jboolean,
     snapshot: JByteArray<'local>,
     memory_budget_bytes: jlong,
@@ -1681,6 +1752,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupA
     .with_filter_columns(filter_columns)
     .with_count_columns(count_columns)
     .with_distinct_view_columns(distinct_view_columns)
+    .with_record_count_column(record_count_column as i64)
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)
 }

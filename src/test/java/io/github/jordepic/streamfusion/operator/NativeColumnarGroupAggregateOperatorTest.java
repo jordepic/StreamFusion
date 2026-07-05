@@ -35,6 +35,7 @@ class NativeColumnarGroupAggregateOperatorTest {
         new int[] {-1},
         new int[] {-1},
         new int[] {-1},
+        -1,
         true);
   }
 

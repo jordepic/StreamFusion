@@ -33,6 +33,7 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
   private final int[] filterColumns;
   private final int[] countColumns;
   private final int[] distinctViewColumns;
+  private final int recordCountColumn;
   private final boolean generateUpdateBefore;
 
   private transient BufferAllocator allocator;
@@ -49,6 +50,7 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
+      int recordCountColumn,
       boolean generateUpdateBefore) {
     this.aggregateKinds = aggregateKinds;
     this.valueTypes = valueTypes;
@@ -57,6 +59,7 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
     this.filterColumns = filterColumns;
     this.countColumns = countColumns;
     this.distinctViewColumns = distinctViewColumns;
+    this.recordCountColumn = recordCountColumn;
     this.generateUpdateBefore = generateUpdateBefore;
   }
 
@@ -79,10 +82,11 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
         snapshot == null
             ? Native.createGroupAggregator(
                 aggregateKinds, valueTypes, valueColumns, keyColumns, filterColumns, countColumns,
-                distinctViewColumns, generateUpdateBefore, memoryBudget.bytes())
+                distinctViewColumns, recordCountColumn, generateUpdateBefore, memoryBudget.bytes())
             : Native.restoreGroupAggregator(
                 aggregateKinds, valueTypes, valueColumns, keyColumns, filterColumns, countColumns,
-                distinctViewColumns, generateUpdateBefore, snapshot, memoryBudget.bytes());
+                distinctViewColumns, recordCountColumn, generateUpdateBefore, snapshot,
+                memoryBudget.bytes());
   }
 
   @Override

@@ -715,6 +715,9 @@ public final class Native {
    * @param distinctViewColumns per-aggregate two-phase distinct-view column ({@code -1} otherwise):
    *     the column carries a local bundle's distinct (value, count) entries as a list of structs,
    *     folded into the per-key distinct set with multiplicities instead of one value per row
+   * @param recordCountColumn the count1 partial column of a retracting two-phase merge ({@code -1}
+   *     otherwise): each row bumps the key's record count by this column instead of ±1, so a key
+   *     whose merged count reaches zero is deleted ({@code -D})
    * @param generateUpdateBefore whether to emit an UPDATE_BEFORE row before each UPDATE_AFTER
    * @param memoryBudgetBytes managed-memory budget (see {@link #createTumblingAggregator})
    */
@@ -726,6 +729,7 @@ public final class Native {
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
+      int recordCountColumn,
       boolean generateUpdateBefore,
       long memoryBudgetBytes);
 
@@ -751,6 +755,7 @@ public final class Native {
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
+      int recordCountColumn,
       boolean generateUpdateBefore,
       byte[] snapshot,
       long memoryBudgetBytes);

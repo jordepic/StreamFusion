@@ -28,6 +28,7 @@ public class NativeColumnarGroupAggExecNode extends ExecNodeBase<ArrowBatch>
   private final int[] filterColumns;
   private final int[] countColumns;
   private final int[] distinctViewColumns;
+  private final int recordCountColumn;
   private final boolean generateUpdateBefore;
 
   public NativeColumnarGroupAggExecNode(
@@ -42,6 +43,7 @@ public class NativeColumnarGroupAggExecNode extends ExecNodeBase<ArrowBatch>
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
+      int recordCountColumn,
       boolean generateUpdateBefore) {
     super(
         ExecNodeContext.newNodeId(),
@@ -57,6 +59,7 @@ public class NativeColumnarGroupAggExecNode extends ExecNodeBase<ArrowBatch>
     this.filterColumns = filterColumns;
     this.countColumns = countColumns;
     this.distinctViewColumns = distinctViewColumns;
+    this.recordCountColumn = recordCountColumn;
     this.generateUpdateBefore = generateUpdateBefore;
   }
 
@@ -72,7 +75,7 @@ public class NativeColumnarGroupAggExecNode extends ExecNodeBase<ArrowBatch>
             createTransformationMeta(TRANSFORMATION, config),
             new NativeColumnarGroupAggregateOperator(
                 aggregateKinds, valueTypes, valueColumns, keyColumns, filterColumns, countColumns,
-                distinctViewColumns, generateUpdateBefore),
+                distinctViewColumns, recordCountColumn, generateUpdateBefore),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);

@@ -50,16 +50,17 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
 are the template), `docs/coverage-and-fallbacks.md` updated in the same commit, and a Nexmark run
 with mini-batch enabled to confirm routed fractions improve.
 
-- **Two-phase FILTER clauses** — surfaced by the tuned column's first run (2026-07-05): under
-  mini-batch two-phase, q15/q16/q17 plan `COUNT(*) FILTER (...)` / distinct-with-filter into the
-  local aggregate, whose matcher declines `filterArg >= 0` — the whole query falls back exactly
-  when the user tunes for it. The single-phase operator already folds per-aggregate filter
-  columns; the local/global split needs the same filter plumbing (and filtered distinct views need
-  Flink's shared-view filter semantics — dedup by arg set carries a filter list).
-- **Retraction-bearing partial layouts** — q4's inner MAX-over-join aggregates a changelog, so its
-  mini-batch local declares retraction count columns the positional walk doesn't model; the
-  defensive layout check declines it (correctly). Modeling `aggCallNeedRetractions` in the
-  local/global matchers is what fills q4's tuned cell.
+- **Two-phase FILTER clauses: DONE (2026-07-05).** Plain filters gate every local fold (the
+  boolean column the Calc materializes; the merge is filter-blind), filtered distinct instances
+  each get a native view/set per (args, filter) pair (identical final output to Flink's shared
+  bitmask view), and string MIN/MAX partials ride the split — q15/q16/q17's tuned plans engage
+  fully natively.
+- **Retraction-bearing partial layouts: DONE (2026-07-05).** The local subtracts -U/-D rows
+  (COUNT/AVG only — their accumulators are layout-invariant under retraction), the appended or
+  reused count1 partial is modeled positionally, and the global drives per-key liveness from the
+  merged count1 (-D + state drop at zero, Flink's RecordCounter semantics) — q4's tuned plan
+  engages fully natively. SUM/MIN/MAX/DISTINCT under retraction still decline (extra accumulator
+  fields / monotonicity exemptions / per-filter view counts).
 
 ## The tuned-Flink benchmark column: SHIPPED 2026-07-05
 

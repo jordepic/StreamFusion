@@ -883,7 +883,13 @@ impl RunningAgg {
             (AvgFloat { sum, .. }, Num::F32(v)) => *sum -= v as f64,
             (AvgPartialSumInt(sum), Num::I64(v)) => *sum = sum.wrapping_sub(v),
             (AvgPartialSumInt(sum), Num::I32(v)) => *sum = sum.wrapping_sub(v as i64),
+            (AvgPartialSumInt(sum), Num::I16(v)) => *sum = sum.wrapping_sub(v as i64),
+            (AvgPartialSumInt(sum), Num::I8(v)) => *sum = sum.wrapping_sub(v as i64),
             (AvgPartialSumFloat(sum), Num::F64(v)) => *sum -= v,
+            (AvgPartialSumFloat(sum), Num::F32(v)) => *sum -= v as f64,
+            (AvgPartialSumDecimal { sum, overflow, .. }, Num::I128(v)) => {
+                accumulate_decimal(sum, overflow, v.wrapping_neg())
+            }
             _ => unreachable!("aggregate does not support retraction"),
         }
     }
