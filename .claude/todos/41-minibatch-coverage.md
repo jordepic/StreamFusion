@@ -21,10 +21,11 @@ those shapes fall back today, dragging whole queries to the host via the all-or-
   AVG state via a per-aggregate count-partial column — the divide/truncate/cast-back emit is the
   single-phase code, byte-identical. Parity-tested keyed + global, mixed with single-partial
   aggregates, negative values included. Scope matches the two-phase set (bigint/int/double).
-- **Wider two-phase value types** — smallint/tinyint/float value columns decline the local matcher
-  today (the single-phase path takes them); extend the running types to match the single-phase set.
-  (The previously-listed "widening partials" item was a misdiagnosis: Flink's SUM partial keeps the
-  value's own type — `SUM(INT)` two-phase already routes.)
+- **Wider two-phase value types: DONE (2026-07-05).** AVG admits the full AvgAggFunction family
+  (smallint/tinyint/float included; the sum partial widens to bigint/double, the emit casts back) —
+  the single-phase set, which for SUM/MIN/MAX remains bigint/int/double. Fixing this surfaced and
+  fixed a single-phase bug: the group aggregator's value-column downcast lacked the narrow arms, so
+  admitted AVG(SMALLINT/TINYINT) folded zeros and AVG(FLOAT) panicked the native library.
 - **Two-phase decimal `SUM`/`AVG`** — the single-phase decimal SUM/AVG (i128, `DECIMAL(38, s)`,
   exact division for AVG) are native, non-windowed and windowed alike; carry the same accumulators
   through the local/global splits (both the mini-batch pair here and the windowed local/global —

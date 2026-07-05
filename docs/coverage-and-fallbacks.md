@@ -50,7 +50,7 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   `count == 0 ? NULL : sum / count` with the result cast back to the input type and **integer division
   truncating toward zero** — a faithful port of Flink's `AvgAggFunction`, over
   bigint/int/smallint/tinyint/float/double, retract-aware — and **two-phase `AVG`** now runs native
-  too (bigint/int/double values; see the mini-batch bullet below). **Decimal `AVG`** is also native
+  too, over the same numeric family (see the mini-batch bullet below). **Decimal `AVG`** is also native
   for the single-phase non-windowed `GROUP BY`: the sum is SUM's `DECIMAL(38, s)` accumulator and
   the emit divides by the non-null count with Flink's exact decimal division (38-significant-digit
   quotient, HALF_UP rescale), reporting `DECIMAL(38, max(6, s))` — `findAvgAggType`'s type. The
@@ -63,14 +63,16 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
   `MapBundleOperator`), the keyed shuffle is a native exchange, and the global reuses the single-phase
   group-aggregate operator (`COUNT` merges as a `SUM` over partial counts).
-  Scope: SUM/MIN/MAX/COUNT/**AVG** over bigint/int/double value columns. (Flink's SUM partial keeps
-  the value's own type — nothing is lost to widening.) An `AVG` spans **two positional partials** —
-  the widened running sum (bigint for integer inputs, double for double) plus the bigint non-null
-  count: the local runs them as a widened-sum state and a COUNT over the same column, and the global
-  folds the pre-summed pair into the ordinary AVG state (the count partial bumps the non-null count),
-  so the final divide/truncate/cast-back is byte-identical to the single-phase AVG. Still falling
-  back: distinct aggregates (they plan as `IncrementalGroupAggregate`), smallint/tinyint/float/
-  decimal value columns, and row-time mini-batch.
+  Scope: SUM/MIN/MAX/COUNT over bigint/int/double value columns, and **AVG** over any of
+  `AvgAggFunction`'s numerics — bigint/int/smallint/tinyint/float/double, the single-phase set.
+  (Flink's SUM partial keeps the value's own type — nothing is lost to widening.) An `AVG` spans
+  **two positional partials** — the widened running sum (bigint for the integer inputs, double for
+  float/double) plus the bigint non-null count: the local runs them as a widened-sum state and a
+  COUNT over the same column, and the global folds the pre-summed pair into the ordinary AVG state
+  (the count partial bumps the non-null count), so the final divide/truncate/cast-back — including
+  the cast back to a narrow integer or float result — is byte-identical to the single-phase AVG.
+  Still falling back: distinct aggregates (they plan as `IncrementalGroupAggregate`),
+  smallint/tinyint/float SUM/MIN/MAX partials and decimal value columns, and row-time mini-batch.
 - **`OVER`** — the unbounded `RANGE … CURRENT ROW` frame (running fold), the bounded
   `ROWS BETWEEN n PRECEDING AND CURRENT ROW` frame (recomputed over the row slice), **and** the
   bounded `RANGE BETWEEN INTERVAL n PRECEDING AND CURRENT ROW` frame (recomputed over the rowtime
@@ -208,14 +210,16 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   per-aggregate **`FILTER (WHERE …)`** is native — the operator folds a row into
   an aggregate only where that aggregate's filter (a boolean input column) is true.
 - **Local group aggregate** (two-phase local half) — any aggregate other than SUM/MIN/MAX/COUNT/AVG;
-  a value type outside bigint/int/double; a partial whose declared type differs from what the native
-  side emits (the value's own type for SUM/MIN/MAX, bigint for COUNT, the widened `(sum, count)` pair
-  for AVG — defensive, not seen from Flink's planner); an unsupported grouping-key/input column type.
+  a SUM/MIN/MAX value type outside bigint/int/double, or an AVG value type outside
+  bigint/int/smallint/tinyint/float/double; a partial whose declared type differs from what the
+  native side emits (the value's own type for SUM/MIN/MAX, bigint for COUNT, the widened
+  `(sum, count)` pair for AVG — defensive, not seen from Flink's planner); an unsupported
+  grouping-key/input column type.
 - **Global group aggregate** (two-phase merge) — any merge other than SUM/MIN/MAX/COUNT/AVG; a
   partial column outside bigint/int/double; an AVG whose partial pair isn't `(bigint, bigint)` for an
-  integer average or `(double, bigint)` for a double one; an unsupported grouping-key/output column
-  type. (Both halves must match for the query to accelerate — one staying on the host drags the whole
-  query back via the gate.)
+  integer (bigint/int/smallint/tinyint) average or `(double, bigint)` for a float/double one; an
+  unsupported grouping-key/output column type. (Both halves must match for the query to accelerate —
+  one staying on the host drags the whole query back via the gate.)
 - **Top-N** — a non-constant (variable) rank range; a row type the converter can't carry. (Insert-only
   and changelog input, an `OFFSET`, and a projected rank number are all handled. `RANK`/`DENSE_RANK`
   never reach us — Flink rejects them in streaming.)

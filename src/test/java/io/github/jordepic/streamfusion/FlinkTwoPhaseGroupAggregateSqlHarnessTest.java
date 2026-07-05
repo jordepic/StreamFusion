@@ -65,6 +65,19 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
   }
 
   @Test
+  void avgNarrowTypesTwoPhaseMatchesHost() throws Exception {
+    // AVG over SMALLINT/TINYINT/FLOAT: the local's sum partial widens (bigint for the integers,
+    // double for float) and the global's emit casts back to the narrow input type. The negative
+    // values keep the truncate-toward-zero division observable on the integer averages.
+    Path input = Files.createTempDirectory("twophase-avg-narrow-in");
+    writeInput(input);
+    NativeParity.assertChangelogParity(
+        readEnvironment(input),
+        "SELECT k, AVG(vs) AS avs, AVG(vt) AS avt, AVG(vf) AS avf, COUNT(*) AS c"
+            + " FROM t GROUP BY k");
+  }
+
+  @Test
   void globalAvgTwoPhaseMatchesHost() throws Exception {
     Path input = Files.createTempDirectory("twophase-avg-global-in");
     writeInput(input);
@@ -93,15 +106,20 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
     env.enableCheckpointing(100);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
     tEnv.executeSql(
-        "CREATE TABLE in_write (k BIGINT, v BIGINT, vd DOUBLE, vi INT) WITH ('connector' ="
-            + " 'filesystem', 'path' = '"
+        "CREATE TABLE in_write (k BIGINT, v BIGINT, vd DOUBLE, vi INT, vs SMALLINT, vt TINYINT,"
+            + " vf FLOAT) WITH ('connector' = 'filesystem', 'path' = '"
             + directory.toUri()
             + "', 'format' = 'parquet')");
     // The negative rows make integer AVG's truncate-toward-zero division observable (-7 + 4 + 9
     // over key 2 divides negatively at some prefixes of the changelog).
     tEnv.executeSql(
-            "INSERT INTO in_write VALUES (1, 10, 1.5, 7), (1, 20, 2.5, 3), (2, 5, 0.5, 9),"
-                + " (1, 30, 3.5, 1), (2, 15, 1.0, 4), (2, -7, -1.25, -8)")
+            "INSERT INTO in_write VALUES"
+                + " (1, 10, 1.5, 7, CAST(100 AS SMALLINT), CAST(3 AS TINYINT), CAST(1.25 AS FLOAT)),"
+                + " (1, 20, 2.5, 3, CAST(-7 AS SMALLINT), CAST(-2 AS TINYINT), CAST(2.5 AS FLOAT)),"
+                + " (2, 5, 0.5, 9, CAST(250 AS SMALLINT), CAST(9 AS TINYINT), CAST(-0.75 AS FLOAT)),"
+                + " (1, 30, 3.5, 1, CAST(42 AS SMALLINT), CAST(5 AS TINYINT), CAST(4.5 AS FLOAT)),"
+                + " (2, 15, 1.0, 4, CAST(-11 AS SMALLINT), CAST(-4 AS TINYINT), CAST(5.125 AS FLOAT)),"
+                + " (2, -7, -1.25, -8, CAST(-3 AS SMALLINT), CAST(-7 AS TINYINT), CAST(0.5 AS FLOAT))")
         .await();
   }
 
@@ -115,8 +133,8 @@ class FlinkTwoPhaseGroupAggregateSqlHarnessTest {
       tEnv.getConfig().set("table.exec.mini-batch.allow-latency", "1 s");
       tEnv.getConfig().set("table.exec.mini-batch.size", "100");
       tEnv.executeSql(
-          "CREATE TABLE t (k BIGINT, v BIGINT, vd DOUBLE, vi INT) WITH ('connector' = 'filesystem',"
-              + " 'path' = '"
+          "CREATE TABLE t (k BIGINT, v BIGINT, vd DOUBLE, vi INT, vs SMALLINT, vt TINYINT,"
+              + " vf FLOAT) WITH ('connector' = 'filesystem', 'path' = '"
               + directory.toUri()
               + "', 'format' = 'parquet')");
       return tEnv;

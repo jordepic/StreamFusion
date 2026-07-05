@@ -65,6 +65,15 @@ class FlinkGroupAggregateSqlHarnessTest {
   }
 
   @Test
+  void avgNarrowTypesMatchesHost() throws Exception {
+    // AVG over SMALLINT/TINYINT/FLOAT: the sum widens (bigint for the integers, double for float)
+    // and the result casts back to the narrow input type — Flink's AvgAggFunction family.
+    NativeParity.assertParity(
+        FlinkGroupAggregateSqlHarnessTest::environment,
+        "SELECT k, AVG(vs) AS avs, AVG(vt) AS avt, AVG(vf) AS avf FROM src GROUP BY k");
+  }
+
+  @Test
   void avgOverRetractingInputMatchesHost() throws Exception {
     // The inner GROUP BY emits a changelog; the outer AVG consumes it, retracting old totals from its
     // running sum/count and adding new ones — the average tracks the live set.
@@ -179,17 +188,20 @@ class FlinkGroupAggregateSqlHarnessTest {
     DataStream<Row> source =
         env.fromData(
             Types.ROW_NAMED(
-                new String[] {"k", "s", "value", "qty", "price"},
+                new String[] {"k", "s", "value", "qty", "price", "vs", "vt", "vf"},
                 Types.LONG,
                 Types.STRING,
                 Types.LONG,
                 Types.INT,
-                Types.DOUBLE),
-            Row.of(7L, "a", 1L, 10, 1.5),
-            Row.of(7L, "a", 2L, 20, 2.5),
-            Row.of(9L, "b", 3L, 30, 3.0),
-            Row.of(7L, "a", 4L, 40, 4.5),
-            Row.of(9L, "b", 5L, 50, 5.5));
+                Types.DOUBLE,
+                Types.SHORT,
+                Types.BYTE,
+                Types.FLOAT),
+            Row.of(7L, "a", 1L, 10, 1.5, (short) 100, (byte) 3, 1.25f),
+            Row.of(7L, "a", 2L, 20, 2.5, (short) -7, (byte) -2, 2.5f),
+            Row.of(9L, "b", 3L, 30, 3.0, (short) 250, (byte) 9, -0.75f),
+            Row.of(7L, "a", 4L, 40, 4.5, (short) 42, (byte) 5, 4.5f),
+            Row.of(9L, "b", 5L, 50, 5.5, (short) -11, (byte) -4, 5.125f));
     tEnv.createTemporaryView(
         "src",
         source,
@@ -199,6 +211,9 @@ class FlinkGroupAggregateSqlHarnessTest {
             .column("value", DataTypes.BIGINT())
             .column("qty", DataTypes.INT())
             .column("price", DataTypes.DOUBLE())
+            .column("vs", DataTypes.SMALLINT())
+            .column("vt", DataTypes.TINYINT())
+            .column("vf", DataTypes.FLOAT())
             .build());
     return tEnv;
   }

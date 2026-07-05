@@ -14,8 +14,9 @@ import scala.collection.Seq;
  * Recognizes the local half of a two-phase non-windowed {@code GROUP BY}: a stateless per-batch
  * pre-aggregate that emits one partial row per key ({@code [grouping.., partial0..]}) for the
  * {@link GlobalGroupAggregateMatcher global half} to merge. Scope mirrors the single-phase
- * {@link GroupAggregateMatcher}: SUM/MIN/MAX/COUNT/AVG (no distinct) over bigint/int/double values,
- * with grouping keys the boundary carries.
+ * {@link GroupAggregateMatcher}: SUM/MIN/MAX/COUNT (no distinct) over bigint/int/double values, and
+ * AVG over any of Flink's AvgAggFunction numerics (the narrow integers and float included — the sum
+ * partial widens to bigint/double), with grouping keys the boundary carries.
  *
  * <p>The native local emits each aggregate's partial in its running type: {@code SUM/MIN/MAX} keep
  * the value's own type (Flink's SUM partial does not widen — verified against the planner), COUNT is
@@ -99,8 +100,12 @@ final class LocalGroupAggregateMatcher {
     switch (valueType) {
       case BIGINT:
       case INTEGER:
+      case SMALLINT:
+      case TINYINT:
         return SqlTypeName.BIGINT;
       case DOUBLE:
+      case FLOAT:
+      case REAL:
         return SqlTypeName.DOUBLE;
       default:
         return null;
@@ -156,7 +161,7 @@ final class LocalGroupAggregateMatcher {
       if (kind == WindowAggregateMatcher.KIND_AVG) {
         SqlTypeName valueType =
             inputType.getFieldList().get(call.getArgList().get(0)).getType().getSqlTypeName();
-        codes.add(valueType == SqlTypeName.DOUBLE ? 1 : 0); // the widened sum: double or bigint
+        codes.add(widenedSumType(valueType) == SqlTypeName.DOUBLE ? 1 : 0); // the widened sum
         codes.add(0); // the bigint count
       } else if (call.getArgList().isEmpty()) {
         codes.add(0);

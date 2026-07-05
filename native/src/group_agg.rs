@@ -613,8 +613,17 @@ impl GroupAggregator {
                     DataType::Int32 => {
                         ValueColumn::I32(column.as_any().downcast_ref().expect("int32 value"))
                     }
+                    DataType::Int16 => {
+                        ValueColumn::I16(column.as_any().downcast_ref().expect("int16 value"))
+                    }
+                    DataType::Int8 => {
+                        ValueColumn::I8(column.as_any().downcast_ref().expect("int8 value"))
+                    }
                     DataType::Float64 => {
                         ValueColumn::F64(column.as_any().downcast_ref().expect("float64 value"))
+                    }
+                    DataType::Float32 => {
+                        ValueColumn::F32(column.as_any().downcast_ref().expect("float32 value"))
                     }
                     DataType::Decimal128(_, _) => {
                         ValueColumn::Decimal128(column.as_any().downcast_ref().expect("decimal128 value"))
@@ -1126,7 +1135,10 @@ impl LocalGroupAggregator {
                 Some(match column.data_type() {
                     DataType::Int64 => ValueColumn::I64(column.as_any().downcast_ref().expect("int64 value")),
                     DataType::Int32 => ValueColumn::I32(column.as_any().downcast_ref().expect("int32 value")),
+                    DataType::Int16 => ValueColumn::I16(column.as_any().downcast_ref().expect("int16 value")),
+                    DataType::Int8 => ValueColumn::I8(column.as_any().downcast_ref().expect("int8 value")),
                     DataType::Float64 => ValueColumn::F64(column.as_any().downcast_ref().expect("float64 value")),
+                    DataType::Float32 => ValueColumn::F32(column.as_any().downcast_ref().expect("float32 value")),
                     _ => ValueColumn::NullOnly(column),
                 })
             })

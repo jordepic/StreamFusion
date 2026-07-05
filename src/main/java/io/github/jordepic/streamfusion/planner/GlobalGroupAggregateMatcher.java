@@ -65,13 +65,11 @@ final class GlobalGroupAggregateMatcher {
             inputType.getFieldList().get(offset + 1).getType().getSqlTypeName();
         SqlTypeName resultType =
             agg.getRowType().getFieldList().get(grouping.length + i).getType().getSqlTypeName();
-        boolean intAvg =
-            sumType == SqlTypeName.BIGINT
-                && (resultType == SqlTypeName.BIGINT || resultType == SqlTypeName.INTEGER);
-        boolean doubleAvg = sumType == SqlTypeName.DOUBLE && resultType == SqlTypeName.DOUBLE;
+        boolean intAvg = sumType == SqlTypeName.BIGINT && isIntegerAvgResult(resultType);
+        boolean doubleAvg = sumType == SqlTypeName.DOUBLE && isFloatAvgResult(resultType);
         if (!(intAvg || doubleAvg) || countType != SqlTypeName.BIGINT) {
           return "global group aggregate: AVG merge partials must be (bigint, bigint) for an"
-              + " integer average or (double, bigint) for a double one";
+              + " integer average or (double, bigint) for a float/double one";
         }
         offset += 2;
         continue;
@@ -94,6 +92,40 @@ final class GlobalGroupAggregateMatcher {
         return 1;
       case INTEGER:
         return 2;
+      default:
+        return -1;
+    }
+  }
+
+  /** AVG result types the bigint-summed merge casts back to (Flink's integer AvgAggFunctions). */
+  private static boolean isIntegerAvgResult(SqlTypeName type) {
+    return type == SqlTypeName.BIGINT
+        || type == SqlTypeName.INTEGER
+        || type == SqlTypeName.SMALLINT
+        || type == SqlTypeName.TINYINT;
+  }
+
+  /** AVG result types the double-summed merge casts back to (float narrows, double stays). */
+  private static boolean isFloatAvgResult(SqlTypeName type) {
+    return type == SqlTypeName.DOUBLE || type == SqlTypeName.FLOAT || type == SqlTypeName.REAL;
+  }
+
+  /** Native value-type code for an AVG's final result (the state casts back to it on emit). */
+  private static int avgResultCode(SqlTypeName type) {
+    switch (type) {
+      case BIGINT:
+        return 0;
+      case DOUBLE:
+        return 1;
+      case INTEGER:
+        return 2;
+      case SMALLINT:
+        return 4;
+      case TINYINT:
+        return 5;
+      case FLOAT:
+      case REAL:
+        return 6;
       default:
         return -1;
     }
@@ -139,7 +171,7 @@ final class GlobalGroupAggregateMatcher {
       if (spanOf(agg, i) == 2) {
         SqlTypeName resultType =
             agg.getRowType().getFieldList().get(grouping + i).getType().getSqlTypeName();
-        codes.add(partialCode(resultType));
+        codes.add(avgResultCode(resultType));
       } else {
         codes.add(partialCode(inputType.getFieldList().get(offset).getType().getSqlTypeName()));
       }
