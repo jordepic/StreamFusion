@@ -14,7 +14,7 @@ barrier (see ticket 01 for why within-batch beats the `AsyncWaitOperator` port).
 matcher gate is the **upsert-materialized** (keyed-state) lookup, which needs a changelog probe the
 island doesn't admit anyway.
 
-## What remains (perf, not coverage)
+## What remains (perf, not coverage) — deprioritized 2026-07-05
 
 - **Columnar assembly / preload for bounded dims.** The sync operator's per-row defensive copy
   (`RowDataSerializer.copy`, ~27% of q13's lookup path) SHIPPED away 2026-07-04: the collector now
@@ -23,5 +23,10 @@ island doesn't admit anyway.
   into a native hash table once (RisingWave/Arroyo cache the dim side) and probe fully columnar —
   zero per-batch JVM crossing in steady state; and Arroyo's within-batch key dedup (one connector
   call for the batch's distinct missing keys, `lookup_join.rs`).
+  **Deprioritized on the 2026-07-05 q13 profile:** after the collect-time assembly shipped, no
+  lookup leaf registers above the 2% floor — the query is bound by the rowwise perimeter and the
+  generator itself. Nexmark's dim is an in-memory test connector, so the preload's real win (a
+  slow external dim: JDBC/HBase-class latency) is invisible here by construction. Pick this up
+  when a real connector-backed workload profiles lookup-bound, not to chase a benchmark number.
 - **Cross-batch async overlap** (`AsyncWaitOperator` port) — only if per-lookup latency is so high
   that blocking on a single batch stalls checkpoints unacceptably; not the case today.

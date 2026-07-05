@@ -128,11 +128,12 @@ here when the ticket is deleted.
    +12.5%; 2026-07-05: ticket 49's borrowed-byte probes for the group-agg/dedup/Top-N maps, and the
    upcall builtins handing off bytes not `String` — q21's residual — both pending the round's
    matrix re-quote): what remains, in recommended order — ticket 41's split-chain remainder (the
-   road to the changelog family's 5-10x-class numbers),
-   ticket 51 (re-scoped 2026-07-05: q5's hop already runs paned via the two-phase split — what
-   remains is the global's slice-merge loop, gated on re-profile), ticket 49's bench-gated
-   `ScalarValue`-vintage retirements, ticket 48's block-store question (re-profile q20/q23 first),
-   and ticket 40's bounded-dim preload.
+   road to the changelog family's 5-10x-class numbers), ticket 49's bench-gated
+   `ScalarValue`-vintage retirements, and ticket 40's bounded-dim preload (deprioritized on the
+   2026-07-05 q13 profile — the Nexmark dim is an in-memory test connector, so the win only shows
+   on real external dims). Closed on the 2026-07-05 profiles: the join block store (wontdos/48 —
+   the joiner's stored-row decode no longer registers) and paned HOP (wontdos/51 — the two-phase
+   split already panes; the residual slice merge is 3–4% of q5).
 1. **Native Kafka source: gate FLIPPED (2026-07-03)** (ticket 33). Per-partition watermarks/idleness
    and specific-offsets/topic-pattern startup shipped; `kafkaSource` defaults on and the `kafka`
    cargo feature is a default build feature (probe-guarded for opt-out builds). Remaining tails in

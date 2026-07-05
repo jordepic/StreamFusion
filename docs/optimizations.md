@@ -368,14 +368,21 @@ The lifecycle that makes this cheap:
 - **The uncommon path pays the decode.** A residual non-equi predicate needs real arrays; the
   associated rows are bulk-decoded in one `convert_rows` call per batch (`ed74dac`, `4429e2f`),
   never row-at-a-time.
-- **Upcall builtins stay in bytes.** The byte-parity JVM upcalls (host-exact `LOWER`/`UPPER`)
-  used to materialize a `java.lang.String` per row from the Arrow column and round-trip it through
-  `BinaryStringData` — the q21 profile's `String.<init>`/`StringLatin1.toLowerCase` leaves. The
-  upcall marshaller now inspects each builtin's declared signature: a method taking
-  `BinaryStringData` gets the column's UTF-8 bytes wrapped with `fromBytes` (no UTF-16 decode) and
-  its result bytes are written straight back, so Flink's ASCII fast path — which operates on the
-  byte array and never decodes — runs end to end without a `String`. Methods that genuinely need
-  `java.util.regex` keep the materializing path.
+- **Upcall builtins stay in bytes — with the fold done ourselves.** The byte-parity JVM upcalls
+  (host-exact `LOWER`/`UPPER`) used to materialize a `java.lang.String` per row from the Arrow
+  column and round-trip it through `BinaryStringData` — the q21 profile's
+  `String.<init>`/`StringLatin1.toLowerCase` leaves. The upcall marshaller now inspects each
+  builtin's declared signature: a method taking `BinaryStringData` gets the column's UTF-8 bytes
+  wrapped with `fromBytes` (no UTF-16 decode) and its result bytes are written straight back.
+  Two profile-driven corrections made this actually pay: (1) Flink's own `BinaryStringData` case
+  fold — its "ASCII fast path" — calls `Character.toLowerCase` through a virtual dispatch **per
+  byte**, which measured slower than the JDK's intrinsified String fold; the builtins fold the
+  bytes themselves in a tight primitive loop with exactly Flink's fast-path semantics (first
+  non-ASCII byte delegates to Flink's method, so results stay byte-identical). (2) The marshaller
+  read argument values row-at-a-time through the vector interface — a megamorphic dispatch per
+  (row, arg), 14% of q21 — and now materializes each argument column once per batch with a
+  monomorphic typed loop. Net: q21's parity path 108 → 121 iterations (+12%) on the profile loop.
+  Methods that genuinely need `java.util.regex` keep the materializing path.
 - **Steady-state probes borrow, only first inserts copy.** State maps key by `ByteKey`
   (`Box<[u8]>` with `Borrow<[u8]>`), so the per-row probe hashes the *borrowed* encoded bytes
   straight out of the batch's `Rows` block and a key already in the map allocates nothing — the
@@ -385,7 +392,10 @@ The lifecycle that makes this cheap:
   payload became `Arc<[u8]>`: the replacing row is copied once into state, and the `-U` *moves*
   the replaced payload out — an ignored stale row now allocates nothing at all), and the
   append-only Top-N's partition map (a row dropped at rank > N allocates nothing). The GROUP BY's
-  emitted changelog keys are borrowed slices too, decoded once per batch.
+  emitted changelog keys are borrowed slices too, decoded once per batch. The second stage
+  measured q23 +8.5%, q18 +5.4%, q16 +3.4% on the generator profile loop — and its q23 profile is
+  what closed the block-store question (wontdos/48): stored-row decode no longer registers in the
+  joiner at all.
 
 Why this matters: a differential profile (native vs Flink, same query) showed native spending
 10–22% of samples in the system allocator where Flink spends ~0.7% — Flink keys by bytes too

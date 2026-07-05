@@ -9,10 +9,12 @@ remaining `OwnedRow`-keyed maps followed.
 `group_agg.rs` (group map + emitted changelog keys as borrowed slices), `dedup.rs` keep-last
 (key `ByteKey`, payload `Arc<[u8]>` — the `-U` moves the replaced payload out, an ignored stale
 row allocates nothing), and `topn.rs` append-only ranker (partition map; a rank>N drop allocates
-nothing) all probe by borrowed bytes now, copying only on first insert. Numbers to be quoted from
-the post-round matrix rerun (q4/q15/q16/q17/q18/q19 are the touched paths). Remaining in this
-family: `LocalGroupAggregator`'s scalar `GroupKey` maps (hot only under mini-batch/tuned mode —
-swap to arrow-row + ByteKey when the tuned benchmark column lands).
+nothing) all probe by borrowed bytes now, copying only on first insert. Measured on the 75s
+generator profile loop (2026-07-05 vs the 2026-07-04 post-round baselines): q23 164→178 (+8.5%),
+q18 149→157 (+5.4%), q16 146→151 (+3.4%); q13/q19/q20 within noise — those queries' state maps
+were minor shares to begin with. Remaining in this family: `LocalGroupAggregator`'s scalar
+`GroupKey` maps (hot only under mini-batch/tuned mode — swap to arrow-row + ByteKey when the
+tuned column becomes a standing benchmark).
 
 ## 2. Retire the `Vec<ScalarValue>` loops (the pre-arrow-row vintage)
 
