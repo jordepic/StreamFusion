@@ -524,10 +524,9 @@ class FlinkWindowSqlHarnessTest {
 
   @Test
   void twoPhaseNarrowSumMatchesHost() throws Exception {
-    // The narrow SUM's partial type is not one the native global merges, so the two-phase window
-    // aggregate can't be made one columnar island — the whole query falls back to the host (never a
-    // native-local + host-global mismatch). The result still matches.
-    NativeParity.assertFallback(
+    // The narrow SUM partial is Flink's nullable-sum buffer (a single SMALLINT field), which the
+    // native local emits and the native global merges — the two-phase plan is one columnar island.
+    NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentTwoPhase,
         "SELECT window_start, window_end, SUM(sm) AS s "
             + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
@@ -536,12 +535,73 @@ class FlinkWindowSqlHarnessTest {
 
   @Test
   void twoPhaseFloatSumMatchesHost() throws Exception {
-    // As with the narrow case: the float partial is not one the native global merges, so the
-    // two-phase plan can't be one columnar island and the whole query falls back. Result still matches.
-    NativeParity.assertFallback(
+    // As with the narrow case: the float partial is the nullable float sum, merged natively.
+    NativeParity.assertParity(
         FlinkWindowSqlHarnessTest::environmentTwoPhase,
         "SELECT window_start, window_end, SUM(fl) AS s "
             + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseIntDecimalSumMatchesHost() throws Exception {
+    // INT and DECIMAL SUM partials across the split: the int partial wraps at 32 bits in the local
+    // (and in the global's merge), the decimal partial is DECIMAL(38, s).
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT window_start, window_end, SUM(qty) AS sq, SUM(price) AS sp "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseWideMinMaxCountMatchesHost() throws Exception {
+    // MIN/MAX/COUNT partials over the non-bigint value types (int, smallint, tinyint, float,
+    // decimal): type-preserving single-field partials the global merges as-is.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::environmentTwoPhase,
+        "SELECT window_start, window_end, MIN(qty) AS lo, MAX(sm) AS hi, COUNT(tn) AS c, "
+            + "MIN(fl) AS lf, MAX(price) AS hp "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseHoppingNarrowSumWrapsLikeHost() throws Exception {
+    // A hopping split whose GLOBAL merge overflows the narrow width: each 1s slice sums to 30000
+    // (in range), and the 2s window's merge of two slice partials wraps to -5536 exactly as the
+    // host's merge expression (a SMALLINT plus) does.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::narrowTwoPhaseOverflowEnvironment,
+        "SELECT window_start, window_end, SUM(sm) AS s "
+            + "FROM TABLE(HOP(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void decimalSumOverflowResetsLikeHost() throws Exception {
+    // Flink's SUM buffer is the nullable sum alone and its accumulate expression is
+    // `isNull(sum) ? value : sum + value` — an overflow past DECIMAL(38, 0) goes NULL, and the NEXT
+    // value RESETS the sum rather than leaving it NULL. Three values in one window: the first two
+    // overflow (9.9e37 + 9.9e37), the third resets, so the window's sum is 5 — not NULL.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::decimalOverflowEnvironment,
+        "SELECT window_start, window_end, SUM(pr) AS s "
+            + "FROM TABLE(TUMBLE(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND)) "
+            + "GROUP BY window_start, window_end");
+  }
+
+  @Test
+  void twoPhaseDecimalSumOverflowedPartialSkippedLikeHost() throws Exception {
+    // A hopping split where one slice's decimal sum overflows: the local flushes that slice's
+    // partial as NULL, and the host's merge expression SKIPS a NULL partial — the overflowed
+    // slice's contribution silently vanishes and the merged window reports the surviving slice's
+    // sum. Slice [0s,1s) overflows (9.9e37 + 9.9e37 → NULL); slice [1s,2s) sums to 5. The window
+    // [0s,2s) is 5 (NULL partial skipped), [−1s,1s) is NULL, [1s,3s) is 5.
+    NativeParity.assertParity(
+        FlinkWindowSqlHarnessTest::decimalTwoPhaseOverflowEnvironment,
+        "SELECT window_start, window_end, SUM(pr) AS s "
+            + "FROM TABLE(HOP(TABLE src, DESCRIPTOR(rt), INTERVAL '1' SECOND, INTERVAL '2' SECOND)) "
             + "GROUP BY window_start, window_end");
   }
 
@@ -768,6 +828,76 @@ class FlinkWindowSqlHarnessTest {
             .column("d", DataTypes.DATE())
             .column("price", DataTypes.DECIMAL(10, 2))
             .column("tsc", DataTypes.TIMESTAMP(3))
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment narrowTwoPhaseOverflowEnvironment() {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", "TWO_PHASE");
+
+    // One in-range value per 1s slice; a 2s hopping window merges two slice partials and the merge
+    // itself overflows the SMALLINT width (30000 + 30000 → -5536).
+    DataStream<Row> source =
+        env.fromData(
+                Types.ROW_NAMED(new String[] {"sm", "ts"}, Types.SHORT, Types.LONG),
+                Row.of((short) 30000, 0L),
+                Row.of((short) 30000, 1500L))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forMonotonousTimestamps()
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+    tEnv.createTemporaryView(
+        "src",
+        source,
+        Schema.newBuilder()
+            .column("sm", DataTypes.SMALLINT())
+            .column("ts", DataTypes.BIGINT())
+            .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
+            .watermark("rt", "SOURCE_WATERMARK()")
+            .build());
+    return tEnv;
+  }
+
+  private static TableEnvironment decimalOverflowEnvironment() {
+    return decimalOverflowEnvironment("ONE_PHASE", 300L, 600L);
+  }
+
+  private static TableEnvironment decimalTwoPhaseOverflowEnvironment() {
+    return decimalOverflowEnvironment("TWO_PHASE", 500L, 1500L);
+  }
+
+  /**
+   * Three DECIMAL(38, 0) values: two of 9.9e37 (whose sum overflows DECIMAL(38, 0) to NULL) and a
+   * trailing 5. The timestamps place the 5 either in the same window (single-phase reset-after-
+   * overflow) or in the next 1s slice (two-phase NULL-partial skip).
+   */
+  private static TableEnvironment decimalOverflowEnvironment(
+      String phaseStrategy, long secondTs, long thirdTs) {
+    StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(1);
+    StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
+    tEnv.getConfig().set("table.optimizer.agg-phase-strategy", phaseStrategy);
+
+    java.math.BigDecimal big = new java.math.BigDecimal("99000000000000000000000000000000000000");
+    DataStream<Row> source =
+        env.fromData(
+                Types.ROW_NAMED(new String[] {"pr", "ts"}, Types.BIG_DEC, Types.LONG),
+                Row.of(big, 0L),
+                Row.of(big, secondTs),
+                Row.of(dec("5"), thirdTs))
+            .assignTimestampsAndWatermarks(
+                WatermarkStrategy.<Row>forMonotonousTimestamps()
+                    .withTimestampAssigner((row, ts) -> (Long) row.getField(1)));
+    tEnv.createTemporaryView(
+        "src",
+        source,
+        Schema.newBuilder()
+            .column("pr", DataTypes.DECIMAL(38, 0))
+            .column("ts", DataTypes.BIGINT())
             .columnByMetadata("rt", DataTypes.TIMESTAMP_LTZ(3), "rowtime")
             .watermark("rt", "SOURCE_WATERMARK()")
             .build());

@@ -951,19 +951,16 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
 
     if (current instanceof StreamPhysicalLocalWindowAggregate) {
       StreamPhysicalLocalWindowAggregate agg = (StreamPhysicalLocalWindowAggregate) current;
-      // Tumbling local (single-field partials, no AVG; bigint or double values), or a hopping local
-      // that pre-aggregates per slice (bigint only — its synthetic count1 column rides through
-      // hoppingLocalKinds). The two-phase global only merges bigint/double partials, so the local is
-      // restricted to those value types — narrower types route single-phase only. A wider local
-      // feeding a host global would mismatch.
-      boolean mergeableValueType =
-          WindowAggregateMatcher.allPartialsMergeable(agg.aggCalls(), agg.getInput().getRowType());
+      // Tumbling local, or a hopping local that pre-aggregates per slice (its synthetic count1
+      // column rides through hoppingLocalKinds). Every non-AVG aggregate has a single-field
+      // mergeable partial — the custom SUMs mirror Flink's nullable-sum buffer — so the two-phase
+      // split admits the same value types as the single-phase path. AVG stays single-phase: its
+      // (sum, count) buffer spans two partial columns.
       boolean hopping =
           WindowAggregateMatcher.matchesHoppingLocal(
               agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType());
       boolean tumbling =
           !hopping
-              && mergeableValueType
               && WindowAggregateMatcher.matches(
                   agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())
               && WindowAggregateMatcher.isTumbling(agg.windowing())
@@ -974,7 +971,6 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       boolean cumulativeLocal =
           !hopping
               && !tumbling
-              && mergeableValueType
               && WindowAggregateMatcher.matches(
                   agg.windowing(), agg.grouping(), agg.aggCalls(), agg.getInput().getRowType())
               && WindowAggregateMatcher.isCumulative(agg.windowing())

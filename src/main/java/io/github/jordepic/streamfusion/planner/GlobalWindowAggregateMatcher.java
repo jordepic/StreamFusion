@@ -14,8 +14,9 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalG
 
 /**
  * Recognizes the global half of a two-phase aggregation: a slice-attached tumbling or hopping
- * window, no extra key or a single integer key, and one or more mergeable aggregates over bigint
- * partial columns (SUM/MIN/MAX — count merges as a sum; no AVG). Its input is the local half's
+ * window, no extra key or a single integer key, and one or more mergeable single-field aggregates
+ * (SUM/MIN/MAX/COUNT over any single-phase-supported value type; no AVG, whose (sum, count) buffer
+ * spans two partial columns). Its input is the local half's
  * {@code [key?, partial0..partialN-1, slice_end]}. For hopping, the planner appends a synthetic
  * {@code COUNT(*)} partial; it is merged like any count but excluded from the output (see
  * {@link #outputAggregateCount}).
@@ -86,29 +87,30 @@ final class GlobalWindowAggregateMatcher {
       if (call.getArgList().isEmpty() && kind != WindowAggregateMatcher.KIND_COUNT) {
         return "global window aggregate: only single-field SUM/MIN/MAX/COUNT partials (no AVG)";
       }
+      // The partial column carries the aggregate's buffer type: the value type for SUM/MIN/MAX
+      // (SUM's partial is Flink's nullable-sum buffer, DECIMAL(38, s) for a decimal SUM), bigint
+      // for COUNT. Any single-phase-supported value type merges natively.
       SqlTypeName partialType = inputType.getFieldList().get(base + i).getType().getSqlTypeName();
-      if (partialType != SqlTypeName.BIGINT && partialType != SqlTypeName.DOUBLE) {
-        return "global window aggregate: partial columns must be bigint/double";
+      if (!WindowAggregateMatcher.supportedValueType(partialType)) {
+        return "global window aggregate: unsupported partial column type " + partialType;
       }
     }
     return null;
   }
 
   /**
-   * Value-type code per aggregate (matching the native side), recovered from each partial column:
-   * double (1) for a sum/min/max over a double value, otherwise bigint (0). Counts are bigint. The
-   * partials are positional ({@code [grouping…, partial0..partialN-1, slice_end]}), so the i-th
-   * partial column is the i-th aggregate's.
+   * Value-type code per aggregate (matching the native side), recovered from each partial column —
+   * the native global builds the same accumulator the local flushed, so the partial's own type
+   * (bigint/double/int/narrow/float/decimal) selects it. Counts are bigint. The partials are
+   * positional ({@code [grouping…, partial0..partialN-1, slice_end]}), so the i-th partial column
+   * is the i-th aggregate's.
    */
   static int[] valueTypes(StreamPhysicalGlobalWindowAggregate aggregate) {
     RelDataType inputType = aggregate.getInput().getRowType();
     int base = aggregate.grouping().length;
     int[] types = new int[aggregate.aggCalls().size()];
     for (int i = 0; i < types.length; i++) {
-      types[i] =
-          inputType.getFieldList().get(base + i).getType().getSqlTypeName() == SqlTypeName.DOUBLE
-              ? 1
-              : 0;
+      types[i] = WindowAggregateMatcher.typeCode(inputType.getFieldList().get(base + i).getType());
     }
     return types;
   }

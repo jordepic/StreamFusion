@@ -108,11 +108,12 @@ final class WindowAggregateMatcher {
 
   /**
    * The local half of a two-phase hopping aggregation: the same user aggregates as the single-phase
-   * matcher (bigint values, single arg, no AVG) over a hopping window whose slide divides its size.
-   * The local pre-aggregates per slice (width = slide). The planner's intermediate also carries a
-   * synthetic {@code COUNT(*)} column between the partials and the slice end; it is not an aggregate
-   * call here, so {@link #hoppingLocalKinds} appends a count to fill that column (the global ignores
-   * it). Restricted to bigint values, matching the global half.
+   * matcher (single arg, no AVG) over a hopping window whose slide divides its size. The local
+   * pre-aggregates per slice (width = slide). The planner's intermediate also carries a synthetic
+   * {@code COUNT(*)} column between the partials and the slice end; it is not an aggregate call
+   * here, so {@link #hoppingLocalKinds} appends a count to fill that column (the global ignores
+   * it). Every non-AVG aggregate has a single-field mergeable partial (the SUMs mirror Flink's
+   * nullable-sum buffer), so the value types are the single-phase set.
    */
   static boolean matchesHoppingLocal(
       WindowingStrategy windowing,
@@ -128,7 +129,6 @@ final class WindowAggregateMatcher {
       return false;
     }
     return supportedAggregation(windowing, grouping, aggCalls, inputType)
-        && allValueTypes(aggCalls, inputType, 0) // bigint values only, matching the global half
         && !containsAvg(aggCalls);
   }
 
@@ -136,8 +136,8 @@ final class WindowAggregateMatcher {
    * A window-attached local half (Nexmark q5): the input rows already carry their window as
    * {@code window_start}/{@code window_end} columns (an upstream window aggregate's output being
    * re-aggregated per window), so there is no rowtime to slice — the local folds each row into the one
-   * window it names. Restricted, like the hopping local, to single-field mergeable partials
-   * (bigint/double, no AVG) so the two-phase global can merge them. Event-time only.
+   * window it names. Restricted, like the hopping local, to single-field mergeable partials (no
+   * AVG, whose (sum, count) buffer spans two partial columns). Event-time only.
    */
   static boolean matchesAttachedLocal(
       WindowingStrategy windowing,
@@ -147,9 +147,7 @@ final class WindowAggregateMatcher {
     if (!(windowing instanceof WindowAttachedWindowingStrategy) || !windowing.isRowtime()) {
       return false;
     }
-    return allPartialsMergeable(aggCalls, inputType)
-        && !containsAvg(aggCalls)
-        && supportedAggregates(grouping, aggCalls, inputType);
+    return !containsAvg(aggCalls) && supportedAggregates(grouping, aggCalls, inputType);
   }
 
   /** The input-column index of the attached {@code window_start}. */
@@ -160,28 +158,6 @@ final class WindowAggregateMatcher {
   /** The input-column index of the attached {@code window_end}. */
   static int windowEndColumn(WindowingStrategy windowing) {
     return ((WindowAttachedWindowingStrategy) windowing).getWindowEnd();
-  }
-
-  /** True if every aggregate's value column has the given native type code. */
-  static boolean allValueTypes(
-      scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType, int code) {
-    for (int type : valueTypeCodes(aggCalls, inputType)) {
-      if (type != code) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /** True if every aggregate's partial is one the two-phase global merges (bigint or double). */
-  static boolean allPartialsMergeable(
-      scala.collection.Seq<AggregateCall> aggCalls, RelDataType inputType) {
-    for (int type : valueTypeCodes(aggCalls, inputType)) {
-      if (type != 0 && type != 1) {
-        return false;
-      }
-    }
-    return true;
   }
 
   /**
@@ -322,7 +298,7 @@ final class WindowAggregateMatcher {
     return true;
   }
 
-  private static boolean supportedValueType(SqlTypeName type) {
+  static boolean supportedValueType(SqlTypeName type) {
     return type == SqlTypeName.BIGINT
         || type == SqlTypeName.DOUBLE
         || type == SqlTypeName.INTEGER

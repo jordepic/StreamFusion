@@ -59,9 +59,12 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   as `DECIMAL(38, s)` (a bundle overflow emits NULL and latches the merged AVG NULL, skipped by the
   SUM merge — the host's own null-propagation), MIN/MAX partials keep `DECIMAL(p, s)` through the
   extremes multiset, and AVG merges the `(DECIMAL(38, s), bigint)` pair into the exact-division
-  emit. Still falling back: the **windowed** two-phase decimal split (the windowed local's partials
-  are single-column bigint/double only); value types outside
-  bigint/double/int/smallint/tinyint/float/decimal (see `aggregate-type-support.md`).
+  emit. The **windowed** two-phase split carries the same full value-type family: every custom SUM
+  accumulator's state is Flink's own buffer — the nullable sum alone — so the windowed local emits
+  it as the single-field partial and the global merges it with Flink's semantics (a NULL partial is
+  skipped; an overflowed decimal sum goes NULL and the next value resets it, not a sticky latch).
+  Still falling back: value types outside bigint/double/int/smallint/tinyint/float/decimal (see
+  `aggregate-type-support.md`).
 - **Two-phase (mini-batch) `GROUP BY`** — all four operators run native: a native `MiniBatchAssigner`
   emits the proc-time marker, the local is a transient in-memory bundle flushed on that marker / a
   `mini-batch.size` trigger / before each checkpoint (no checkpointed state, like Flink's
@@ -219,7 +222,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   slide divides its size, or a single-phase `SESSION`; anything else proctime (the two-phase local/
   global path) is not yet on the processing-time-timer path; `HOP` slide / `CUMULATE` step doesn't
   divide size; key type outside bigint/int/string/boolean/date/timestamp/decimal; value type/aggregate
-  mismatch; `AVG` (where noted); two-phase partials not single-field bigint/double; a **windowed
+  mismatch; `AVG` under two-phase (its (sum, count) buffer spans two positional partial columns;
+  single-phase `AVG` is native as a lone aggregate); a **windowed
   `DISTINCT` aggregate** (`SUM(DISTINCT …)` etc. inside a window — it dedups per window, which the
   native window operators' every-row fold would over-count; the non-windowed `GROUP BY` handles
   `DISTINCT` natively). A **zero-aggregate**

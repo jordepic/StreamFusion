@@ -23,7 +23,7 @@ DataFusion: `sum(intN)→Int64`, `sum(floatN)→Float64`, `avg(int)→Float64`,
 | INT     | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | SMALLINT / TINYINT | ✓ (custom wrapping) | ✓ (custom truncating) | ✓ | ✓ | ✓ |
 | FLOAT (REAL) | ✓ (custom f32) | ✓ (custom f64→f32) | ✓ | ✓ | ✓ |
-| DECIMAL | ✓ (✗ two-phase) | ✓ (✗ two-phase) | ✓ | ✓ | ✓ |
+| DECIMAL | ✓ | ✓ | ✓ | ✓ | ✓ |
 | CHAR / VARCHAR | ✗ | ✗ | ✓ (byte-lexicographic) | ✓ (byte-lexicographic) | ✓ |
 
 Notes / divergences this avoids:
@@ -42,15 +42,17 @@ Notes / divergences this avoids:
   same per-row order as the host, so the result is bit-identical — verified by a
   parity test over values whose float running sum carries rounding error.
 - **DECIMAL** carries `MIN`/`MAX`/`COUNT` everywhere (type-preserving comparisons/counts
-  over an Arrow decimal vector of the column's precision/scale). The non-windowed
-  `GROUP BY` and the **single-phase windowed** aggregates also run decimal `SUM` (an
-  i128 running sum at the input scale, reported as Flink's `DECIMAL(38, s)`,
-  overflow → NULL) and decimal `AVG` (that sum divided by the non-null count with
-  Flink's exact decimal division — 38-significant-digit quotient then HALF_UP
-  rescale — reported as `findAvgAggType`'s `DECIMAL(38, max(6, s))`). The
-  **two-phase** split (non-windowed mini-batch and windowed local/global) still
-  leaves decimal `SUM`/`AVG` on the host — its partial columns are gated to
-  bigint/double (ticket 41).
+  over an Arrow decimal vector of the column's precision/scale), plus decimal `SUM` (an
+  i128 running sum at the input scale, reported as Flink's `DECIMAL(38, s)`) and decimal
+  `AVG` (that sum divided by the non-null count with Flink's exact decimal division —
+  38-significant-digit quotient then HALF_UP rescale — reported as `findAvgAggType`'s
+  `DECIMAL(38, max(6, s))`), single- and two-phase alike (`AVG` two-phase is
+  non-windowed only; the windowed split excludes AVG for every type). The overflow
+  semantics mirror Flink's buffers exactly: `SUM`'s buffer is the nullable sum alone, so
+  an overflow past `DECIMAL(38, s)` goes NULL and the **next value resets it** (no sticky
+  latch), and the two-phase merge **skips** a NULL partial; `AVG`'s (sum, count) buffer
+  null-propagates instead, so its overflow is sticky. Both are pinned by parity tests at
+  the overflow boundary.
 
 ## Predicate arithmetic (filter expressions)
 The native expression engine admits `+`/`-`/`*` in filter predicates. DataFusion
@@ -74,14 +76,17 @@ Comparisons are width-insensitive and always safe.
   would diverge from the host's type/precision (integer `SUM` wraps, integer `AVG`
   truncates, float `SUM` stays 4-byte, float `AVG` narrows from a double sum, double
   `AVG` divides in double). `DECIMAL` carries all five (custom i128 accumulators with
-  Flink's overflow-to-NULL and exact-division semantics; two-phase excepted — its
-  partials are bigint/double only). The native value path is type-general; each type is an
+  Flink's overflow-to-NULL and exact-division semantics). The native value path is
+  type-general; each type is an
   Arrow vector class + getter + a value-type code (decimal packs precision/scale in).
 - **Multiple value columns:** each aggregate reads its own value column, so
   `SUM(a), SUM(b)` over different columns (of different types) is accelerated. The
   native batch carries one `value{i}` column per aggregate, decoded by a per-aggregate
-  value-type code. Two-phase is admitted when every aggregate's partial is one the
-  global merges (bigint/double); narrower value types route single-phase only.
+  value-type code. Two-phase is admitted for every non-AVG aggregate over the full value
+  set: each partial is a single field of the value's own type — Flink's nullable-sum
+  buffer for the SUMs, the type-preserving extreme for MIN/MAX, a bigint count — which
+  the local flushes and the global merges with Flink's own merge semantics. Windowed AVG
+  routes single-phase only (its (sum, count) buffer spans two positional partials).
 - `COUNT(*)` is supported, including alongside value aggregates: it reads a
   synthesized non-null value column so the existing COUNT counts every row. Two-phase
   (default planning) works for tumbling and cumulative — the local counts rows per

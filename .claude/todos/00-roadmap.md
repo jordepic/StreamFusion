@@ -51,8 +51,11 @@ here when the ticket is deleted.
   Top-N also handles an `OFFSET` and a retracting input; `RANK`/`DENSE_RANK` are parity (Flink
   rejects them in streaming).
 - **Window aggregate input schemas:** all five aggregates over every numeric value type incl.
-  decimal (custom accumulators keep the host's type/precision; decimal SUM/AVG are single-phase —
-  the two-phase partial columns stay bigint/double, ticket 41);
+  decimal (custom accumulators keep the host's type/precision), single- and two-phase alike —
+  the custom SUMs carry Flink's own nullable-sum buffer as their single-field partial, so the
+  windowed local/global split admits the full value-type family (AVG stays single-phase; shipped
+  2026-07-05, closing ticket 41 — the overflow semantics are Flink's exactly: reset-after-overflow
+  for SUM, NULL partials skipped in the merge, pinned by overflow-boundary parity tests);
   multiple value columns (`SUM(a), SUM(b)`); bigint/int/string/boolean/date/timestamp/decimal grouping
   keys; and `COUNT(*)` (one- and two-phase). Parity matrix in `docs/aggregate-type-support.md`.
   Join/`OVER` partition keys now carry the
@@ -127,8 +130,7 @@ here when the ticket is deleted.
    dedup SipHash item on ticket 20 via the crate-wide ahash default; the q21 upcall regex cache,
    +12.5%; 2026-07-05: ticket 49's borrowed-byte probes for the group-agg/dedup/Top-N maps, and the
    upcall builtins handing off bytes not `String` — q21's residual — both pending the round's
-   matrix re-quote): what remains, in recommended order — ticket 41's windowed-split remainder,
-   ticket 49's bench-gated
+   matrix re-quote): what remains, in recommended order — ticket 49's bench-gated
    `ScalarValue`-vintage retirements, and ticket 40's bounded-dim preload (deprioritized on the
    2026-07-05 q13 profile — the Nexmark dim is an in-memory test connector, so the win only shows
    on real external dims). Closed on the 2026-07-05 profiles: the join block store (wontdos/48 —
@@ -142,25 +144,19 @@ here when the ticket is deleted.
    readme/benchmarks Kafka numbers re-quoted (after the 2026-07-04 optimization round: floor 1.34x,
    peak q11 3.8–5.1x — watermark
    regeneration costs nothing measurable).
-2. **Mini-batch coverage** (ticket 41): landed 2026-07-05 — the whole two-phase family including
-   distinct aggregates (filters included), FILTER clauses, string MIN/MAX partials,
-   retraction-bearing partials (q4), decimal/narrow types, and row-time mini-batch; all ten
-   changelog-family queries run native under production tuning (the tuned table in
-   docs/benchmarks.md). The opt-in `distinct-agg.split.enabled` chain is a deliberate non-goal
-   (wontdos/52). Remaining on the ticket: the windowed two-phase decimal/narrow split.
-3. **Legacy group windows** (ticket 43): map `GROUP BY TUMBLE/HOP(...)` onto the existing native
+2. **Legacy group windows** (ticket 43): map `GROUP BY TUMBLE/HOP(...)` onto the existing native
    window operators — the event-time `SESSION` exception is the template.
-4. **Cheap wins, interleaved:** the format-option parity audit (ticket 32). (Shipped 2026-07-03:
+3. **Cheap wins, interleaved:** the format-option parity audit (ticket 32). (Shipped 2026-07-03:
    `avro-confluent` routing — registry-fed writer schemas by frame id, decode path; the lookup-join
    extensions: calc/residual/pre-filter/constant-keys + distributed execution, via Flink's own
    generated runners driven per Arrow batch — ticket 40 now holds only the columnar-assembly perf
    item; `ignore-parse-errors` skip mode, native for the JSON-decoded formats incl. CDC, gated to
    fallback for CSV/protobuf; and the decode operator's time-based + pre-barrier flushes.)
-5. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
+4. **Richer columnar endpoints** (ticket 24): beyond local Parquet — Iceberg and remote
    filesystems (`hdfs:`/`s3:`) for the native source/sink; currently `file:` only. **Deferred by
    direction until generalized operator support lands** — broaden what we can run (the ticket 11
    operators and any remaining expression tail) before broadening where we read/write.
-6. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
+5. **Operator-level perf** (ticket 20 backlog): the scalar `GroupKey` remaining in the smaller
    keyed loops (dedup, `OVER` partitions, Top-N, exchange split) — swap to arrow-row keys only
    with a bench showing it pays. (All aggregators now use arrow-row keys — keyed tumbling 2.2×;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`

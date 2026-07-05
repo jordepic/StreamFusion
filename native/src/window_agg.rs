@@ -374,7 +374,9 @@ impl TumblingAggregator {
         columns.push(Arc::new(Int64Array::from(starts)));
         columns.push(Arc::new(Int64Array::from(ends)));
         for (i, scalars) in results.into_iter().enumerate() {
-            fields.push(Field::new(format!("result{i}"), self.aggregates[i].result_type(), false));
+            // Nullable: a SUM whose window saw only NULL values (or whose decimal sum overflowed)
+            // evaluates to NULL, matching the host.
+            fields.push(Field::new(format!("result{i}"), self.aggregates[i].result_type(), true));
             columns.push(scalars_to_array(scalars, &self.aggregates[i].result_type()));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -409,8 +411,10 @@ impl TumblingAggregator {
         let mut fields = key_fields(&self.key_types);
         let mut columns = decode_keys(self.key_converter.as_ref(), &keys, &self.key_types);
         for (i, scalars) in partials.into_iter().enumerate() {
+            // Nullable: a SUM partial is Flink's nullable-sum buffer — NULL for an all-NULL bundle
+            // or an overflowed decimal bundle (the global's merge skips it, as the host's does).
             let partial_type = self.aggregates[i].state_fields()[0].data_type().clone();
-            fields.push(Field::new(format!("partial{i}"), partial_type.clone(), false));
+            fields.push(Field::new(format!("partial{i}"), partial_type.clone(), true));
             columns.push(scalars_to_array(scalars, &partial_type));
         }
         fields.push(Field::new("slice_end", DataType::Int64, false));

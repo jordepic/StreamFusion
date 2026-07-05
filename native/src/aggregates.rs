@@ -125,41 +125,38 @@ impl Accumulator for IntegerAvgAccumulator {
 }
 
 /// Sum of an int32 column matching the host engine's semantics: the accumulator is itself int32 and
-/// wraps on overflow (Flink keeps the input type and does not widen, unlike DataFusion's int64 sum),
-/// and the result is null when no non-null value was seen. The two-field partial state (sum, count)
-/// rides the general checkpoint path; the count distinguishes the empty case from a genuine zero.
+/// wraps on overflow (Flink keeps the input type and does not widen, unlike DataFusion's int64 sum).
+/// The state mirrors Flink's SumAggFunction buffer exactly — the nullable sum alone, NULL until a
+/// non-null value is seen — so it is a single-field mergeable partial: the two-phase local emits it
+/// and the global merges it (skipping NULL partials, as Flink's merge expression does).
 #[derive(Debug, Default)]
 pub(crate) struct WrappingIntSumAccumulator {
-    sum: i32,
-    count: i64,
+    sum: Option<i32>,
 }
 
 impl Accumulator for WrappingIntSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
         let array = values[0].as_any().downcast_ref::<Int32Array>().expect("value must be int32");
         for value in array.iter().flatten() {
-            self.sum = self.sum.wrapping_add(value);
-            self.count += 1;
+            self.sum = Some(self.sum.unwrap_or(0).wrapping_add(value));
         }
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
         let sums = states[0].as_any().downcast_ref::<Int32Array>().expect("sum state int32");
-        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
         for value in sums.iter().flatten() {
-            self.sum = self.sum.wrapping_add(value);
+            self.sum = Some(self.sum.unwrap_or(0).wrapping_add(value));
         }
-        self.count += counts.iter().flatten().sum::<i64>();
         Ok(())
     }
 
     fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
-        Ok(vec![ScalarValue::Int32(Some(self.sum)), ScalarValue::Int64(Some(self.count))])
+        Ok(vec![ScalarValue::Int32(self.sum)])
     }
 
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
-        Ok(ScalarValue::Int32((self.count != 0).then_some(self.sum)))
+        Ok(ScalarValue::Int32(self.sum))
     }
 
     fn size(&self) -> usize {
@@ -167,28 +164,82 @@ impl Accumulator for WrappingIntSumAccumulator {
     }
 }
 
-/// Decimal SUM/AVG window accumulator with Flink's semantics: an i128 running sum at the input scale
-/// with overflow past DECIMAL(38, s) latched to NULL (Flink's fromBigDecimal, where DataFusion's
-/// decimal sum errors instead), plus the non-null count. SUM evaluates to the sum as DECIMAL(38, s);
-/// AVG divides sum by count with Flink's exact decimal division (38-significant-digit quotient, then
-/// the HALF_UP rescale) at findAvgAggType's DECIMAL(38, max(6, s)). The snapshot state is the
-/// (sum, count) pair; a NULL sum with a live count marks an overflowed accumulator on restore.
+/// Decimal SUM with Flink's SumAggFunction semantics: the buffer is the nullable sum alone, an i128
+/// at the input scale reported as DECIMAL(38, s). Overflow past DECIMAL(38, s) goes NULL (Flink's
+/// fromBigDecimal, where DataFusion's decimal sum errors instead) but does NOT latch: Flink's
+/// accumulate expression is `isNull(sum) ? value : sum + value`, so the next value resets an
+/// overflowed sum — "empty" and "overflowed" are the same NULL buffer. The merge expression skips a
+/// NULL partial (an overflowed bundle's contribution silently vanishes), which the single-field
+/// state reproduces for the two-phase local/global split.
 #[derive(Debug)]
-pub(crate) struct DecimalWindowAccumulator {
+pub(crate) struct DecimalSumAccumulator {
+    sum: Option<i128>,
+    scale: i8,
+}
+
+/// One Flink SUM accumulate/merge step: a NULL sum resets to the value, a live sum adds with
+/// overflow past DECIMAL(38, _) going back to NULL.
+fn decimal_sum_add(sum: Option<i128>, value: i128) -> Option<i128> {
+    match sum {
+        None => Some(value),
+        Some(s) => {
+            s.checked_add(value).filter(|t| *t > -DECIMAL128_MAX && *t < DECIMAL128_MAX)
+        }
+    }
+}
+
+impl Accumulator for DecimalSumAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let array =
+            values[0].as_any().downcast_ref::<Decimal128Array>().expect("value decimal128");
+        for value in array.iter().flatten() {
+            self.sum = decimal_sum_add(self.sum, value);
+        }
+        Ok(())
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
+        let sums = states[0].as_any().downcast_ref::<Decimal128Array>().expect("sum decimal128");
+        for value in sums.iter().flatten() {
+            self.sum = decimal_sum_add(self.sum, value);
+        }
+        Ok(())
+    }
+
+    fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
+        Ok(vec![ScalarValue::Decimal128(self.sum, 38, self.scale)])
+    }
+
+    fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
+        Ok(ScalarValue::Decimal128(self.sum, 38, self.scale))
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Decimal AVG with Flink's AvgAggFunction semantics: a (sum, count) buffer where the sum starts at
+/// zero (not NULL) and overflow past DECIMAL(38, s) is sticky — Flink's AVG merges and accumulates
+/// with a plain null-propagating plus, so once the sum goes NULL it stays NULL (unlike SUM's
+/// reset-on-next-value). Evaluates by dividing sum by count with Flink's exact decimal division
+/// (38-significant-digit quotient, then the HALF_UP rescale) at findAvgAggType's
+/// DECIMAL(38, max(6, s)); a NULL sum or zero count evaluates to NULL.
+#[derive(Debug)]
+pub(crate) struct DecimalAvgAccumulator {
     sum: i128,
     count: i64,
     overflow: bool,
     scale: i8,
-    avg: bool,
 }
 
-impl DecimalWindowAccumulator {
-    fn new(scale: i8, avg: bool) -> Self {
-        DecimalWindowAccumulator { sum: 0, count: 0, overflow: false, scale, avg }
+impl DecimalAvgAccumulator {
+    fn new(scale: i8) -> Self {
+        DecimalAvgAccumulator { sum: 0, count: 0, overflow: false, scale }
     }
 }
 
-impl Accumulator for DecimalWindowAccumulator {
+impl Accumulator for DecimalAvgAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
         let array =
             values[0].as_any().downcast_ref::<Decimal128Array>().expect("value decimal128");
@@ -223,10 +274,6 @@ impl Accumulator for DecimalWindowAccumulator {
     }
 
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
-        if !self.avg {
-            let sum = (!self.overflow && self.count != 0).then_some(self.sum);
-            return Ok(ScalarValue::Decimal128(sum, 38, self.scale));
-        }
         let result_scale = self.scale.max(6);
         if self.overflow || self.count == 0 {
             return Ok(ScalarValue::Decimal128(None, 38, result_scale));
@@ -246,18 +293,18 @@ impl Accumulator for DecimalWindowAccumulator {
 
 /// Sum of a narrow integer column (smallint/tinyint) matching the host's semantics: the host keeps
 /// the input type and casts back each accumulate step, so the running sum wraps at the narrow width.
-/// We fold at int64 but wrap to the width on every step, and emit the narrow type. Null when no
-/// non-null value was seen. `data_type` is Int16 or Int8.
+/// We fold at int64 but wrap to the width on every step, and emit the narrow type. The state is
+/// Flink's buffer — the nullable narrow sum alone (NULL until a non-null value is seen) — so it is
+/// a single-field mergeable partial for the two-phase split. `data_type` is Int16 or Int8.
 #[derive(Debug)]
 pub(crate) struct WrappingNarrowSumAccumulator {
-    sum: i64,
-    count: i64,
+    sum: Option<i64>,
     data_type: DataType,
 }
 
 impl WrappingNarrowSumAccumulator {
     fn new(data_type: DataType) -> Self {
-        WrappingNarrowSumAccumulator { sum: 0, count: 0, data_type }
+        WrappingNarrowSumAccumulator { sum: None, data_type }
     }
 
     fn wrap(&self, value: i64) -> i64 {
@@ -272,49 +319,42 @@ impl WrappingNarrowSumAccumulator {
         if self.data_type == DataType::Int16 {
             let array = array.as_any().downcast_ref::<Int16Array>().expect("value int16");
             for value in array.iter().flatten() {
-                self.sum = self.wrap(self.sum + i64::from(value));
+                self.sum = Some(self.wrap(self.sum.unwrap_or(0) + i64::from(value)));
             }
         } else {
             let array = array.as_any().downcast_ref::<Int8Array>().expect("value int8");
             for value in array.iter().flatten() {
-                self.sum = self.wrap(self.sum + i64::from(value));
+                self.sum = Some(self.wrap(self.sum.unwrap_or(0) + i64::from(value)));
             }
+        }
+    }
+
+    fn narrow_scalar(&self) -> ScalarValue {
+        if self.data_type == DataType::Int16 {
+            ScalarValue::Int16(self.sum.map(|s| s as i16))
+        } else {
+            ScalarValue::Int8(self.sum.map(|s| s as i8))
         }
     }
 }
 
 impl Accumulator for WrappingNarrowSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
-        let non_null = values[0].len() - values[0].null_count();
         self.fold_narrow(&values[0]);
-        self.count += non_null as i64;
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
         self.fold_narrow(&states[0]);
-        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
-        self.count += counts.iter().flatten().sum::<i64>();
         Ok(())
     }
 
     fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
-        let sum = (self.count != 0).then_some(self.sum);
-        let sum = if self.data_type == DataType::Int16 {
-            ScalarValue::Int16(sum.map(|s| s as i16))
-        } else {
-            ScalarValue::Int8(sum.map(|s| s as i8))
-        };
-        Ok(vec![sum, ScalarValue::Int64(Some(self.count))])
+        Ok(vec![self.narrow_scalar()])
     }
 
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
-        let sum = (self.count != 0).then_some(self.sum);
-        Ok(if self.data_type == DataType::Int16 {
-            ScalarValue::Int16(sum.map(|s| s as i16))
-        } else {
-            ScalarValue::Int8(sum.map(|s| s as i8))
-        })
+        Ok(self.narrow_scalar())
     }
 
     fn size(&self) -> usize {
@@ -325,42 +365,36 @@ impl Accumulator for WrappingNarrowSumAccumulator {
 /// Sum of a float (4-byte) column matching the host: the host keeps the input type and accumulates
 /// the running sum in float, so it rounds to 4-byte precision on every step (unlike DataFusion's
 /// sum, which widens to double). We accumulate in f32 in the same per-row fold order, so the result
-/// is bit-identical. Null when no non-null value was seen.
+/// is bit-identical. The state is Flink's buffer — the nullable float sum alone (NULL until a
+/// non-null value is seen) — so it is a single-field mergeable partial for the two-phase split.
 #[derive(Debug, Default)]
 pub(crate) struct FloatSumAccumulator {
-    sum: f32,
-    count: i64,
+    sum: Option<f32>,
 }
 
 impl Accumulator for FloatSumAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion::common::Result<()> {
         let array = values[0].as_any().downcast_ref::<Float32Array>().expect("value float32");
         for value in array.iter().flatten() {
-            self.sum += value;
-            self.count += 1;
+            self.sum = Some(self.sum.unwrap_or(0.0) + value);
         }
         Ok(())
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion::common::Result<()> {
         let sums = states[0].as_any().downcast_ref::<Float32Array>().expect("sum state float32");
-        let counts = states[1].as_any().downcast_ref::<Int64Array>().expect("count state int64");
         for value in sums.iter().flatten() {
-            self.sum += value;
+            self.sum = Some(self.sum.unwrap_or(0.0) + value);
         }
-        self.count += counts.iter().flatten().sum::<i64>();
         Ok(())
     }
 
     fn state(&mut self) -> datafusion::common::Result<Vec<ScalarValue>> {
-        Ok(vec![
-            ScalarValue::Float32((self.count != 0).then_some(self.sum)),
-            ScalarValue::Int64(Some(self.count)),
-        ])
+        Ok(vec![ScalarValue::Float32(self.sum)])
     }
 
     fn evaluate(&mut self) -> datafusion::common::Result<ScalarValue> {
-        Ok(ScalarValue::Float32((self.count != 0).then_some(self.sum)))
+        Ok(ScalarValue::Float32(self.sum))
     }
 
     fn size(&self) -> usize {
@@ -507,10 +541,10 @@ impl WindowAggregate {
             WindowAggregate::FloatAvg => Box::<FloatAvgAccumulator>::default(),
             WindowAggregate::DoubleAvg => Box::<DoubleAvgAccumulator>::default(),
             WindowAggregate::DecimalSum { scale } => {
-                Box::new(DecimalWindowAccumulator::new(*scale, false))
+                Box::new(DecimalSumAccumulator { sum: None, scale: *scale })
             }
             WindowAggregate::DecimalAvg { scale } => {
-                Box::new(DecimalWindowAccumulator::new(*scale, true))
+                Box::new(DecimalAvgAccumulator::new(*scale))
             }
         }
     }
@@ -527,23 +561,23 @@ impl WindowAggregate {
                 Field::new("sum", DataType::Int64, true),
                 Field::new("count", DataType::Int64, true),
             ],
-            WindowAggregate::WrappingIntSum => vec![
-                Field::new("sum", DataType::Int32, true),
-                Field::new("count", DataType::Int64, true),
-            ],
-            WindowAggregate::WrappingNarrowSum(data_type) => vec![
-                Field::new("sum", data_type.clone(), true),
-                Field::new("count", DataType::Int64, true),
-            ],
-            WindowAggregate::FloatSum => vec![
-                Field::new("sum", DataType::Float32, true),
-                Field::new("count", DataType::Int64, true),
-            ],
+            // The custom SUMs mirror Flink's SumAggFunction buffer: the nullable sum alone, a
+            // single-field mergeable partial (the two-phase local emits state[0]).
+            WindowAggregate::WrappingIntSum => {
+                vec![Field::new("sum", DataType::Int32, true)]
+            }
+            WindowAggregate::WrappingNarrowSum(data_type) => {
+                vec![Field::new("sum", data_type.clone(), true)]
+            }
+            WindowAggregate::FloatSum => vec![Field::new("sum", DataType::Float32, true)],
+            WindowAggregate::DecimalSum { scale } => {
+                vec![Field::new("sum", DataType::Decimal128(38, *scale), true)]
+            }
             WindowAggregate::FloatAvg | WindowAggregate::DoubleAvg => vec![
                 Field::new("sum", DataType::Float64, true),
                 Field::new("count", DataType::Int64, true),
             ],
-            WindowAggregate::DecimalSum { scale } | WindowAggregate::DecimalAvg { scale } => vec![
+            WindowAggregate::DecimalAvg { scale } => vec![
                 Field::new("sum", DataType::Decimal128(38, *scale), true),
                 Field::new("count", DataType::Int64, true),
             ],
