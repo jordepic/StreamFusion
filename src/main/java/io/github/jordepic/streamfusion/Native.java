@@ -1237,6 +1237,9 @@ public final class Native {
    *     shift cascade and appends the rank); false for the plain Top-N and the global LIMIT
    * @param retracting whether the input is a changelog (use the retracting ranker, which keeps the
    *     full buffer to promote on delete) rather than insert-only (the append-only bounded ranker)
+   * @param netDiff mini-batch mode (append-only ranker only): emit the net per-batch rank diff —
+   *     old top-N vs new top-N per touched partition — instead of the per-record shift cascade;
+   *     the collapsed changelog is unchanged (see divergences/20)
    * @param memoryBudgetBytes managed-memory budget (see {@link #createTumblingAggregator})
    */
   public static native long createTopNRanker(
@@ -1248,6 +1251,7 @@ public final class Native {
       long limit,
       boolean outputRankNumber,
       boolean retracting,
+      boolean netDiff,
       long memoryBudgetBytes);
 
   /** Pushes an input batch, exporting the top-N changelog (input columns plus the row kind). */
@@ -1270,6 +1274,7 @@ public final class Native {
       long limit,
       boolean outputRankNumber,
       boolean retracting,
+      boolean netDiff,
       byte[] snapshot,
       long memoryBudgetBytes);
 

@@ -87,6 +87,11 @@ pub(crate) struct TopNRanker {
     sort_columns: Vec<SortColumn>,
     limit: i64,
     output_rank_number: bool,
+    // Mini-batch mode: emit the NET rank diff per input batch (old top-N vs new top-N for each
+    // touched partition) instead of the host's per-record -U/+U cascade. Gated on the host plan
+    // running mini-batch, whose parity contract is the collapsed changelog — which the diff
+    // preserves exactly — rather than the per-record byte sequence (see divergences/20).
+    net_diff: bool,
     schema: Option<SchemaRef>,
     converters: Option<TopNConverters>,
     // Keyed by the partition key's encoded bytes (`ByteKey`): the per-row probe hashes the BORROWED
@@ -106,12 +111,14 @@ impl TopNRanker {
         sort_columns: Vec<SortColumn>,
         limit: i64,
         output_rank_number: bool,
+        net_diff: bool,
     ) -> Self {
         TopNRanker {
             partition_columns,
             sort_columns,
             limit,
             output_rank_number,
+            net_diff,
             schema: None,
             converters: None,
             groups: HashMap::default(),
@@ -171,6 +178,9 @@ impl TopNRanker {
     }
 
     pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+        if self.net_diff {
+            return self.push_net_diff(batch);
+        }
         let arity = data_arity(batch);
         self.schema = Some(data_schema(batch));
         self.ensure_converters(batch, arity);
@@ -274,6 +284,127 @@ impl TopNRanker {
         Ok(self.emit(out_rows, out_kinds, out_ranks))
     }
 
+    /// The mini-batch push: folds the whole batch into the per-partition buffers first, then emits
+    /// one net diff per touched partition — old top-N vs new top-N — instead of the per-record rank
+    /// cascade. The collapsed changelog is identical to the cascade's; only the intermediate
+    /// retractions differ, exactly as Flink's own mini-batch operators collapse intermediates.
+    fn push_net_diff(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+        let arity = data_arity(batch);
+        self.schema = Some(data_schema(batch));
+        self.ensure_converters(batch, arity);
+        let conv = self.converters.as_ref().expect("converters set");
+        let partition_arrays: Vec<ArrayRef> =
+            self.partition_columns.iter().map(|&i| batch.column(i).clone()).collect();
+        let sort_arrays: Vec<ArrayRef> =
+            self.sort_columns.iter().map(|s| batch.column(s.index).clone()).collect();
+        let data_arrays: Vec<ArrayRef> = (0..arity).map(|i| batch.column(i).clone()).collect();
+        let parts = encode_group_keys(&conv.partition, &partition_arrays, batch.num_rows());
+        let keys = encode_group_keys(&conv.sort, &sort_arrays, batch.num_rows());
+        let payloads = conv.payload.convert_columns(&data_arrays).expect("encode payload");
+
+        let limit = self.limit as usize;
+        let track = self.memory.tracking();
+        let mut delta = 0isize;
+        let groups = &mut self.groups;
+
+        // Pass 1: fold every row, capturing each touched partition's PRE-batch top-N once (Arc
+        // bumps, no payload copies). Rows landing beyond rank N never allocate, as in the cascade.
+        let mut touched: Vec<&[u8]> = Vec::new();
+        let mut old_tops: HashMap<&[u8], Vec<Arc<OwnedRow>>> = HashMap::default();
+        for row in 0..batch.num_rows() {
+            let key_row = keys.row(row);
+            let part = parts.row(row).data();
+            let buffer = match groups.get_mut(part) {
+                Some(buffer) => buffer,
+                None => {
+                    if track {
+                        delta += (part.len() + GROUP_ENTRY_OVERHEAD) as isize;
+                    }
+                    groups.entry(ByteKey::from(part)).or_default()
+                }
+            };
+            if !old_tops.contains_key(part) {
+                old_tops.insert(part, buffer.iter().map(|(_, p)| p.clone()).collect());
+                touched.push(part);
+            }
+            let pos = buffer.partition_point(|(k, _)| k.row() <= key_row);
+            if pos >= limit {
+                continue; // beyond rank N — never enters (a buffer never exceeds the limit)
+            }
+            buffer.insert(pos, (key_row.owned(), Arc::new(payloads.row(row).owned())));
+            if track {
+                delta += topn_entry_bytes(&buffer[pos]) as isize;
+            }
+            if buffer.len() > limit {
+                let evicted = buffer.pop().expect("buffer over limit is non-empty");
+                if track {
+                    delta -= topn_entry_bytes(&evicted) as isize;
+                }
+            }
+        }
+        self.memory.record(delta);
+        self.memory.account()?;
+
+        // Pass 2: per touched partition, in first-touch order, diff the old and new top-N.
+        let mut out_rows: Vec<Arc<OwnedRow>> = Vec::new();
+        let mut out_kinds: Vec<i8> = Vec::new();
+        let mut out_ranks: Vec<i64> = Vec::new();
+        for part in touched {
+            let old = &old_tops[part];
+            let new = &groups[part];
+            if self.output_rank_number {
+                // Rank-by-rank: an unchanged occupant emits nothing; a changed one retracts the old
+                // occupant at that rank and asserts the new; a brand-new rank inserts. Append-only
+                // input means ranks only fill in — the new top is never shorter.
+                for rank in 0..new.len() {
+                    match old.get(rank) {
+                        Some(o) if **o == *new[rank].1 => {}
+                        Some(o) => {
+                            out_rows.push(o.clone());
+                            out_kinds.push(1); // -U
+                            out_ranks.push((rank + 1) as i64);
+                            out_rows.push(new[rank].1.clone());
+                            out_kinds.push(2); // +U
+                            out_ranks.push((rank + 1) as i64);
+                        }
+                        None => {
+                            out_rows.push(new[rank].1.clone());
+                            out_kinds.push(0); // +I a brand-new rank
+                            out_ranks.push((rank + 1) as i64);
+                        }
+                    }
+                }
+            } else {
+                // Rank-free: the emitted set is the top-N membership, so the diff is a multiset
+                // difference — rows that left the top-N delete, rows that entered insert.
+                let mut counts: HashMap<&[u8], i64> = HashMap::default();
+                for o in old {
+                    *counts.entry(o.row().data()).or_insert(0) += 1;
+                }
+                for (_, n) in new {
+                    *counts.entry(n.row().data()).or_insert(0) -= 1;
+                }
+                for o in old {
+                    let count = counts.get_mut(o.row().data()).expect("counted");
+                    if *count > 0 {
+                        *count -= 1;
+                        out_rows.push(o.clone());
+                        out_kinds.push(3); // -D — left the top-N
+                    }
+                }
+                for (_, n) in new {
+                    let count = counts.get_mut(n.row().data()).expect("counted");
+                    if *count < 0 {
+                        *count += 1;
+                        out_rows.push(n.clone());
+                        out_kinds.push(0); // +I — entered the top-N
+                    }
+                }
+            }
+        }
+        Ok(self.emit(out_rows, out_kinds, out_ranks))
+    }
+
     fn emit(&self, out_rows: Vec<Arc<OwnedRow>>, out_kinds: Vec<i8>, out_ranks: Vec<i64>) -> RecordBatch {
         if out_rows.is_empty() {
             return RecordBatch::new_empty(Arc::new(Schema::empty()));
@@ -332,9 +463,11 @@ impl TopNRanker {
         sort_columns: Vec<SortColumn>,
         limit: i64,
         output_rank_number: bool,
+        net_diff: bool,
         bytes: &[u8],
     ) -> Self {
-        let mut ranker = TopNRanker::new(partition_columns, sort_columns, limit, output_rank_number);
+        let mut ranker =
+            TopNRanker::new(partition_columns, sort_columns, limit, output_rank_number, net_diff);
         for batch in read_ipc_if_present(bytes) {
             let arity = batch.num_columns();
             ranker.schema = Some(batch.schema());
@@ -1003,6 +1136,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRan
     limit: jlong,
     output_rank_number: jboolean,
     retracting: jboolean,
+    net_diff: jboolean,
     memory_budget_bytes: jlong,
 ) -> jlong {
     let partitions = read_columns(&env, &partition_columns);
@@ -1017,7 +1151,13 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createTopNRan
         ))
     } else {
         // The append-only ranker is the no-OFFSET path (offset always 0).
-        TopNHandle::Append(TopNRanker::new(partitions, sort, limit, output_rank_number != 0))
+        TopNHandle::Append(TopNRanker::new(
+            partitions,
+            sort,
+            limit,
+            output_rank_number != 0,
+            net_diff != 0,
+        ))
     };
     boxed_or_throw(&mut env, handle.with_memory_budget(memory_budget_bytes))
 }
@@ -1072,6 +1212,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
     limit: jlong,
     output_rank_number: jboolean,
     retracting: jboolean,
+    net_diff: jboolean,
     snapshot: JByteArray<'local>,
     memory_budget_bytes: jlong,
 ) -> jlong {
@@ -1088,7 +1229,14 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
             &bytes,
         ))
     } else {
-        TopNHandle::Append(TopNRanker::restore(partitions, sort, limit, output_rank_number != 0, &bytes))
+        TopNHandle::Append(TopNRanker::restore(
+            partitions,
+            sort,
+            limit,
+            output_rank_number != 0,
+            net_diff != 0,
+            &bytes,
+        ))
     };
     boxed_or_throw(&mut env, handle.with_memory_budget(memory_budget_bytes))
 }

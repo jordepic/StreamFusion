@@ -53,6 +53,23 @@ class FlinkTopNSqlHarnessTest {
   }
 
   @Test
+  void topNUnderMiniBatchCollapsesToHost() throws Exception {
+    // With mini-batch on, the native ranker emits the NET per-batch rank diff instead of the
+    // per-record shift cascade (divergences/20) — the collapsed changelog, the parity contract of
+    // every mini-batch plan, must still match the host exactly.
+    NativeParity.assertChangelogParity(
+        () -> {
+          TableEnvironment tEnv = environment();
+          tEnv.getConfig().set("table.exec.mini-batch.enabled", "true");
+          tEnv.getConfig().set("table.exec.mini-batch.allow-latency", "1 s");
+          tEnv.getConfig().set("table.exec.mini-batch.size", "100");
+          return tEnv;
+        },
+        "SELECT k, v, rn FROM (SELECT k, v, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS rn "
+            + "FROM src) WHERE rn <= 2");
+  }
+
+  @Test
   void topNWithOffsetMatchesHost() throws Exception {
     // An OFFSET (rank range [2, 3]) routes through the retracting ranker's rank window; the collapsed
     // result is ranks 2-3 per key (k=1 has them; k=2 has only rank 2).

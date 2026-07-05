@@ -195,9 +195,12 @@ behind a post-round profile (ticket 48).
 and over across the batch's cascades — while emit decoded arrow-row state bytes per *emitted* row
 (72% of the operator's CPU in the q19 profile). Emit now decodes each distinct row once and
 rebuilds the emitted positions with a vectorized `take`: output byte-identical, decode O(distinct).
-q19 +13% end to end (generator profile loop), decode share 72% → 6%; the operator is now bound by
-materializing the cascade's output volume itself, which is Flink's own changelog contract
-(the per-batch net-diff question is parity-gated — ticket 46).
+q19 +13% end to end (generator profile loop), decode share 72% → 6%; the operator is then bound by
+materializing the cascade's output volume itself, which is Flink's own changelog contract. Under
+**mini-batch** the volume itself is cut: the ranker emits the net per-batch rank diff — old top-N
+vs new per touched partition — instead of the per-record cascade, preserving the collapsed
+changelog (the mini-batch parity contract) exactly; mini-batch off keeps the byte-identical
+cascade (divergences/20).
 
 **Group-aggregate DISTINCT folds primitives; the changelog emit reads its cache.** The
 multi-`DISTINCT` day/channel aggregates (q15/q16/q17) owned the largest native islands, and their

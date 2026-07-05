@@ -120,14 +120,15 @@ here when the ticket is deleted.
    `.claude/research/nexmark-operator-profiles-2026-07.md` — differential flame graphs of every
    Nexmark query, native vs Flink, plus Arroyo/RisingWave/Proton technique survey and the
    provenance of Alibaba's 5-10x claim). The ranked levers, each its own ticket
-   (shipped 2026-07-04: ticket 45 — the forked rowwise prefix, q3 +17%/q9 +9%/q20 +6%; ticket 46's
-   decode half — Top-N emit dedup, q19 +13%, its net-diff remainder parity-gated in the trimmed
-   ticket; ticket 47 — typed DISTINCT sets + cached changelog emit, q16 +17%/q17 +4%/q15 +3%; the
+   (shipped 2026-07-04: ticket 45 — the forked rowwise prefix, q3 +17%/q9 +9%/q20 +6%; ticket 46 —
+   Top-N emit dedup, q19 +13%, and (2026-07-05) net-diff emission under mini-batch plans,
+   divergences/20; ticket 47 — typed DISTINCT sets + cached changelog emit, q16 +17%/q17 +4%/q15
+   +3%; the
    dedup SipHash item on ticket 20 via the crate-wide ahash default; the q21 upcall regex cache,
    +12.5%; 2026-07-05: ticket 49's borrowed-byte probes for the group-agg/dedup/Top-N maps, and the
    upcall builtins handing off bytes not `String` — q21's residual — both pending the round's
-   matrix re-quote): what remains, in recommended order — ticket 46's parity decision + ticket 41's
-   split-chain remainder as one package (the road to the changelog family's 5-10x-class numbers),
+   matrix re-quote): what remains, in recommended order — ticket 41's split-chain remainder (the
+   road to the changelog family's 5-10x-class numbers),
    ticket 51 (re-scoped 2026-07-05: q5's hop already runs paned via the two-phase split — what
    remains is the global's slice-merge loop, gated on re-profile), ticket 49's bench-gated
    `ScalarValue`-vintage retirements, ticket 48's block-store question (re-profile q20/q23 first),

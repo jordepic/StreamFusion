@@ -66,6 +66,15 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
+    // Under mini-batch, the append-only ranker emits the net per-batch rank diff instead of the
+    // per-record shift cascade: the parity contract of a mini-batch plan is the collapsed
+    // changelog (Flink's own bundling already drops intermediates upstream), which the diff
+    // preserves exactly (divergences/20). With mini-batch off, the cascade stays byte-identical
+    // to the host. The retracting ranker already diffs per input row and is unaffected.
+    boolean netDiff =
+        !retracting
+            && config.get(
+                org.apache.flink.table.api.config.ExecutionConfigOptions.TABLE_EXEC_MINIBATCH_ENABLED);
     Transformation<ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
@@ -78,7 +87,8 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
                 offset,
                 limit,
                 outputRankNumber,
-                retracting),
+                retracting,
+                netDiff),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);

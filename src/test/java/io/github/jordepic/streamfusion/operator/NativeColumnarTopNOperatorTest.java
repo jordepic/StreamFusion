@@ -27,7 +27,7 @@ class NativeColumnarTopNOperatorTest {
 
   private static NativeColumnarTopNOperator operator() {
     return new NativeColumnarTopNOperator(
-        new int[] {0}, new int[] {1}, new int[] {1}, new int[] {0}, 0L, 2L, false, false);
+        new int[] {0}, new int[] {1}, new int[] {1}, new int[] {0}, 0L, 2L, false, false, false);
   }
 
   @Test

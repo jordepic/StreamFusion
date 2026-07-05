@@ -1147,7 +1147,7 @@ fn updating_join_state_over_budget_fails_and_retract_releases() {
 #[test]
 fn topn_buffer_stays_within_budget_under_eviction() {
     // A bounded Top-3 keeps its reservation bounded no matter how many rows stream through.
-    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 3, false)
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 3, false, false)
         .with_memory_budget(1 << 20)
         .unwrap();
     for i in 0..50 {
@@ -1439,7 +1439,7 @@ fn asc(index: usize) -> SortColumn {
 #[test]
 fn topn_keeps_smallest_n_per_partition() {
     // partition col 0, ORDER BY col 1 ASC, limit 2.
-    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, false);
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, false, false);
     // s = 5, 3, 8, 1 for partition 1.
     let out = ranker.push(&topn_batch(vec![1, 1, 1, 1], vec![5, 3, 8, 1])).unwrap();
     // 5: +I5. 3: +I3 (top2 = {3,5}). 8: rank 3 -> nothing. 1: +I1, -D5 (top2 = {1,3}).
@@ -1451,7 +1451,7 @@ fn topn_keeps_smallest_n_per_partition() {
 // UPDATE_BEFORE/UPDATE_AFTER cascade Flink does, and an INSERT for a brand-new rank.
 #[test]
 fn topn_with_rank_number_emits_cascade() {
-    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, true);
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, true, false);
     let out = ranker.push(&topn_batch(vec![1, 1, 1, 1], vec![5, 3, 8, 1])).unwrap();
     // 5: +I(5,1). 3: -U(5,1) +U(3,1) +I(5,2). 8: rank 3 -> nothing.
     // 1: -U(3,1) +U(1,1) -U(5,2) +U(3,2)  [5 pushed past rank 2, retracted by the -U].
@@ -1463,7 +1463,7 @@ fn topn_with_rank_number_emits_cascade() {
 // Partitions are independent: each keeps its own top-N.
 #[test]
 fn topn_is_per_partition() {
-    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 1, false);
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 1, false, false);
     let out = ranker.push(&topn_batch(vec![1, 2, 1], vec![5, 7, 3])).unwrap();
     // p1: +I5; p2: +I7; p1 sees 3 < 5 -> -D5 then +I3 (delete first, as the host emits).
     assert_eq!(row_kinds(&out), vec![0, 0, 3, 0]);
@@ -1471,13 +1471,48 @@ fn topn_is_per_partition() {
     assert_eq!(values(&out, 1), vec![5, 7, 5, 3]);
 }
 
+// Net-diff (mini-batch) mode collapses the same batch to the per-partition net change: the same
+// four rows that cascade eight changelog entries above emit only the final top-2 state diff.
+#[test]
+fn topn_net_diff_emits_batch_delta_with_rank() {
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, true, true);
+    let out = ranker.push(&topn_batch(vec![1, 1, 1, 1], vec![5, 3, 8, 1])).unwrap();
+    // Fresh partition: old top empty, new top = {1@rank1, 3@rank2} — two inserts, no cascade.
+    assert_eq!(row_kinds(&out), vec![0, 0]);
+    assert_eq!(values(&out, 1), vec![1, 3]);
+    assert_eq!(values(&out, 2), vec![1, 2]);
+
+    // Second batch: 2 enters at rank 2 (1 stays at rank 1) — one -U/+U pair, rank 1 untouched.
+    let out = ranker.push(&topn_batch(vec![1], vec![2])).unwrap();
+    assert_eq!(row_kinds(&out), vec![1, 2]);
+    assert_eq!(values(&out, 1), vec![3, 2]);
+    assert_eq!(values(&out, 2), vec![2, 2]);
+}
+
+// Net-diff without the rank number: the diff is top-N membership — leavers delete, entrants insert.
+#[test]
+fn topn_net_diff_emits_membership_delta() {
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, false, true);
+    let out = ranker.push(&topn_batch(vec![1, 1, 1, 1], vec![5, 3, 8, 1])).unwrap();
+    // New partition: final top-2 = {1, 3}; the transient 5 never surfaces.
+    assert_eq!(row_kinds(&out), vec![0, 0]);
+    assert_eq!(values(&out, 1), vec![1, 3]);
+
+    // 2 displaces 3: one -D and one +I; a batch that changes nothing emits nothing.
+    let out = ranker.push(&topn_batch(vec![1], vec![2])).unwrap();
+    assert_eq!(row_kinds(&out), vec![3, 0]);
+    assert_eq!(values(&out, 1), vec![3, 2]);
+    let out = ranker.push(&topn_batch(vec![1], vec![9])).unwrap();
+    assert_eq!(out.num_rows(), 0);
+}
+
 // The bounded buffer survives a checkpoint, so post-restore ranking continues correctly.
 #[test]
 fn topn_buffer_survives_snapshot_restore() {
-    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, false);
+    let mut ranker = TopNRanker::new(vec![0], vec![asc(1)], 2, false, false);
     ranker.push(&topn_batch(vec![1, 1], vec![5, 3])); // top2 = {3, 5}
     let snapshot = ranker.snapshot();
-    let mut restored = TopNRanker::restore(vec![0], vec![asc(1)], 2, false, &snapshot);
+    let mut restored = TopNRanker::restore(vec![0], vec![asc(1)], 2, false, false, &snapshot);
     // A 1 enters the restored top-2 and displaces the 5.
     let out = restored.push(&topn_batch(vec![1], vec![1])).unwrap();
     assert_eq!(row_kinds(&out), vec![3, 0]); // -D5, +I1

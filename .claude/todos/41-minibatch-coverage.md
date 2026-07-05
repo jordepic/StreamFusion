@@ -64,6 +64,6 @@ also the apples-to-apples config for the only public per-query Alibaba table (mi
 distinct split). Do NOT run it before the coverage above lands — with the mini-batch exec nodes
 still falling back it measures our fallback, not our engine.
 
-This benchmark mode doubles as ticket 46's harness: if net-diff Top-N emission ships gated on
-mini-batch plans, its parity check (collapsed changelog vs mini-batch Flink) and its performance
-claim both live here.
+This benchmark mode is also where net-diff Top-N emission (shipped 2026-07-05 gated on mini-batch
+plans, divergences/20) makes its performance claim: the collapsed-changelog parity check and the
+tuned numbers both live here.
