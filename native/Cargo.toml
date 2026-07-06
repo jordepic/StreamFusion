@@ -56,6 +56,11 @@ datafusion = "53.1.0"
 # without a system dependency. (SSL/SASL-GSSAPI for the Kerberos cluster would add the `ssl` +
 # `gssapi-vendored` features — a heavier build, deferred until needed.)
 rdkafka = { version = "0.36", default-features = false, features = ["libz-static"], optional = true }
+# Native Fluss log-table reader, behind the `fluss` feature. Pinned to a temporary fork of
+# apache/fluss-rust whose only change is bumping its arrow dependency to align with this workspace's
+# arrow version (resolving to 58.3.0 in Cargo.lock), so the batches the reader hands back are this
+# crate's arrow types rather than a second arrow in the build. Replace with upstream
+# apache/fluss-rust once the arrow bump is upstreamed there.
 fluss_rs = { package = "fluss-rs", git = "https://github.com/michaelmitchell-bit/fluss-rust.git", rev = "7182719652d5f6227f15611f888430d74f2eb26b", default-features = true, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"

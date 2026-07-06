@@ -86,8 +86,8 @@ is picked up. Operators are in `~/data/arroyo/crates/arroyo-worker/src/arrow/`.
 ## Connectors (later)
 - [x] Parquet source + sink (local `file:`), exactly-once sink.
 - [ ] Remote/columnar sources and sinks (Iceberg, `hdfs:`/`s3:`) — ticket 24.
-- [ ] Native columnar sources (Fluss / Iceberg-CDC) via Flink Source API +
-      availability futures — ticket 01.
+- [ ] Native columnar sources beyond Fluss (Iceberg-CDC) via Flink Source API +
+      availability futures — ticket 01. (The native Fluss log-table source is done.)
 
 ## Cross-cutting (do alongside, not after)
 - Acceleration config (allowIncompatible / master / per-operator flags) — done (`NativeConfig`)

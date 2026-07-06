@@ -20,7 +20,8 @@ Flink-native client. An operator's keyed state maps cleanly onto a Fluss PK tabl
 `(operator, key)`. Crucially, the state we now hold is **already arrow-row bytes** (memcomparable key +
 value-encoded payload — from the Top-N/join/dedup/group-by refactors): that byte layout is exactly what
 a remote KV store wants on the wire, so the encode/decode is mostly already paid. Pairs naturally with
-ticket 36 (Fluss as a *source*) — one Fluss dependency serving both ingest and state.
+the native Fluss source (shipped — the Nexmark matrix's Fluss rung) — one Fluss dependency serving both
+ingest and state.
 
 **Sketch of the work (to be designed, not prescribed):**
 - A state-access abstraction over the operators' maps (get/put/delete/scan by key) so the in-memory map
@@ -35,5 +36,5 @@ ticket 36 (Fluss as a *source*) — one Fluss dependency serving both ingest and
 object-store + LSM (Hummock/ForSt-style) the better primitive with Fluss only for the changelog? Benchmark
 state-heavy Nexmark (q4/q9/q16 — large keyspaces) under disaggregated vs in-memory before committing.
 
-Relates to: ticket 36 (Fluss source), memory accounting (shipped — divergences/16), ticket 01 (mailbox/async),
+Relates to: the native Fluss source (shipped), memory accounting (shipped — divergences/16), ticket 01 (mailbox/async),
 and the changelog-operator byte-state refactors (the on-the-wire format is ready).
