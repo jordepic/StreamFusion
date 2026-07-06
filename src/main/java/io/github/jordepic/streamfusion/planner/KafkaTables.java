@@ -18,6 +18,7 @@ import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDe
 import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.util.TimeUtils;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 
@@ -577,7 +578,7 @@ final class KafkaTables {
   }
 
   /** The consumer {@code Properties}: the {@code properties.*} options plus Flink's forced overrides. */
-  private static Properties consumerProperties(Map<String, String> options) {
+  static Properties consumerProperties(Map<String, String> options) {
     Properties props = new Properties();
     options.forEach(
         (key, value) -> {
@@ -585,6 +586,14 @@ final class KafkaTables {
             props.setProperty(key.substring(PROPERTIES_PREFIX.length()), value);
           }
         });
+    // Mirror Flink's table factory: scan.topic-partition-discovery.interval (default 5 min, 0 disables)
+    // becomes the enumerator's discovery property unconditionally, overriding any properties.* value.
+    props.setProperty(
+        "partition.discovery.interval.ms",
+        Long.toString(
+            TimeUtils.parseDuration(
+                    options.getOrDefault("scan.topic-partition-discovery.interval", "5 min"))
+                .toMillis()));
     // Offsets are checkpointed, never auto-committed; the reader assigns+seeks to concrete offsets.
     props.setProperty("enable.auto.commit", "false");
     // A group id is needed for the enumerator's committed-offset reads; synthesize one if absent.

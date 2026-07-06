@@ -407,7 +407,9 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   reader `schema`, basic/bearer auth, SSL stores, or pass-through client `properties`. All startup
   modes are supported (earliest/latest/group-offsets/timestamp/specific-offsets),
   as are `topic` lists and `topic-pattern` — discovery and offset resolution run in Flink's own
-  reused enumerator, so the native paths inherit its semantics.
+  reused enumerator (`scan.topic-partition-discovery.interval` honored, including `0` to disable),
+  so the native paths inherit its semantics; mid-job partition additions reach the native consumer
+  as incremental split assignments.
 - **Kafka watermarks / event time** — Flink pushes a Kafka table's `WATERMARK` clause *into the scan*
   (no assigner node survives), so whatever replaces the scan must regenerate the watermarks. Only the
   **native source** (`kafkaSource` operator + the `kafka` build feature) does: it reuses Flink's own
