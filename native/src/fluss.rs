@@ -153,7 +153,7 @@ impl FlussSplitReader {
             Err(e) => return Err(format!("failed to poll Fluss batches: {e}")),
         };
         for batch in batches {
-            self.enqueue(batch);
+            self.enqueue(batch)?;
         }
         Ok(self.pending.len())
     }
@@ -190,10 +190,10 @@ impl FlussSplitReader {
         Ok(())
     }
 
-    fn enqueue(&mut self, scan_batch: fluss_rs::record::ScanBatch) {
+    fn enqueue(&mut self, scan_batch: fluss_rs::record::ScanBatch) -> Result<(), String> {
         let table_bucket = scan_batch.bucket().clone();
         let Some(split_id) = self.split_ids.get(&table_bucket).cloned() else {
-            return;
+            return Ok(());
         };
 
         let base_offset = scan_batch.base_offset();
@@ -203,13 +203,13 @@ impl FlussSplitReader {
         if let Some(stopping_offset) = self.stopping_offsets.get(&table_bucket).copied() {
             if base_offset >= stopping_offset {
                 self.finish_stopped_bucket(&table_bucket);
-                return;
+                return Ok(());
             }
             if next_offset > stopping_offset {
                 let keep_rows = (stopping_offset - base_offset).max(0) as usize;
                 if keep_rows == 0 {
                     self.finish_stopped_bucket(&table_bucket);
-                    return;
+                    return Ok(());
                 }
                 batch = batch.slice(0, keep_rows);
                 next_offset = stopping_offset;
@@ -220,8 +220,10 @@ impl FlussSplitReader {
         }
 
         if batch.num_rows() > 0 {
+            batch = normalize_timestamp_units(batch)?;
             self.pending.push_back((split_id, next_offset, batch));
         }
+        Ok(())
     }
 
     /// Removes a bucket that reached its stopping offset so later in-flight
@@ -241,6 +243,93 @@ impl FlussSplitReader {
         } else {
             let _ = runtime().block_on(self.scanner.unsubscribe(table_bucket.bucket_id()));
         }
+    }
+}
+
+#[cfg(feature = "fluss")]
+fn normalize_timestamp_units(batch: RecordBatch) -> Result<RecordBatch, String> {
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let (normalized_field, normalized_column, field_changed) =
+            normalize_field_array(field, column.clone())?;
+        changed |= field_changed;
+        fields.push(normalized_field);
+        columns.push(normalized_column);
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| format!("failed to normalize Fluss batch timestamp units: {e}"))
+}
+
+#[cfg(feature = "fluss")]
+fn normalize_field_array(
+    field: &FieldRef,
+    array: ArrayRef,
+) -> Result<(FieldRef, ArrayRef, bool), String> {
+    let (data_type, array, changed) = normalize_array(field.data_type(), array)?;
+    if !changed {
+        return Ok((field.clone(), array, false));
+    }
+    Ok((
+        Arc::new(field.as_ref().clone().with_data_type(data_type)),
+        array,
+        true,
+    ))
+}
+
+#[cfg(feature = "fluss")]
+fn normalize_array(
+    data_type: &DataType,
+    array: ArrayRef,
+) -> Result<(DataType, ArrayRef, bool), String> {
+    match data_type {
+        DataType::Timestamp(unit, None) if *unit != arrow::datatypes::TimeUnit::Nanosecond => {
+            let target = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
+            let casted = arrow::compute::cast(array.as_ref(), &target)
+                .map_err(|e| format!("failed to cast Fluss timestamp to nanoseconds: {e}"))?;
+            Ok((target, casted, true))
+        }
+        DataType::Struct(fields) => {
+            let struct_array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "expected StructArray for Fluss field, got {:?}",
+                        array.data_type()
+                    )
+                })?;
+            let mut changed = false;
+            let mut normalized_fields = Vec::with_capacity(fields.len());
+            let mut normalized_columns = Vec::with_capacity(fields.len());
+            for (index, field) in fields.iter().enumerate() {
+                let (normalized_field, normalized_column, field_changed) =
+                    normalize_field_array(field, struct_array.column(index).clone())?;
+                changed |= field_changed;
+                normalized_fields.push(normalized_field);
+                normalized_columns.push(normalized_column);
+            }
+            if !changed {
+                return Ok((data_type.clone(), array, false));
+            }
+            let normalized_fields: Fields = normalized_fields.into();
+            let normalized = StructArray::try_new(
+                normalized_fields.clone(),
+                normalized_columns,
+                struct_array.nulls().cloned(),
+            )
+            .map_err(|e| format!("failed to normalize nested Fluss struct timestamps: {e}"))?;
+            Ok((
+                DataType::Struct(normalized_fields),
+                Arc::new(normalized),
+                true,
+            ))
+        }
+        _ => Ok((data_type.clone(), array, false)),
     }
 }
 
@@ -497,6 +586,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeFlussRea
 #[cfg(all(test, feature = "fluss"))]
 mod tests {
     use super::*;
+    use arrow::datatypes::TimeUnit;
 
     #[test]
     fn translated_keys_populate_fluss_rs_config_fields() {
@@ -533,5 +623,65 @@ mod tests {
         assert_eq!(config.security_sasl_mechanism, "PLAIN");
         assert_eq!(config.security_sasl_username, "alice");
         assert_eq!(config.security_sasl_password, "secret");
+    }
+
+    #[test]
+    fn normalizes_timestamp_units_recursively() {
+        let timestamp_ms = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let timestamp_ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let nested_fields: Fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", timestamp_ms.clone(), true),
+        ]
+        .into();
+        let nested: ArrayRef = Arc::new(
+            StructArray::try_new(
+                nested_fields.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                    Arc::new(TimestampMillisecondArray::from(vec![Some(3), Some(4)])) as ArrayRef,
+                ],
+                None,
+            )
+            .expect("nested struct"),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", timestamp_ms, true),
+                Field::new("nested", DataType::Struct(nested_fields), true),
+            ])),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![Some(1), Some(2)])) as ArrayRef,
+                nested,
+            ],
+        )
+        .expect("batch");
+
+        let normalized = normalize_timestamp_units(batch).expect("normalize");
+
+        assert_eq!(normalized.schema().field(0).data_type(), &timestamp_ns);
+        let top = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("top timestamp ns");
+        assert_eq!(top.value(0), 1_000_000);
+        match normalized.schema().field(1).data_type() {
+            DataType::Struct(fields) => {
+                assert_eq!(fields[1].data_type(), &timestamp_ns);
+            }
+            other => panic!("expected nested struct, got {other:?}"),
+        }
+        let nested = normalized
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("nested struct");
+        let nested_ts = nested
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("nested timestamp ns");
+        assert_eq!(nested_ts.value(1), 4_000_000);
     }
 }

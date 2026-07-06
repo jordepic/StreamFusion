@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -95,6 +96,71 @@ class NativeFlussSourceSqlHarnessTest {
       List<List<Object>> rows = readRows(bootstrapServers, "SELECT name FROM " + tablePath, 3);
 
       assertEquals(List.of(List.of("alice"), List.of("bob"), List.of("carol")), rows);
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
+  @Test
+  void nativeFlussSourceGatesOnlyProjectedColumnsThroughSql() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      tablePath =
+          CATALOG + "." + DATABASE + ".native_fluss_projected_gate_it_" + System.nanoTime();
+      writeRowsWithUnusedUnsupportedColumn(bootstrapServers, tablePath);
+
+      List<List<Object>> rows = readRows(bootstrapServers, "SELECT id FROM " + tablePath, 2);
+
+      assertEquals(List.of(List.of(1L), List.of(2L)), rows);
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
+  @Test
+  void nativeFlussSourceReadsNestedRowFieldsThroughSql() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      tablePath = CATALOG + "." + DATABASE + ".native_fluss_nested_it_" + System.nanoTime();
+      writeNestedRows(bootstrapServers, tablePath);
+
+      List<List<Object>> rows =
+          readRows(
+              bootstrapServers,
+              "SELECT bid.auction, bid.bidder, bid.price, bid.`dateTime`, bid.extra FROM "
+                  + tablePath
+                  + " WHERE event_type = 2",
+              2);
+
+      assertEquals(
+          List.of(
+              List.of(
+                  100L,
+                  7L,
+                  42L,
+                  LocalDateTime.parse("2024-01-01T00:00:00.123"),
+                  "bextra-1"),
+              List.of(
+                  101L,
+                  8L,
+                  43L,
+                  LocalDateTime.parse("2024-01-01T00:00:00.456"),
+                  "bextra-2")),
+          rows);
     } finally {
       if (bootstrapServers != null && tablePath != null) {
         dropTable(bootstrapServers, tablePath);
@@ -354,6 +420,50 @@ class NativeFlussSourceSqlHarnessTest {
                 + " VALUES (1, 'alice', 10), (2, 'bob', 20), (3, 'carol', 30),"
                 + " (4, 'dave', 40), (5, 'erin', 50), (6, 'frank', 60),"
                 + " (7, 'grace', 70), (8, 'heidi', 80), (9, 'ivan', 90)")
+        .await();
+  }
+
+  private static void writeRowsWithUnusedUnsupportedColumn(String bootstrapServers, String tablePath)
+      throws Exception {
+    StreamTableEnvironment tEnv = environment(bootstrapServers);
+    tEnv.executeSql("DROP TABLE IF EXISTS " + tablePath);
+    tEnv.executeSql(
+        "CREATE TABLE "
+            + tablePath
+            + " (id BIGINT, unsupported TIMESTAMP_LTZ(3)) WITH ('bucket.num' = '1')");
+    tEnv.executeSql(
+            "INSERT INTO "
+                + tablePath
+                + " VALUES"
+                + " (1, CAST(TIMESTAMP '2024-01-01 00:00:00.001' AS TIMESTAMP_LTZ(3))),"
+                + " (2, CAST(TIMESTAMP '2024-01-01 00:00:00.002' AS TIMESTAMP_LTZ(3)))")
+        .await();
+  }
+
+  private static void writeNestedRows(String bootstrapServers, String tablePath) throws Exception {
+    StreamTableEnvironment tEnv = environment(bootstrapServers);
+    tEnv.executeSql("DROP TABLE IF EXISTS " + tablePath);
+    String bidType =
+        "ROW<auction BIGINT, bidder BIGINT, price BIGINT, channel STRING, url STRING,"
+            + " `dateTime` TIMESTAMP(3), extra STRING>";
+    tEnv.executeSql(
+        "CREATE TABLE "
+            + tablePath
+            + " (event_type INT, bid "
+            + bidType
+            + ", `dateTime` TIMESTAMP(3)) WITH ('bucket.num' = '1')");
+    tEnv.executeSql(
+            "INSERT INTO "
+                + tablePath
+                + " VALUES"
+                + " (2, CAST(ROW(100, 7, 42, 'web', 'https://nexmark.test/100',"
+                + " TIMESTAMP '2024-01-01 00:00:00.123', 'bextra-1') AS "
+                + bidType
+                + "), TIMESTAMP '2024-01-01 00:00:00.123'),"
+                + " (2, CAST(ROW(101, 8, 43, 'mobile', 'https://nexmark.test/101',"
+                + " TIMESTAMP '2024-01-01 00:00:00.456', 'bextra-2') AS "
+                + bidType
+                + "), TIMESTAMP '2024-01-01 00:00:00.456')")
         .await();
   }
 

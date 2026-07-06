@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -54,7 +55,7 @@ class NativeFlussTypeParityTest {
       writeRows(bootstrapServers, tablePath);
 
       String query =
-          "SELECT id, b, ti, si, i, bi, f, d, c, s, dc, dt, tm, vb FROM " + tablePath;
+          "SELECT id, b, ti, si, i, bi, f, d, c, s, dc, dt, tm, ts, vb, nested FROM " + tablePath;
       List<List<Object>> stockRows = readRows(bootstrapServers, query, false);
       List<List<Object>> nativeRows = readRows(bootstrapServers, query, true);
 
@@ -79,7 +80,9 @@ class NativeFlussTypeParityTest {
         "CREATE TABLE "
             + tablePath
             + " (id BIGINT, b BOOLEAN, ti TINYINT, si SMALLINT, i INT, bi BIGINT, f FLOAT,"
-            + " d DOUBLE, c CHAR(5), s STRING, dc DECIMAL(10, 2), dt DATE, tm TIME, vb BYTES)"
+            + " d DOUBLE, c CHAR(5), s STRING, dc DECIMAL(10, 2), dt DATE, tm TIME,"
+            + " ts TIMESTAMP(3), vb BYTES,"
+            + " nested ROW<nested_id BIGINT, nested_name STRING, nested_ts TIMESTAMP(3)>)"
             + " WITH ('bucket.num' = '1')");
     tEnv.executeSql(
             "INSERT INTO "
@@ -87,22 +90,26 @@ class NativeFlussTypeParityTest {
                 + " VALUES"
                 + " (1, TRUE, CAST(1 AS TINYINT), CAST(2 AS SMALLINT), 3, 4,"
                 + " CAST(1.5 AS FLOAT), 2.5, CAST('ab' AS CHAR(5)), 'héllo, fluss', 12345.67,"
-                + " DATE '2024-02-29', TIME '12:34:56', x'01af'),"
+                + " DATE '2024-02-29', TIME '12:34:56', TIMESTAMP '2024-02-29 12:34:56.789',"
+                + " x'01af', ROW(10, 'nested-alice', TIMESTAMP '2024-02-29 12:35:00.123')),"
                 + " (2, FALSE, CAST(-128 AS TINYINT), CAST(-32768 AS SMALLINT), -2147483648,"
                 + " -9223372036854775807, CAST(-3.4028235E38 AS FLOAT),"
                 + " -1.7976931348623157E308, CAST('' AS CHAR(5)), '', -99999999.99,"
                 + " DATE '1970-01-01',"
-                + " TIME '00:00:00', x'00'),"
+                + " TIME '00:00:00', TIMESTAMP '1970-01-01 00:00:00.000', x'00',"
+                + " ROW(20, '', TIMESTAMP '1970-01-01 00:00:00.001')),"
                 + " (3, TRUE, CAST(127 AS TINYINT), CAST(32767 AS SMALLINT), 2147483647,"
                 + " 9223372036854775807, CAST(3.4028235E38 AS FLOAT), 1.7976931348623157E308,"
                 + " CAST('abcde' AS CHAR(5)), 'a longer utf-8 string', 99999999.99,"
                 + " DATE '9999-12-31',"
-                + " TIME '23:59:59', x'deadbeef'),"
+                + " TIME '23:59:59', TIMESTAMP '2262-04-11 23:47:16.854', x'deadbeef',"
+                + " ROW(30, 'nested-carol', TIMESTAMP '2024-01-01 00:00:00.999')),"
                 + " (4, CAST(NULL AS BOOLEAN), CAST(NULL AS TINYINT), CAST(NULL AS SMALLINT),"
                 + " CAST(NULL AS INT), CAST(NULL AS BIGINT), CAST(NULL AS FLOAT),"
                 + " CAST(NULL AS DOUBLE), CAST(NULL AS CHAR(5)), CAST(NULL AS STRING),"
                 + " CAST(NULL AS DECIMAL(10, 2)), CAST(NULL AS DATE), CAST(NULL AS TIME),"
-                + " CAST(NULL AS BYTES))")
+                + " CAST(NULL AS TIMESTAMP(3)), CAST(NULL AS BYTES),"
+                + " CAST(NULL AS ROW<nested_id BIGINT, nested_name STRING, nested_ts TIMESTAMP(3)>))")
         .await();
   }
 
@@ -181,15 +188,29 @@ class NativeFlussTypeParityTest {
 
   /** byte[] compares by identity inside a List; carry binary columns as List&lt;Byte&gt; instead. */
   private static Object comparable(Object field) {
-    if (!(field instanceof byte[])) {
+    if (field instanceof byte[]) {
+      byte[] bytes = (byte[]) field;
+      List<Byte> boxed = new ArrayList<>(bytes.length);
+      for (byte b : bytes) {
+        boxed.add(b);
+      }
+      return boxed;
+    }
+    if (field instanceof Row) {
+      Row row = (Row) field;
+      List<Object> values = new ArrayList<>(row.getArity());
+      for (int i = 0; i < row.getArity(); i++) {
+        values.add(comparable(row.getField(i)));
+      }
+      return values;
+    }
+    if (field instanceof java.sql.Timestamp) {
+      return ((java.sql.Timestamp) field).toLocalDateTime();
+    }
+    if (field instanceof LocalDateTime) {
       return field;
     }
-    byte[] bytes = (byte[]) field;
-    List<Byte> boxed = new ArrayList<>(bytes.length);
-    for (byte b : bytes) {
-      boxed.add(b);
-    }
-    return boxed;
+    return field;
   }
 
   private static final class CollectingSink extends RichSinkFunction<Row> {

@@ -69,10 +69,6 @@ final class FlussTables {
     if (!(source instanceof FlinkTableSource)) {
       return Planned.fallback("the scan's table source is not the Fluss FlinkTableSource");
     }
-    String columnReason = unsupportedColumnReason(scan);
-    if (columnReason != null) {
-      return Planned.fallback(columnReason);
-    }
     Map<String, String> options = FilesystemTables.options(scan);
     if (options == null) {
       return Planned.fallback("the table's connector options could not be resolved");
@@ -133,6 +129,10 @@ final class FlussTables {
       if (projectedFields != null && projectedFields.length == 0) {
         return Planned.fallback("an empty projection is not supported natively");
       }
+      String columnReason = unsupportedColumnReason(scan, projectedFields);
+      if (columnReason != null) {
+        return Planned.fallback(columnReason);
+      }
 
       FlussConfigTranslator.Result translated = FlussConfigTranslator.translate(flussConfig.toMap());
       if (!translated.isTranslated()) {
@@ -166,46 +166,73 @@ final class FlussTables {
   }
 
   /**
-   * The first column whose type is outside the verified fluss-rs ↔ vendored-Arrow surface (as a
-   * fallback reason), or null when every physical column is safe.
+   * The first projected column whose type is outside the verified fluss-rs ↔ vendored-Arrow surface
+   * (as a fallback reason), or null when every read column is safe.
    *
    * <p>The whitelist is the intersection of fluss-rs' {@code to_arrow_type} export and what the
    * vendored {@code ArrowConversion} readers accept: the fixed-width scalars, CHAR/VARCHAR (Utf8
    * both sides), DECIMAL (Decimal128 both sides), DATE (Date32), TIME (the same per-precision
-   * Time32/Time64 unit on both sides), and VARBINARY (Binary). TIMESTAMP and TIMESTAMP_LTZ are
-   * excluded: fluss-rs exports a per-precision unit — with a UTC zone for TIMESTAMP_LTZ — while
-   * {@code ArrowConversion} pins {@code Timestamp(NANOSECOND, null)} and rejects any zoned
-   * timestamp vector. BINARY is excluded because {@code ArrowConversion.toArrowSchema} has no
-   * BINARY mapping, and nested types (ARRAY/MAP/ROW) are unverified across the boundary.
+   * Time32/Time64 unit on both sides), plain TIMESTAMP (timezone-free Arrow timestamp), VARBINARY
+   * (Binary), and nested ROWs whose leaves are themselves supported. TIMESTAMP_LTZ is excluded:
+   * fluss-rs exports it as a UTC-zoned timestamp vector, while {@code ArrowConversion} currently
+   * rejects zoned timestamp vectors. BINARY is excluded because {@code ArrowConversion.toArrowSchema}
+   * has no BINARY mapping, and ARRAY/MAP are left gated until they have Fluss parity coverage.
    */
-  private static String unsupportedColumnReason(StreamPhysicalTableSourceScan scan) {
+  private static String unsupportedColumnReason(StreamPhysicalTableSourceScan scan, int[] projectedFields) {
     RowType rowType = FilesystemTables.physicalRowType(scan);
     if (rowType == null) {
       return "the table's physical row type could not be resolved";
     }
-    for (LogicalType type : rowType.getChildren()) {
-      switch (type.getTypeRoot()) {
-        case BOOLEAN:
-        case TINYINT:
-        case SMALLINT:
-        case INTEGER:
-        case BIGINT:
-        case FLOAT:
-        case DOUBLE:
-        case CHAR:
-        case VARCHAR:
-        case DECIMAL:
-        case DATE:
-        case TIME_WITHOUT_TIME_ZONE:
-        case VARBINARY:
-          break;
-        default:
-          return "column type "
-              + type.asSummaryString()
-              + " is not verified across the fluss-rs Arrow boundary";
+    int[] fields = projectedFields == null ? null : projectedFields;
+    if (fields == null) {
+      fields = new int[rowType.getFieldCount()];
+      for (int i = 0; i < fields.length; i++) {
+        fields[i] = i;
+      }
+    }
+    for (int field : fields) {
+      if (field < 0 || field >= rowType.getFieldCount()) {
+        return "projected Fluss field index " + field + " is outside the physical row type";
+      }
+      LogicalType type = rowType.getTypeAt(field);
+      String reason = unsupportedTypeReason(type);
+      if (reason != null) {
+        return reason;
       }
     }
     return null;
+  }
+
+  private static String unsupportedTypeReason(LogicalType type) {
+    switch (type.getTypeRoot()) {
+      case BOOLEAN:
+      case TINYINT:
+      case SMALLINT:
+      case INTEGER:
+      case BIGINT:
+      case FLOAT:
+      case DOUBLE:
+      case CHAR:
+      case VARCHAR:
+      case DECIMAL:
+      case DATE:
+      case TIME_WITHOUT_TIME_ZONE:
+      case TIMESTAMP_WITHOUT_TIME_ZONE:
+      case VARBINARY:
+        return null;
+      case ROW:
+        for (LogicalType child : type.getChildren()) {
+          String reason = unsupportedTypeReason(child);
+          if (reason != null) {
+            return reason;
+          }
+        }
+        return null;
+      default:
+        return "column type "
+            + type.asSummaryString()
+            + " is not verified across the fluss-rs Arrow boundary";
+    }
   }
 
   private static DynamicTableSource tableSource(StreamPhysicalTableSourceScan scan) {
