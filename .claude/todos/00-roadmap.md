@@ -178,7 +178,8 @@ here when the ticket is deleted.
    the exchange split — OVER +121–162%, retracting Top-N +228%, exchange +208% on Criterion;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
-   rejected on benchmark grounds — wontdos/28.)
+   rejected on benchmark grounds — wontdos/28.) Native Fluss follow-up: coalesce small fluss-rs
+   scanner batches before JNI export if profiles show per-batch overhead inside columnar pipelines.
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate

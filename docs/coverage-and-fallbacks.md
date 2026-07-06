@@ -458,13 +458,12 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   - **A `WATERMARK` clause** — like Kafka, Flink pushes it into the scan, and the native Fluss
     source does not regenerate watermarks.
   - **A column type outside the verified whitelist** — BOOLEAN, TINYINT, SMALLINT, INT, BIGINT,
-    FLOAT, DOUBLE, CHAR, VARCHAR, DECIMAL, DATE, TIME, VARBINARY: the intersection of fluss-rs'
-    Arrow export and what the vendored `ArrowConversion` readers accept, parity-pinned by
-    `NativeFlussTypeParityTest`. Notable exclusions: **TIMESTAMP/TIMESTAMP_LTZ** (fluss-rs exports
-    a per-precision unit — zoned for LTZ — where `ArrowConversion` pins
-    `Timestamp(NANOSECOND, null)` and rejects any zoned vector); **BINARY**
-    (`ArrowConversion.toArrowSchema` has no BINARY mapping); **nested ARRAY/MAP/ROW** (unverified
-    across the boundary).
+    FLOAT, DOUBLE, CHAR, VARCHAR, DECIMAL, DATE, TIME, plain TIMESTAMP, VARBINARY, and nested ROWs
+    whose leaves are also whitelisted: the intersection of fluss-rs' Arrow export and what the
+    vendored `ArrowConversion` readers accept, parity-pinned by `NativeFlussTypeParityTest`.
+    Notable exclusions: **TIMESTAMP_LTZ** (fluss-rs exports a zoned timestamp vector, which
+    `ArrowConversion` currently rejects), **BINARY** (`ArrowConversion.toArrowSchema` has no
+    BINARY mapping), and **nested ARRAY/MAP** (unverified across the boundary).
   - **`table.log.format` other than `ARROW`** — fluss-rs' scan validation errors on any other log
     format.
   - **Client config the native client can't mirror** — an unrecognized `client.*` option; a known
