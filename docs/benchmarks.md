@@ -498,7 +498,8 @@ fluss-rs log-table reader. Boundedness comes from a count-N-then-cancel collecti
 cell measures time-to-Nth-row at `SF_ROWS` scale. The native reader requires the `fluss` cargo
 feature in the build, added alongside the recommended `mimalloc`: `SF_BENCHMARK=true
 SF_MATRIX_FLUSS=true mvn test -Pbench -Dnative.cargo.args="build --release --features
-mimalloc,fluss" -Dtest=NexmarkMatrixBenchmark`.
+mimalloc,fluss" -Dtest=NexmarkMatrixBenchmark`. Building the `fluss` feature currently needs
+`protoc` (`protobuf-compiler`) because fluss-rs generates its RPC protos at build time.
 
 _Fluss numbers are pending a full run; the rung's column will be reported here alongside the
 tables above once it lands._
