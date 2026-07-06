@@ -455,6 +455,14 @@ class NexmarkMatrixBenchmark {
     String formatsEnv = System.getenv("SF_LADDER_FORMATS");
     String[] formats =
         formatsEnv != null ? formatsEnv.split(",") : new String[] {"json", "avro", "protobuf"};
+    if (runFluss && ROWS > FLUSS_LIMIT_READ_MAX_ROWS) {
+      throw new IllegalArgumentException(
+          "SF_MATRIX_FLUSS=true uses Fluss's stock batch limit-read path, which supports at most "
+              + FLUSS_LIMIT_READ_MAX_ROWS
+              + " rows; set SF_ROWS <= "
+              + FLUSS_LIMIT_READ_MAX_ROWS
+              + " or disable SF_MATRIX_FLUSS.");
+    }
 
     // result[label] -> ordered cells (rendered at the end as one table).
     Map<String, List<String>> report = new LinkedHashMap<>();
@@ -491,14 +499,6 @@ class NexmarkMatrixBenchmark {
     }
 
     if (runFluss) {
-      if (ROWS > FLUSS_LIMIT_READ_MAX_ROWS) {
-        throw new IllegalArgumentException(
-            "SF_MATRIX_FLUSS=true uses Fluss's stock batch limit-read path, which supports at most "
-                + FLUSS_LIMIT_READ_MAX_ROWS
-                + " rows; set SF_ROWS <= "
-                + FLUSS_LIMIT_READ_MAX_ROWS
-                + " or disable SF_MATRIX_FLUSS.");
-      }
       FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
       cluster.start();
       try {

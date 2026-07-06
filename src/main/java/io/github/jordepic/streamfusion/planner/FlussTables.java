@@ -92,11 +92,17 @@ final class FlussTables {
       if (isDataLakeEnabled || lakeSource != null) {
         return null;
       }
+      if (partitionKeyIndexes.length > 0 && scanPartitionDiscoveryIntervalMs > 0) {
+        return null;
+      }
       if (singleRowFilter != null
           || modificationScanType != null
           || selectRowCount
           || limit > 0
           || partitionFilters != null) {
+        return null;
+      }
+      if (projectedFields != null && projectedFields.length == 0) {
         return null;
       }
 

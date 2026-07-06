@@ -47,6 +47,18 @@ class FlussConfigTranslatorTest {
   }
 
   @Test
+  void usesFlinkParsersForMemoryAndDurationUnits() {
+    Map<String, String> config =
+        translated(
+            Map.of(
+                "client.writer.buffer.memory-size", "1 tb",
+                "client.writer.buffer.wait-timeout", "1 d"));
+
+    assertEquals("1099511627776", config.get("writer_buffer_memory_size"));
+    assertEquals("86400000", config.get("writer_buffer_wait_timeout_ms"));
+  }
+
+  @Test
   void keepsFlinkCoordinationOptionsOutOfNativeConfig() {
     FlussConfigTranslator.Result result =
         FlussConfigTranslator.translate(

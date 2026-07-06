@@ -1,9 +1,10 @@
 package io.github.jordepic.streamfusion.fluss;
 
-import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import org.apache.flink.configuration.MemorySize;
+import org.apache.flink.util.TimeUtils;
 
 /**
  * Translates the Fluss Java/Flink table options that belong to the Fluss client into the field names
@@ -163,58 +164,10 @@ public final class FlussConfigTranslator {
   }
 
   private static long parseMemoryBytes(String value) {
-    String normalized = value.trim().toLowerCase().replaceAll("\\s+", "");
-    long multiplier = 1;
-    String number = normalized;
-    if (normalized.endsWith("bytes")) {
-      number = normalized.substring(0, normalized.length() - "bytes".length());
-    } else if (normalized.endsWith("byte")) {
-      number = normalized.substring(0, normalized.length() - "byte".length());
-    } else if (normalized.endsWith("kib")) {
-      number = normalized.substring(0, normalized.length() - 3);
-      multiplier = 1024L;
-    } else if (normalized.endsWith("kb") || normalized.endsWith("k")) {
-      number = normalized.replaceAll("k[b]?$", "");
-      multiplier = 1024L;
-    } else if (normalized.endsWith("mib")) {
-      number = normalized.substring(0, normalized.length() - 3);
-      multiplier = 1024L * 1024L;
-    } else if (normalized.endsWith("mb") || normalized.endsWith("m")) {
-      number = normalized.replaceAll("m[b]?$", "");
-      multiplier = 1024L * 1024L;
-    } else if (normalized.endsWith("gib")) {
-      number = normalized.substring(0, normalized.length() - 3);
-      multiplier = 1024L * 1024L * 1024L;
-    } else if (normalized.endsWith("gb") || normalized.endsWith("g")) {
-      number = normalized.replaceAll("g[b]?$", "");
-      multiplier = 1024L * 1024L * 1024L;
-    } else if (normalized.endsWith("b")) {
-      number = normalized.substring(0, normalized.length() - 1);
-    }
-    return Long.parseLong(number) * multiplier;
+    return MemorySize.parseBytes(value);
   }
 
   private static long parseDurationMillis(String value) {
-    String trimmed = value.trim();
-    if (trimmed.toUpperCase().startsWith("P")) {
-      return Duration.parse(trimmed).toMillis();
-    }
-    String normalized = trimmed.toLowerCase().replaceAll("\\s+", "");
-    if (normalized.endsWith("ms")) {
-      return Long.parseLong(normalized.substring(0, normalized.length() - 2));
-    }
-    if (normalized.endsWith("s")) {
-      return Long.parseLong(normalized.substring(0, normalized.length() - 1)) * 1000L;
-    }
-    if (normalized.endsWith("min")) {
-      return Long.parseLong(normalized.substring(0, normalized.length() - 3)) * 60_000L;
-    }
-    if (normalized.endsWith("m")) {
-      return Long.parseLong(normalized.substring(0, normalized.length() - 1)) * 60_000L;
-    }
-    if (normalized.endsWith("h")) {
-      return Long.parseLong(normalized.substring(0, normalized.length() - 1)) * 3_600_000L;
-    }
-    return Long.parseLong(normalized);
+    return TimeUtils.parseDuration(value).toMillis();
   }
 }

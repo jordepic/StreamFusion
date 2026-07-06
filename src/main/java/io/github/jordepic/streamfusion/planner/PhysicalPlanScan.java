@@ -2,6 +2,7 @@ package io.github.jordepic.streamfusion.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.Sort;
@@ -673,11 +674,17 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           scan.getCluster(), scan.getTraitSet(), scan.getRowType(), OrcSourceMatcher.path(scan));
     }
 
-    if (FlussTables.isNativeFluss(current) && NativeConfig.operatorEnabled("flussSource")) {
+    if (current instanceof StreamPhysicalTableSourceScan) {
       StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
-      substitutions++;
-      return new StreamPhysicalNativeFlussSource(
-          scan.getCluster(), scan.getTraitSet(), scan.getRowType(), scan);
+      Map<String, String> options = FilesystemTables.options(scan);
+      if (options != null
+          && "fluss".equals(options.get("connector"))
+          && NativeConfig.operatorEnabled("flussSource")
+          && FlussTables.isNativeFluss(scan)) {
+        substitutions++;
+        return new StreamPhysicalNativeFlussSource(
+            scan.getCluster(), scan.getTraitSet(), scan.getRowType(), scan);
+      }
     }
 
     // The fully-native rdkafka source (Rust owns the consume) is the default Kafka path for the

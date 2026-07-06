@@ -30,38 +30,38 @@ impl FlussSplitReader {
         database_name: &str,
         table_name: &str,
         projected_fields: &[usize],
-    ) -> Self {
-        let config = fluss_config(config);
+    ) -> Result<Self, String> {
+        let config = fluss_config(config)?;
         let table_path =
             fluss_rs::metadata::TablePath::new(database_name.to_string(), table_name.to_string());
         let (connection, scanner) = runtime().block_on(async {
             let connection = fluss_rs::client::FlussConnection::new(config)
                 .await
-                .expect("failed to create Fluss connection");
+                .map_err(|e| format!("failed to create Fluss connection: {e}"))?;
             let scanner = {
                 let table = connection
                     .get_table(&table_path)
                     .await
-                    .expect("failed to get Fluss table");
+                    .map_err(|e| format!("failed to get Fluss table: {e}"))?;
                 let scan = table.new_scan();
                 let scan = if projected_fields.is_empty() {
                     scan
                 } else {
                     scan.project(projected_fields)
-                        .expect("failed to project Fluss scan")
+                        .map_err(|e| format!("failed to project Fluss scan: {e}"))?
                 };
                 scan.create_record_batch_log_scanner()
-                    .expect("failed to create Fluss RecordBatch log scanner")
+                    .map_err(|e| format!("failed to create Fluss RecordBatch log scanner: {e}"))?
             };
-            (connection, scanner)
-        });
-        Self {
+            Ok::<_, String>((connection, scanner))
+        })?;
+        Ok(Self {
             _connection: connection,
             scanner,
-            split_ids: HashMap::new(),
-            stopping_offsets: HashMap::new(),
+            split_ids: HashMap::default(),
+            stopping_offsets: HashMap::default(),
             pending: std::collections::VecDeque::new(),
-        }
+        })
     }
 
     fn assign_splits(
@@ -72,7 +72,15 @@ impl FlussSplitReader {
         buckets: &[i64],
         start_offsets: &[i64],
         stopping_offsets: &[i64],
-    ) {
+    ) -> Result<(), String> {
+        if split_ids.len() != table_ids.len()
+            || split_ids.len() != partition_ids.len()
+            || split_ids.len() != buckets.len()
+            || split_ids.len() != start_offsets.len()
+            || split_ids.len() != stopping_offsets.len()
+        {
+            return Err("mismatched Fluss split assignment array lengths".to_string());
+        }
         for i in 0..split_ids.len() {
             let table_bucket = table_bucket(table_ids[i], partition_ids[i], buckets[i]);
             self.split_ids
@@ -84,7 +92,7 @@ impl FlussSplitReader {
             if partition_ids[i] == NO_PARTITION {
                 runtime()
                     .block_on(self.scanner.subscribe(buckets[i] as i32, start_offsets[i]))
-                    .expect("failed to subscribe Fluss bucket");
+                    .map_err(|e| format!("failed to subscribe Fluss bucket: {e}"))?;
             } else {
                 runtime()
                     .block_on(self.scanner.subscribe_partition(
@@ -92,28 +100,38 @@ impl FlussSplitReader {
                         buckets[i] as i32,
                         start_offsets[i],
                     ))
-                    .expect("failed to subscribe Fluss partition bucket");
+                    .map_err(|e| format!("failed to subscribe Fluss partition bucket: {e}"))?;
             }
         }
+        Ok(())
     }
 
-    fn unassign_splits(&mut self, table_ids: &[i64], partition_ids: &[i64], buckets: &[i64]) {
+    fn unassign_splits(
+        &mut self,
+        table_ids: &[i64],
+        partition_ids: &[i64],
+        buckets: &[i64],
+    ) -> Result<(), String> {
+        if table_ids.len() != partition_ids.len() || table_ids.len() != buckets.len() {
+            return Err("mismatched Fluss split unassignment array lengths".to_string());
+        }
         for i in 0..table_ids.len() {
             let table_bucket = table_bucket(table_ids[i], partition_ids[i], buckets[i]);
             self.unsubscribe_bucket(&table_bucket);
             self.split_ids.remove(&table_bucket);
             self.stopping_offsets.remove(&table_bucket);
         }
+        Ok(())
     }
 
-    fn poll(&mut self, timeout: std::time::Duration) -> usize {
+    fn poll(&mut self, timeout: std::time::Duration) -> Result<usize, String> {
         let batches = runtime()
             .block_on(self.scanner.poll(timeout))
-            .expect("failed to poll Fluss batches");
+            .map_err(|e| format!("failed to poll Fluss batches: {e}"))?;
         for batch in batches {
             self.enqueue(batch);
         }
-        self.pending.len()
+        Ok(self.pending.len())
     }
 
     fn enqueue(&mut self, scan_batch: fluss_rs::record::ScanBatch) {
@@ -177,91 +195,119 @@ fn table_bucket(table_id: i64, partition_id: i64, bucket: i64) -> fluss_rs::meta
 }
 
 #[cfg(feature = "fluss")]
-fn fluss_config(values: &[(String, String)]) -> fluss_rs::config::Config {
+fn fluss_config(values: &[(String, String)]) -> Result<fluss_rs::config::Config, String> {
     let mut config = fluss_rs::config::Config::default();
     for (key, value) in values {
         match key.as_str() {
             "bootstrap_servers" => config.bootstrap_servers = value.clone(),
-            "writer_request_max_size" => config.writer_request_max_size = parse(key, value),
+            "writer_request_max_size" => config.writer_request_max_size = parse(key, value)?,
             "writer_acks" => config.writer_acks = value.clone(),
-            "writer_retries" => config.writer_retries = parse(key, value),
-            "writer_batch_size" => config.writer_batch_size = parse(key, value),
+            "writer_retries" => config.writer_retries = parse(key, value)?,
+            "writer_batch_size" => config.writer_batch_size = parse(key, value)?,
             "writer_dynamic_batch_size_enabled" => {
-                config.writer_dynamic_batch_size_enabled = parse(key, value)
+                config.writer_dynamic_batch_size_enabled = parse(key, value)?
             }
             "writer_dynamic_batch_size_min" => {
-                config.writer_dynamic_batch_size_min = parse(key, value)
+                config.writer_dynamic_batch_size_min = parse(key, value)?
             }
             "writer_bucket_no_key_assigner" => {
-                config.writer_bucket_no_key_assigner = value
-                    .parse()
-                    .expect("failed to parse writer_bucket_no_key_assigner")
+                config.writer_bucket_no_key_assigner = value.parse().map_err(|e| {
+                    format!("failed to parse writer_bucket_no_key_assigner={value}: {e}")
+                })?
             }
             "scanner_remote_log_prefetch_num" => {
-                config.scanner_remote_log_prefetch_num = parse(key, value)
+                config.scanner_remote_log_prefetch_num = parse(key, value)?
             }
             "remote_file_download_thread_num" => {
-                config.remote_file_download_thread_num = parse(key, value)
+                config.remote_file_download_thread_num = parse(key, value)?
             }
             "scanner_log_max_poll_records" => {
-                config.scanner_log_max_poll_records = parse(key, value)
+                config.scanner_log_max_poll_records = parse(key, value)?
             }
-            "scanner_log_fetch_max_bytes" => config.scanner_log_fetch_max_bytes = parse(key, value),
-            "scanner_log_fetch_min_bytes" => config.scanner_log_fetch_min_bytes = parse(key, value),
+            "scanner_log_fetch_max_bytes" => {
+                config.scanner_log_fetch_max_bytes = parse(key, value)?
+            }
+            "scanner_log_fetch_min_bytes" => {
+                config.scanner_log_fetch_min_bytes = parse(key, value)?
+            }
             "scanner_log_fetch_wait_max_time_ms" => {
-                config.scanner_log_fetch_wait_max_time_ms = parse(key, value)
+                config.scanner_log_fetch_wait_max_time_ms = parse(key, value)?
             }
             "scanner_log_fetch_max_bytes_for_bucket" => {
-                config.scanner_log_fetch_max_bytes_for_bucket = parse(key, value)
+                config.scanner_log_fetch_max_bytes_for_bucket = parse(key, value)?
             }
-            "writer_batch_timeout_ms" => config.writer_batch_timeout_ms = parse(key, value),
-            "writer_enable_idempotence" => config.writer_enable_idempotence = parse(key, value),
+            "writer_batch_timeout_ms" => config.writer_batch_timeout_ms = parse(key, value)?,
+            "writer_enable_idempotence" => config.writer_enable_idempotence = parse(key, value)?,
             "writer_max_inflight_requests_per_bucket" => {
-                config.writer_max_inflight_requests_per_bucket = parse(key, value)
+                config.writer_max_inflight_requests_per_bucket = parse(key, value)?
             }
-            "writer_buffer_memory_size" => config.writer_buffer_memory_size = parse(key, value),
+            "writer_buffer_memory_size" => config.writer_buffer_memory_size = parse(key, value)?,
             "writer_buffer_wait_timeout_ms" => {
-                config.writer_buffer_wait_timeout_ms = parse(key, value)
+                config.writer_buffer_wait_timeout_ms = parse(key, value)?
             }
-            "connect_timeout_ms" => config.connect_timeout_ms = parse(key, value),
+            "connect_timeout_ms" => config.connect_timeout_ms = parse(key, value)?,
             "security_protocol" => config.security_protocol = value.clone(),
             "security_sasl_mechanism" => config.security_sasl_mechanism = value.clone(),
             "security_sasl_username" => config.security_sasl_username = value.clone(),
             "security_sasl_password" => config.security_sasl_password = value.clone(),
-            "lookup_queue_size" => config.lookup_queue_size = parse(key, value),
-            "lookup_max_batch_size" => config.lookup_max_batch_size = parse(key, value),
-            "lookup_batch_timeout_ms" => config.lookup_batch_timeout_ms = parse(key, value),
+            "lookup_queue_size" => config.lookup_queue_size = parse(key, value)?,
+            "lookup_max_batch_size" => config.lookup_max_batch_size = parse(key, value)?,
+            "lookup_batch_timeout_ms" => config.lookup_batch_timeout_ms = parse(key, value)?,
             "lookup_max_inflight_requests" => {
-                config.lookup_max_inflight_requests = parse(key, value)
+                config.lookup_max_inflight_requests = parse(key, value)?
             }
-            "lookup_max_retries" => config.lookup_max_retries = parse(key, value),
-            other => panic!("unsupported fluss-rs config key {other}"),
+            "lookup_max_retries" => config.lookup_max_retries = parse(key, value)?,
+            other => return Err(format!("unsupported fluss-rs config key {other}")),
         }
     }
-    config
+    Ok(config)
 }
 
 #[cfg(feature = "fluss")]
-fn parse<T>(key: &str, value: &str) -> T
+fn parse<T>(key: &str, value: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
     value
         .parse()
-        .unwrap_or_else(|e| panic!("failed to parse Fluss config {key}={value}: {e}"))
+        .map_err(|e| format!("failed to parse Fluss config {key}={value}: {e}"))
 }
 
 #[cfg(feature = "fluss")]
-fn export_record_batch(batch: RecordBatch, array_address: jlong, schema_address: jlong) {
-    let struct_array = StructArray::from(batch);
-    let out_data = <StructArray as Array>::into_data(struct_array);
-    let out_array = FFI_ArrowArray::new(&out_data);
-    let out_schema = FFI_ArrowSchema::try_from(out_data.data_type())
-        .expect("failed to export Fluss Arrow schema");
-    unsafe {
-        std::ptr::write(array_address as *mut FFI_ArrowArray, out_array);
-        std::ptr::write(schema_address as *mut FFI_ArrowSchema, out_schema);
+fn fluss_jni<T, F>(env: &mut JNIEnv, default: T, f: F) -> T
+where
+    F: FnOnce(&mut JNIEnv) -> Result<T, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(env))) {
+        Ok(Ok(value)) => value,
+        Ok(Err(message)) => {
+            throw_fluss_exception(env, &message);
+            default
+        }
+        Err(payload) => {
+            throw_fluss_exception(
+                env,
+                &format!("native Fluss reader panic: {}", panic_message(payload)),
+            );
+            default
+        }
+    }
+}
+
+#[cfg(feature = "fluss")]
+fn throw_fluss_exception(env: &mut JNIEnv, message: &str) {
+    let _ = env.throw_new("java/io/IOException", message);
+}
+
+#[cfg(feature = "fluss")]
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -276,24 +322,26 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openFlussRead
     table_name: JString<'local>,
     projected_fields: JIntArray<'local>,
 ) -> jlong {
-    let keys = read_string_array(&mut env, &config_keys);
-    let values = read_string_array(&mut env, &config_values);
-    let config: Vec<(String, String)> = keys.into_iter().zip(values).collect();
-    let database_name: String = env
-        .get_string(&database_name)
-        .map(Into::into)
-        .expect("failed to read Fluss database name");
-    let table_name: String = env
-        .get_string(&table_name)
-        .map(Into::into)
-        .expect("failed to read Fluss table name");
-    let projected_fields = read_columns(&env, &projected_fields);
-    into_handle(FlussSplitReader::open(
-        &config,
-        &database_name,
-        &table_name,
-        &projected_fields,
-    ))
+    fluss_jni(&mut env, 0, |env| {
+        let keys = read_string_array(env, &config_keys);
+        let values = read_string_array(env, &config_values);
+        let config: Vec<(String, String)> = keys.into_iter().zip(values).collect();
+        let database_name: String = env
+            .get_string(&database_name)
+            .map(Into::into)
+            .map_err(|e| format!("failed to read Fluss database name: {e}"))?;
+        let table_name: String = env
+            .get_string(&table_name)
+            .map(Into::into)
+            .map_err(|e| format!("failed to read Fluss table name: {e}"))?;
+        let projected_fields = read_columns(env, &projected_fields);
+        Ok(into_handle(FlussSplitReader::open(
+            &config,
+            &database_name,
+            &table_name,
+            &projected_fields,
+        )?))
+    })
 }
 
 #[cfg(feature = "fluss")]
@@ -309,56 +357,62 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignFlussSp
     start_offsets: JLongArray<'local>,
     stopping_offsets: JLongArray<'local>,
 ) {
-    let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
-    let split_ids = read_string_array(&mut env, &split_ids);
-    let table_ids = read_longs(&env, &table_ids);
-    let partition_ids = read_longs(&env, &partition_ids);
-    let buckets = read_longs(&env, &buckets);
-    let start_offsets = read_longs(&env, &start_offsets);
-    let stopping_offsets = read_longs(&env, &stopping_offsets);
-    reader.assign_splits(
-        &split_ids,
-        &table_ids,
-        &partition_ids,
-        &buckets,
-        &start_offsets,
-        &stopping_offsets,
-    );
+    fluss_jni(&mut env, (), |env| {
+        let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
+        let split_ids = read_string_array(env, &split_ids);
+        let table_ids = read_longs(env, &table_ids);
+        let partition_ids = read_longs(env, &partition_ids);
+        let buckets = read_longs(env, &buckets);
+        let start_offsets = read_longs(env, &start_offsets);
+        let stopping_offsets = read_longs(env, &stopping_offsets);
+        reader.assign_splits(
+            &split_ids,
+            &table_ids,
+            &partition_ids,
+            &buckets,
+            &start_offsets,
+            &stopping_offsets,
+        )
+    });
 }
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unassignFlussSplits<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     table_ids: JLongArray<'local>,
     partition_ids: JLongArray<'local>,
     buckets: JLongArray<'local>,
 ) {
-    let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
-    let table_ids = read_longs(&env, &table_ids);
-    let partition_ids = read_longs(&env, &partition_ids);
-    let buckets = read_longs(&env, &buckets);
-    reader.unassign_splits(&table_ids, &partition_ids, &buckets);
+    fluss_jni(&mut env, (), |env| {
+        let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
+        let table_ids = read_longs(env, &table_ids);
+        let partition_ids = read_longs(env, &partition_ids);
+        let buckets = read_longs(env, &buckets);
+        reader.unassign_splits(&table_ids, &partition_ids, &buckets)
+    });
 }
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pollFlussBatch<'local>(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     timeout_ms: jlong,
 ) -> jint {
-    let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
-    reader.poll(std::time::Duration::from_millis(timeout_ms as u64)) as jint
+    fluss_jni(&mut env, 0, |_env| {
+        let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
+        Ok(reader.poll(std::time::Duration::from_millis(timeout_ms as u64))? as jint)
+    })
 }
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSplit<'local>(
-    env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
     split_meta: JLongArray<'local>,
@@ -366,33 +420,38 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSpl
     out_array_address: jlong,
     out_schema_address: jlong,
 ) -> jint {
-    let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
-    let (split_id, next_offset, batch) = reader
-        .pending
-        .pop_front()
-        .expect("drainFlussSplit called with no pending batch");
-    let rows = batch.num_rows() as jint;
-    env.set_long_array_region(&split_meta, 0, &[next_offset])
-        .expect("failed to write Fluss split meta");
-    let split_id = env
-        .new_string(&split_id)
-        .expect("failed to allocate Fluss split id string");
-    env.set_object_array_element(&out_split_id, 0, &split_id)
-        .expect("failed to write Fluss split id");
-    export_record_batch(batch, out_array_address, out_schema_address);
-    rows
+    fluss_jni(&mut env, 0, |env| {
+        let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
+        let (split_id, next_offset, batch) = reader
+            .pending
+            .pop_front()
+            .ok_or_else(|| "drainFlussSplit called with no pending batch".to_string())?;
+        let rows = batch.num_rows() as jint;
+        env.set_long_array_region(&split_meta, 0, &[next_offset])
+            .map_err(|e| format!("failed to write Fluss split meta: {e}"))?;
+        let split_id = env
+            .new_string(&split_id)
+            .map_err(|e| format!("failed to allocate Fluss split id string: {e}"))?;
+        env.set_object_array_element(&out_split_id, 0, &split_id)
+            .map_err(|e| format!("failed to write Fluss split id: {e}"))?;
+        export_record_batch(batch, out_array_address, out_schema_address);
+        Ok(rows)
+    })
 }
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeFlussReader<'local>(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
 ) {
-    unsafe {
-        drop(from_handle::<FlussSplitReader>(handle));
-    }
+    fluss_jni(&mut env, (), |_env| {
+        unsafe {
+            drop(from_handle::<FlussSplitReader>(handle));
+        }
+        Ok(())
+    });
 }
 
 #[cfg(all(test, feature = "fluss"))]
@@ -434,7 +493,8 @@ mod tests {
             ("lookup_batch_timeout_ms".into(), "25".into()),
             ("lookup_max_inflight_requests".into(), "16".into()),
             ("lookup_max_retries".into(), "7".into()),
-        ]);
+        ])
+        .expect("translated config");
 
         assert_eq!(config.bootstrap_servers, "localhost:9123");
         assert_eq!(config.scanner_log_max_poll_records, 2048);
