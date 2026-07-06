@@ -2,10 +2,12 @@ package io.github.jordepic.streamfusion.planner;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Calc;
 import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.type.RelDataType;
+import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCalc;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalChangelogNormalize;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalCorrelate;
@@ -43,6 +45,7 @@ import org.apache.flink.table.planner.plan.trait.MiniBatchMode;
 import org.apache.flink.table.planner.plan.optimize.program.FlinkOptimizeProgram;
 import org.apache.flink.table.planner.plan.utils.ChangelogPlanUtils;
 import org.apache.flink.table.planner.plan.optimize.program.StreamOptimizeContext;
+import org.apache.flink.table.planner.plan.schema.TableSourceTable;
 
 /**
  * Optimizer program appended after the host engine's physical optimization. It rewrites the
@@ -671,6 +674,22 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       substitutions++;
       return new StreamPhysicalNativeOrcSource(
           scan.getCluster(), scan.getTraitSet(), scan.getRowType(), OrcSourceMatcher.path(scan));
+    }
+
+    if (current instanceof StreamPhysicalTableSourceScan) {
+      StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
+      Map<String, String> options = FilesystemTables.options(scan);
+      boolean flussConnectorOption = options != null && "fluss".equals(options.get("connector"));
+      if ((flussConnectorOption || isFlussTableSource(scan))
+          && NativeConfig.operatorEnabled("flussSource")) {
+        String flussFallback = FlussTables.fallbackReason(scan);
+        if (flussFallback == null) {
+          substitutions++;
+          return new StreamPhysicalNativeFlussSource(
+              scan.getCluster(), scan.getTraitSet(), scan.getRowType(), scan);
+        }
+        recordFallback("fluss source: " + flussFallback);
+      }
     }
 
     // The fully-native rdkafka source (Rust owns the consume) is the default Kafka path for the
@@ -1348,6 +1367,20 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     substitutions++;
     return new StreamPhysicalNativeKafkaDecode(
         scan.getCluster(), scan.getTraitSet(), scan.getRowType(), FilesystemTables.options(scan));
+  }
+
+  private static boolean isFlussTableSource(StreamPhysicalTableSourceScan scan) {
+    try {
+      TableSourceTable table = scan.getTable().unwrap(TableSourceTable.class);
+      if (table == null) {
+        return false;
+      }
+      DynamicTableSource source = table.tableSource();
+      return source != null
+          && "org.apache.fluss.flink.source.FlinkTableSource".equals(source.getClass().getName());
+    } catch (LinkageError | RuntimeException e) {
+      return false;
+    }
   }
 
   /**

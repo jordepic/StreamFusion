@@ -64,3 +64,44 @@ jobs:
       # hosted runners' preinstalled Docker daemon serves directly.
       - name: Run Java test suite
         run: mvn -B -ntp test
+
+  # The jobs above build without `--features fluss`, so Native.flussFeatureBuilt() is false and
+  # every @EnabledIf-gated Fluss test silently skips there. This leg builds the native library
+  # with the fluss feature and actually runs them: the Rust unit tests under the feature, then
+  # the Fluss JUnit classes against a fluss-feature debug build (the Fluss harness uses an
+  # in-process test cluster, no Docker needed).
+  fluss-tests:
+    name: Fluss feature (Rust + Java tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+
+      # Same reason as java-tests: a cold debug build of the native library plus the
+      # Maven repository outgrows the runner's default free space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Run native test suite (fluss feature)
+        working-directory: native
+        run: cargo test --features fluss
+
+      - name: Run Fluss Java tests (fluss-feature native build)
+        run: mvn -B -ntp -Dnative.cargo.args="build --features fluss" -Dtest='*Fluss*' test

@@ -398,7 +398,7 @@ pub(crate) fn read_columns(env: &JNIEnv, columns: &JIntArray) -> Vec<usize> {
 }
 
 /// Reads a JVM String[] into a Vec<String>.
-#[cfg(feature = "kafka")]
+#[cfg(any(feature = "kafka", feature = "fluss"))]
 pub(crate) fn read_string_array(env: &mut JNIEnv, array: &JObjectArray) -> Vec<String> {
     let length = env.get_array_length(array).expect("failed to read string[] length");
     let mut out = Vec::with_capacity(length as usize);

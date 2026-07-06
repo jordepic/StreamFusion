@@ -114,10 +114,17 @@ here when the ticket is deleted.
   Flink's converters exactly (divergences/21). The residual tail lives in ticket 32 (CSV/JSON
   *file* sources and the smaller CDC follow-ups).
 - **Nexmark matrix vs Flink — running.** The full q0–q22 suite (q6 excluded, wontdos/39) runs
-  native-substituted vs stock Flink across four source rungs (generator, Kafka JSON/Avro/Protobuf);
+  native-substituted vs stock Flink across the source rungs (generator, Parquet, Kafka
+  JSON/Avro/Protobuf, and the opt-in Fluss rung below);
   per-query routed-fraction/fallback reasons via `NexmarkExplainTest`, throughput matrix in the readme.
   It is the standing prioritization + regression gate; the coverage/perf gaps it surfaces feed the
   backlog below.
+- **Native Fluss log-table source — done** (was ticket 36). Fluss (columnar streaming storage) is the
+  opt-in fourth source rung of the Nexmark matrix (`SF_MATRIX_FLUSS=true`): the native fluss-rs
+  log-table reader vs stock Flink-on-Fluss, same steelman perimeter — the columnar-on-the-wire source
+  the perimeter-transpose hypothesis called for. Requires the `fluss` cargo feature (a pinned
+  arrow-aligned fork of apache/fluss-rust until the bump is upstreamed — `native/Cargo.toml`).
+  Method + build line in `docs/benchmarks.md`; numbers pending a full run.
 
 ## Next, roughly in order (re-prioritized 2026-07-04 after the operator profiling round)
 
@@ -171,7 +178,8 @@ here when the ticket is deleted.
    the exchange split — OVER +121–162%, retracting Top-N +228%, exchange +208% on Criterion;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
-   rejected on benchmark grounds — wontdos/28.)
+   rejected on benchmark grounds — wontdos/28.) Native Fluss follow-up: coalesce small fluss-rs
+   scanner batches before JNI export if profiles show per-batch overhead inside columnar pipelines.
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate
@@ -204,15 +212,6 @@ here when the ticket is deleted.
   decode; raw consume 1.21x the Java client). Remaining before the `kafkaSource` gate can default
   on: per-partition watermarks/idleness, specific-offsets / topic-pattern startup, key.format,
   SASL/SSL build features, Linux `mimalloc` link-alias verification, multi-broker measurement.
-- **Nexmark with Apache Fluss as the source** (ticket 36): add Fluss (columnar streaming storage) as a
-  fourth source in the Nexmark matrix; its columnar format may let the native island ingest Arrow with
-  little/no row transpose — the perimeter transpose is a visible share of the remaining stateful-query
-  cost, so Fluss is the source most likely to show the engine's largest end-to-end margin.
-- **Native Fluss log source** (ticket 44): the Kafka pattern mirrored onto Fluss — reuse its Flink
-  enumerator (dynamic partition discovery included) verbatim, swap the split reader for a JNI reader
-  over fluss-rust's Arrow batch scanner. Fluss's log is Arrow on the wire, so ingest can be
-  zero-decode/zero-transpose; feasibility confirmed 2026-07-05
-  (`.claude/research/fluss-native-source-findings.md`). Enables ticket 36's measurement.
 - **Native lookup join** (ticket 40): **coverage DONE** (2026-07-03). The native operators drive
   Flink's own generated lookup runners over each Arrow probe batch, so a processing-time lookup join
   (Nexmark q13) — INNER + LEFT, sync + async, field-ref *and constant* keys, pre-filter, dim-side

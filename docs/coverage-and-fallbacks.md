@@ -142,7 +142,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   batch's I/O. Still falls back: an **upsert-materialized** (keyed-state) lookup.
 - **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
   (see below); CDC covers the four JSON dialects (Debezium/OGG/Maxwell/Canal — the latter two for
-  flat scalar schemas).
+  flat scalar schemas); Fluss log tables via the native fluss-rs scanner (ARROW log format, a
+  verified scalar-type whitelist — see §5).
 - **Proctime** support, by operator:
   - **Deduplication** and **`OVER`** (running / bounded-ROWS) — native; they emit eagerly in arrival
     order, no wall-clock timer needed.
@@ -190,7 +191,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   `localGroupAggregate`, `miniBatchAssigner`, `lookupJoin`, …). The two-phase global half reuses the
   `groupAggregate` switch. All default on, `kafkaSource` included — the planner probes whether the
   loaded native library carries the (default) `kafka` cargo feature and falls back to the decode
-  path on an opt-out build.
+  path on an opt-out build. `flussSource` probes the same way for the **opt-in** `fluss` cargo
+  feature and falls back to the stock Fluss connector when the library was built without it.
 
 ### 2. Per-operator matcher declines (exact conditions)
 - **OVER** — a frame not of the form `… PRECEDING .. CURRENT ROW` (a `ROWS`/`RANGE` lower bound that
@@ -435,3 +437,41 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   columns** (findValue's recursive search could false-match a column name inside another field —
   flat scalar schemas only, up to 128 columns); Canal's `database.include`/`table.include` regex
   filters; and `debezium-avro-confluent` (Avro-bodied envelope).
+- **Fluss** — the native source (fluss-rs' `RecordBatchLogScanner`) replaces a Fluss **log-table**
+  scan behind a two-level gate: the `flussSource` operator switch
+  (`-Dstreamfusion.operator.flussSource.enabled`, default on) **and** a native library built with
+  the **opt-in** `fluss` cargo feature (`-Dnative.cargo.args="build --features fluss"` — the planner
+  probes `flussFeatureBuilt` and records `the native library was built without the fluss feature`
+  on a build without it). Coordination stays on the JVM by design — split assignment, startup-offset
+  resolution, partition discovery/acknowledgement, snapshot leases, and checkpointing run in the
+  Flink-side enumerator, so `scan.startup.mode`/`scan.startup.timestamp`,
+  `scan.partition.discovery.interval`, and `scan.kv.snapshot.lease.*` are honored there and never
+  translated into the native config (streaming and bounded scans, static and dynamically discovered
+  partitions, and column projection are all native). Still falling back, each recorded as
+  `fluss source: <reason>`:
+  - **Primary-key tables** — they read a changelog the native log scanner does not carry
+    (append-only log tables only).
+  - **Datalake-enabled tables** — a `lakeSource` reads through the lake, not the log.
+  - **Pushdown the native reader can't honor** — a pushed single-row filter, a modification scan
+    type, a row-count scan, a pushed-down `LIMIT`, pushed partition filters, an empty projection;
+    plus metadata/computed columns (not produced natively).
+  - **A `WATERMARK` clause** — like Kafka, Flink pushes it into the scan, and the native Fluss
+    source does not regenerate watermarks.
+  - **A column type outside the verified whitelist** — BOOLEAN, TINYINT, SMALLINT, INT, BIGINT,
+    FLOAT, DOUBLE, CHAR, VARCHAR, DECIMAL, DATE, TIME, plain TIMESTAMP, VARBINARY, and nested ROWs
+    whose leaves are also whitelisted: the intersection of fluss-rs' Arrow export and what the
+    vendored `ArrowConversion` readers accept, parity-pinned by `NativeFlussTypeParityTest`.
+    Notable exclusions: **TIMESTAMP_LTZ** (fluss-rs exports a zoned timestamp vector, which
+    `ArrowConversion` currently rejects), **BINARY** (`ArrowConversion.toArrowSchema` has no
+    BINARY mapping), and **nested ARRAY/MAP** (unverified across the boundary).
+  - **`table.log.format` other than `ARROW`** — fluss-rs' scan validation errors on any other log
+    format.
+  - **Client config the native client can't mirror** — an unrecognized `client.*` option; a known
+    option with no fluss-rs `Config` field (`client.id`, `client.request-timeout`,
+    `client.scanner.log.check-crc`, `client.scanner.io.tmpdir`, `client.metrics.enabled`,
+    `client.security.sasl.jaas.config`); a `client.security.protocol` other than PLAINTEXT or SASL;
+    a SASL mechanism other than PLAIN. `client.writer.*`/`client.lookup.*` options are **ignored**,
+    not fallbacks — a read-only source never runs the write or lookup paths.
+
+  Every decline above surfaces through the usual channel — `NativePlanner.explain(...)` /
+  `-Dstreamfusion.logFallbackReasons=true`.
