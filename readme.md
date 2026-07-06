@@ -84,8 +84,8 @@ engines (standard tuned-prod setting).
 StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively end-to-end with no
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
 ([analysis](.claude/wontdos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, on the
-recommended `mimalloc` native build (the Kafka feature is a default), from a rowwise `RowData` source, a local Parquet file, and
-each Kafka value format, ordered by query number. Both engines run Flink's **default configuration**
+recommended `mimalloc` native build (the Kafka feature is a default), from a rowwise `RowData` source, a local Parquet file, a
+Fluss log table (the opt-in `fluss` cargo feature), and each Kafka value format, ordered by query number. Both engines run Flink's **default configuration**
 (mini-batch off) apart from the object reuse noted above; the mini-batch-tuned comparison is a
 separate table in [docs/benchmarks.md](docs/benchmarks.md):
 
@@ -97,32 +97,32 @@ diverge from Flink at an edge; where the two differ enough to matter (**q21**) b
 separate rows, and where the opt-in measures within noise (**‡ q1**, **§ q10/q14/q15/q16/q17**) it stays
 one row with a footnote.
 
-| Query | Shape | From RowData | From Parquet file | From JSON on Kafka | From Avro on Kafka | From Protobuf on Kafka |
-|---|---|---|---|---|---|---|
-| q0 | pass-through projection of `bid` | **1.33×** | **3.21×** | **2.71×** | **3.42×** | **2.58×** |
-| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.13×** | **3.07×** | **2.39×** | **3.35×** | **2.62×** |
-| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.30×** | **3.56×** | **2.04×** | **2.48×** | **2.09×** |
-| q3 | updating join `auction ⋈ person` | 0.95× | **3.57×** | **1.97×** | **2.38×** | **1.80×** |
-| q4 | regular join → `MAX` → `AVG` per category | **1.31×** | **3.61×** | **2.43×** | **3.27×** | **2.66×** |
-| q5 | Hot Items (window re-agg + window join) | **1.47×** | **3.45×** | **2.32×** | **3.35×** | **3.04×** |
-| q7 | tumble `MAX` ⋈ bid | **1.61×** | **4.22×** | **2.89×** | **4.11×** | **3.21×** |
-| q8 | tumble windowed-distinct ⋈ join | 0.87× | **4.37×** | **2.22×** | **2.94×** | **2.58×** |
-| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.18×** | **1.94×** | **2.24×** | **2.13×** | **2.35×** |
-| q10 § | `DATE_FORMAT` projection | **1.11×** | **2.54×** | **2.69×** | **2.64×** | **2.26×** |
-| q11 | session-window `COUNT` per bidder | **2.79×** | **5.39×** | **3.93×** | **5.18×** | **5.55×** |
-| q12 | proctime tumble `COUNT` per bidder | **1.52×** | **3.23×** | **2.31×** | **2.55×** | **2.14×** |
-| q13 | lookup join (bounded dimension) | **1.07×** | **2.26×** | **2.20×** | **2.75×** | **2.14×** |
-| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | **1.02×** | **3.30×** | **2.47×** | **3.50×** | **2.66×** |
-| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.42×** | **2.07×** | **2.76×** | **3.06×** | **2.52×** |
-| q16 § | multi-`DISTINCT` per channel/day | **1.36×** | **1.37×** | **1.86×** | **1.87×** | **1.65×** |
-| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.32×** | **2.23×** | **2.49×** | **2.59×** | **2.23×** |
-| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.13×** | **2.27×** | **2.52×** | **3.02×** | **2.58×** |
-| q19 | `ROW_NUMBER` topN (≤ 10) | **1.50×** | **1.75×** | **1.98×** | **1.89×** | **1.85×** |
-| q20 | updating join (`category = 10`) | 0.84× | **3.40×** | **2.38×** | **3.40×** | **2.92×** |
-| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.96× | **2.77×** | **2.44×** | **2.98×** | **2.64×** |
-| q21 † | …opt-in native regex/case (`allowIncompatible`) | **1.54×** | **6.14×** | **2.46×** | **3.01×** | **2.62×** |
-| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.18×** | **3.58×** | **2.49×** | **2.83×** | **2.28×** |
-| q23 | three-way join `bid ⋈ person ⋈ auction` | **1.38×** | **3.91×** | **2.09×** | **2.85×** | **2.38×** |
+| Query | Shape | From RowData | From Parquet file | From Fluss | From JSON on Kafka | From Avro on Kafka | From Protobuf on Kafka |
+|---|---|---|---|---|---|---|---|
+| q0 | pass-through projection of `bid` | **1.33×** | **3.21×** | **3.01×** | **2.71×** | **3.42×** | **2.58×** |
+| q1 ‡ | `0.908 * price` — exact `Decimal128` (byte-parity) | **1.13×** | **3.07×** | **2.31×** | **2.39×** | **3.35×** | **2.62×** |
+| q2 | filter `WHERE MOD(auction, 123) = 0` | **1.30×** | **3.56×** | **3.11×** | **2.04×** | **2.48×** | **2.09×** |
+| q3 | updating join `auction ⋈ person` | 0.95× | **3.57×** | **1.59×** | **1.97×** | **2.38×** | **1.80×** |
+| q4 | regular join → `MAX` → `AVG` per category | **1.31×** | **3.61×** | — ¶ | **2.43×** | **3.27×** | **2.66×** |
+| q5 | Hot Items (window re-agg + window join) | **1.47×** | **3.45×** | — ¶ | **2.32×** | **3.35×** | **3.04×** |
+| q7 | tumble `MAX` ⋈ bid | **1.61×** | **4.22×** | — ¶ | **2.89×** | **4.11×** | **3.21×** |
+| q8 | tumble windowed-distinct ⋈ join | 0.87× | **4.37×** | — ¶ | **2.22×** | **2.94×** | **2.58×** |
+| q9 | regular join → `ROW_NUMBER` (≤ 1) | **1.18×** | **1.94×** | — ¶ | **2.24×** | **2.13×** | **2.35×** |
+| q10 § | `DATE_FORMAT` projection | **1.11×** | **2.54×** | **1.54×** | **2.69×** | **2.64×** | **2.26×** |
+| q11 | session-window `COUNT` per bidder | **2.79×** | **5.39×** | — ¶ | **3.93×** | **5.18×** | **5.55×** |
+| q12 | proctime tumble `COUNT` per bidder | **1.52×** | **3.23×** | — ¶ | **2.31×** | **2.55×** | **2.14×** |
+| q13 | lookup join (bounded dimension) | **1.07×** | **2.26×** | — ¶ | **2.20×** | **2.75×** | **2.14×** |
+| q14 § | `HOUR`/`CASE` + `count_char` UDF + decimal | **1.02×** | **3.30×** | **1.43×** | **2.47×** | **3.50×** | **2.66×** |
+| q15 § | multi-`DISTINCT` `COUNT`s per day (`DATE_FORMAT` group) | **1.42×** | **2.07×** | 0.72× | **2.76×** | **3.06×** | **2.52×** |
+| q16 § | multi-`DISTINCT` per channel/day | **1.36×** | **1.37×** | 0.77× | **1.86×** | **1.87×** | **1.65×** |
+| q17 § | group agg + `AVG`/`MIN`/`MAX`/`SUM` per day | **1.32×** | **2.23×** | 0.70× | **2.49×** | **2.59×** | **2.23×** |
+| q18 | `ROW_NUMBER` dedup (≤ 1) | **1.13×** | **2.27×** | **1.99×** | **2.52×** | **3.02×** | **2.58×** |
+| q19 | `ROW_NUMBER` topN (≤ 10) | **1.50×** | **1.75×** | **1.08×** | **1.98×** | **1.89×** | **1.85×** |
+| q20 | updating join (`category = 10`) | 0.84× | **3.40×** | **2.29×** | **2.38×** | **3.40×** | **2.92×** |
+| q21 | `CASE` + `REGEXP_EXTRACT`/`LOWER` — JVM upcall (byte-parity) | 0.96× | **2.77×** | — ¶ | **2.44×** | **2.98×** | **2.64×** |
+| q21 † | …opt-in native regex/case (`allowIncompatible`) | **1.54×** | **6.14×** | — ¶ | **2.46×** | **3.01×** | **2.62×** |
+| q22 | `SPLIT_INDEX(url, '/', n)` projection | **1.18×** | **3.58×** | **1.85×** | **2.49×** | **2.83×** | **2.28×** |
+| q23 | three-way join `bid ⋈ person ⋈ auction` | **1.38×** | **3.91×** | **1.10×** | **2.09×** | **2.85×** | **2.38×** |
 
 From `RowData`, 19 of 23 queries win outright — the joins, Top-N/dedup family, projections and
 aggregates, lifted across the 2026-07 profiling round (shared rowwise prefix, allocation-free
@@ -151,6 +151,22 @@ and the opt-in pure-Rust `chrono-tz` path is no faster here because the datetime
 bottleneck — so parity is free (unlike q21's regex). On `RowData`/Parquet those queries use a plain
 `TIMESTAMP` and never take the LTZ path. See
 [divergences/17](divergences/17-ltz-datetime-session-zone.md).
+
+**From a Fluss log table the wire format *is* Arrow** — the native fluss-rs reader consumes the
+table's log batches directly, no ingest transpose and no decode — and eleven of the fourteen
+measured queries beat the stock Fluss connector: projections and filters at **1.4–3.1×** (the
+highest absolute native rates of any streaming rung), and the updating joins that trail on the
+`RowData` rung (q3 0.95×, q20 0.84×) clearing it decisively here (**1.59×**, **2.29×**). The distinct-agg
+family (q15–q17) trails 1× on this rung only — the fluss-rs scanner emits one small Arrow batch
+per producer wire batch, and per-batch overhead lands hardest on the changelog-aggregate chain;
+batch coalescing is the known follow-up.
+**¶** The Fluss rung times *time-to-Nth-row* on an unbounded log (Fluss has no bounded scan
+mode), so it skips queries with no deterministic finish line: the windowed/proctime/lookup set
+(the benchmark's Fluss table declares no time attribute yet — watermark push-down regeneration
+is on the board), q4/q9 (a two-input join feeds an update-collapsing aggregate/rank, so the
+changelog row *count* varies with join-input interleaving even between two stock Flink runs),
+and q21 (zero output rows over this generator's channels/URLs). All of them stay measured on
+the bounded rungs, which run to end-of-input and need no row target.
 
 **From a Kafka source, owning the consume in Rust compounds the operator verdict**: with the native
 rdkafka source every query on every format clears **1.65×**, all but a handful clear **2×**, and the

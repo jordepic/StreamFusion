@@ -124,9 +124,11 @@ here when the ticket is deleted.
   log-table reader vs stock Flink-on-Fluss, same steelman perimeter — the columnar-on-the-wire source
   the perimeter-transpose hypothesis called for. Requires the `fluss` cargo feature (a pinned
   arrow-aligned fork of apache/fluss-rust until the bump is upstreamed — `native/Cargo.toml`).
-  Method + build line in `docs/benchmarks.md`; numbers pending a full run. Follow-up: regenerate
-  the pushed watermark so event-time queries route (the Kafka machinery, shared — ticket 53),
-  which also unlocks the rung's skipped windowed queries.
+  Method + full numbers in `docs/benchmarks.md` (2026-07-06 run: 11 of 14 measured queries clear
+  1×, projections/filters 1.4–3.1×, updating joins 1.59–2.29×; the distinct-agg family trails at
+  0.70–0.77× pending scanner-batch coalescing). Follow-up: regenerate the pushed watermark so
+  event-time queries route (the Kafka machinery, shared — ticket 53), which also unlocks the
+  rung's skipped windowed queries.
 
 ## Next, roughly in order (re-prioritized 2026-07-04 after the operator profiling round)
 
@@ -181,7 +183,9 @@ here when the ticket is deleted.
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
    rejected on benchmark grounds — wontdos/28.) Native Fluss follow-up: coalesce small fluss-rs
-   scanner batches before JNI export if profiles show per-batch overhead inside columnar pipelines.
+   scanner batches before JNI export — the 2026-07-06 Fluss rung run gives this its acceptance
+   benchmark (q15/q16/q17 at 0.70–0.77× on Fluss vs 1.3–1.4× on the generator: the
+   changelog-aggregate chain pays per-batch costs on one-wire-batch-sized Arrow batches).
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate

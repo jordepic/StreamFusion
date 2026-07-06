@@ -49,7 +49,8 @@ import org.testcontainers.utility.DockerImageName;
  * run counts changelog rows in the sink and cancels the job once the Nth row arrives, reporting
  * time-to-Nth-row. N is the query's full output cardinality over the preloaded events, measured once
  * per query with stock Flink on the bounded generator (the same rows the preload wrote) through the
- * same plain-TIMESTAMP views, so both engines are cancelled at the same row.
+ * same plain-TIMESTAMP views, so both engines are cancelled at the same row. Queries with no such
+ * deterministic N report a skip cell instead — see {@link #flussSkipReason}.
  *
  * <p>The query set is every query StreamFusion accelerates: q0–q5, q7–q23 (q1's and q14's decimal are
  * exact and native by default; q21's REGEXP_EXTRACT/LOWER and q14's HOUR route through the host
@@ -519,13 +520,9 @@ class NexmarkMatrixBenchmark {
         String bootstrapServers = cluster.getBootstrapServers();
         writeFlussSource(bootstrapServers);
         for (Query q : queries) {
-          if (!flussBaselineSupported(q)) {
-            report
-                .get(q.label)
-                .add(
-                    skipCell(
-                        "fluss",
-                        "plain-timestamp baseline does not cover time-attribute/proctime/lookup"));
+          String skipReason = flussSkipReason(q);
+          if (skipReason != null) {
+            report.get(q.label).add(skipCell("fluss", skipReason));
             continue;
           }
           long targetRows = flussTargetRows(q);
@@ -886,8 +883,23 @@ class NexmarkMatrixBenchmark {
             + "')");
   }
 
-  private static boolean flussBaselineSupported(Query q) {
-    return !Set.of("q5", "q7", "q8", "q11", "q12", "q13").contains(q.label);
+  /**
+   * Why a query cannot run on the Fluss rung, or null when it can. Two families: the
+   * windowed/proctime/lookup queries need a time attribute the plain-timestamp Fluss table doesn't
+   * declare (ticket 53 adds the watermark), and q4/q9 have no deterministic Nth sink row to cancel
+   * at — their two-input join feeds an update-collapsing aggregate/rank (Flink skips the -U/+U pair
+   * when the aggregate value didn't change), so the changelog cardinality depends on the join's
+   * input interleaving, which varies run to run. The bounded rungs never see this: they measure to
+   * end-of-input, not to a row count.
+   */
+  private static String flussSkipReason(Query q) {
+    if (Set.of("q5", "q7", "q8", "q11", "q12", "q13").contains(q.label)) {
+      return "plain-timestamp baseline does not cover time-attribute/proctime/lookup";
+    }
+    if (Set.of("q4", "q9").contains(q.label)) {
+      return "changelog cardinality is interleaving-dependent; no deterministic Nth row to cancel at";
+    }
+    return null;
   }
 
   /**
