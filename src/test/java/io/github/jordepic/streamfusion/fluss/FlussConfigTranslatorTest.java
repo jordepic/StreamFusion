@@ -51,11 +51,39 @@ class FlussConfigTranslatorTest {
     Map<String, String> config =
         translated(
             Map.of(
-                "client.writer.buffer.memory-size", "1 tb",
-                "client.writer.buffer.wait-timeout", "1 d"));
+                "client.scanner.log.fetch.max-bytes", "1 tb",
+                "client.connect-timeout", "1 d"));
 
-    assertEquals("1099511627776", config.get("writer_buffer_memory_size"));
-    assertEquals("86400000", config.get("writer_buffer_wait_timeout_ms"));
+    assertEquals("1099511627776", config.get("scanner_log_fetch_max_bytes"));
+    assertEquals("86400000", config.get("connect_timeout_ms"));
+  }
+
+  @Test
+  void ignoresWriterAndLookupOptionsWithoutTranslatingThem() {
+    FlussConfigTranslator.Result result =
+        FlussConfigTranslator.translate(
+            Map.of(
+                "bootstrap.servers", "localhost:9123",
+                "client.writer.acks", "all",
+                "client.writer.batch-size", "2 mb",
+                "client.writer.bucket.no-key-assigner", "round_robin",
+                "client.lookup.max-batch-size", "256",
+                "client.lookup.batch-timeout", "50 ms"));
+
+    assertTrue(result.isTranslated(), () -> "expected translation, got " + result.fallbackReason());
+    assertEquals(Map.of("bootstrap_servers", "localhost:9123"), result.config());
+  }
+
+  @Test
+  void fallsBackOnUnrecognizedClientOptions() {
+    String reason =
+        fallback(
+            Map.of(
+                "bootstrap.servers", "localhost:9123",
+                "client.scanner.log.fetch.max-bytes", "16 mb",
+                "client.scanner.new-knob", "on"));
+
+    assertTrue(reason.contains("client.scanner.new-knob"), reason);
   }
 
   @Test
@@ -94,6 +122,14 @@ class FlussConfigTranslatorTest {
                     "client.security.protocol", "sasl",
                     "client.security.sasl.mechanism", "SCRAM-SHA-256"))
             .contains("PLAIN"));
+  }
+
+  @Test
+  void rejectsSecurityProtocolsFlussRsDoesNotImplement() {
+    assertTrue(fallback(Map.of("client.security.protocol", "ssl")).contains("ssl"));
+    assertEquals(
+        "PLAINTEXT",
+        translated(Map.of("client.security.protocol", "PLAINTEXT")).get("security_protocol"));
   }
 
   @Test

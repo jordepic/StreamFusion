@@ -681,11 +681,14 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       Map<String, String> options = FilesystemTables.options(scan);
       boolean flussConnectorOption = options != null && "fluss".equals(options.get("connector"));
       if ((flussConnectorOption || isFlussTableSource(scan))
-          && NativeConfig.operatorEnabled("flussSource")
-          && FlussTables.isNativeFluss(scan)) {
-        substitutions++;
-        return new StreamPhysicalNativeFlussSource(
-            scan.getCluster(), scan.getTraitSet(), scan.getRowType(), scan);
+          && NativeConfig.operatorEnabled("flussSource")) {
+        String flussFallback = FlussTables.fallbackReason(scan);
+        if (flussFallback == null) {
+          substitutions++;
+          return new StreamPhysicalNativeFlussSource(
+              scan.getCluster(), scan.getTraitSet(), scan.getRowType(), scan);
+        }
+        recordFallback("fluss source: " + flussFallback);
       }
     }
 

@@ -10,7 +10,10 @@ import org.apache.flink.util.TimeUtils;
  * Translates the Fluss Java/Flink table options that belong to the Fluss client into the field names
  * used by {@code fluss-rs::Config}. Flink source-coordination options are deliberately kept out of
  * the native config: those decide startup offsets, partition discovery, split assignment, and
- * checkpoints on the JVM side.
+ * checkpoints on the JVM side. Writer/lookup client options are likewise dropped without falling
+ * back — they configure the write and lookup paths, which a read-only source never executes. Any
+ * other {@code client.*} option without a known fluss-rs mapping produces a fallback, so a setting
+ * the native path cannot honor declines instead of silently diverging.
  */
 public final class FlussConfigTranslator {
 
@@ -59,18 +62,6 @@ public final class FlussConfigTranslator {
           Map.entry("client.scanner.log.max-poll-records", "scanner_log_max_poll_records"),
           Map.entry("client.scanner.remote-log.prefetch-num", "scanner_remote_log_prefetch_num"),
           Map.entry("client.remote-file.download-thread-num", "remote_file_download_thread_num"),
-          Map.entry("client.writer.dynamic-batch-size.enabled", "writer_dynamic_batch_size_enabled"),
-          Map.entry("client.writer.bucket.no-key-assigner", "writer_bucket_no_key_assigner"),
-          Map.entry("client.writer.acks", "writer_acks"),
-          Map.entry("client.writer.retries", "writer_retries"),
-          Map.entry("client.writer.enable-idempotence", "writer_enable_idempotence"),
-          Map.entry(
-              "client.writer.max-inflight-requests-per-bucket",
-              "writer_max_inflight_requests_per_bucket"),
-          Map.entry("client.lookup.queue-size", "lookup_queue_size"),
-          Map.entry("client.lookup.max-batch-size", "lookup_max_batch_size"),
-          Map.entry("client.lookup.max-inflight-requests", "lookup_max_inflight_requests"),
-          Map.entry("client.lookup.max-retries", "lookup_max_retries"),
           Map.entry("client.security.protocol", "security_protocol"),
           Map.entry("client.security.sasl.mechanism", "security_sasl_mechanism"),
           Map.entry("client.security.sasl.username", "security_sasl_username"),
@@ -82,18 +73,12 @@ public final class FlussConfigTranslator {
           Map.entry(
               "client.scanner.log.fetch.max-bytes-for-bucket",
               "scanner_log_fetch_max_bytes_for_bucket"),
-          Map.entry("client.scanner.log.fetch.min-bytes", "scanner_log_fetch_min_bytes"),
-          Map.entry("client.writer.request-max-size", "writer_request_max_size"),
-          Map.entry("client.writer.batch-size", "writer_batch_size"),
-          Map.entry("client.writer.buffer.memory-size", "writer_buffer_memory_size"));
+          Map.entry("client.scanner.log.fetch.min-bytes", "scanner_log_fetch_min_bytes"));
 
   private static final Map<String, String> DURATION =
       Map.ofEntries(
           Map.entry("client.connect-timeout", "connect_timeout_ms"),
-          Map.entry("client.scanner.log.fetch.wait-max-time", "scanner_log_fetch_wait_max_time_ms"),
-          Map.entry("client.writer.batch-timeout", "writer_batch_timeout_ms"),
-          Map.entry("client.writer.buffer.wait-timeout", "writer_buffer_wait_timeout_ms"),
-          Map.entry("client.lookup.batch-timeout", "lookup_batch_timeout_ms"));
+          Map.entry("client.scanner.log.fetch.wait-max-time", "scanner_log_fetch_wait_max_time_ms"));
 
   private static final String[] COORDINATION = {
     "scan.startup.mode",
@@ -112,6 +97,10 @@ public final class FlussConfigTranslator {
     "client.security.sasl.jaas.config"
   };
 
+  // Write/lookup-path client options: legitimate table/client properties, but they configure paths a
+  // read-only source never executes, so they are ignored rather than translated or fallback-triggering.
+  private static final String[] READ_IRRELEVANT_PREFIXES = {"client.writer.", "client.lookup."};
+
   /** Translates known client options, or returns a fallback reason for a setting not safely mirrored. */
   public static Result translate(Map<String, String> options) {
     Map<String, String> out = new LinkedHashMap<>();
@@ -129,9 +118,19 @@ public final class FlussConfigTranslator {
       }
     }
 
+    for (String key : options.keySet()) {
+      if (key.startsWith("client.")
+          && !DIRECT.containsKey(key)
+          && !MEMORY.containsKey(key)
+          && !DURATION.containsKey(key)
+          && !readIrrelevant(key)) {
+        return Result.fallback("unrecognized Fluss client option " + key);
+      }
+    }
+
     for (Map.Entry<String, String> entry : DIRECT.entrySet()) {
       if (options.containsKey(entry.getKey())) {
-        out.put(entry.getValue(), translateDirect(entry.getKey(), options.get(entry.getKey())));
+        out.put(entry.getValue(), options.get(entry.getKey()));
       }
     }
     for (Map.Entry<String, String> entry : MEMORY.entrySet()) {
@@ -146,6 +145,12 @@ public final class FlussConfigTranslator {
     }
 
     String protocol = out.get("security_protocol");
+    if (protocol != null
+        && !protocol.equalsIgnoreCase("plaintext")
+        && !protocol.equalsIgnoreCase("sasl")) {
+      return Result.fallback(
+          "fluss-rs supports only the PLAINTEXT and SASL security protocols, not " + protocol);
+    }
     String mechanism = out.getOrDefault("security_sasl_mechanism", "PLAIN");
     if (protocol != null
         && protocol.equalsIgnoreCase("sasl")
@@ -156,11 +161,13 @@ public final class FlussConfigTranslator {
     return Result.translated(out, coordination);
   }
 
-  private static String translateDirect(String javaKey, String value) {
-    if ("client.writer.bucket.no-key-assigner".equals(javaKey)) {
-      return value.trim().toLowerCase().replace('-', '_');
+  private static boolean readIrrelevant(String key) {
+    for (String prefix : READ_IRRELEVANT_PREFIXES) {
+      if (key.startsWith(prefix)) {
+        return true;
+      }
     }
-    return value;
+    return false;
   }
 
   private static long parseMemoryBytes(String value) {
