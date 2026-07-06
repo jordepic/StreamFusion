@@ -124,7 +124,9 @@ here when the ticket is deleted.
   log-table reader vs stock Flink-on-Fluss, same steelman perimeter — the columnar-on-the-wire source
   the perimeter-transpose hypothesis called for. Requires the `fluss` cargo feature (a pinned
   arrow-aligned fork of apache/fluss-rust until the bump is upstreamed — `native/Cargo.toml`).
-  Method + build line in `docs/benchmarks.md`; numbers pending a full run.
+  Method + build line in `docs/benchmarks.md`; numbers pending a full run. Follow-up: regenerate
+  the pushed watermark so event-time queries route (the Kafka machinery, shared — ticket 53),
+  which also unlocks the rung's skipped windowed queries.
 
 ## Next, roughly in order (re-prioritized 2026-07-04 after the operator profiling round)
 
