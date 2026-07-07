@@ -140,10 +140,15 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   own `table.exec.async-lookup.buffer-capacity`). This is not vectorizable compute — it is a JVM
   upcall into the host connector — but it keeps the island unbroken, and the async path overlaps a
   batch's I/O. Still falls back: an **upsert-materialized** (keyed-state) lookup.
-- **Sources/sink** — local `file:` path only (Parquet source, Parquet sink); Kafka decode limited
-  (see below); CDC covers the four JSON dialects (Debezium/OGG/Maxwell/Canal — the latter two for
-  flat scalar schemas); Fluss log tables via the native fluss-rs scanner (ARROW log format, a
-  verified scalar-type whitelist — see §5).
+- **Sources/sink** — Parquet source reads local `file:` paths only. The Parquet **sink** writes to
+  **any path scheme Flink has a filesystem for** (`file:`/`s3:`/`gs:`/`abfs:`/`hdfs:`/`oss:`/…):
+  the native side only encodes Parquet bytes, drained into Flink's own recoverable output streams,
+  so filesystem plugins, credentials, exactly-once commit, and partition commit are the host's own
+  code. `PARTITIONED BY` tables are fully supported, including `sink.partition-commit.*` triggers
+  and policies (`_SUCCESS` files) via Flink's verbatim `PartitionCommitter`. Sink fallback causes
+  are enumerated in §5. Kafka decode limited (see below); CDC covers the four JSON dialects
+  (Debezium/OGG/Maxwell/Canal — the latter two for flat scalar schemas); Fluss log tables via the
+  native fluss-rs scanner (ARROW log format, a verified scalar-type whitelist — see §5).
 - **Proctime** support, by operator:
   - **Deduplication** and **`OVER`** (running / bounded-ROWS) — native; they emit eagerly in arrival
     order, no wall-clock timer needed.
@@ -377,11 +382,38 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   split still falls back.
 
 ### 5. Source / sink / connector
-- **Filesystem** — non-local path (`hdfs:`/`s3:`/…) for the Parquet source and Parquet sink; any
-  non-Parquet source format; any non-Parquet sink format. (An ORC source existed and was removed:
-  its scan engine, datafusion-orc, lags DataFusion releases, and keeping it meant carrying a fork
-  pin through every DataFusion bump — restoring it is
-  https://github.com/datafusion-contrib/StreamFusion/issues/19.)
+- **Filesystem source** — non-local path (`hdfs:`/`s3:`/…) for the Parquet source; any non-Parquet
+  source format. (An ORC source existed and was removed: its scan engine, datafusion-orc, lags
+  DataFusion releases, and keeping it meant carrying a fork pin through every DataFusion bump —
+  restoring it is https://github.com/datafusion-contrib/StreamFusion/issues/19.)
+- **Filesystem Parquet sink** — any path scheme Flink has a filesystem for is accepted (Flink's own
+  recoverable streams do the IO). The sink's config translator honors every option 1:1 or declines
+  with a recorded reason; `parquet.*` keys that stock Flink itself never reads (its writer builder
+  bypasses the Hadoop-config-driven properties: bloom filters, page row limits, statistics/column
+  index truncation, page checksums, per-column `#col` overrides, …) are ignored exactly as the host
+  ignores them. Every fallback cause:
+  - **Timestamp columns without `'parquet.write.int64.timestamp' = 'true'`** — Flink's default
+    encoding is INT96, which the Rust writer cannot produce (INT96 support via the low-level writer
+    is a tracked follow-up).
+  - **Timestamp columns without `'parquet.utc-timezone' = 'true'`** — the default shifts values
+    through the JVM's local timezone, not safely reproducible off-JVM.
+  - **Nested written columns** (`ARRAY`/`MAP`/`MULTISET`/`ROW`/`RAW`) — Parquet group-encoding
+    parity unverified; scalar columns cover BOOLEAN/TINYINT/SMALLINT/INT/BIGINT/FLOAT/DOUBLE/
+    CHAR/VARCHAR/BINARY/VARBINARY/DECIMAL(any precision, minimal fixed-width binary like the
+    host)/DATE/TIME/TIMESTAMP/TIMESTAMP_LTZ. Partition-key columns are exempt (their values become
+    directory names via Flink's own code, never Parquet bytes).
+  - **`'auto-compaction' = 'true'`** — Flink's compaction topology has no native counterpart.
+  - **`parquet.compression` outside UNCOMPRESSED/SNAPPY/GZIP/ZSTD** (LZO/LZ4/BROTLI/LZ4_RAW);
+    zstd/gzip levels are honored, including DDL and cluster-Hadoop-config overrides.
+  - **Multithreaded zstd** (`parquet.compression.codec.zstd.workers` ≠ 0) — changes the compressed
+    frame layout.
+  - **`'parquet.validation' = 'true'`**, an unrecognized `parquet.writer.version` or
+    `parquet.timestamp.time.unit`, a non-numeric size option, or any unrecognized non-`parquet.`
+    sink option.
+  - **`INSERT OVERWRITE`** and any unmodeled sink ability — falling back reproduces the host's own
+    streaming-mode rejection.
+  - A **changelog (retracting) input** — defense-in-depth; Flink's own validation rejects it first.
+- **Filesystem sink, non-Parquet format** — any non-Parquet sink format falls back.
 - **Kafka** — value format outside JSON/CSV/raw/bare-Avro/`avro-confluent`/protobuf; a `key.format`;
   a `scan.bounded.mode` other than unbounded/latest-offset; protobuf fields needing representation
   reconciliation (enum/unsigned/bytes/proto3-defaults/well-known types); **`ignore-parse-errors` on a

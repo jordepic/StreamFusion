@@ -1,96 +1,14 @@
 use crate::*;
 
-/// Encodes a single Arrow batch to a Parquet file. The core of the native columnar sink: the batch
-/// is written in its columnar form directly, skipping the host's row-to-Parquet encoding.
+/// Writes one batch to a Parquet file at `path` with default settings — a test fixture helper for
+/// the source-side tests (the sink writes through `ParquetEncoder`, never to a path).
+#[cfg(test)]
 pub(crate) fn write_parquet(batch: &RecordBatch, path: &str) {
     let file = std::fs::File::create(path).expect("failed to create parquet file");
     let mut writer = parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
         .expect("failed to create parquet writer");
     writer.write(batch).expect("failed to write batch");
     writer.close().expect("failed to close parquet writer");
-}
-
-/// Writes an Arrow batch the JVM exported to a Parquet file at `path`.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_writeParquet<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    in_array_address: jlong,
-    in_schema_address: jlong,
-    path: JString<'local>,
-) {
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    let path: String = env.get_string(&path).expect("failed to read path").into();
-    write_parquet(&batch, &path);
-}
-
-/// A Parquet sink that holds one open `ArrowWriter` across many batches, so the output file count is
-/// decoupled from the input batch size: the JVM rolls a file by closing this handle when its row
-/// target is reached (and on checkpoint), not once per batch. The writer is created lazily from the
-/// first batch's schema; an empty file (closed before any batch) writes a valid header-only Parquet.
-pub(crate) struct ParquetSink {
-    path: String,
-    writer: Option<parquet::arrow::ArrowWriter<std::fs::File>>,
-}
-
-impl ParquetSink {
-    fn new(path: String) -> ParquetSink {
-        ParquetSink { path, writer: None }
-    }
-
-    fn write(&mut self, batch: RecordBatch) {
-        if self.writer.is_none() {
-            let file = std::fs::File::create(&self.path).expect("failed to create parquet file");
-            self.writer = Some(
-                parquet::arrow::ArrowWriter::try_new(file, batch.schema(), None)
-                    .expect("failed to create parquet writer"),
-            );
-        }
-        self.writer.as_mut().unwrap().write(&batch).expect("failed to write batch");
-    }
-
-    fn close(self) {
-        if let Some(writer) = self.writer {
-            writer.close().expect("failed to close parquet writer");
-        }
-    }
-}
-
-/// Opens a Parquet file for writing and returns an opaque handle. Batches are appended with
-/// `parquetWriterWrite`; the file is finalized (and the handle released) by `closeParquetWriter`.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createParquetWriter<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    path: JString<'local>,
-) -> jlong {
-    let path: String = env.get_string(&path).expect("failed to read path").into();
-    into_handle(ParquetSink::new(path))
-}
-
-/// Appends an Arrow batch the JVM exported to the open file behind `handle`.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_parquetWriterWrite<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    handle: jlong,
-    in_array_address: jlong,
-    in_schema_address: jlong,
-) {
-    let sink = unsafe { &mut *(handle as *mut ParquetSink) };
-    let batch = import_record_batch(in_array_address, in_schema_address);
-    sink.write(batch);
-}
-
-/// Finalizes the Parquet file (writes its footer) and releases the writer handle.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquetWriter<'local>(
-    _env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    handle: jlong,
-) {
-    let sink = unsafe { from_handle::<ParquetSink>(handle) };
-    sink.close();
 }
 
 /// In-memory landing zone for encoded Parquet bytes. The `ArrowWriter` owns one clone as its sink

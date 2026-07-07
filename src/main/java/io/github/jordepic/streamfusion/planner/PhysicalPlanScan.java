@@ -166,19 +166,27 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     // A sink is terminal, so the changelog guard below (which protects operator substitution within a
     // stream) does not apply; it is eligible as long as its input is insert-only.
     if (current instanceof StreamPhysicalSink
-        && ParquetSinkMatcher.matches((StreamPhysicalSink) current)
-        && ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
+        && ParquetSinkMatcher.appliesTo((StreamPhysicalSink) current)) {
+      StreamPhysicalSink sink = (StreamPhysicalSink) current;
+      if (!ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
+        recordFallback("parquet sink: the input is a changelog, not an insert-only stream");
+        return current;
+      }
       if (!NativeConfig.operatorEnabled("parquetSink")) {
         return noteDisabled(current, "parquetSink");
       }
-      StreamPhysicalSink sink = (StreamPhysicalSink) current;
+      ParquetSinkMatcher.Planned planned = ParquetSinkMatcher.plan(sink);
+      if (planned.fallbackReason != null) {
+        recordFallback("parquet sink: " + planned.fallbackReason);
+        return current;
+      }
       substitutions++;
       return new StreamPhysicalNativeParquetSink(
           sink.getCluster(),
           sink.getTraitSet(),
           sink.getInputs().get(0),
           sink.getRowType(),
-          ParquetSinkMatcher.path(sink));
+          planned);
     }
 
     // A non-windowed GROUP BY both emits and consumes a changelog, so it is exempt from the

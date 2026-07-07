@@ -289,42 +289,8 @@ public final class Native {
   public static native void closeCalcExpression(long handle);
 
   /**
-   * Writes an Arrow batch the JVM exported to a Parquet file at {@code path}, encoding it in its
-   * columnar form directly rather than through the host's row-to-Parquet path. The core of the
-   * native columnar sink.
-   *
-   * @param inArrayAddress address of the input {@code ArrowArray} C struct
-   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
-   * @param path filesystem path of the Parquet file to write
-   */
-  public static native void writeParquet(long inArrayAddress, long inSchemaAddress, String path);
-
-  /**
-   * Opens a Parquet file for writing and returns an opaque handle. Batches are appended with {@link
-   * #parquetWriterWrite}; the file is finalized (footer written) and the handle released by {@link
-   * #closeParquetWriter}. One open writer takes many batches before it is closed, so the sink rolls
-   * a file on its own row/size target rather than once per batch.
-   *
-   * @param path filesystem path of the Parquet file to write
-   */
-  public static native long createParquetWriter(String path);
-
-  /**
-   * Appends an Arrow batch the JVM exported to the open file behind {@code handle}.
-   *
-   * @param handle a handle from {@link #createParquetWriter}
-   * @param inArrayAddress address of the input {@code ArrowArray} C struct
-   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
-   */
-  public static native void parquetWriterWrite(
-      long handle, long inArrayAddress, long inSchemaAddress);
-
-  /** Finalizes the Parquet file (writes its footer) and releases the writer handle. */
-  public static native void closeParquetWriter(long handle);
-
-  /**
-   * Creates a Parquet encoder for the sink and returns an opaque handle. Unlike {@link
-   * #createParquetWriter}, the encoder owns no file: it encodes batches into an in-memory buffer
+   * Creates a Parquet encoder for the sink and returns an opaque handle. The encoder owns no file:
+   * it encodes batches into an in-memory buffer
    * that the JVM drains into whatever Flink output stream the part file lives behind, so the host
    * keeps its filesystems, rolling, and exactly-once commit.
    *

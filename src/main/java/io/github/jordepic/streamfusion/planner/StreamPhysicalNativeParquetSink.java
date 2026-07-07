@@ -7,7 +7,6 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.RelWriter;
 import org.apache.calcite.rel.SingleRel;
 import org.apache.calcite.rel.type.RelDataType;
-import org.apache.flink.table.planner.calcite.FlinkTypeFactory$;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNode;
 import org.apache.flink.table.planner.plan.nodes.exec.InputProperty;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalRel;
@@ -15,28 +14,31 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
  * Physical node standing in for a filesystem Parquet sink the native writer runs. It keeps the
- * replaced sink's row type and traits and carries the output path; the native operator writes the
- * incoming rows to Parquet directly. Stateless with respect to event time, so it needs no watermark.
+ * replaced sink's row type and traits and carries the matcher's plan — path, partition keys, table
+ * options, and the translated encoder settings — for the operator chain the exec node builds.
+ * Stateless with respect to event time, so it needs no watermark.
  */
 public class StreamPhysicalNativeParquetSink extends SingleRel
     implements StreamPhysicalRel, ColumnarInput {
 
   private final RelDataType outputRowType;
-  private final String path;
+  private final ParquetSinkMatcher.Planned planned;
 
-  public StreamPhysicalNativeParquetSink(
+  StreamPhysicalNativeParquetSink(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelNode input,
       RelDataType outputRowType,
-      String path) {
+      ParquetSinkMatcher.Planned planned) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
-    this.path = path;
+    this.planned = planned;
   }
 
   @Override
   public boolean requireWatermark() {
+    // Partition-time commit triggers consume watermarks inside the reused Flink writer, but they
+    // arrive on the stream regardless; the sink itself forces no watermark generation.
     return false;
   }
 
@@ -48,7 +50,7 @@ public class StreamPhysicalNativeParquetSink extends SingleRel
   @Override
   public RelNode copy(RelTraitSet traitSet, List<RelNode> inputs) {
     return new StreamPhysicalNativeParquetSink(
-        getCluster(), traitSet, inputs.get(0), outputRowType, path);
+        getCluster(), traitSet, inputs.get(0), outputRowType, planned);
   }
 
   @Override
@@ -56,9 +58,9 @@ public class StreamPhysicalNativeParquetSink extends SingleRel
     return new NativeParquetSinkExecNode(
         ShortcutUtils.unwrapTableConfig(this),
         InputProperty.DEFAULT,
-        FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
+        planned.rowType,
         getRelDetailedDescription(),
-        path);
+        planned);
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -69,4 +71,3 @@ public class StreamPhysicalNativeParquetSink extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-
