@@ -323,6 +323,75 @@ public final class Native {
   public static native void closeParquetWriter(long handle);
 
   /**
+   * Creates a Parquet encoder for the sink and returns an opaque handle. Unlike {@link
+   * #createParquetWriter}, the encoder owns no file: it encodes batches into an in-memory buffer
+   * that the JVM drains into whatever Flink output stream the part file lives behind, so the host
+   * keeps its filesystems, rolling, and exactly-once commit.
+   *
+   * @param schemaAddress address of an {@code ArrowSchema} C struct carrying the full row schema
+   * @param partitionColumns indices of columns written to the directory path, not the file
+   * @param configKeys resolved writer setting names from the sink's config translator
+   * @param configValues resolved writer setting values, parallel to {@code configKeys}
+   */
+  public static native long createParquetEncoder(
+      long schemaAddress, int[] partitionColumns, String[] configKeys, String[] configValues);
+
+  /**
+   * Encodes an Arrow batch the JVM exported into the open Parquet stream behind {@code handle}.
+   *
+   * @param handle a handle from {@link #createParquetEncoder}
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   */
+  public static native void parquetEncoderWrite(
+      long handle, long inArrayAddress, long inSchemaAddress);
+
+  /**
+   * Copies buffered encoded bytes into {@code chunk}, returning the count (0 = fully drained). The
+   * chunk is pinned critically for the duration of one memcpy — the only copy between the native
+   * encoder's buffer and the Flink output stream the caller writes it to.
+   *
+   * @param handle a handle from {@link #createParquetEncoder}
+   * @param chunk reusable buffer the caller hands to the output stream after each call
+   */
+  public static native int parquetEncoderDrain(long handle, byte[] chunk);
+
+  /**
+   * Writes the Parquet footer into the encoder's buffer. The handle stays open so the caller can
+   * drain the remaining bytes; release it with {@link #closeParquetEncoder}.
+   */
+  public static native void parquetEncoderFinish(long handle);
+
+  /** Releases a Parquet encoder handle; also the abort path for a part file that never finished. */
+  public static native void closeParquetEncoder(long handle);
+
+  /**
+   * Splits an Arrow batch the JVM exported by its partition-key columns, grouping rows in
+   * first-seen key order, and returns a handle to the groups. Each group keeps the full row schema
+   * and is single-keyed, so the caller routes it by its first row's partition values.
+   *
+   * @param inArrayAddress address of the input {@code ArrowArray} C struct
+   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
+   * @param partitionColumns indices of the partition-key columns in the row schema
+   */
+  public static native long splitByPartitionColumns(
+      long inArrayAddress, long inSchemaAddress, int[] partitionColumns);
+
+  /**
+   * Exports the next partition group into the consumer-allocated C structs, returning false once
+   * every group has been pulled.
+   *
+   * @param handle a handle from {@link #splitByPartitionColumns}
+   * @param outArrayAddress address of a consumer-allocated {@code ArrowArray} C struct
+   * @param outSchemaAddress address of a consumer-allocated {@code ArrowSchema} C struct
+   */
+  public static native boolean nextPartitionSlice(
+      long handle, long outArrayAddress, long outSchemaAddress);
+
+  /** Releases a partition split handle, dropping any groups the caller did not pull. */
+  public static native void closePartitionSplit(long handle);
+
+  /**
    * Opens one Parquet split — the row groups of {@code path} starting within {@code [rangeStart,
    * rangeStart + rangeLength)} — and returns an opaque handle. Flink's file source enumerates the
    * directory and assigns each subtask file byte ranges; the handle yields batches one at a time via
