@@ -1,10 +1,6 @@
 package io.github.jordepic.streamfusion.fluss;
 
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
@@ -19,7 +15,6 @@ import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
 import org.apache.fluss.flink.source.split.LogSplitState;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.source.split.SourceSplitState;
-import org.apache.fluss.metadata.TableBucket;
 
 /** FLIP-27 source reader that swaps Fluss' row split reader for a native Arrow log reader. */
 final class NativeFlussSourceReader
@@ -27,7 +22,6 @@ final class NativeFlussSourceReader
         NativeFlussRecord, ArrowBatch, SourceSplitBase, SourceSplitState> {
 
   private final NativeFlussFetcherManager fetcherManager;
-  private final Map<String, SourceSplitBase> assignedSplits = new HashMap<>();
 
   NativeFlussSourceReader(
       Supplier<SplitReader<NativeFlussRecord, SourceSplitBase>> splitReaderSupplier,
@@ -47,14 +41,6 @@ final class NativeFlussSourceReader
   }
 
   @Override
-  public void addSplits(List<SourceSplitBase> splits) {
-    super.addSplits(splits);
-    for (SourceSplitBase split : splits) {
-      assignedSplits.put(split.splitId(), split);
-    }
-  }
-
-  @Override
   public void handleSourceEvents(SourceEvent sourceEvent) {
     if (sourceEvent instanceof PartitionsRemovedEvent) {
       handlePartitionsRemoved(((PartitionsRemovedEvent) sourceEvent).getRemovedPartitions());
@@ -65,9 +51,7 @@ final class NativeFlussSourceReader
 
   @Override
   protected void onSplitFinished(Map<String, SourceSplitState> finishedSplitIds) {
-    for (String splitId : finishedSplitIds.keySet()) {
-      assignedSplits.remove(splitId);
-    }
+    // Split-state cleanup rides the finished-splits report from the fetch path; nothing to do here.
   }
 
   @Override
@@ -89,29 +73,10 @@ final class NativeFlussSourceReader
       context.sendSourceEventToCoordinator(new PartitionBucketsUnsubscribedEvent(Set.of()));
       return;
     }
-
-    List<SourceSplitBase> splitsToRemove = new ArrayList<>();
-    Set<TableBucket> bucketsToAck = new HashSet<>();
-    for (SourceSplitBase split : assignedSplits.values()) {
-      TableBucket tableBucket = split.getTableBucket();
-      Long partitionId = tableBucket.getPartitionId();
-      if (partitionId != null && removedPartitions.containsKey(partitionId)) {
-        splitsToRemove.add(split);
-        bucketsToAck.add(tableBucket);
-      }
-    }
-
-    if (splitsToRemove.isEmpty()) {
-      context.sendSourceEventToCoordinator(new PartitionBucketsUnsubscribedEvent(Set.of()));
-      return;
-    }
-
-    for (SourceSplitBase split : splitsToRemove) {
-      assignedSplits.remove(split.splitId());
-    }
-    fetcherManager.removeSplitsAndAck(
-        splitsToRemove,
-        bucketsToAck,
+    // The split reader answers which of its splits the partitions own (Fluss's own shape) — no
+    // split bookkeeping is duplicated here.
+    fetcherManager.removePartitions(
+        removedPartitions,
         buckets ->
             context.sendSourceEventToCoordinator(new PartitionBucketsUnsubscribedEvent(buckets)));
   }

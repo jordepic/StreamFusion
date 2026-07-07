@@ -477,6 +477,69 @@ class NativeFlussSourceSqlHarnessTest {
     return Native.flussFeatureBuilt();
   }
 
+  @Test
+  void nativeFlussSplitReaderAnswersPartitionRemovalItself() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      String tableName = "native_fluss_remove_partitions_it_" + System.nanoTime();
+      tablePath = CATALOG + "." + DATABASE + "." + tableName;
+      createPartitionedTable(bootstrapServers, tablePath, "100 ms");
+      addPartitionedRow(bootstrapServers, tablePath, "US", 1, 10);
+      addPartitionedRow(bootstrapServers, tablePath, "EU", 2, 20);
+
+      Map<String, SourceSplitBase> splitsByPartition =
+          logSplitsByPartition(cluster.getClientConfig(), tableName);
+      SourceSplitBase usSplit = splitsByPartition.get("US");
+      SourceSplitBase euSplit = splitsByPartition.get("EU");
+
+      NativeFlussSplitReader reader =
+          new NativeFlussSplitReader(
+              new String[] {"bootstrap_servers"},
+              new String[] {bootstrapServers},
+              DATABASE,
+              tableName,
+              new int[0],
+              -1,
+              100L);
+      try {
+        reader.handleSplitsChanges(new SplitsAddition<>(List.of(usSplit, euSplit)));
+
+        // The reader owns the partition->splits question (Fluss's shape): removing the US
+        // partition returns exactly its bucket for the coordinator ack...
+        Set<TableBucket> unsubscribed =
+            reader.removePartitions(
+                Map.of(usSplit.getTableBucket().getPartitionId(), "US"));
+        assertEquals(Set.of(usSplit.getTableBucket()), unsubscribed);
+
+        // ...reports the removed split as finished on the next fetch (checkpoint cleanup), and
+        // keeps serving the surviving partition (exactly the EU row, the US pending purge held).
+        Set<String> finishedSplitIds = new HashSet<>();
+        int rows = 0;
+        long deadline = System.nanoTime() + 30_000_000_000L;
+        while ((rows < 1 || !finishedSplitIds.contains(usSplit.splitId()))
+            && System.nanoTime() < deadline) {
+          rows += drainBatches(reader.fetch(), finishedSplitIds);
+        }
+        assertTrue(
+            finishedSplitIds.contains(usSplit.splitId()),
+            "removed partition's split not reported finished: " + finishedSplitIds);
+        assertFalse(finishedSplitIds.contains(euSplit.splitId()));
+        assertEquals(1, rows);
+      } finally {
+        reader.close();
+      }
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
   private static Map<String, SourceSplitBase> logSplitsByPartition(
       org.apache.fluss.config.Configuration clientConfig, String tableName) throws Exception {
     TablePath flussTablePath = TablePath.of(DATABASE, tableName);

@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion.fluss;
 
-import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
@@ -22,39 +22,40 @@ final class NativeFlussFetcherManager
     super(splitReaderSupplier, config);
   }
 
-  void removeSplitsAndAck(
-      List<SourceSplitBase> splits,
-      Set<TableBucket> removedBuckets,
-      Consumer<Set<TableBucket>> unsubscribeCallback) {
+  /**
+   * Enqueues one fetcher task that asks the split reader which of its splits belong to the removed
+   * partitions, unsubscribes them, and acks the unsubscribed buckets to the coordinator — the shape
+   * of Fluss's own {@code FlinkSourceFetcherManager.removePartitions}. Runs on the fetcher thread,
+   * where the JNI reader is confined; if no fetcher is running, one is created so the (possibly
+   * empty) ack still flows.
+   */
+  void removePartitions(
+      Map<Long, String> removedPartitions, Consumer<Set<TableBucket>> unsubscribeCallback) {
     SplitFetcher<NativeFlussRecord, SourceSplitBase> fetcher = getRunningFetcher();
-    if (fetcher == null) {
-      unsubscribeCallback.accept(removedBuckets);
+    if (fetcher != null) {
+      enqueueRemovePartitionsTask(fetcher, removedPartitions, unsubscribeCallback);
       return;
     }
-
-    Set<TableBucket> bucketsToAck = Set.copyOf(removedBuckets);
-    fetcher.removeSplits(splits);
-    fetcher.enqueueTask(new PartitionRemovalAckTask(bucketsToAck, unsubscribeCallback));
+    fetcher = createSplitFetcher();
+    enqueueRemovePartitionsTask(fetcher, removedPartitions, unsubscribeCallback);
+    startFetcher(fetcher);
   }
 
-  private final class PartitionRemovalAckTask implements SplitFetcherTask {
-    private final Set<TableBucket> removedBuckets;
-    private final Consumer<Set<TableBucket>> unsubscribeCallback;
+  private static void enqueueRemovePartitionsTask(
+      SplitFetcher<NativeFlussRecord, SourceSplitBase> fetcher,
+      Map<Long, String> removedPartitions,
+      Consumer<Set<TableBucket>> unsubscribeCallback) {
+    NativeFlussSplitReader splitReader = (NativeFlussSplitReader) fetcher.getSplitReader();
+    fetcher.enqueueTask(
+        new SplitFetcherTask() {
+          @Override
+          public boolean run() {
+            unsubscribeCallback.accept(splitReader.removePartitions(removedPartitions));
+            return true;
+          }
 
-    private PartitionRemovalAckTask(
-        Set<TableBucket> removedBuckets,
-        Consumer<Set<TableBucket>> unsubscribeCallback) {
-      this.removedBuckets = removedBuckets;
-      this.unsubscribeCallback = unsubscribeCallback;
-    }
-
-    @Override
-    public boolean run() {
-      unsubscribeCallback.accept(removedBuckets);
-      return true;
-    }
-
-    @Override
-    public void wakeUp() {}
+          @Override
+          public void wakeUp() {}
+        });
   }
 }

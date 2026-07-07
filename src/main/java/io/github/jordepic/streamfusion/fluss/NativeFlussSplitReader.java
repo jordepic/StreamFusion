@@ -130,6 +130,40 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
     }
   }
 
+  /**
+   * Unsubscribes every assigned split belonging to the removed partitions and returns their table
+   * buckets for the coordinator ack — the split reader answers the "which splits" question from
+   * its own bookkeeping, exactly as Fluss's {@code FlinkSourceSplitReader.removePartitions} does.
+   * The removed splits are reported as finished on the next {@link #fetch()} so the source reader
+   * drops them from checkpoint state.
+   */
+  Set<org.apache.fluss.metadata.TableBucket> removePartitions(Map<Long, String> removedPartitions) {
+    List<NativeFlussLogSplit> removed = new ArrayList<>();
+    Set<org.apache.fluss.metadata.TableBucket> buckets = new HashSet<>();
+    for (NativeFlussLogSplit split : List.copyOf(splitsById.values())) {
+      OptionalLong partitionId = split.partitionId();
+      if (partitionId.isPresent() && removedPartitions.containsKey(partitionId.getAsLong())) {
+        removed.add(split);
+        buckets.add(
+            new org.apache.fluss.metadata.TableBucket(
+                split.tableId(), partitionId.getAsLong(), (int) split.bucket()));
+      }
+    }
+    for (NativeFlussLogSplit split : removed) {
+      splitsById.remove(split.splitId());
+      stoppingOffsets.remove(split.splitId());
+      positions.remove(split.splitId());
+      if (!finished.remove(split.splitId())) {
+        pendingFinishedSplits.add(split.splitId());
+      }
+    }
+    if (!removed.isEmpty()) {
+      Native.unassignFlussSplits(
+          handle, tableIds(removed), partitionIds(removed), buckets(removed));
+    }
+    return buckets;
+  }
+
   private void removeSplits(List<SourceSplitBase> splits) {
     List<NativeFlussLogSplit> nativeSplits = new ArrayList<>(splits.size());
     for (SourceSplitBase split : splits) {

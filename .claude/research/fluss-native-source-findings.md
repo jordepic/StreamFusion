@@ -93,4 +93,5 @@ source where the ingest perimeter cost can genuinely go to ~zero (ticket 36's hy
   behavior when a TM task closes mid-fetch.
 - Non-default ZSTD level tables fail to decode (gate on it, or fix upstream).
 
-See `.claude/todos/44-native-fluss-log-source.md` for the build plan.
+(The build plan lived in ticket 44, deleted when the source shipped; coverage now lives in
+`docs/coverage-and-fallbacks.md` and the benchmark method in `docs/benchmarks.md`.)
