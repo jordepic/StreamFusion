@@ -701,6 +701,46 @@ class NexmarkMatrixBenchmark {
     System.out.println("[profile] " + (nativeRun ? "native " : "flink ") + label + " iterations: " + iterations);
   }
 
+  /**
+   * Runs one query (default q0, override with {@code -Dprofile.query}) against a preloaded local
+   * Fluss cluster in a loop for {@code -Dprofile.seconds} (default 60), so an attached sampler
+   * sees the native fluss-rs source's steady state — poll, decode, FFI export, and whatever the
+   * query chains on top. {@code -Dprofile.native=false} profiles the stock Flink-on-Fluss path
+   * instead, for the differential read. Gated by {@code SF_PROFILE_FLUSS=true} on top of {@code
+   * SF_BENCHMARK}; attach async-profiler to the fork (see docs/benchmarks.md).
+   */
+  @Test
+  @EnabledIfEnvironmentVariable(named = "SF_PROFILE_FLUSS", matches = "true")
+  void flussNativeProfileLoop() throws Exception {
+    String label = System.getProperty("profile.query", "q0");
+    Query q =
+        Arrays.stream(ALL_QUERIES)
+            .filter(x -> x.label.equals(label))
+            .findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("unknown profile.query: " + label));
+    boolean nativeRun = !"false".equals(System.getProperty("profile.native", "true"));
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    try {
+      cluster.start();
+      String bootstrapServers = cluster.getBootstrapServers();
+      writeFlussSource(bootstrapServers);
+      if (FLUSS_MARKERS.containsKey(label)) {
+        writeFlussTracedSource(bootstrapServers);
+      }
+      long targetRows = FLUSS_MARKERS.containsKey(label) ? -1 : flussTargetRows(q);
+      long deadline = System.currentTimeMillis() + Long.getLong("profile.seconds", 60L) * 1000L;
+      long iterations = 0;
+      while (System.currentTimeMillis() < deadline) {
+        withProps(q, nativeRun, null, () -> runFlussOnce(bootstrapServers, nativeRun, q, targetRows));
+        iterations++;
+      }
+      System.out.println(
+          "[profile] fluss " + (nativeRun ? "native " : "flink ") + label + " iterations: " + iterations);
+    } finally {
+      cluster.close();
+    }
+  }
+
   private static Query[] selectQueries() {
     String subset = System.getenv("SF_MATRIX_QUERIES");
     if (subset == null) {

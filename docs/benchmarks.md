@@ -572,13 +572,17 @@ windowed family runs natively end to end off the table's watermark, q11's sessio
 peaking at **4.17×** — the rung's best cell.
 
 **The distinct-agg family (q15/q16/q17) trails 1× on this rung only** (0.78–0.85×, vs
-1.3–1.4× on the generator and 2.1–3.1× on Kafka), with q19 at the line (0.97×). The salient
-difference is batch shape: the fluss-rs scanner emits one Arrow batch per producer wire batch,
-so the island sees a stream of small batches, and the changelog-aggregate chain
-(exchange → multi-`DISTINCT` group agg) pays its per-batch costs — state probe setup, per-batch
-emit — many more times per 500K events than on the coalesced rungs. This is the batch-coalescing
-follow-up already on the roadmap (coalesce scanner batches to a target row count before JNI
-export), and these queries are its acceptance benchmark.
+1.3–1.4× on the generator and 2.1–3.1× on Kafka), with q19 at the line (0.97×). Profiling
+(`.claude/research/fluss-source-profile-2026-07.md`) overturned the first hypothesis: fluss-rs
+delivers *huge* batches (~83K rows average — 500K rows in ~6 batches), not per-wire-batch
+slivers, so there is nothing to coalesce and per-batch overhead is not the story. The native
+source itself is lean (its only real cost is the zstd log decode both engines pay); what decides
+these cells is the **changelog aggregate's allocation churn** — Vec-growth memmove, mimalloc
+purge syscalls, a changelog emit still materializing per-row `ScalarValue`s — plus `DATE_FORMAT`
+re-parsing its format string and allocating a `String` per row. The rung exposes it because the
+stock connector's per-row source conversion (the ~580-sample cost native avoids on every other
+query) is absent from the comparison ledger here: both sides' source is cheap, so the aggregate
+decides. The levers, ranked with acceptance benchmarks, are in the research note.
 
 The opt-in variants measure within noise of their byte-parity defaults on this rung — except
 **† q21**, whose work is regex-dominated: the byte-parity JVM-upcall default reads **2.28×** and

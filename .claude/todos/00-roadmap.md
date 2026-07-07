@@ -189,10 +189,13 @@ here when the ticket is deleted.
    the exchange split — OVER +121–162%, retracting Top-N +228%, exchange +208% on Criterion;
    session `update` batches gap-connected runs — dense shape 20× vs per-row; the `RowData → Arrow`
    transpose was made row-major + pre-sized, ~25% faster; a native decoder was investigated and
-   rejected on benchmark grounds — wontdos/28.) Native Fluss follow-up: coalesce small fluss-rs
-   scanner batches before JNI export — the 2026-07-06 Fluss rung run gives this its acceptance
-   benchmark (q15/q16/q17 at 0.78–0.85× on Fluss vs 1.3–1.4× on the generator: the
-   changelog-aggregate chain pays per-batch costs on one-wire-batch-sized Arrow batches).
+   rejected on benchmark grounds — wontdos/28.) Native Fluss follow-up, re-scoped by the
+   2026-07-06 profile (`.claude/research/fluss-source-profile-2026-07.md`): the coalescing
+   hypothesis is refuted (fluss-rs delivers ~83K-row batches; the source is zstd-bound and
+   lean) — the q15/q16/q17 Fluss cells (0.78–0.85×) are decided by the changelog aggregate's
+   allocation churn (Vec growth, mimalloc purge, ScalarValue emit) and per-row DATE_FORMAT
+   formatting (StrftimeItems re-parsed per call). Ranked levers + acceptance benchmarks in the
+   research note.
 
 ## Production-readiness (not yet load-bearing)
 - **Memory accounting**: shipped for every stateful native operator (mini-batch local pre-aggregate
