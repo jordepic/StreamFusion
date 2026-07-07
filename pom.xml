@@ -221,6 +221,21 @@
             <version>1.21.4</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>minio</artifactId>
+            <version>1.21.4</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- The remote-filesystem sink test writes through Flink's own s3 filesystem (the native sink
+             only encodes bytes). Discovered from the test classpath via ServiceLoader, standing in for
+             the plugins/ directory of a real deployment. -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-s3-fs-hadoop</artifactId>
+            <version>${flink.version}</version>
+            <scope>test</scope>
+        </dependency>
         <!-- Apache Fluss connector classes. Main code references the public split types for the native
              proof seam; the dependency stays provided so StreamFusion does not bundle Fluss at runtime. -->
         <dependency>
