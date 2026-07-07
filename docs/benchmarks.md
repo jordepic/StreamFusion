@@ -149,8 +149,8 @@ the debug build and 3.0× on release — same code.)
 
 | Operator | Query | Flink | Native | Native vs. Flink |
 |---|---|---|---|---|
-| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.35 M rows/s | 6.34 M rows/s | **4.68×** |
-| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.23 M rows/s | 2.76 M rows/s | **2.24×** |
+| Parquet copy (columnar source → sink) | `INSERT INTO parquet SELECT * FROM parquet` | 1.51 M rows/s | 19.4 M rows/s | **12.85×** |
+| Parquet sink (row source) | `INSERT INTO parquet SELECT *` | 1.26 M rows/s | 4.12 M rows/s | **3.26×** |
 | Windowed aggregate over a columnar source | `SUM` by 1s window from a Parquet table | 1.80 M rows/s | 3.29 M rows/s | **1.82×** |
 | Interval join (event-time) | `a JOIN b ON a.k=b.k AND a.rt BETWEEN b.rt ± 1s` | 0.37 M rows/s | 0.63 M rows/s | **1.71×** |
 | `OVER` running `SUM` (row source) | `SUM(v) OVER (ORDER BY rt)` | 0.91 M rows/s | 1.42 M rows/s | **1.56×** |
@@ -158,12 +158,13 @@ the debug build and 3.0× on release — same code.)
 | Filter (`WHERE`) | `SELECT * FROM f WHERE v > 50` | 3.23 M rows/s | 2.41 M rows/s | **0.75×** |
 
 The gain tracks how much of the pipeline stays columnar. Fully-columnar paths lead — the copy
-**4.68×**, the windowed aggregate over a columnar source **1.82×**, the event-time interval join
+**12.85×**, the windowed aggregate over a columnar source **1.82×**, the event-time interval join
 **1.71×** (Flink's interval join is slow; ours delegates the match to a DataFusion hash join). The
-**Parquet sink reaches 2.24×** even from a row source: it writes Arrow → Parquet natively and
-coalesces batches into size-targeted files
-(rolling on a row target / checkpoint) instead of one file per batch, so per-file overhead no longer
-scales with batch count — this also lifted the columnar copy (2.61 → 4.68×). Other row-source ops
+**Parquet sink reaches 3.26×** even from a row source: it encodes Arrow → Parquet natively and
+rolls part files exactly like the host (on checkpoint and on the configured size/time policies —
+the sink now runs inside Flink's own streaming file writer, so file lifecycle overhead matches the
+host's and the entire margin is the encoding), which also lifted the columnar copy (4.68 → 12.85×:
+the old sink rolled a file per million rows; checkpoint-driven rolling writes one). Other row-source ops
 still pay a `RowData → Arrow` transpose at the input, ~25% cheaper since the converter was made
 row-major + pre-sized ([wontdos/28](../.claude/wontdos/28-native-row-transpose-and-shuffle.md)): `OVER`
 running `SUM` **1.56×**, tumbling **1.24×**. The lone stateless **filter stays below 1× at 0.75×** —

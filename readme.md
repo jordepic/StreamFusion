@@ -31,7 +31,9 @@ Native coverage is broad — most of the streaming SQL surface:
   event-time temporal-table joins, and processing-time lookup joins (sync and async).
 - **Changelog:** non-windowed `GROUP BY`, streaming Top-N / `LIMIT`, deduplication, changelog
   normalization — all consuming and emitting a retract changelog.
-- **Connectors:** a Parquet file source and sink (native Arrow scan/write); Kafka
+- **Connectors:** a Parquet file source (native Arrow scan, local paths) and a Parquet sink that
+  writes to any filesystem Flink supports (`s3:`/`gs:`/`abfs:`/`hdfs:`/…, `PARTITIONED BY` and
+  partition commit included — native encoding drained into Flink's own recoverable streams); Kafka
   source decode for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC — JSON/Avro/protobuf via a
   fully native rdkafka source (the default path; it also regenerates the table's watermark
   per partition, exactly as Flink's source does).
