@@ -93,7 +93,7 @@ impl FilterExpression {
             Arc::new(DFSchema::try_from(schema.as_ref().clone()).expect("failed to build schema"));
         // Match the planner's logical pipeline: coerce operand types (e.g. an int column against a
         // bigint literal) before building the physical expression, which assumes coerced types.
-        let context = SimplifyContext::default().with_schema(df_schema.clone());
+        let context = SimplifyContext::builder().with_schema(df_schema.clone()).build();
         let coerced = ExprSimplifier::new(context)
             .coerce(logical, df_schema.as_ref())
             .expect("failed to coerce predicate");

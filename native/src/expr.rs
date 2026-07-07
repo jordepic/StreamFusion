@@ -426,9 +426,6 @@ impl NarrowingCast {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for NarrowingCast {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "narrowing_cast"
     }
@@ -650,9 +647,6 @@ pub(crate) fn remainder_exact(a: i128, s1: i8, b: i128, s2: i8) -> (num_bigint::
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for DecimalDivide {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         if self.modulo {
             "flink_decimal_mod"
@@ -722,9 +716,6 @@ impl SplitIndex {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for SplitIndex {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "split_index"
     }
@@ -831,9 +822,6 @@ impl DateFormat {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for DateFormat {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "date_format"
     }
@@ -899,9 +887,6 @@ impl ExtractField {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for ExtractField {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "extract_field"
     }
@@ -997,9 +982,6 @@ impl DateFormatLtz {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for DateFormatLtz {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "date_format_ltz"
     }
@@ -1065,9 +1047,6 @@ impl ExtractFieldLtz {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for ExtractFieldLtz {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "extract_field_ltz"
     }
@@ -1146,9 +1125,6 @@ impl RegexpExtract {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for RegexpExtract {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "regexp_extract"
     }
@@ -1244,9 +1220,6 @@ impl JvmUdf {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for JvmUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "jvm_udf"
     }
@@ -1322,7 +1295,7 @@ pub(crate) fn compile_expr(
     let mut cursor = root;
     let logical =
         build_expr(schema, kinds, payload, child_counts, longs, doubles, strings, &mut cursor);
-    let context = SimplifyContext::default().with_schema(Arc::new(df_schema.clone()));
+    let context = SimplifyContext::builder().with_schema(Arc::new(df_schema.clone())).build();
     let coerced =
         ExprSimplifier::new(context).coerce(logical, df_schema).expect("failed to coerce expr");
     create_physical_expr(&coerced, df_schema, &ExecutionProps::new()).expect("failed to compile expr")

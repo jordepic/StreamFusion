@@ -50,7 +50,7 @@ RocksDB block cache via `getSharedMemoryResourceForManagedMemory`):
   the operator's bounded pool (comet's `RuntimeEnvBuilder::with_memory_pool`), so the
   join's transient build side draws on the same budget as the buffered state and a denial
   fails with the same remedy message.
-- **File scans are NOT pool-wired, on purpose.** DataFusion 53's scan path (the Parquet
+- **File scans are NOT pool-wired, on purpose.** DataFusion 54's scan path (the Parquet
   opener/source and the datasource file streams) registers no memory consumers — only its
   `ParquetSink` does, and our sink writes via arrow's `ArrowWriter` directly. Wiring a pool
   into the scan's `TaskContext` would enforce nothing, while plumbing a budget to the
