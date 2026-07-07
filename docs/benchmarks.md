@@ -508,20 +508,30 @@ the watermark as an assigner node above the Fluss scan (no push-down, unlike Kaf
 assigner runs natively above the native source. A preloaded sentinel event (an `event_type`
 outside 0..2 with a far-future rowtime, invisible to every view) advances the watermark past
 every real window end, closing the same windows the bounded generator calibration's end-of-input
-flush closes, so the counts line up. Three queries have no deterministic finish line and skip
-with the reason in the report:
+flush closes, so the counts line up. Three queries have no usable row count and use a **poison
+marker** finish line instead: a traced copy of the preload appends one poison auction+bid pair
+(ids outside every real range; the bid's channel is `apple`) after all real events, and the run
+cancels when the pair's output row reaches the sink — in a parallelism-1 pipeline that row is
+necessarily emitted after every real row, so time-to-marker measures the same full drain,
+without a count:
 
 - **q4/q9** — their two-input join feeds an update-collapsing aggregate/rank: Flink skips the
   `-U/+U` pair when an input row doesn't change the aggregate value, so the changelog row *count*
   depends on the join's input interleaving — non-deterministic even between two stock Flink runs
   (a 500K run calibrated 362,710 rows off the generator and observed 316,092 on Fluss, the job
-  idle). Values and final state are identical; only the update cadence varies. The bounded rungs
-  measure these to end-of-input and never need a row target.
-- **q12** — a proctime window's output count is wall-clock-dependent, so no deterministic N
-  exists.
+  idle). Values and final state are identical; only the update cadence varies. The marker (q4:
+  the poison category's aggregate row; q9: the poison auction's rank row) sidesteps the count
+  entirely.
 - **q21** — emits zero rows over this generator's data (its channels are `channel-N` and its
-  URLs carry no `channel_id=`), so there is no first row to time to. The bounded rungs still
-  measure it: the work is the filter over 500K events, not the empty output.
+  URLs carry no `channel_id=`), so the poison bid's `apple` channel makes the marker row its
+  first and only output.
+
+One query skips: **q12** — a proctime window's output count is wall-clock-dependent, and any
+marker's own window would close ~10s (the window size) after the drain, so a finish line would
+time the window, not the engines. It stays measured on the bounded rungs, whose end-of-input
+flush fires proctime windows immediately. Upstreaming `scan.bounded.mode` to Fluss
+(`.claude/todos/54-fluss-bounded-scan-upstream.md`) would retire the count, sentinel, and
+marker machinery at once and admit q12.
 
 Run of 2026-07-06 (500K events, best of 2 after a warmup, time-to-Nth-row, native vs the stock
 Fluss connector in the identical default streaming environment, both over the watermarked
@@ -535,15 +545,18 @@ table), sorted by speedup:
 | q1 ‡ | **2.59×** | 1.35 M | 3.49 M |
 | q7 | **2.48×** | 0.62 M | 1.54 M |
 | q20 | **2.31×** | 0.85 M | 1.96 M |
+| q21 † | **2.28×** | 0.86 M | 1.96 M |
 | q3 | **2.27×** | 1.77 M | 4.02 M |
 | q8 | **2.20×** | 1.03 M | 2.26 M |
 | q22 | **1.87×** | 1.00 M | 1.86 M |
 | q13 | **1.66×** | 1.24 M | 2.06 M |
 | q5 | **1.61×** | 1.00 M | 1.62 M |
+| q4 | **1.51×** | 0.60 M | 0.91 M |
 | q14 § | **1.49×** | 1.30 M | 1.94 M |
 | q10 § | **1.45×** | 1.04 M | 1.51 M |
 | q23 | **1.41×** | 0.60 M | 0.85 M |
 | q18 | **1.28×** | 0.93 M | 1.19 M |
+| q9 | **1.03×** | 0.56 M | 0.57 M |
 | q19 | 0.97× | 0.18 M | 0.17 M |
 | q16 § | 0.85× | 0.50 M | 0.43 M |
 | q17 § | 0.84× | 0.86 M | 0.73 M |
@@ -567,8 +580,11 @@ emit — many more times per 500K events than on the coalesced rungs. This is th
 follow-up already on the roadmap (coalesce scanner batches to a target row count before JNI
 export), and these queries are its acceptance benchmark.
 
-The opt-in variants measure within noise of their byte-parity defaults on this rung, consistent
-with every other rung: parity is free where the expression isn't the bottleneck.
+The opt-in variants measure within noise of their byte-parity defaults on this rung — except
+**† q21**, whose work is regex-dominated: the byte-parity JVM-upcall default reads **2.28×** and
+the opt-in pure-Rust regex/case path **5.25×**, the honest cost of the parity guarantee on a
+full-drain measurement (the same split the Parquet rung shows at 2.77× vs 6.14×). q4/q9/q21 are
+the marker-measured cells (run 2026-07-06, same build).
 
 **Two masked native bugs surfaced the first time this rung ran unbounded** — worth recording
 because every earlier rung was bounded, where the end-of-input `MAX_WATERMARK` flush forgives

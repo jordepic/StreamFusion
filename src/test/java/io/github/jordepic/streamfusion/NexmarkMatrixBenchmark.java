@@ -462,6 +462,19 @@ class NexmarkMatrixBenchmark {
           + " `dateTime` TIMESTAMP(3)";
   private static final String FLUSS_CATALOG = "fluss_catalog";
   private static final String FLUSS_TABLE = FLUSS_CATALOG + ".fluss.nexmark_events";
+  // A second copy of the preload with a poison auction+bid pair appended after every real event:
+  // the pair's output row is the finish line for the queries whose changelog row count is not
+  // deterministic (q4/q9) or zero (q21) — in a parallelism-1 pipeline the marker's output is
+  // necessarily emitted after all real output, so time-to-marker measures the full drain without
+  // needing a row count. The ids are outside every real range (categories are 0..99; auction ids
+  // grow ~3 per 50-event block), and the bid's channel is 'apple' — the only row in the stream
+  // q21's filter selects, so its marker doubles as its first output.
+  private static final String FLUSS_TRACED_TABLE = FLUSS_CATALOG + ".fluss.nexmark_events_traced";
+  private static final long POISON_AUCTION_ID = 999_999_999L;
+  private static final long POISON_CATEGORY = 999L;
+  // Sink-row marker (column 0) per traced query: q4 emits its category, q9/q21 the auction id.
+  private static final Map<String, Long> FLUSS_MARKERS =
+      Map.of("q4", POISON_CATEGORY, "q9", POISON_AUCTION_ID, "q21", POISON_AUCTION_ID);
   // How long a Fluss run may take to reach its Nth sink row before the benchmark fails loudly (the
   // unbounded source never finishes on its own, so a wrong target must not hang the matrix
   // forever). Healthy 500K-event cells finish in single-digit seconds, so two minutes is a stall,
@@ -529,13 +542,18 @@ class NexmarkMatrixBenchmark {
       try {
         String bootstrapServers = cluster.getBootstrapServers();
         writeFlussSource(bootstrapServers);
+        if (Arrays.stream(queries).anyMatch(q -> FLUSS_MARKERS.containsKey(q.label))) {
+          writeFlussTracedSource(bootstrapServers);
+        }
         for (Query q : queries) {
           String skipReason = flussSkipReason(q);
           if (skipReason != null) {
             report.get(q.label).add(skipCell("fluss", skipReason));
             continue;
           }
-          long targetRows = flussTargetRows(q);
+          // Marker queries cancel on the poison pair's output row, not a row count — no
+          // calibration run needed (and none possible: their counts are what's non-deterministic).
+          long targetRows = FLUSS_MARKERS.containsKey(q.label) ? -1 : flussTargetRows(q);
           if (targetRows == 0) {
             report
                 .get(q.label)
@@ -789,6 +807,59 @@ class NexmarkMatrixBenchmark {
         .await();
   }
 
+  /**
+   * The traced copy for the marker queries ({@link #FLUSS_MARKERS}): the same events plus a poison
+   * auction+bid pair appended last (2099, after every 2024 rowtime), whose output row is the
+   * cancel condition — no watermark sentinel needed, since nothing here waits on a window.
+   */
+  private static void writeFlussTracedSource(String bootstrapServers) throws Exception {
+    TableEnvironment tEnv = NexmarkBenchmark.environment(ROWS);
+    createFlussCatalog(tEnv, bootstrapServers);
+    tEnv.executeSql("DROP TABLE IF EXISTS " + FLUSS_TRACED_TABLE);
+    tEnv.executeSql(
+        "CREATE TABLE "
+            + FLUSS_TRACED_TABLE
+            + " ("
+            + PARQUET_SCHEMA
+            + ", WATERMARK FOR `dateTime` AS `dateTime` - INTERVAL '4' SECOND"
+            + ") WITH ('bucket.num' = '1')");
+    tEnv.executeSql(
+            "INSERT INTO "
+                + FLUSS_TRACED_TABLE
+                + " SELECT event_type, person, auction, bid, `dateTime` FROM events")
+        .await();
+    tEnv.executeSql(
+            "INSERT INTO "
+                + FLUSS_TRACED_TABLE
+                + " SELECT CAST(1 AS INT), CAST(NULL AS "
+                + PERSON_TYPE
+                + "), CAST(ROW("
+                + POISON_AUCTION_ID
+                + ", 'poison-item', 'poison', 1, 1, TIMESTAMP '2099-01-01 00:00:00',"
+                + " TIMESTAMP '2099-01-02 00:00:00', 1, "
+                + POISON_CATEGORY
+                + ", 'x') AS "
+                + AUCTION_TYPE
+                + "), CAST(NULL AS "
+                + BID_TYPE
+                + "), TIMESTAMP '2099-01-01 00:00:00'")
+        .await();
+    tEnv.executeSql(
+            "INSERT INTO "
+                + FLUSS_TRACED_TABLE
+                + " SELECT CAST(2 AS INT), CAST(NULL AS "
+                + PERSON_TYPE
+                + "), CAST(NULL AS "
+                + AUCTION_TYPE
+                + "), CAST(ROW("
+                + POISON_AUCTION_ID
+                + ", 1, 100, 'apple', 'https://nexmark.test/poison',"
+                + " TIMESTAMP '2099-01-01 00:00:01', 'x') AS "
+                + BID_TYPE
+                + "), TIMESTAMP '2099-01-01 00:00:01'")
+        .await();
+  }
+
   private static double flussBest(
       String bootstrapServers, Query q, boolean nativeRun, Map<String, String> extra, long targetRows)
       throws Exception {
@@ -818,7 +889,10 @@ class NexmarkMatrixBenchmark {
     env.getConfig().enableObjectReuse();
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
     createFlussCatalog(tEnv, bootstrapServers);
-    tEnv.executeSql("CREATE TEMPORARY VIEW src AS SELECT * FROM " + FLUSS_TABLE);
+    Long marker = FLUSS_MARKERS.get(q.label);
+    tEnv.executeSql(
+        "CREATE TEMPORARY VIEW src AS SELECT * FROM "
+            + (marker != null ? FLUSS_TRACED_TABLE : FLUSS_TABLE));
     createEventViews(tEnv);
     tEnv.createTemporarySystemFunction("count_char", CountChar.class);
     runSetup(tEnv, q);
@@ -828,7 +902,9 @@ class NexmarkMatrixBenchmark {
     Table table = tEnv.sqlQuery(q.insertSql.substring("INSERT INTO sink ".length()));
     flussRowsSeen = new AtomicLong();
     flussTargetReached = new CountDownLatch(1);
-    tEnv.toChangelogStream(table).addSink(new CountingSink(targetRows)).name("count-fluss-bench");
+    tEnv.toChangelogStream(table)
+        .addSink(new CountingSink(targetRows, marker))
+        .name("count-fluss-bench");
     long start = System.nanoTime();
     JobClient job = env.executeAsync("fluss-nexmark-" + q.label);
     try {
@@ -841,9 +917,11 @@ class NexmarkMatrixBenchmark {
             q.label
                 + ": Fluss run saw "
                 + flussRowsSeen.get()
-                + " of "
-                + targetRows
-                + " sink rows within "
+                + " sink rows and no finish line ("
+                + (FLUSS_MARKERS.containsKey(q.label)
+                    ? "marker row " + FLUSS_MARKERS.get(q.label)
+                    : targetRows + " rows")
+                + ") within "
                 + FLUSS_NTH_ROW_TIMEOUT_SECONDS
                 + "s");
       }
@@ -911,33 +989,35 @@ class NexmarkMatrixBenchmark {
   }
 
   /**
-   * Why a query cannot run on the Fluss rung, or null when it can. Both families lack a
-   * deterministic Nth sink row to cancel at on an unbounded source: q12's proctime windows group by
-   * wall clock, so even its total output count varies run to run; q4/q9's two-input join feeds an
-   * update-collapsing aggregate/rank (Flink skips the -U/+U pair when the aggregate value didn't
-   * change), so the changelog cardinality depends on the join's input interleaving. The bounded
-   * rungs never see this: they measure to end-of-input, not to a row count.
+   * Why a query cannot run on the Fluss rung, or null when it can. Only q12 is out: a proctime
+   * window's output count is wall-clock-dependent, and any marker's own window would close ~10s
+   * (the window size) after the drain, so a finish line would time the window, not the engines.
+   * The queries whose changelog row count is not deterministic (q4/q9 — the join-input
+   * interleaving decides how many -U/+U pairs the update-collapsing aggregate/rank emits) or zero
+   * (q21) run against the traced table and cancel on the poison marker's output row instead of a
+   * row count ({@link #FLUSS_MARKERS}).
    */
   private static String flussSkipReason(Query q) {
     if ("q12".equals(q.label)) {
       return "proctime windows have no deterministic output count to cancel at";
     }
-    if (Set.of("q4", "q9").contains(q.label)) {
-      return "changelog cardinality is interleaving-dependent; no deterministic Nth row to cancel at";
-    }
     return null;
   }
 
   /**
-   * Counts changelog rows and releases the latch at the Nth — the count-N-then-cancel sink the Fluss
-   * rung times against (the latch pattern of NativeFlussSourceSqlHarnessTest's CollectingSink,
-   * replicated locally so the benchmark stays self-contained).
+   * Counts changelog rows and releases the latch at the finish line — the Nth row for the counted
+   * queries, or the poison pair's output row (column 0 equals the marker id) for the marker
+   * queries, whose emission necessarily follows every real row in a parallelism-1 pipeline. (The
+   * latch pattern of NativeFlussSourceSqlHarnessTest's CollectingSink, replicated locally so the
+   * benchmark stays self-contained.)
    */
   private static final class CountingSink extends RichSinkFunction<Row> {
     private final long targetRows;
+    private final Long marker;
 
-    private CountingSink(long targetRows) {
+    private CountingSink(long targetRows, Long marker) {
       this.targetRows = targetRows;
+      this.marker = marker;
     }
 
     @Override
@@ -947,7 +1027,10 @@ class NexmarkMatrixBenchmark {
       if (seen == null || latch == null) {
         return;
       }
-      if (seen.incrementAndGet() >= targetRows) {
+      long count = seen.incrementAndGet();
+      if (marker != null
+          ? marker.equals(value.getField(0))
+          : count >= targetRows) {
         latch.countDown();
       }
     }
