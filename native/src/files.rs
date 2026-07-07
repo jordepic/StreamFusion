@@ -588,6 +588,120 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeParquetE
     }
 }
 
+/// Splits one batch into per-partition sub-batches — Arroyo's Partitioner::partition shape: the
+/// partition-key columns row-convert to comparable keys, rows group by key in first-seen order, and
+/// one permutation take() reorders every column so each group is a zero-copy slice. Groups keep the
+/// full row schema; the JVM reads the partition values off row 0 to route the group to its bucket
+/// and the encoder projects the columns out of the written file.
+pub(crate) fn split_by_partition_columns(
+    batch: &RecordBatch,
+    partition_columns: &[usize],
+) -> Vec<RecordBatch> {
+    let key_arrays: Vec<ArrayRef> =
+        partition_columns.iter().map(|&index| batch.column(index).clone()).collect();
+    let converter = RowConverter::new(
+        key_arrays.iter().map(|array| SortField::new(array.data_type().clone())).collect(),
+    )
+    .expect("failed to build partition key converter");
+    let rows = converter.convert_columns(&key_arrays).expect("failed to convert partition keys");
+
+    let mut groups: HashMap<Row, Vec<u32>> = HashMap::default();
+    let mut order: Vec<Row> = Vec::new();
+    for index in 0..batch.num_rows() {
+        let key = rows.row(index);
+        groups
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            })
+            .push(index as u32);
+    }
+    // Streaming batches are frequently single-partition (time partitions, pre-shuffled keys), so
+    // skip the permutation when there is nothing to reorder.
+    if order.len() == 1 {
+        return vec![batch.clone()];
+    }
+
+    let mut permutation: Vec<u32> = Vec::with_capacity(batch.num_rows());
+    let mut lengths: Vec<usize> = Vec::with_capacity(order.len());
+    for key in &order {
+        let indices = &groups[key];
+        permutation.extend_from_slice(indices);
+        lengths.push(indices.len());
+    }
+    let permutation = UInt32Array::from(permutation);
+    let permuted_columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &permutation, None).expect("failed to permute batch"))
+        .collect();
+    let permuted =
+        RecordBatch::try_new(batch.schema(), permuted_columns).expect("failed to rebuild batch");
+
+    let mut slices = Vec::with_capacity(lengths.len());
+    let mut offset = 0;
+    for length in lengths {
+        slices.push(permuted.slice(offset, length));
+        offset += length;
+    }
+    slices
+}
+
+/// Splits an Arrow batch the JVM exported by its partition-key columns and returns a handle to the
+/// resulting groups, pulled one at a time with `nextPartitionSlice` and released with
+/// `closePartitionSplit`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_splitByPartitionColumns<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    in_array_address: jlong,
+    in_schema_address: jlong,
+    partition_columns: JIntArray<'local>,
+) -> jlong {
+    let batch = import_record_batch(in_array_address, in_schema_address);
+    let partition_columns = read_columns(&env, &partition_columns);
+    let slices = split_by_partition_columns(&batch, &partition_columns);
+    into_handle(PartitionSplit { slices: slices.into_iter().rev().collect() })
+}
+
+/// Per-partition groups awaiting export, in reverse so the JVM pulls them in first-seen order.
+pub(crate) struct PartitionSplit {
+    slices: Vec<RecordBatch>,
+}
+
+/// Exports the next partition group into the consumer-allocated C structs, returning false once
+/// every group has been pulled.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_nextPartitionSlice<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    out_array_address: jlong,
+    out_schema_address: jlong,
+) -> jboolean {
+    let split = unsafe { &mut *(handle as *mut PartitionSplit) };
+    match split.slices.pop() {
+        Some(slice) => {
+            export_record_batch(slice, out_array_address, out_schema_address);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Releases a partition split handle, dropping any groups the JVM did not pull.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closePartitionSplit<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    unsafe {
+        drop(from_handle::<PartitionSplit>(handle));
+    }
+}
+
 /// Reorders/selects a batch's columns to match the requested projection (by name); identity when no
 /// projection was requested. Shared by the file sources so projection pushdown behaves identically.
 /// A native source the JVM pulls one Arrow batch at a time, until the split is exhausted. The concrete
@@ -1150,5 +1264,123 @@ mod parquet_encoder_tests {
         // parquet-mr leaves chunk-level min/max untruncated; parquet-rs would truncate to 64 bytes
         // by default, so the 200-byte max must have survived intact.
         assert_eq!(statistics.max_bytes_opt().expect("max missing").len(), 200);
+    }
+}
+
+#[cfg(test)]
+mod partition_split_tests {
+    use super::*;
+
+    fn batch(keys: Vec<Option<&str>>, values: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, true),
+                Field::new("v", DataType::Int32, false),
+            ])),
+            vec![Arc::new(StringArray::from(keys)), Arc::new(Int32Array::from(values))],
+        )
+        .unwrap()
+    }
+
+    fn key_of(slice: &RecordBatch, row: usize) -> Option<String> {
+        let keys = slice.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        if keys.is_null(row) { None } else { Some(keys.value(row).to_string()) }
+    }
+
+    #[test]
+    fn groups_in_first_seen_order_with_null_key_group() {
+        let batch = batch(
+            vec![Some("b"), None, Some("a"), Some("b"), None, Some("b")],
+            vec![1, 2, 3, 4, 5, 6],
+        );
+        let slices = split_by_partition_columns(&batch, &[0]);
+        assert_eq!(slices.len(), 3);
+
+        assert_eq!(key_of(&slices[0], 0), Some("b".to_string()));
+        let values = slices[0].column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), &[1, 4, 6]);
+
+        assert_eq!(key_of(&slices[1], 0), None);
+        let values = slices[1].column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), &[2, 5]);
+
+        assert_eq!(key_of(&slices[2], 0), Some("a".to_string()));
+        let values = slices[2].column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), &[3]);
+
+        // Every group is single-keyed: the JVM routes each slice by its row 0.
+        for slice in &slices {
+            for row in 1..slice.num_rows() {
+                assert_eq!(key_of(slice, row), key_of(slice, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn multi_column_keys_group_together() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Utf8, true),
+                Field::new("k2", DataType::Int32, false),
+                Field::new("v", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("x"), Some("x"), Some("y"), Some("x")])),
+                Arc::new(Int32Array::from(vec![1, 2, 1, 1])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+        let slices = split_by_partition_columns(&batch, &[0, 1]);
+        assert_eq!(slices.len(), 3);
+        let values = slices[0].column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.values(), &[10, 40]); // (x, 1)
+        let values = slices[1].column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.values(), &[20]); // (x, 2)
+        let values = slices[2].column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(values.values(), &[30]); // (y, 1)
+    }
+
+    #[test]
+    fn single_key_batch_passes_through_unpermuted() {
+        let source = batch(vec![Some("only"), Some("only")], vec![1, 2]);
+        let slices = split_by_partition_columns(&source, &[0]);
+        assert_eq!(slices.len(), 1);
+        // The fast path must hand back the same underlying buffers, not a permuted copy.
+        assert_eq!(
+            source.column(1).to_data().buffers()[0].as_ptr(),
+            slices[0].column(1).to_data().buffers()[0].as_ptr()
+        );
+        assert_eq!(slices[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn sliced_groups_encode_correctly() {
+        // A permuted group is a sliced batch (nonzero offset); it must encode into a parquet file
+        // whose rows are exactly the group's, proving the slice survives the encoder path.
+        let source = batch(vec![Some("b"), Some("a"), Some("b")], vec![1, 2, 3]);
+        let slices = split_by_partition_columns(&source, &[0]);
+        let mut encoder = ParquetEncoder::new(source.schema(), &[0], &[], &[]);
+        encoder.write(&slices[1]);
+        encoder.finish();
+        let mut file = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = encoder.drain_into(&mut chunk);
+            if n == 0 {
+                break;
+            }
+            file.extend_from_slice(&chunk[..n]);
+        }
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(file),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let read: Vec<RecordBatch> = reader.collect::<Result<_, _>>().unwrap();
+        assert_eq!(read[0].num_columns(), 1);
+        let values = read[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), &[2]);
     }
 }
