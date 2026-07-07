@@ -480,11 +480,6 @@ class NexmarkMatrixBenchmark {
   // forever). Healthy 500K-event cells finish in single-digit seconds, so two minutes is a stall,
   // not a slow run.
   private static final long FLUSS_NTH_ROW_TIMEOUT_SECONDS = 120L;
-  // Latch/counter for the Fluss rung's count-N-then-cancel sink. Static volatile because Flink
-  // serializes the sink function into the task, so instance fields cannot signal the driver — the
-  // same pattern as NativeFlussSourceSqlHarnessTest's CollectingSink.
-  private static volatile CountDownLatch flussTargetReached;
-  private static volatile AtomicLong flussRowsSeen;
 
   @Test
   void matrix() throws Exception {
@@ -937,26 +932,32 @@ class NexmarkMatrixBenchmark {
     tEnv.createTemporarySystemFunction("count_char", CountChar.class);
     runSetup(tEnv, q);
     PhysicalPlanScan scan = nativeRun ? NativePlanner.install(tEnv) : null;
-    // The query's SELECT without the blackhole INSERT wrapper, routed to the counting sink instead
-    // (toChangelogStream, so the updating queries' retractions count like any other sink row).
-    Table table = tEnv.sqlQuery(q.insertSql.substring("INSERT INTO sink ".length()));
-    flussRowsSeen = new AtomicLong();
-    flussTargetReached = new CountDownLatch(1);
-    tEnv.toChangelogStream(table)
-        .addSink(new CountingSink(targetRows, marker))
-        .name("count-fluss-bench");
+    // The same INSERT INTO sink shape as every other rung, with the counting blackhole standing in
+    // for blackhole: the sink swallows raw RowData (no external-Row conversion — the previous
+    // toChangelogStream sink added one heavy enough to compress every ratio) while still giving the
+    // driver its finish line, the Nth changelog row or the poison marker's output row.
+    tEnv.executeSql(
+        q.sinkDdl
+            .replace("'connector' = 'blackhole'", "'connector' = 'counting-blackhole'")
+            .replace("%TS%", "TIMESTAMP(3)")
+            .replace("%WTS%", "TIMESTAMP(3)"));
+    CountingBlackholeTableFactory.arm(targetRows, marker);
     long start = System.nanoTime();
-    JobClient job = env.executeAsync("fluss-nexmark-" + q.label);
+    JobClient job =
+        tEnv.executeSql(q.insertSql)
+            .getJobClient()
+            .orElseThrow(() -> new IllegalStateException("insert produced no job"));
     try {
       if (nativeRun && scan.substitutions() == 0) {
         throw new IllegalStateException(
             q.label + ": native island did not engage; comparison is moot. " + scan.fallbackReasons());
       }
-      if (!flussTargetReached.await(FLUSS_NTH_ROW_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+      if (!CountingBlackholeTableFactory.targetReached.await(
+          FLUSS_NTH_ROW_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
         throw new TimeoutException(
             q.label
                 + ": Fluss run saw "
-                + flussRowsSeen.get()
+                + CountingBlackholeTableFactory.rowsSeen.get()
                 + " sink rows and no finish line ("
                 + (FLUSS_MARKERS.containsKey(q.label)
                     ? "marker row " + FLUSS_MARKERS.get(q.label)
@@ -973,8 +974,7 @@ class NexmarkMatrixBenchmark {
         // The job may already be terminating (e.g. it failed before the Nth row); the exception
         // propagating out of the try block is the interesting one, so cancellation noise stays here.
       }
-      flussRowsSeen = null;
-      flussTargetReached = null;
+      CountingBlackholeTableFactory.disarm();
     }
   }
 
@@ -1042,38 +1042,6 @@ class NexmarkMatrixBenchmark {
       return "proctime windows have no deterministic output count to cancel at";
     }
     return null;
-  }
-
-  /**
-   * Counts changelog rows and releases the latch at the finish line — the Nth row for the counted
-   * queries, or the poison pair's output row (column 0 equals the marker id) for the marker
-   * queries, whose emission necessarily follows every real row in a parallelism-1 pipeline. (The
-   * latch pattern of NativeFlussSourceSqlHarnessTest's CollectingSink, replicated locally so the
-   * benchmark stays self-contained.)
-   */
-  private static final class CountingSink extends RichSinkFunction<Row> {
-    private final long targetRows;
-    private final Long marker;
-
-    private CountingSink(long targetRows, Long marker) {
-      this.targetRows = targetRows;
-      this.marker = marker;
-    }
-
-    @Override
-    public void invoke(Row value, Context context) {
-      AtomicLong seen = flussRowsSeen;
-      CountDownLatch latch = flussTargetReached;
-      if (seen == null || latch == null) {
-        return;
-      }
-      long count = seen.incrementAndGet();
-      if (marker != null
-          ? marker.equals(value.getField(0))
-          : count >= targetRows) {
-        latch.countDown();
-      }
-    }
   }
 
   // ----- parquet file source -----

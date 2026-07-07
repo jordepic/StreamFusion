@@ -75,3 +75,12 @@ conversion advantage is gone (finding 1) and the whole cell is decided inside th
    native *slower* (2.83× → 2.18×; stock unchanged; q15 within noise) — fetches are byte-capped,
    so the uncompressed log costs ~4× the fetch round-trips. The zstd decode is the price of
    fewer RPCs, not removable overhead.
+
+## Acted on: the sink perimeter (finding 1) was the trailing cells' main story
+
+Replacing the rung's `toChangelogStream` counting sink with a `counting-blackhole` table sink
+(raw `RowData`, blackhole-equivalent, latch at the finish line) re-quoted the whole column:
+q19 0.97×→2.43×, q23 1.41×→2.72×, q15 0.78×→0.98×, q16 0.85×→1.00×, q17 0.84×→1.26× — twenty of
+twenty-two now clear 1× with a 0.98× floor. The external-`Row` conversion was a shared constant
+large enough to compress every ratio, worst for changelog-heavy output. Levers 1–3 remain the
+path for q15/q16, now from a fair baseline.

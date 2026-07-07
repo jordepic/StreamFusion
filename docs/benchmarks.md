@@ -494,8 +494,10 @@ is diluted, not reversed.
 **Fluss** — the opt-in fourth source rung (`SF_MATRIX_FLUSS=true`), the columnar-on-the-wire
 source: the same wide event row is preloaded into a local Fluss test cluster and read back by
 both engines in the identical default streaming runtime — stock Flink-on-Fluss vs the native
-fluss-rs log-table reader. Boundedness comes from a count-N-then-cancel collecting sink, so each
-cell measures time-to-Nth-row at `SF_ROWS` scale. The native reader requires the `fluss` cargo
+fluss-rs log-table reader. Boundedness comes from a counting blackhole sink —
+raw `RowData`, the same perimeter as the other rungs' `blackhole`, releasing the driver's latch
+at the finish line — so each cell measures time-to-Nth-row (or time-to-marker) at `SF_ROWS`
+scale. The native reader requires the `fluss` cargo
 feature in the build, added alongside the recommended `mimalloc`: `SF_BENCHMARK=true
 SF_MATRIX_FLUSS=true mvn test -Pbench -Dnative.cargo.args="build --release --features
 mimalloc,fluss" -Dtest=NexmarkMatrixBenchmark`. Building the `fluss` feature currently needs
@@ -533,34 +535,52 @@ flush fires proctime windows immediately. Upstreaming `scan.bounded.mode` to Flu
 (`.claude/todos/54-fluss-bounded-scan-upstream.md`) would retire the count, sentinel, and
 marker machinery at once and admit q12.
 
-Run of 2026-07-06 (500K events, best of 2 after a warmup, time-to-Nth-row, native vs the stock
-Fluss connector in the identical default streaming environment, both over the watermarked
-table), sorted by speedup:
+Run of 2026-07-06 (500K events, best of 2 after a warmup, time-to-Nth-row / time-to-marker,
+native vs the stock Fluss connector in the identical default streaming environment, both over
+the watermarked table, both sinking to the counting blackhole), sorted by speedup:
 
 | Query | Native vs. Flink-on-Fluss | Flink (ev/s) | Native (ev/s) |
 |---|---|---|---|
-| q11 | **4.17×** | 0.77 M | 3.22 M |
-| q2 | **2.87×** | 1.64 M | 4.70 M |
-| q0 | **2.83×** | 1.34 M | 3.78 M |
-| q1 ‡ | **2.59×** | 1.35 M | 3.49 M |
-| q7 | **2.48×** | 0.62 M | 1.54 M |
-| q20 | **2.31×** | 0.85 M | 1.96 M |
-| q21 † | **2.28×** | 0.86 M | 1.96 M |
-| q3 | **2.27×** | 1.77 M | 4.02 M |
-| q8 | **2.20×** | 1.03 M | 2.26 M |
-| q22 | **1.87×** | 1.00 M | 1.86 M |
-| q13 | **1.66×** | 1.24 M | 2.06 M |
-| q5 | **1.61×** | 1.00 M | 1.62 M |
-| q4 | **1.51×** | 0.60 M | 0.91 M |
-| q14 § | **1.49×** | 1.30 M | 1.94 M |
-| q10 § | **1.45×** | 1.04 M | 1.51 M |
-| q23 | **1.41×** | 0.60 M | 0.85 M |
-| q18 | **1.28×** | 0.93 M | 1.19 M |
-| q9 | **1.03×** | 0.56 M | 0.57 M |
-| q19 | 0.97× | 0.18 M | 0.17 M |
-| q16 § | 0.85× | 0.50 M | 0.43 M |
-| q17 § | 0.84× | 0.86 M | 0.73 M |
-| q15 § | 0.78× | 0.70 M | 0.54 M |
+| q11 | **4.02×** | 0.72 M | 2.89 M |
+| q22 | **3.07×** | 0.99 M | 3.06 M |
+| q2 | **2.77×** | 1.49 M | 4.12 M |
+| q23 | **2.72×** | 0.59 M | 1.60 M |
+| q1 ‡ | **2.65×** | 1.37 M | 3.64 M |
+| q0 | **2.58×** | 1.38 M | 3.54 M |
+| q10 § | **2.53×** | 1.17 M | 2.97 M |
+| q14 § | **2.53×** | 1.37 M | 3.46 M |
+| q7 | **2.46×** | 0.57 M | 1.41 M |
+| q19 | **2.43×** | 0.37 M | 0.91 M |
+| q5 | **2.25×** | 0.79 M | 1.77 M |
+| q21 † | **2.14×** | 0.83 M | 1.77 M |
+| q8 | **2.12×** | 0.93 M | 1.98 M |
+| q13 | **2.11×** | 1.28 M | 2.70 M |
+| q20 | **2.02×** | 0.83 M | 1.68 M |
+| q18 | **1.88×** | 0.97 M | 1.84 M |
+| q9 | **1.59×** | 0.58 M | 0.92 M |
+| q3 | **1.55×** | 1.38 M | 2.14 M |
+| q4 | **1.43×** | 0.65 M | 0.93 M |
+| q17 § | **1.26×** | 0.96 M | 1.21 M |
+| q16 § | 1.00× | 0.79 M | 0.79 M |
+| q15 § | 0.98× | 0.94 M | 0.92 M |
+
+**Twenty of twenty-two clear 1×, floor 0.98×.** An earlier quote of this table (same day, same
+build) had the distinct-agg family at 0.78–0.85× and q19 at 0.97× — an artifact of the rung's
+original sink: the count-to-N cancel ran through `toChangelogStream`, whose `TableToDataStream`
+conversion turns every internal `RowData` into an external `Row` (boxing, UTF-8 decode,
+`LocalDateTime` materialization). Both engines paid it equally, but a large shared perimeter
+constant compresses every ratio toward 1× — worst exactly for the changelog-heavy queries that
+emit ~2 sink rows per input row. Replacing it with the counting blackhole (raw `RowData`, the
+same swallow as every other rung's `blackhole`, plus the latch) restored the rung's
+comparability: q19 0.97×→2.43×, q23 1.41×→2.72×, q15 0.78×→0.98×, q16 0.85×→1.00×, q17
+0.84×→1.26×. The profiled operator levers (the changelog aggregate's allocation churn and
+`DATE_FORMAT`'s per-row formatting — `.claude/research/fluss-source-profile-2026-07.md`) remain
+the path to push q15/q16 past the line.
+
+The opt-in variants measure within noise of their byte-parity defaults on this rung — except
+**† q21**, whose work is regex-dominated: the byte-parity JVM-upcall default reads **2.14×** and
+the opt-in pure-Rust regex/case path **4.98×**, the honest cost of the parity guarantee (the
+same split the Parquet rung shows at 2.77× vs 6.14×). q4/q9/q21 are the marker-measured cells.
 
 The table's log rides Fluss's defaults, including ZSTD-compressed Arrow batches (as the Parquet
 rung's file rides Flink's Snappy default) — both engines decode the same bytes. Turning
@@ -569,33 +589,13 @@ compression off is not a lever: with `'table.log.arrow.compression.type' = 'NONE
 an uncompressed log needs ~4× the fetch round-trips for the same rows — the zstd decode the
 profile shows is the price of fewer RPCs, not waste.
 
-**The zero-transpose hypothesis holds where the pipeline is source-bound.** The wire format is
-Arrow, so the native reader feeds the island directly — no ingest transpose, no decode — and
-the stateless queries hit the highest absolute native rates of any streaming rung (q2 at 4.7 M
-ev/s; the generator rung's q2 runs ~2.8 M). The updating joins are the clearest confirmation:
-q3 and q20, *below 1×* on the `RowData` generator (0.95×/0.84×) because their cost was the
-perimeter transpose, run 2.27× and 2.31× here — the same jump the Parquet rung showed. The
-windowed family runs natively end to end off the table's watermark, q11's session windows
-peaking at **4.17×** — the rung's best cell.
-
-**The distinct-agg family (q15/q16/q17) trails 1× on this rung only** (0.78–0.85×, vs
-1.3–1.4× on the generator and 2.1–3.1× on Kafka), with q19 at the line (0.97×). Profiling
-(`.claude/research/fluss-source-profile-2026-07.md`) overturned the first hypothesis: fluss-rs
-delivers *huge* batches (~83K rows average — 500K rows in ~6 batches), not per-wire-batch
-slivers, so there is nothing to coalesce and per-batch overhead is not the story. The native
-source itself is lean (its only real cost is the zstd log decode both engines pay); what decides
-these cells is the **changelog aggregate's allocation churn** — Vec-growth memmove, mimalloc
-purge syscalls, a changelog emit still materializing per-row `ScalarValue`s — plus `DATE_FORMAT`
-re-parsing its format string and allocating a `String` per row. The rung exposes it because the
-stock connector's per-row source conversion (the ~580-sample cost native avoids on every other
-query) is absent from the comparison ledger here: both sides' source is cheap, so the aggregate
-decides. The levers, ranked with acceptance benchmarks, are in the research note.
-
-The opt-in variants measure within noise of their byte-parity defaults on this rung — except
-**† q21**, whose work is regex-dominated: the byte-parity JVM-upcall default reads **2.28×** and
-the opt-in pure-Rust regex/case path **5.25×**, the honest cost of the parity guarantee on a
-full-drain measurement (the same split the Parquet rung shows at 2.77× vs 6.14×). q4/q9/q21 are
-the marker-measured cells (run 2026-07-06, same build).
+**The zero-transpose hypothesis holds.** The wire format is Arrow, so the native reader feeds
+the island directly — no ingest transpose, no decode — and the stateless queries hit the highest
+absolute native rates of any streaming rung (q2 at 4.1 M ev/s). The stock connector is itself
+the strongest baseline of any rung (a lazy columnar read of the same Arrow log — its per-row
+`ColumnarRow`→`RowData` conversion is the gap the stateless 2.5–3.1× measures), which is why
+these ratios sit below Parquet's despite higher absolute rates: stock-on-Fluss is simply much
+faster than stock-on-Parquet.
 
 **Two masked native bugs surfaced the first time this rung ran unbounded** — worth recording
 because every earlier rung was bounded, where the end-of-input `MAX_WATERMARK` flush forgives
