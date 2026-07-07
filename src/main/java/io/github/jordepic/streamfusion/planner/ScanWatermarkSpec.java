@@ -18,27 +18,27 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
 import org.apache.flink.util.TimeUtils;
 
 /**
- * A Kafka scan's pushed-down source watermark, in the shapes the native source reproduces: bounded
+ * A scan's pushed-down source watermark, in the shapes the native sources reproduce: bounded
  * out-of-orderness ({@code rt} or {@code rt - INTERVAL const}) where the rowtime read from the scan is
  * either a physical timestamp column or {@code TO_TIMESTAMP_LTZ(bigintCol, 3)} (a computed rowtime
  * over epoch millis — the common Kafka-table idiom), periodic emit, no alignment. Flink pushes the
- * table's {@code WATERMARK} clause into the Kafka scan (the connector supports watermark push-down),
- * so no separate assigner node exists in the plan — whichever operator replaces the scan must
+ * table's {@code WATERMARK} clause into a scan whose connector supports watermark push-down (Kafka
+ * and Fluss both do), so no separate assigner node exists in the plan — whichever operator replaces the scan must
  * regenerate the watermarks or the query never fires its event-time timers. {@link #UNSUPPORTED} marks
  * a watermarked scan outside the reproducible shapes (any other computed rowtime, on-event emit,
  * alignment); the caller must then leave the whole scan on the host.
  */
-final class KafkaWatermarkSpec {
+final class ScanWatermarkSpec {
 
   /** Watermarked, but not in a shape the native source reproduces — leave the scan on the host. */
-  static final KafkaWatermarkSpec UNSUPPORTED = new KafkaWatermarkSpec(-1, null, 0, 0);
+  static final ScanWatermarkSpec UNSUPPORTED = new ScanWatermarkSpec(-1, null, 0, 0);
 
   final int rowtimeIndex;
   final String rowtimeFieldName;
   final long delayMillis;
   final long idleTimeoutMillis;
 
-  private KafkaWatermarkSpec(
+  private ScanWatermarkSpec(
       int rowtimeIndex, String rowtimeFieldName, long delayMillis, long idleTimeoutMillis) {
     this.rowtimeIndex = rowtimeIndex;
     this.rowtimeFieldName = rowtimeFieldName;
@@ -47,15 +47,15 @@ final class KafkaWatermarkSpec {
   }
 
   /** This spec with the rowtime column re-indexed for a projected output type. */
-  KafkaWatermarkSpec withRowtimeIndex(int index) {
-    return new KafkaWatermarkSpec(index, rowtimeFieldName, delayMillis, idleTimeoutMillis);
+  ScanWatermarkSpec withRowtimeIndex(int index) {
+    return new ScanWatermarkSpec(index, rowtimeFieldName, delayMillis, idleTimeoutMillis);
   }
 
   /**
    * The scan's watermark: {@code null} when the table declares none, {@link #UNSUPPORTED} when it
    * declares one the native source can't reproduce, else the parsed spec.
    */
-  static KafkaWatermarkSpec of(StreamPhysicalTableSourceScan scan) {
+  static ScanWatermarkSpec of(StreamPhysicalTableSourceScan scan) {
     TableSourceTable table = scan.getTable().unwrap(TableSourceTable.class);
     if (table == null) {
       return null;
@@ -111,7 +111,7 @@ final class KafkaWatermarkSpec {
     if (!valid) {
       return UNSUPPORTED;
     }
-    return new KafkaWatermarkSpec(
+    return new ScanWatermarkSpec(
         bounded.rowtimeIndex,
         scan.getRowType().getFieldNames().get(bounded.rowtimeIndex),
         bounded.delayMillis,

@@ -1,7 +1,7 @@
 package io.github.jordepic.streamfusion.planner;
 
 import io.github.jordepic.streamfusion.kafka.NativeKafkaSource;
-import io.github.jordepic.streamfusion.kafka.NativeKafkaWatermarks;
+import io.github.jordepic.streamfusion.operator.NativeSourceWatermarks;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import java.util.Collections;
@@ -32,7 +32,7 @@ public class NativeKafkaSourceExecNode extends ExecNodeBase<ArrowBatch>
   private final RowType writerType;
   private final RowType outputType;
   private final Map<String, String> options;
-  private final KafkaWatermarkSpec watermark;
+  private final ScanWatermarkSpec watermark;
 
   public NativeKafkaSourceExecNode(
       ReadableConfig tableConfig,
@@ -40,7 +40,7 @@ public class NativeKafkaSourceExecNode extends ExecNodeBase<ArrowBatch>
       RowType outputType,
       String description,
       Map<String, String> options,
-      KafkaWatermarkSpec watermark) {
+      ScanWatermarkSpec watermark) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-kafka-source_1"),
@@ -67,7 +67,7 @@ public class NativeKafkaSourceExecNode extends ExecNodeBase<ArrowBatch>
     WatermarkStrategy<ArrowBatch> strategy =
         watermark == null
             ? WatermarkStrategy.noWatermarks()
-            : NativeKafkaWatermarks.strategy(watermark.delayMillis, watermark.idleTimeoutMillis);
+            : NativeSourceWatermarks.strategy(watermark.delayMillis, watermark.idleTimeoutMillis);
     DataStreamSource<ArrowBatch> stream =
         env.fromSource(source, strategy, TRANSFORMATION, ArrowBatchTypeInformation.INSTANCE);
     return stream.getTransformation();

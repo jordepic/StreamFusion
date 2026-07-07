@@ -31,6 +31,7 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
   private final int[] keyColumns;
   private final int[] valueTypes;
   private final int[] aggregateKinds;
+  private final boolean timestampLtz;
 
   public NativeColumnarLocalWindowAggExecNode(
       ReadableConfig tableConfig,
@@ -44,7 +45,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
-      int[] aggregateKinds) {
+      int[] aggregateKinds,
+      boolean timestampLtz) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-local-window-aggregate_1"),
@@ -60,6 +62,7 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
+    this.timestampLtz = timestampLtz;
   }
 
   @Override
@@ -68,7 +71,12 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
-    String timeZoneId = planner.getTableConfig().getLocalTimeZone().getId();
+    // Flink's shift-zone rule: plain-TIMESTAMP rowtime windows compute on epoch millis with UTC
+    // digits; only a TIMESTAMP_LTZ rowtime shifts boundaries into the session zone. The zone is
+    // read by the window-attached ingest, which must invert exactly the shift the upstream window
+    // aggregate's boundary rendering applied.
+    String timeZoneId =
+        timestampLtz ? planner.getTableConfig().getLocalTimeZone().getId() : "UTC";
     Transformation<ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,

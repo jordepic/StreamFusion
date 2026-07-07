@@ -705,7 +705,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           scan.getTraitSet(),
           scan.getRowType(),
           FilesystemTables.options(scan),
-          KafkaWatermarkSpec.of(scan));
+          ScanWatermarkSpec.of(scan));
     }
 
     // Shallow native-decode path (the default for every value format): Flink's KafkaSource consumes raw
@@ -1052,7 +1052,8 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
             valueColumns,
             keyColumns,
             valueTypes,
-            kinds);
+            kinds,
+            WindowAggregateMatcher.isLtz(agg.windowing()));
       }
     }
 

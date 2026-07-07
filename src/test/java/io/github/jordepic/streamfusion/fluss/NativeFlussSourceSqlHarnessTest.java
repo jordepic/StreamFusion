@@ -128,6 +128,125 @@ class NativeFlussSourceSqlHarnessTest {
   }
 
   @Test
+  void nativeFlussSourceRunsWatermarkedWindowedQueryFullyNatively() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      tablePath = CATALOG + "." + DATABASE + ".native_fluss_watermark_it_" + System.nanoTime();
+      writeWatermarkedRows(bootstrapServers, tablePath);
+
+      // Flink does not push a watermark into a Fluss scan (the assigner survives as its own node),
+      // so a watermarked log table runs as native source -> native columnar watermark assigner ->
+      // native window aggregate. Tumbling windows fire only if that chain actually carries the
+      // watermark: the 00:01:00 row advances it past both real windows (its own window never
+      // closes), so exactly two rows arrive.
+      String sql =
+          "SELECT window_start, COUNT(id) FROM TABLE(TUMBLE(TABLE "
+              + tablePath
+              + ", DESCRIPTOR(ts), INTERVAL '5' SECOND)) GROUP BY window_start, window_end";
+      // Pin the mechanism in the optimized plan: the native assigner above the native scan.
+      String plan = explain(bootstrapServers, sql);
+      String optimized = plan.substring(plan.indexOf("== Optimized Physical Plan =="));
+      assertTrue(
+          optimized.contains("NativeWatermarkAssigner") && optimized.contains("NativeFlussSource"),
+          "expected a native assigner over the native scan; plan:\n" + plan);
+      List<List<Object>> rows = readRows(bootstrapServers, sql, 2);
+
+      assertEquals(
+          List.of(
+              List.of(LocalDateTime.parse("2024-01-01T00:00:00"), 2L),
+              List.of(LocalDateTime.parse("2024-01-01T00:00:05"), 1L)),
+          rows);
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
+  @Test
+  void nativeFlussSourceFiresWindowReaggregationMidStream() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      tablePath = CATALOG + "." + DATABASE + ".native_fluss_reagg_it_" + System.nanoTime();
+      writeWatermarkedRows(bootstrapServers, tablePath);
+
+      // The q5 shape: a window aggregate re-aggregated per window (window-attached strategy). On an
+      // unbounded source there is no end-of-input flush, so these rows arrive only if the attached
+      // level's window bookkeeping closes on the mid-stream watermark — the shift-zone regression
+      // this pins held the re-aggregated windows six hours (the session-zone offset) in the future,
+      // where only a bounded run's final flush ever released them.
+      List<List<Object>> rows =
+          readRows(
+              bootstrapServers,
+              "SELECT starttime, MAX(c) FROM (SELECT window_start AS starttime, window_end AS"
+                  + " endtime, COUNT(*) AS c FROM TABLE(TUMBLE(TABLE "
+                  + tablePath
+                  + ", DESCRIPTOR(ts), INTERVAL '5' SECOND)) GROUP BY window_start, window_end, id)"
+                  + " GROUP BY starttime, endtime",
+              2);
+
+      assertEquals(
+          List.of(
+              List.of(LocalDateTime.parse("2024-01-01T00:00"), 1L),
+              List.of(LocalDateTime.parse("2024-01-01T00:00:05"), 1L)),
+          rows);
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
+  @Test
+  void nativeFlussSourceIsNotSharedAcrossBranchesThroughSql() throws Exception {
+    FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
+    String bootstrapServers = null;
+    String tablePath = null;
+    try {
+      cluster.start();
+      bootstrapServers = cluster.getBootstrapServers();
+      tablePath = CATALOG + "." + DATABASE + ".native_fluss_reuse_barrier_it_" + System.nanoTime();
+      writeRows(bootstrapServers, tablePath);
+
+      // Two branches over the same table must plan two independent native sources: the Arrow
+      // hand-off is zero-copy single-consumer, so Flink's sub-plan reuse merging the scan into one
+      // broadcasting source is a use-after-free (the digest reuse barrier prevents the merge).
+      String sql =
+          "SELECT id FROM "
+              + tablePath
+              + " WHERE score < 25 UNION ALL SELECT id FROM "
+              + tablePath
+              + " WHERE score >= 25";
+      String plan = explain(bootstrapServers, sql);
+      String physical =
+          plan.substring(
+              plan.indexOf("== Optimized Physical Plan =="),
+              plan.indexOf("== Optimized Execution Plan =="));
+      int sources = physical.split("NativeFlussSource", -1).length - 1;
+      assertEquals(2, sources, "expected one native source per branch; plan:\n" + plan);
+
+      List<List<Object>> rows = readRows(bootstrapServers, sql, 3);
+
+      assertEquals(List.of(List.of(1L), List.of(2L), List.of(3L)), rows);
+    } finally {
+      if (bootstrapServers != null && tablePath != null) {
+        dropTable(bootstrapServers, tablePath);
+      }
+      cluster.close();
+    }
+  }
+
+  @Test
   void nativeFlussSourceReadsNestedRowFieldsThroughSql() throws Exception {
     FlussClusterExtension cluster = FlussClusterExtension.builder().setNumOfTabletServers(1).build();
     String bootstrapServers = null;
@@ -319,6 +438,7 @@ class NativeFlussSourceSqlHarnessTest {
               DATABASE,
               tableName,
               new int[0],
+              -1,
               100L);
       try {
         reader.handleSplitsChanges(new SplitsAddition<>(List.of(usSplit, euSplit)));
@@ -440,6 +560,26 @@ class NativeFlussSourceSqlHarnessTest {
         .await();
   }
 
+  private static void writeWatermarkedRows(String bootstrapServers, String tablePath)
+      throws Exception {
+    StreamTableEnvironment tEnv = environment(bootstrapServers);
+    tEnv.executeSql("DROP TABLE IF EXISTS " + tablePath);
+    tEnv.executeSql(
+        "CREATE TABLE "
+            + tablePath
+            + " (id BIGINT, ts TIMESTAMP(3), WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)"
+            + " WITH ('bucket.num' = '1')");
+    tEnv.executeSql(
+            "INSERT INTO "
+                + tablePath
+                + " VALUES"
+                + " (1, TIMESTAMP '2024-01-01 00:00:01'),"
+                + " (2, TIMESTAMP '2024-01-01 00:00:02'),"
+                + " (3, TIMESTAMP '2024-01-01 00:00:07'),"
+                + " (99, TIMESTAMP '2024-01-01 00:01:00')")
+        .await();
+  }
+
   private static void writeNestedRows(String bootstrapServers, String tablePath) throws Exception {
     StreamTableEnvironment tEnv = environment(bootstrapServers);
     tEnv.executeSql("DROP TABLE IF EXISTS " + tablePath);
@@ -521,6 +661,12 @@ class NativeFlussSourceSqlHarnessTest {
     return readRows(bootstrapServers, sql, targetRows, () -> {});
   }
 
+  private static String explain(String bootstrapServers, String sql) {
+    StreamTableEnvironment tEnv = environment(bootstrapServers);
+    NativePlanner.install(tEnv);
+    return tEnv.explainSql(sql);
+  }
+
   private static List<List<Object>> readRows(
       String bootstrapServers, String sql, int targetRows, ThrowingRunnable afterStart)
       throws Exception {
@@ -539,6 +685,13 @@ class NativeFlussSourceSqlHarnessTest {
           "Fluss source did not route to native; reasons=" + scan.fallbackReasons());
       afterStart.run();
       if (!rowsCollected.await(30, TimeUnit.SECONDS)) {
+        try {
+          job.getJobExecutionResult().get(1, TimeUnit.SECONDS);
+        } catch (java.util.concurrent.ExecutionException jobFailure) {
+          throw new AssertionError("the Fluss job failed asynchronously", jobFailure);
+        } catch (TimeoutException stillRunning) {
+          // Fall through to the row-timeout below; the job is alive but produced nothing.
+        }
         throw new TimeoutException("timed out waiting for native Fluss rows: " + collectedRows);
       }
       List<List<Object>> rows;

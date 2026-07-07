@@ -3,6 +3,7 @@ package io.github.jordepic.streamfusion.planner;
 import io.github.jordepic.streamfusion.fluss.NativeFlussSource;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
+import io.github.jordepic.streamfusion.operator.NativeSourceWatermarks;
 import java.util.Collections;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.dag.Transformation;
@@ -23,12 +24,14 @@ public class NativeFlussSourceExecNode extends ExecNodeBase<ArrowBatch>
   private static final String TRANSFORMATION = "native-fluss-source";
 
   private final NativeFlussSource source;
+  private final ScanWatermarkSpec watermark;
 
   public NativeFlussSourceExecNode(
       ReadableConfig tableConfig,
       RowType outputType,
       String description,
-      NativeFlussSource source) {
+      NativeFlussSource source,
+      ScanWatermarkSpec watermark) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-fluss-source_1"),
@@ -37,18 +40,22 @@ public class NativeFlussSourceExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.source = source;
+    this.watermark = watermark;
   }
 
   @Override
   protected Transformation<ArrowBatch> translateToPlanInternal(
       PlannerBase planner, ExecNodeConfig config) {
     StreamExecutionEnvironment env = planner.getExecEnv();
+    // A watermarked table's WATERMARK clause was pushed into the scan this node replaced, so the
+    // source regenerates it: Flink's own per-split machinery (one generator per split, min
+    // combination, idleness, periodic emit) drives the batch-max timestamps the reader supplies.
+    WatermarkStrategy<ArrowBatch> strategy =
+        watermark == null
+            ? WatermarkStrategy.noWatermarks()
+            : NativeSourceWatermarks.strategy(watermark.delayMillis, watermark.idleTimeoutMillis);
     DataStreamSource<ArrowBatch> stream =
-        env.fromSource(
-            source,
-            WatermarkStrategy.noWatermarks(),
-            TRANSFORMATION,
-            ArrowBatchTypeInformation.INSTANCE);
+        env.fromSource(source, strategy, TRANSFORMATION, ArrowBatchTypeInformation.INSTANCE);
     return stream.getTransformation();
   }
 }

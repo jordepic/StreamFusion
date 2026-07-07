@@ -23,7 +23,7 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
  * columns/sub-fields straight from the bytes (a narrowed JSON output schema, a bare-Avro reader schema,
  * or a pruned protobuf descriptor), the source's columnar analog of the entry-transpose pruning.
  *
- * <p>A watermarked table additionally carries its parsed {@link KafkaWatermarkSpec}: the table's
+ * <p>A watermarked table additionally carries its parsed {@link ScanWatermarkSpec}: the table's
  * {@code WATERMARK} clause was pushed into the scan this node replaces, so the source itself must
  * regenerate the per-split watermarks (the exec node wires the strategy).
  */
@@ -33,14 +33,14 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
   private final RelDataType writerRowType;
   private final RelDataType outputRowType;
   private final Map<String, String> options;
-  private final KafkaWatermarkSpec watermark;
+  private final ScanWatermarkSpec watermark;
 
   public StreamPhysicalNativeKafkaSource(
       RelOptCluster cluster,
       RelTraitSet traitSet,
       RelDataType outputRowType,
       Map<String, String> options,
-      KafkaWatermarkSpec watermark) {
+      ScanWatermarkSpec watermark) {
     this(cluster, traitSet, outputRowType, outputRowType, options, watermark);
   }
 
@@ -50,7 +50,7 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
       RelDataType writerRowType,
       RelDataType outputRowType,
       Map<String, String> options,
-      KafkaWatermarkSpec watermark) {
+      ScanWatermarkSpec watermark) {
     super(cluster, traitSet);
     this.writerRowType = writerRowType;
     this.outputRowType = outputRowType;
@@ -75,7 +75,7 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
   /** A copy that emits only {@code projected} (a subset of the full schema), keeping the full schema as
    * the writer type the decoder parses against. */
   public StreamPhysicalNativeKafkaSource withProjection(RelDataType projected) {
-    KafkaWatermarkSpec remapped =
+    ScanWatermarkSpec remapped =
         watermark == null
             ? null
             : watermark.withRowtimeIndex(

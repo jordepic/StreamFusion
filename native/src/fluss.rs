@@ -20,7 +20,11 @@ struct FlussSplitReader {
     scanner: fluss_rs::client::RecordBatchLogScanner,
     split_ids: HashMap<fluss_rs::metadata::TableBucket, String>,
     stopping_offsets: HashMap<fluss_rs::metadata::TableBucket, i64>,
-    pending: std::collections::VecDeque<(String, i64, RecordBatch)>,
+    /// Index of the rowtime column in the projected batch, or -1 when the table declares no
+    /// watermark — per-batch max rowtimes feed the per-split source watermarks on the JVM side.
+    rowtime_index: i32,
+    /// (split id, next offset, max rowtime millis or i64::MIN, batch).
+    pending: std::collections::VecDeque<(String, i64, i64, RecordBatch)>,
 }
 
 #[cfg(feature = "fluss")]
@@ -30,6 +34,7 @@ impl FlussSplitReader {
         database_name: &str,
         table_name: &str,
         projected_fields: &[usize],
+        rowtime_index: i32,
     ) -> Result<Self, String> {
         let config = fluss_config(config)?;
         let table_path =
@@ -60,6 +65,7 @@ impl FlussSplitReader {
             scanner,
             split_ids: HashMap::default(),
             stopping_offsets: HashMap::default(),
+            rowtime_index,
             pending: std::collections::VecDeque::new(),
         })
     }
@@ -136,7 +142,7 @@ impl FlussSplitReader {
             self.stopping_offsets.remove(&table_bucket);
         }
         self.pending
-            .retain(|(split_id, _, _)| !removed_split_ids.contains(split_id));
+            .retain(|(split_id, _, _, _)| !removed_split_ids.contains(split_id));
         Ok(())
     }
 
@@ -186,7 +192,7 @@ impl FlussSplitReader {
             self.stopping_offsets.remove(&table_bucket);
         }
         self.pending
-            .retain(|(split_id, _, _)| !removed_split_ids.contains(split_id));
+            .retain(|(split_id, _, _, _)| !removed_split_ids.contains(split_id));
         Ok(())
     }
 
@@ -221,7 +227,12 @@ impl FlussSplitReader {
 
         if batch.num_rows() > 0 {
             batch = normalize_timestamp_units(batch)?;
-            self.pending.push_back((split_id, next_offset, batch));
+            let max_rowtime = if self.rowtime_index >= 0 {
+                crate::kafka::max_rowtime_millis(&batch, self.rowtime_index as usize)
+            } else {
+                i64::MIN
+            };
+            self.pending.push_back((split_id, next_offset, max_rowtime, batch));
         }
         Ok(())
     }
@@ -450,6 +461,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openFlussRead
     database_name: JString<'local>,
     table_name: JString<'local>,
     projected_fields: JIntArray<'local>,
+    rowtime_index: jint,
 ) -> jlong {
     fluss_jni(&mut env, 0, |env| {
         let keys = read_string_array(env, &config_keys);
@@ -469,6 +481,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openFlussRead
             &database_name,
             &table_name,
             &projected_fields,
+            rowtime_index,
         )?))
     })
 }
@@ -551,12 +564,12 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSpl
 ) -> jint {
     fluss_jni(&mut env, 0, |env| {
         let reader = unsafe { &mut *(handle as *mut FlussSplitReader) };
-        let (split_id, next_offset, batch) = reader
+        let (split_id, next_offset, max_rowtime, batch) = reader
             .pending
             .pop_front()
             .ok_or_else(|| "drainFlussSplit called with no pending batch".to_string())?;
         let rows = batch.num_rows() as jint;
-        env.set_long_array_region(&split_meta, 0, &[next_offset])
+        env.set_long_array_region(&split_meta, 0, &[next_offset, max_rowtime])
             .map_err(|e| format!("failed to write Fluss split meta: {e}"))?;
         let split_id = env
             .new_string(&split_id)

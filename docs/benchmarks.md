@@ -501,62 +501,93 @@ SF_MATRIX_FLUSS=true mvn test -Pbench -Dnative.cargo.args="build --release --fea
 mimalloc,fluss" -Dtest=NexmarkMatrixBenchmark`. Building the `fluss` feature currently needs
 `protoc` (`protobuf-compiler`) because fluss-rs generates its RPC protos at build time.
 
-Because the log table is unbounded, the rung needs a deterministic Nth sink row to cancel at,
-and it skips (with the reason in the report) the queries that have none:
+Because the log table is unbounded, the rung needs a deterministic Nth sink row to cancel at.
+The benchmark table declares the generator's own 4s bounded-out-of-orderness `WATERMARK` (the
+Fluss catalog persists it), so the windowed event-time queries run on both engines — Flink keeps
+the watermark as an assigner node above the Fluss scan (no push-down, unlike Kafka), and that
+assigner runs natively above the native source. A preloaded sentinel event (an `event_type`
+outside 0..2 with a far-future rowtime, invisible to every view) advances the watermark past
+every real window end, closing the same windows the bounded generator calibration's end-of-input
+flush closes, so the counts line up. Three queries have no deterministic finish line and skip
+with the reason in the report:
 
-- **q5/q7/q8/q11/q12/q13** — the benchmark's Fluss table declares no watermark/time attribute
-  yet, so the windowed/proctime/lookup queries have no baseline on either engine
-  (`.claude/todos/53-fluss-watermark-pushdown.md` adds it, including the sentinel-event trick
-  the count-N method then needs).
 - **q4/q9** — their two-input join feeds an update-collapsing aggregate/rank: Flink skips the
-  `-U/+U` pair when an input row doesn't change the aggregate value, so the changelog row
-  *count* depends on the join's input interleaving — non-deterministic even between two stock
-  Flink runs (a 500K run calibrated 362,710 rows off the generator and observed 316,092 on
-  Fluss, the job idle). Values and final state are identical; only the update cadence varies.
-  The bounded rungs measure these to end-of-input and never need a row target.
+  `-U/+U` pair when an input row doesn't change the aggregate value, so the changelog row *count*
+  depends on the join's input interleaving — non-deterministic even between two stock Flink runs
+  (a 500K run calibrated 362,710 rows off the generator and observed 316,092 on Fluss, the job
+  idle). Values and final state are identical; only the update cadence varies. The bounded rungs
+  measure these to end-of-input and never need a row target.
+- **q12** — a proctime window's output count is wall-clock-dependent, so no deterministic N
+  exists.
 - **q21** — emits zero rows over this generator's data (its channels are `channel-N` and its
   URLs carry no `channel_id=`), so there is no first row to time to. The bounded rungs still
   measure it: the work is the filter over 500K events, not the empty output.
 
 Run of 2026-07-06 (500K events, best of 2 after a warmup, time-to-Nth-row, native vs the stock
-Fluss connector in the identical default streaming environment), sorted by speedup:
+Fluss connector in the identical default streaming environment, both over the watermarked
+table), sorted by speedup:
 
 | Query | Native vs. Flink-on-Fluss | Flink (ev/s) | Native (ev/s) |
 |---|---|---|---|
-| q2 | **3.11×** | 1.61 M | 5.00 M |
-| q0 | **3.01×** | 1.34 M | 4.02 M |
-| q1 ‡ | **2.31×** | 1.32 M | 3.04 M |
-| q20 | **2.29×** | 0.85 M | 1.94 M |
-| q18 | **1.99×** | 0.48 M | 0.96 M |
-| q22 | **1.85×** | 1.03 M | 1.90 M |
-| q3 | **1.59×** | 1.75 M | 2.78 M |
-| q10 § | **1.54×** | 1.00 M | 1.54 M |
-| q14 § | **1.43×** | 1.23 M | 1.76 M |
-| q23 | **1.10×** | 0.64 M | 0.70 M |
-| q19 | **1.08×** | 0.17 M | 0.19 M |
-| q16 § | 0.77× | 0.54 M | 0.41 M |
-| q15 § | 0.72× | 0.74 M | 0.53 M |
-| q17 § | 0.70× | 0.85 M | 0.60 M |
+| q11 | **4.17×** | 0.77 M | 3.22 M |
+| q2 | **2.87×** | 1.64 M | 4.70 M |
+| q0 | **2.83×** | 1.34 M | 3.78 M |
+| q1 ‡ | **2.59×** | 1.35 M | 3.49 M |
+| q7 | **2.48×** | 0.62 M | 1.54 M |
+| q20 | **2.31×** | 0.85 M | 1.96 M |
+| q3 | **2.27×** | 1.77 M | 4.02 M |
+| q8 | **2.20×** | 1.03 M | 2.26 M |
+| q22 | **1.87×** | 1.00 M | 1.86 M |
+| q13 | **1.66×** | 1.24 M | 2.06 M |
+| q5 | **1.61×** | 1.00 M | 1.62 M |
+| q14 § | **1.49×** | 1.30 M | 1.94 M |
+| q10 § | **1.45×** | 1.04 M | 1.51 M |
+| q23 | **1.41×** | 0.60 M | 0.85 M |
+| q18 | **1.28×** | 0.93 M | 1.19 M |
+| q19 | 0.97× | 0.18 M | 0.17 M |
+| q16 § | 0.85× | 0.50 M | 0.43 M |
+| q17 § | 0.84× | 0.86 M | 0.73 M |
+| q15 § | 0.78× | 0.70 M | 0.54 M |
 
 **The zero-transpose hypothesis holds where the pipeline is source-bound.** The wire format is
 Arrow, so the native reader feeds the island directly — no ingest transpose, no decode — and
-the stateless queries hit the highest absolute native rates of any streaming rung (q2 at 5.0 M
+the stateless queries hit the highest absolute native rates of any streaming rung (q2 at 4.7 M
 ev/s; the generator rung's q2 runs ~2.8 M). The updating joins are the clearest confirmation:
 q3 and q20, *below 1×* on the `RowData` generator (0.95×/0.84×) because their cost was the
-perimeter transpose, run 1.59× and 2.29× here — the same jump the Parquet rung showed.
+perimeter transpose, run 2.27× and 2.31× here — the same jump the Parquet rung showed. The
+windowed family runs natively end to end off the table's watermark, q11's session windows
+peaking at **4.17×** — the rung's best cell.
 
-**The distinct-agg family (q15/q16/q17) trails 1× on this rung only** (0.70–0.77×, vs
-1.3–1.4× on the generator and 2.1–3.1× on Kafka). The salient difference is batch shape: the
-fluss-rs scanner emits one Arrow batch per producer wire batch, so the island sees a stream of
-small batches, and the changelog-aggregate chain (exchange → multi-`DISTINCT` group agg) pays
-its per-batch costs — state probe setup, per-batch emit — many more times per 500K events than
-on the coalesced rungs. q19/q23 sit just above 1× under the same pressure. This is the
-batch-coalescing follow-up already on the roadmap (coalesce scanner batches to a target row
-count before JNI export), and these three queries are its acceptance benchmark.
+**The distinct-agg family (q15/q16/q17) trails 1× on this rung only** (0.78–0.85×, vs
+1.3–1.4× on the generator and 2.1–3.1× on Kafka), with q19 at the line (0.97×). The salient
+difference is batch shape: the fluss-rs scanner emits one Arrow batch per producer wire batch,
+so the island sees a stream of small batches, and the changelog-aggregate chain
+(exchange → multi-`DISTINCT` group agg) pays its per-batch costs — state probe setup, per-batch
+emit — many more times per 500K events than on the coalesced rungs. This is the batch-coalescing
+follow-up already on the roadmap (coalesce scanner batches to a target row count before JNI
+export), and these queries are its acceptance benchmark.
 
-The opt-in variants measure within noise of their byte-parity defaults on this rung (q1's
-approximate decimal 2.35× vs 2.31×; the `§` datetime queries ±0.03×), consistent with every
-other rung: parity is free where the expression isn't the bottleneck.
+The opt-in variants measure within noise of their byte-parity defaults on this rung, consistent
+with every other rung: parity is free where the expression isn't the bottleneck.
+
+**Two masked native bugs surfaced the first time this rung ran unbounded** — worth recording
+because every earlier rung was bounded, where the end-of-input `MAX_WATERMARK` flush forgives
+mid-stream watermark mistakes:
+
+1. **A missing sub-plan-reuse barrier on the Fluss scan.** Every native rel carries a digest
+   barrier so Flink's post-optimize reuse can never merge two branches onto one columnar
+   producer (the Arrow hand-off is zero-copy, single-consumer); the Fluss source node lacked
+   one, so multi-view queries merged into one source broadcasting the same batch to two
+   consumers — a use-after-free the watermark assigner turned into a hard crash.
+2. **A shift-zone asymmetry in the window re-aggregation path (q5's shape).** Flink's rule:
+   plain-`TIMESTAMP` rowtime windows compute on epoch millis with UTC digits; only
+   `TIMESTAMP_LTZ` shifts boundaries into the session zone. The local window aggregate's exec
+   node passed the session zone unconditionally, and its window-attached ingest (the only
+   consumer of that zone) "un-shifted" boundaries that were never shifted — every re-aggregated
+   window landed the session-zone offset in the future, where only a bounded run's final flush
+   ever released it. Both engines' results were still identical on the bounded rungs, which is
+   why parity never caught it; the unbounded rung is the first consumer of mid-stream firing
+   for that shape.
 
 ### The tuned (mini-batch) matrix — the full suite
 

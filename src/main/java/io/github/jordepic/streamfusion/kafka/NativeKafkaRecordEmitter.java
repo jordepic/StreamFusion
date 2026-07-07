@@ -11,7 +11,7 @@ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplitState;
  * Flink's checkpoint, with Kafka commits only optional external monitoring (not done here).
  *
  * <p>A watermarked table's batch is collected with its max rowtime as the record timestamp: the source
- * operator's per-split watermark generator ({@link NativeKafkaWatermarks}) folds it in, which is
+ * operator's per-split watermark generator ({@link NativeSourceWatermarks}) folds it in, which is
  * equivalent to feeding every row because the delay is constant and the generator keeps a max.
  */
 final class NativeKafkaRecordEmitter

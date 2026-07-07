@@ -45,9 +45,13 @@ public class StreamPhysicalNativeFlussSource extends AbstractRelNode
     return new StreamPhysicalNativeFlussSource(getCluster(), traitSet, outputRowType, scan);
   }
 
+  /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
+  private final long reuseBarrier = NativeRelDigests.nextId();
+
   @Override
   public RelWriter explainTerms(RelWriter writer) {
-    return super.explainTerms(writer).item("connector", "fluss");
+    return NativeRelDigests.withBarrier(
+        super.explainTerms(writer).item("connector", "fluss"), reuseBarrier);
   }
 
   @Override
@@ -56,6 +60,7 @@ public class StreamPhysicalNativeFlussSource extends AbstractRelNode
         ShortcutUtils.unwrapTableConfig(this),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(outputRowType),
         getRelDetailedDescription(),
-        FlussTables.build(scan));
+        FlussTables.build(scan),
+        ScanWatermarkSpec.of(scan));
   }
 }

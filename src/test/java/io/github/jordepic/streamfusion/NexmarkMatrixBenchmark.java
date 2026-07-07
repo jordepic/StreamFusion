@@ -48,9 +48,11 @@ import org.testcontainers.utility.DockerImageName;
  * default streaming environment the other rungs use; because the Fluss log table is unbounded, each
  * run counts changelog rows in the sink and cancels the job once the Nth row arrives, reporting
  * time-to-Nth-row. N is the query's full output cardinality over the preloaded events, measured once
- * per query with stock Flink on the bounded generator (the same rows the preload wrote) through the
- * same plain-TIMESTAMP views, so both engines are cancelled at the same row. Queries with no such
- * deterministic N report a skip cell instead — see {@link #flussSkipReason}.
+ * per query with stock Flink on the bounded generator (the same rows the preload wrote) through its
+ * watermarked event-time views — the Fluss table declares the identical watermark, and a preloaded
+ * far-future sentinel event closes the final windows the generator's end-of-input flush closes — so
+ * both engines are cancelled at the same row. Queries with no such deterministic N report a skip
+ * cell instead — see {@link #flussSkipReason}.
  *
  * <p>The query set is every query StreamFusion accelerates: q0–q5, q7–q23 (q1's and q14's decimal are
  * exact and native by default; q21's REGEXP_EXTRACT/LOWER and q14's HOUR route through the host
@@ -442,21 +444,29 @@ class NexmarkMatrixBenchmark {
 
   // The wide nested event row written to / read from Parquet. Same shape as the generator's event row,
   // with a plain TIMESTAMP(3) rowtime (so DATE_FORMAT/HOUR stay native, unlike the Kafka LTZ rowtime).
+  private static final String PERSON_TYPE =
+      "ROW<id BIGINT, name STRING, emailAddress STRING, creditCard STRING, city STRING,"
+          + " state STRING, `dateTime` TIMESTAMP(3), extra STRING>";
+  private static final String AUCTION_TYPE =
+      "ROW<id BIGINT, itemName STRING, description STRING, initialBid BIGINT,"
+          + " reserve BIGINT, `dateTime` TIMESTAMP(3), expires TIMESTAMP(3), seller BIGINT,"
+          + " category BIGINT, extra STRING>";
+  private static final String BID_TYPE =
+      "ROW<auction BIGINT, bidder BIGINT, price BIGINT, channel STRING, url STRING,"
+          + " `dateTime` TIMESTAMP(3), extra STRING>";
   private static final String PARQUET_SCHEMA =
       "event_type INT,"
-          + " person ROW<id BIGINT, name STRING, emailAddress STRING, creditCard STRING, city STRING,"
-          + " state STRING, `dateTime` TIMESTAMP(3), extra STRING>,"
-          + " auction ROW<id BIGINT, itemName STRING, description STRING, initialBid BIGINT,"
-          + " reserve BIGINT, `dateTime` TIMESTAMP(3), expires TIMESTAMP(3), seller BIGINT,"
-          + " category BIGINT, extra STRING>,"
-          + " bid ROW<auction BIGINT, bidder BIGINT, price BIGINT, channel STRING, url STRING,"
-          + " `dateTime` TIMESTAMP(3), extra STRING>,"
+          + " person " + PERSON_TYPE + ","
+          + " auction " + AUCTION_TYPE + ","
+          + " bid " + BID_TYPE + ","
           + " `dateTime` TIMESTAMP(3)";
   private static final String FLUSS_CATALOG = "fluss_catalog";
   private static final String FLUSS_TABLE = FLUSS_CATALOG + ".fluss.nexmark_events";
   // How long a Fluss run may take to reach its Nth sink row before the benchmark fails loudly (the
-  // unbounded source never finishes on its own, so a wrong target must not hang the matrix forever).
-  private static final long FLUSS_NTH_ROW_TIMEOUT_SECONDS = 600L;
+  // unbounded source never finishes on its own, so a wrong target must not hang the matrix
+  // forever). Healthy 500K-event cells finish in single-digit seconds, so two minutes is a stall,
+  // not a slow run.
+  private static final long FLUSS_NTH_ROW_TIMEOUT_SECONDS = 120L;
   // Latch/counter for the Fluss rung's count-N-then-cancel sink. Static volatile because Flink
   // serializes the sink function into the task, so instance fields cannot signal the driver — the
   // same pattern as NativeFlussSourceSqlHarnessTest's CollectingSink.
@@ -737,7 +747,17 @@ class NexmarkMatrixBenchmark {
 
   // ----- Fluss source -----
 
-  /** Writes the wide event row to a local Fluss log table once; every Fluss query reads it back. */
+  /**
+   * Writes the wide event row to a local Fluss log table once; every Fluss query reads it back. The
+   * table declares the same 4s bounded-out-of-orderness WATERMARK the generator uses, so the
+   * windowed queries have a time attribute on both engines (the watermark runs natively as the
+   * columnar assigner above the native source). After the events, one sentinel row with a
+   * far-future rowtime and an
+   * event_type outside 0..2 is appended: it is filtered from every person/auction/bid view but
+   * advances the table's watermark past every real window end, so the unbounded Fluss runs emit
+   * exactly the rows the bounded generator calibration counted (whose end-of-input flush plays the
+   * same role).
+   */
   private static void writeFlussSource(String bootstrapServers) throws Exception {
     TableEnvironment tEnv = NexmarkBenchmark.environment(ROWS);
     createFlussCatalog(tEnv, bootstrapServers);
@@ -747,11 +767,25 @@ class NexmarkMatrixBenchmark {
             + FLUSS_TABLE
             + " ("
             + PARQUET_SCHEMA
+            + ", WATERMARK FOR `dateTime` AS `dateTime` - INTERVAL '4' SECOND"
             + ") WITH ('bucket.num' = '1')");
     tEnv.executeSql(
             "INSERT INTO "
                 + FLUSS_TABLE
                 + " SELECT event_type, person, auction, bid, `dateTime` FROM events")
+        .await();
+    // The Fluss sink rejects partial-column inserts on a non-PK table, so the sentinel spells out
+    // every column with NULL-cast structs.
+    tEnv.executeSql(
+            "INSERT INTO "
+                + FLUSS_TABLE
+                + " SELECT CAST(99 AS INT), CAST(NULL AS "
+                + PERSON_TYPE
+                + "), CAST(NULL AS "
+                + AUCTION_TYPE
+                + "), CAST(NULL AS "
+                + BID_TYPE
+                + "), TIMESTAMP '2100-01-01 00:00:00'")
         .await();
   }
 
@@ -828,21 +862,14 @@ class NexmarkMatrixBenchmark {
 
   /**
    * The number of changelog rows {@code q} emits over the preloaded events — measured once per query
-   * with stock Flink on the bounded generator (the same rows the Fluss preload wrote) through the
-   * same plain-TIMESTAMP views the Fluss runs use, so both engines are cancelled at the same Nth
-   * sink row.
+   * with stock Flink on the bounded generator (the same rows the Fluss preload wrote) through its
+   * own watermarked event-time views (the Fluss table declares the identical 4s watermark), so both
+   * engines are cancelled at the same Nth sink row. The generator's end-of-input flush closes the
+   * final windows here; the preloaded sentinel row closes the same windows on the unbounded Fluss
+   * runs, so the counts line up.
    */
   private static long flussTargetRows(Query q) throws Exception {
     TableEnvironment tEnv = NexmarkBenchmark.environment(ROWS);
-    // Rebuild the person/auction/bid views over a materialized (non-time-attribute) dateTime so the
-    // calibration plan has the same shape as the Fluss runs', whose log table has no watermark.
-    tEnv.dropTemporaryView("person");
-    tEnv.dropTemporaryView("auction");
-    tEnv.dropTemporaryView("bid");
-    tEnv.executeSql(
-        "CREATE TEMPORARY VIEW src AS SELECT event_type, person, auction, bid,"
-            + " CAST(`dateTime` AS TIMESTAMP(3)) AS `dateTime` FROM events");
-    createEventViews(tEnv);
     tEnv.createTemporarySystemFunction("count_char", CountChar.class);
     runSetup(tEnv, q);
     long rows = 0;
@@ -884,17 +911,16 @@ class NexmarkMatrixBenchmark {
   }
 
   /**
-   * Why a query cannot run on the Fluss rung, or null when it can. Two families: the
-   * windowed/proctime/lookup queries need a time attribute the plain-timestamp Fluss table doesn't
-   * declare (ticket 53 adds the watermark), and q4/q9 have no deterministic Nth sink row to cancel
-   * at — their two-input join feeds an update-collapsing aggregate/rank (Flink skips the -U/+U pair
-   * when the aggregate value didn't change), so the changelog cardinality depends on the join's
-   * input interleaving, which varies run to run. The bounded rungs never see this: they measure to
-   * end-of-input, not to a row count.
+   * Why a query cannot run on the Fluss rung, or null when it can. Both families lack a
+   * deterministic Nth sink row to cancel at on an unbounded source: q12's proctime windows group by
+   * wall clock, so even its total output count varies run to run; q4/q9's two-input join feeds an
+   * update-collapsing aggregate/rank (Flink skips the -U/+U pair when the aggregate value didn't
+   * change), so the changelog cardinality depends on the join's input interleaving. The bounded
+   * rungs never see this: they measure to end-of-input, not to a row count.
    */
   private static String flussSkipReason(Query q) {
-    if (Set.of("q5", "q7", "q8", "q11", "q12", "q13").contains(q.label)) {
-      return "plain-timestamp baseline does not cover time-attribute/proctime/lookup";
+    if ("q12".equals(q.label)) {
+      return "proctime windows have no deterministic output count to cancel at";
     }
     if (Set.of("q4", "q9").contains(q.label)) {
       return "changelog cardinality is interleaving-dependent; no deterministic Nth row to cancel at";

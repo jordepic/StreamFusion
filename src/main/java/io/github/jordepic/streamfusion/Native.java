@@ -938,13 +938,16 @@ public final class Native {
    * @param databaseName Fluss database name
    * @param tableName Fluss table name
    * @param projectedFields projected column indices, or empty for all columns
+   * @param rowtimeIndex index of the rowtime column in the projected batch, or -1 when the table
+   *     declares no watermark (per-batch max rowtimes feed the per-split source watermarks)
    */
   public static native long openFlussReader(
       String[] configKeys,
       String[] configValues,
       String databaseName,
       String tableName,
-      int[] projectedFields);
+      int[] projectedFields,
+      int rowtimeIndex);
 
   /**
    * Adds assigned log splits to the native Fluss reader. Index-aligned arrays; {@code Long.MIN_VALUE}
@@ -972,9 +975,10 @@ public final class Native {
   public static native int pollFlussBatch(long handle, long timeoutMillis);
 
   /**
-   * Drains one pending Fluss batch, writes {@code [nextOffset]} into {@code splitMeta}, writes the
-   * split id into {@code outSplitId[0]}, exports Arrow into the consumer C structs, and returns the row
-   * count. Call it {@link #pollFlussBatch}'s return-value times.
+   * Drains one pending Fluss batch, writes {@code [nextOffset, maxRowtimeMillis]} into
+   * {@code splitMeta} ({@code Long.MIN_VALUE} when the table has no watermark or the batch's rowtimes
+   * are all null), writes the split id into {@code outSplitId[0]}, exports Arrow into the consumer C
+   * structs, and returns the row count. Call it {@link #pollFlussBatch}'s return-value times.
    */
   public static native int drainFlussSplit(
       long handle,

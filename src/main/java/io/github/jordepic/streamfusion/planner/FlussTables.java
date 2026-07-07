@@ -53,14 +53,22 @@ final class FlussTables {
         plan.leaseContext,
         plan.nativeConfigKeys,
         plan.nativeConfigValues,
-        plan.projectedFields);
+        plan.projectedFields,
+        plan.rowtimeIndex);
   }
 
   private static Planned plan(StreamPhysicalTableSourceScan scan) {
-    if (scan.requireWatermark()) {
+    // Current Flink keeps a Fluss table's WATERMARK as its own assigner node (no push-down), which
+    // routes natively above this source with no work here. Defensively, a watermark that IS pushed
+    // into the scan routes only in a shape the source regenerates (per-split bounded
+    // out-of-orderness over the rowtime column, periodic emit); the scan replaces the host source,
+    // so an unreproducible pushed watermark must leave the whole scan on Flink.
+    ScanWatermarkSpec watermark = ScanWatermarkSpec.of(scan);
+    if (watermark == ScanWatermarkSpec.UNSUPPORTED) {
       return Planned.fallback(
-          "the table's WATERMARK is pushed into the scan, which the native source does not"
-              + " regenerate");
+          "the table's WATERMARK is pushed into the scan in a shape the native source cannot"
+              + " regenerate (only bounded out-of-orderness over the rowtime column, periodic emit,"
+              + " no alignment)");
     }
     if (!FilesystemTables.allPhysicalColumns(scan)) {
       return Planned.fallback("metadata/computed columns are not produced natively");
@@ -159,7 +167,11 @@ final class FlussTables {
               leaseContext == null ? LeaseContext.DEFAULT : leaseContext,
               keys,
               values,
-              projectedFields == null ? new int[0] : projectedFields));
+              projectedFields == null ? new int[0] : projectedFields,
+              // The pushed watermark expression indexes the scan's produced (projected) row type,
+              // and the native reader emits columns in that same order, so the index maps directly
+              // onto the drained batch.
+              watermark == null ? -1 : watermark.rowtimeIndex));
     } catch (ReflectiveOperationException | RuntimeException e) {
       return Planned.fallback("Fluss table source introspection failed: " + e);
     }
@@ -306,6 +318,7 @@ final class FlussTables {
     private final String[] nativeConfigKeys;
     private final String[] nativeConfigValues;
     private final int[] projectedFields;
+    private final int rowtimeIndex;
 
     private SourcePlan(
         org.apache.fluss.config.Configuration flussConfig,
@@ -320,7 +333,8 @@ final class FlussTables {
         LeaseContext leaseContext,
         String[] nativeConfigKeys,
         String[] nativeConfigValues,
-        int[] projectedFields) {
+        int[] projectedFields,
+        int rowtimeIndex) {
       this.flussConfig = flussConfig;
       this.tablePath = tablePath;
       this.hasPrimaryKey = hasPrimaryKey;
@@ -334,6 +348,7 @@ final class FlussTables {
       this.nativeConfigKeys = nativeConfigKeys;
       this.nativeConfigValues = nativeConfigValues;
       this.projectedFields = projectedFields;
+      this.rowtimeIndex = rowtimeIndex;
     }
   }
 }

@@ -32,6 +32,7 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
   private final int[] keyColumns;
   private final int[] valueTypes;
   private final int[] aggregateKinds;
+  private final boolean timestampLtz;
 
   public StreamPhysicalNativeColumnarLocalWindowAggregate(
       RelOptCluster cluster,
@@ -45,7 +46,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
       int[] valueColumns,
       int[] keyColumns,
       int[] valueTypes,
-      int[] aggregateKinds) {
+      int[] aggregateKinds,
+      boolean timestampLtz) {
     super(cluster, traitSet, input);
     this.outputRowType = outputRowType;
     this.sliceMillis = sliceMillis;
@@ -56,6 +58,7 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
     this.keyColumns = keyColumns;
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
+    this.timestampLtz = timestampLtz;
   }
 
   @Override
@@ -82,7 +85,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
         valueColumns,
         keyColumns,
         valueTypes,
-        aggregateKinds);
+        aggregateKinds,
+        timestampLtz);
   }
 
   @Override
@@ -99,7 +103,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
         valueColumns,
         keyColumns,
         valueTypes,
-        aggregateKinds);
+        aggregateKinds,
+        timestampLtz);
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */

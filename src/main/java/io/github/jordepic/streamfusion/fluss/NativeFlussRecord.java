@@ -7,10 +7,12 @@ final class NativeFlussRecord {
 
   private final ArrowBatch batch;
   private final long nextOffset;
+  private final long maxRowtimeMillis;
 
-  NativeFlussRecord(ArrowBatch batch, long nextOffset) {
+  NativeFlussRecord(ArrowBatch batch, long nextOffset, long maxRowtimeMillis) {
     this.batch = batch;
     this.nextOffset = nextOffset;
+    this.maxRowtimeMillis = maxRowtimeMillis;
   }
 
   ArrowBatch batch() {
@@ -19,5 +21,14 @@ final class NativeFlussRecord {
 
   long nextOffset() {
     return nextOffset;
+  }
+
+  /**
+   * Max of the batch's rowtime column in epoch millis, or {@code Long.MIN_VALUE} when the table has
+   * no watermark (or every rowtime in the batch is null). Emitted as the batch's record timestamp so
+   * the source operator's per-split watermark generator sees it.
+   */
+  long maxRowtimeMillis() {
+    return maxRowtimeMillis;
   }
 }

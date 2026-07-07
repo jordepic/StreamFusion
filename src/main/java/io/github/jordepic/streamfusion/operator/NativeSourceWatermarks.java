@@ -1,6 +1,5 @@
-package io.github.jordepic.streamfusion.kafka;
+package io.github.jordepic.streamfusion.operator;
 
-import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import java.time.Duration;
 import org.apache.flink.api.common.eventtime.Watermark;
 import org.apache.flink.api.common.eventtime.WatermarkGenerator;
@@ -17,9 +16,9 @@ import org.apache.flink.api.common.eventtime.WatermarkStrategy;
  * max(rowtime) - delay, starting at {@code Long.MIN_VALUE}, emitted unconditionally on the periodic
  * tick (the pipeline's auto-watermark interval).
  */
-public final class NativeKafkaWatermarks {
+public final class NativeSourceWatermarks {
 
-  private NativeKafkaWatermarks() {}
+  private NativeSourceWatermarks() {}
 
   public static WatermarkStrategy<ArrowBatch> strategy(long delayMillis, long idleTimeoutMillis) {
     WatermarkStrategy<ArrowBatch> strategy =

@@ -287,7 +287,7 @@ impl KafkaSplitReader {
 /// the two watermark forms the planner admits: a nanosecond timestamp (floor-divided to millis, so
 /// pre-epoch values round down like Flink's `TimestampData.getMillisecond`), and a bigint already
 /// holding epoch millis (a `TO_TIMESTAMP_LTZ(col, 3)` computed rowtime reads the column verbatim).
-#[cfg(any(feature = "kafka", test))]
+#[cfg(any(feature = "kafka", feature = "fluss", test))]
 pub(crate) fn max_rowtime_millis(batch: &RecordBatch, index: usize) -> i64 {
     use arrow::array::TimestampNanosecondArray;
     let column = batch.column(index);

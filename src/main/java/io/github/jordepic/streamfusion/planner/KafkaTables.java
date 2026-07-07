@@ -59,7 +59,7 @@ final class KafkaTables {
     // A watermarked table routes only when the pushed watermark is a shape the source regenerates
     // (per-split bounded out-of-orderness); the scan replaces the host source, so an unreproducible
     // watermark must leave the whole scan on Flink.
-    if (KafkaWatermarkSpec.of(scan) == KafkaWatermarkSpec.UNSUPPORTED) {
+    if (ScanWatermarkSpec.of(scan) == ScanWatermarkSpec.UNSUPPORTED) {
       return false;
     }
     return supports(FilesystemTables.options(scan));
@@ -402,7 +402,7 @@ final class KafkaTables {
     // The decode path replaces the scan but regenerates no watermarks, so a watermarked table (the
     // WATERMARK clause is pushed into the Kafka scan — no assigner node remains) must stay on the
     // host; only the native source reproduces the per-split source watermarks.
-    if (KafkaWatermarkSpec.of(scan) != null) {
+    if (ScanWatermarkSpec.of(scan) != null) {
       return false;
     }
     Map<String, String> options = FilesystemTables.options(scan);
@@ -454,7 +454,7 @@ final class KafkaTables {
     }
     StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) node;
     // Same watermark rule as isNativeKafkaDecode: the decode path regenerates no watermarks.
-    if (KafkaWatermarkSpec.of(scan) != null) {
+    if (ScanWatermarkSpec.of(scan) != null) {
       return false;
     }
     Map<String, String> options = FilesystemTables.options(scan);
@@ -530,7 +530,7 @@ final class KafkaTables {
       return false;
     }
     StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) node;
-    if (KafkaWatermarkSpec.of(scan) == null) {
+    if (ScanWatermarkSpec.of(scan) == null) {
       return false;
     }
     Map<String, String> options = FilesystemTables.options(scan);

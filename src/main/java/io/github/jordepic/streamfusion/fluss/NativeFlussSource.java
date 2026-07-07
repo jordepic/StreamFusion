@@ -51,6 +51,7 @@ public final class NativeFlussSource
   private final String[] nativeConfigKeys;
   private final String[] nativeConfigValues;
   private final int[] projectedFields;
+  private final int rowtimeIndex;
 
   public NativeFlussSource(
       org.apache.fluss.config.Configuration flussConfig,
@@ -65,7 +66,8 @@ public final class NativeFlussSource
       LeaseContext leaseContext,
       String[] nativeConfigKeys,
       String[] nativeConfigValues,
-      int[] projectedFields) {
+      int[] projectedFields,
+      int rowtimeIndex) {
     this.flussConfig = flussConfig;
     this.tablePath = tablePath;
     this.hasPrimaryKey = hasPrimaryKey;
@@ -79,6 +81,7 @@ public final class NativeFlussSource
     this.nativeConfigKeys = nativeConfigKeys;
     this.nativeConfigValues = nativeConfigValues;
     this.projectedFields = projectedFields;
+    this.rowtimeIndex = rowtimeIndex;
   }
 
   @Override
@@ -96,6 +99,7 @@ public final class NativeFlussSource
                 tablePath.getDatabaseName(),
                 tablePath.getTableName(),
                 projectedFields,
+                rowtimeIndex,
                 POLL_TIMEOUT_MILLIS);
     return new NativeFlussSourceReader(
         splitReaderSupplier, new NativeFlussRecordEmitter(), context.getConfiguration(), context);

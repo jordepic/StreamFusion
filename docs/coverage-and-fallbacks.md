@@ -455,8 +455,15 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   - **Pushdown the native reader can't honor** — a pushed single-row filter, a modification scan
     type, a row-count scan, a pushed-down `LIMIT`, pushed partition filters, an empty projection;
     plus metadata/computed columns (not produced natively).
-  - **A `WATERMARK` clause** — like Kafka, Flink pushes it into the scan, and the native Fluss
-    source does not regenerate watermarks.
+  - **A pushed-down `WATERMARK` outside the regenerated shapes** — in current Flink a Fluss
+    table's `WATERMARK` clause is *not* pushed into the scan (unlike Kafka): the assigner survives
+    as its own plan node and runs natively as the columnar watermark assigner above the native
+    source, so watermarked log tables route with no source involvement. Defensively, if a pushed
+    spec does appear on the scan, the source regenerates it with the same shared per-split
+    machinery the Kafka source uses (per-batch max rowtime → one generator per split, min-combined,
+    idle timeout honored, periodic emit) for the supported shapes — `rt` or `rt - INTERVAL const`
+    over a physical rowtime column — and leaves the whole scan on Flink for anything else, rather
+    than silently losing watermarks.
   - **A column type outside the verified whitelist** — BOOLEAN, TINYINT, SMALLINT, INT, BIGINT,
     FLOAT, DOUBLE, CHAR, VARCHAR, DECIMAL, DATE, TIME, plain TIMESTAMP, VARBINARY, and nested ROWs
     whose leaves are also whitelisted: the intersection of fluss-rs' Arrow export and what the

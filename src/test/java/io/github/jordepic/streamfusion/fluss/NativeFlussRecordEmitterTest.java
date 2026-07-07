@@ -29,9 +29,30 @@ class NativeFlussRecordEmitterTest {
       VectorSchemaRoot root = VectorSchemaRoot.create(new Schema(List.of()), allocator);
       ArrowBatch batch = new ArrowBatch(root);
 
-      emitter.emitRecord(new NativeFlussRecord(batch, 42L), output, splitState);
+      emitter.emitRecord(new NativeFlussRecord(batch, 42L, Long.MIN_VALUE), output, splitState);
 
       assertSame(batch, output.record);
+      assertEquals(Long.MIN_VALUE, output.timestamp);
+      assertEquals(42L, splitState.toSourceSplit().getStartingOffset());
+      output.record.root().close();
+    }
+  }
+
+  @Test
+  void emitsWatermarkedBatchWithMaxRowtimeAsRecordTimestamp() throws Exception {
+    NativeFlussRecordEmitter emitter = new NativeFlussRecordEmitter();
+    LogSplitState splitState =
+        new LogSplitState(new LogSplit(new TableBucket(7L, 2), null, 11L, 99L));
+    CapturingOutput output = new CapturingOutput();
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      VectorSchemaRoot root = VectorSchemaRoot.create(new Schema(List.of()), allocator);
+      ArrowBatch batch = new ArrowBatch(root);
+
+      emitter.emitRecord(new NativeFlussRecord(batch, 42L, 1_700_000_000_123L), output, splitState);
+
+      assertSame(batch, output.record);
+      assertEquals(1_700_000_000_123L, output.timestamp);
       assertEquals(42L, splitState.toSourceSplit().getStartingOffset());
       output.record.root().close();
     }
@@ -40,6 +61,7 @@ class NativeFlussRecordEmitterTest {
   private static final class CapturingOutput implements SourceOutput<ArrowBatch> {
 
     private ArrowBatch record;
+    private long timestamp = Long.MIN_VALUE;
 
     @Override
     public void collect(ArrowBatch record) {
@@ -49,6 +71,7 @@ class NativeFlussRecordEmitterTest {
     @Override
     public void collect(ArrowBatch record, long timestamp) {
       this.record = record;
+      this.timestamp = timestamp;
     }
 
     @Override

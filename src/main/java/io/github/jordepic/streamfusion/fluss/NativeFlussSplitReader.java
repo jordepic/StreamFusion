@@ -46,10 +46,12 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       String databaseName,
       String tableName,
       int[] projectedFields,
+      int rowtimeIndex,
       long pollTimeoutMillis) {
     this.pollTimeoutMillis = pollTimeoutMillis;
     this.handle =
-        Native.openFlussReader(configKeys, configValues, databaseName, tableName, projectedFields);
+        Native.openFlussReader(
+            configKeys, configValues, databaseName, tableName, projectedFields, rowtimeIndex);
   }
 
   @Override
@@ -65,14 +67,14 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
     for (int i = 0; i < pending; i++) {
       try (ArrowArray outArray = ArrowArray.allocateNew(allocator);
           ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
-        long[] meta = new long[1];
+        long[] meta = new long[2];
         String[] splitId = new String[1];
         Native.drainFlussSplit(
             handle, meta, splitId, outArray.memoryAddress(), outSchema.memoryAddress());
         VectorSchemaRoot root =
             Data.importVectorSchemaRoot(allocator, outArray, outSchema, NativeAllocator.DICTIONARIES);
         positions.put(splitId[0], meta[0]);
-        builder.add(splitId[0], new NativeFlussRecord(new ArrowBatch(root), meta[0]));
+        builder.add(splitId[0], new NativeFlussRecord(new ArrowBatch(root), meta[0], meta[1]));
       }
     }
 
