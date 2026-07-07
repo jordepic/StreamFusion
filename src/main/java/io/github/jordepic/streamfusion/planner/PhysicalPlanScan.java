@@ -666,16 +666,6 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           ParquetSourceMatcher.utcTimestamp(scan));
     }
 
-    if (OrcSourceMatcher.matches(current)) {
-      if (!NativeConfig.operatorEnabled("orcSource")) {
-        return noteDisabled(current, "orcSource");
-      }
-      StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
-      substitutions++;
-      return new StreamPhysicalNativeOrcSource(
-          scan.getCluster(), scan.getTraitSet(), scan.getRowType(), OrcSourceMatcher.path(scan));
-    }
-
     if (current instanceof StreamPhysicalTableSourceScan) {
       StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
       Map<String, String> options = FilesystemTables.options(scan);

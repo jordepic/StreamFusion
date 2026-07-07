@@ -296,7 +296,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex 0.13.1",
+ "lz4_flex",
  "zstd",
 ]
 
@@ -559,12 +559,6 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
-name = "bytemuck"
-version = "1.25.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 
 [[package]]
 name = "byteorder"
@@ -1475,21 +1469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datafusion-orc"
-version = "0.8.0"
-source = "git+https://github.com/jordepic/datafusion-orc.git?rev=4fdcb1111c11d3cd50e6186fa1fcde8e9c41000e#4fdcb1111c11d3cd50e6186fa1fcde8e9c41000e"
-dependencies = [
- "async-trait",
- "bytes",
- "datafusion",
- "futures",
- "futures-util",
- "object_store",
- "orc-rust",
- "tokio",
-]
-
-[[package]]
 name = "datafusion-physical-expr"
 version = "54.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1753,12 +1732,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1830,7 +1803,7 @@ dependencies = [
  "ordered-float 5.3.0",
  "parking_lot",
  "parse-display",
- "prost 0.14.4",
+ "prost",
  "prost-build",
  "rand 0.9.4",
  "scopeguard",
@@ -2677,30 +2650,11 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "lz4_flex"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef0d4ed8669f8f8826eb00dc878084aa8f253506c4fd5e8f58f5bce72ddb97e"
 dependencies = [
  "twox-hash",
-]
-
-[[package]]
-name = "lzokay-native"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "792ba667add2798c6c3e988e630f4eb921b5cbc735044825b7111ef1582c8730"
-dependencies = [
- "byteorder",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2767,20 +2721,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "num"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
-dependencies = [
- "num-bigint",
- "num-complex",
- "num-integer",
- "num-iter",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2805,28 +2745,6 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-iter"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
-dependencies = [
- "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-rational"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
-dependencies = [
- "num-bigint",
- "num-integer",
  "num-traits",
 ]
 
@@ -2943,33 +2861,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orc-rust"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32b9867c4e7343218682ba11aceae1310c80735ec2beaf6124a0f8f848dad197"
-dependencies = [
- "arrow",
- "async-trait",
- "bytemuck",
- "bytes",
- "chrono",
- "chrono-tz",
- "fallible-streaming-iterator",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "lz4_flex 0.11.6",
- "lzokay-native",
- "num",
- "prost 0.13.5",
- "snafu",
- "snap",
- "tokio",
- "zstd",
-]
-
-[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3033,7 +2924,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.17.1",
- "lz4_flex 0.13.1",
+ "lz4_flex",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -3238,22 +3129,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive 0.14.4",
+ "prost-derive",
 ]
 
 [[package]]
@@ -3268,24 +3149,11 @@ dependencies = [
  "multimap",
  "petgraph",
  "prettyplease",
- "prost 0.14.4",
+ "prost",
  "prost-types",
  "regex",
  "syn",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools 0.14.0",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -3307,7 +3175,7 @@ version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
 dependencies = [
- "prost 0.14.4",
+ "prost",
  "prost-types",
 ]
 
@@ -3317,7 +3185,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost 0.14.4",
+ "prost",
 ]
 
 [[package]]
@@ -3340,7 +3208,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "chrono",
- "prost 0.14.4",
+ "prost",
  "prost-reflect",
 ]
 
@@ -4029,16 +3897,14 @@ dependencies = [
  "criterion",
  "csv-core",
  "datafusion",
- "datafusion-orc",
  "fluss-rs",
  "futures",
  "jni",
  "libmimalloc-sys",
  "num-bigint",
  "num-traits",
- "orc-rust",
  "parquet",
- "prost 0.14.4",
+ "prost",
  "prost-reflect",
  "prost-types",
  "ptars",

@@ -347,23 +347,8 @@ public final class Native {
    */
   public static native boolean nextBatch(long handle, long outArrayAddress, long outSchemaAddress);
 
-  /** Releases a native file source handle (Parquet, ORC, …). */
+  /** Releases a native file source handle. */
   public static native void closeSource(long handle);
-
-  /**
-   * Opens one ORC split — the stripes of {@code path} starting within {@code [rangeStart, rangeStart +
-   * rangeLength)} — and returns an opaque handle. ORC is self-describing, so the reader derives the
-   * schema from the file. The handle yields batches one at a time via {@link #nextBatch} and must be
-   * released with {@link #closeSource}.
-   *
-   * @param path the ORC file to read
-   * @param projection output column names, in the order the plan expects (honoring projection
-   *     pushdown); an empty array emits every column as read
-   * @param rangeStart first byte of the assigned split
-   * @param rangeLength length of the assigned split in bytes
-   */
-  public static native long openOrc(
-      String path, String[] projection, long rangeStart, long rangeLength);
 
   /**
    * Splits a batch the JVM exported by a consistent hash of the {@code keyColumns} into up to {@code

@@ -25,7 +25,7 @@ import org.testcontainers.utility.DockerImageName;
 /**
  * End-to-end SQL test: a {@code CREATE TABLE ... WITH ('connector'='kafka', 'format'='json')} queried
  * through the {@code TableEnvironment} routes to the native source via the planner hook (like the
- * Parquet/ORC source harness), reads the topic with the native rdkafka reader, and produces the
+ * Parquet source harness), reads the topic with the native rdkafka reader, and produces the
  * expected rows. Confirms the whole path — matcher → physical rel → exec node → FLIP-27 source → native
  * consume+decode — and that the source actually substituted (not silently fell back to Flink's).
  *

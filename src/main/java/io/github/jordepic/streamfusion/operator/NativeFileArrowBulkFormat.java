@@ -16,12 +16,12 @@ import org.apache.flink.connector.file.src.util.IteratorResultIterator;
 import org.apache.flink.connector.file.src.util.RecordAndPosition;
 
 /**
- * Reads a self-describing columnar file (Parquet, ORC, …) natively into {@link ArrowBatch}es, plugged
+ * Reads a self-describing columnar file (Parquet, …) natively into {@link ArrowBatch}es, plugged
  * into Flink's file source so Flink owns file discovery, split assignment across subtasks, and
  * checkpointing of which splits are done. The native side reads only the byte range of the one file it
- * is handed — the row groups / stripes whose start falls in the range — so each is read by exactly one
+ * is handed — the row groups whose start falls in the range — so each is read by exactly one
  * split, and the data is born columnar and never becomes rows. Splittable: a large file is read by
- * several subtasks in parallel, one row-group/stripe range each.
+ * several subtasks in parallel, one row-group range each.
  *
  * <p>A file source's reader runs on a fetcher thread while its emitted batches are consumed later on
  * the task thread, so a batch's off-heap buffers must outlive the reader that produced them; reads go

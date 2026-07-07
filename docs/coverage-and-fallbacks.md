@@ -140,7 +140,7 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   own `table.exec.async-lookup.buffer-capacity`). This is not vectorizable compute — it is a JVM
   upcall into the host connector — but it keeps the island unbroken, and the async path overlaps a
   batch's I/O. Still falls back: an **upsert-materialized** (keyed-state) lookup.
-- **Sources/sink** — local `file:` path only (Parquet/ORC source, Parquet sink); Kafka decode limited
+- **Sources/sink** — local `file:` path only (Parquet source, Parquet sink); Kafka decode limited
   (see below); CDC covers the four JSON dialects (Debezium/OGG/Maxwell/Canal — the latter two for
   flat scalar schemas); Fluss log tables via the native fluss-rs scanner (ARROW log format, a
   verified scalar-type whitelist — see §5).
@@ -377,8 +377,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   split still falls back.
 
 ### 5. Source / sink / connector
-- **Filesystem** — non-local path (`hdfs:`/`s3:`/…) for the Parquet/ORC source and Parquet sink; any
-  non-Parquet/ORC source format; any non-Parquet sink format.
+- **Filesystem** — non-local path (`hdfs:`/`s3:`/…) for the Parquet source and Parquet sink; any
+  non-Parquet source format; any non-Parquet sink format. (An ORC source existed and was removed:
+  its scan engine, datafusion-orc, lags DataFusion releases, and keeping it meant carrying a fork
+  pin through every DataFusion bump — restoring it is
+  https://github.com/datafusion-contrib/StreamFusion/issues/19.)
 - **Kafka** — value format outside JSON/CSV/raw/bare-Avro/`avro-confluent`/protobuf; a `key.format`;
   a `scan.bounded.mode` other than unbounded/latest-offset; protobuf fields needing representation
   reconciliation (enum/unsigned/bytes/proto3-defaults/well-known types); **`ignore-parse-errors` on a

@@ -27,15 +27,8 @@ regex = "1"
 # intermediate needs integers wider than i128/i256 in the worst case. Already in the tree
 # transitively via datafusion; pinned here for direct use.
 num-bigint = "0.4"
-# Native file readers, both driven through DataFusion's file-scan execution (projection pushdown,
-# row-group/stripe range selection) — datafusion's built-in Parquet source and datafusion-orc's ORC
-# source. datafusion-orc is not published for this datafusion version, so it is pinned by git rev —
-# a temporary fork whose only change is the datafusion 54 bump (upstream PR:
-# https://github.com/datafusion-contrib/datafusion-orc/pull/151); repoint at datafusion-contrib once
-# that merges. orc-rust (published) is used directly only to read an ORC file's schema before
-# building the scan.
-datafusion-orc = { git = "https://github.com/jordepic/datafusion-orc.git", rev = "4fdcb1111c11d3cd50e6186fa1fcde8e9c41000e" }
-orc-rust = "0.8"
+# Native Parquet reader, driven through DataFusion's file-scan execution (projection pushdown,
+# row-group range selection) via datafusion's built-in Parquet source.
 parquet = { version = "58", features = ["arrow"] }
 # Native Avro decode incl. the Confluent Schema Registry wire format (magic byte + 4-byte schema id +
 # Avro body), resolved against a local SchemaStore keyed by integer id. Used by the Kafka source.

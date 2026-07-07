@@ -103,10 +103,10 @@ pub(crate) trait BatchSource {
 }
 
 /// A scan of one file split, driven by DataFusion's file-scan execution — the same path
-/// datafusion-comet uses. DataFusion selects the row groups (Parquet) / stripes (ORC) whose start
-/// falls in the split's byte range, pushes the projection into the decode (only the wanted columns are
-/// read), and yields Arrow batches, which we pull synchronously on the shared runtime. Parquet and ORC
-/// differ only in the `FileSource` constructed.
+/// datafusion-comet uses. DataFusion selects the row groups whose start falls in the split's byte
+/// range, pushes the projection into the decode (only the wanted columns are read), and yields Arrow
+/// batches, which we pull synchronously on the shared runtime. File formats differ only in the
+/// `FileSource` constructed.
 pub(crate) struct FileScan {
     stream: datafusion::physical_plan::SendableRecordBatchStream,
 }
@@ -167,14 +167,6 @@ pub(crate) fn parquet_file_schema(path: &str) -> SchemaRef {
         .clone()
 }
 
-/// The Arrow schema of an ORC file, read from its footer.
-pub(crate) fn orc_file_schema(path: &str) -> SchemaRef {
-    let file = std::fs::File::open(path).expect("failed to open orc file");
-    orc_rust::ArrowReaderBuilder::try_new(file)
-        .expect("failed to read orc metadata")
-        .schema()
-}
-
 /// Opens one Parquet split — the row groups of `path` within `[range_start, range_start +
 /// range_length)` — and returns an opaque handle, released with `closeSource`.
 #[no_mangle]
@@ -231,30 +223,4 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeSource<'
     unsafe {
         drop(from_handle::<Box<dyn BatchSource>>(handle));
     }
-}
-
-/// Opens one ORC split — the stripes of `path` within `[range_start, range_start + range_length)` —
-/// and returns an opaque handle, released with `closeSource`. Driven by datafusion-orc's file source,
-/// which maps the split's byte range to the stripes it covers.
-#[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openOrc<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    path: JString<'local>,
-    projection: JObjectArray<'local>,
-    range_start: jlong,
-    range_length: jlong,
-) -> jlong {
-    let path: String = env.get_string(&path).expect("failed to read path").into();
-    let projection = read_strings(&mut env, &projection)
-        .into_iter()
-        .map(|name| name.expect("projection column name was null"))
-        .collect::<Vec<_>>();
-    let schema = orc_file_schema(&path);
-    let table_schema = datafusion::datasource::table_schema::TableSchema::from(schema.clone());
-    let file_source = Arc::new(datafusion_orc::OrcSource::new(table_schema))
-        as Arc<dyn datafusion::datasource::physical_plan::FileSource>;
-    let source: Box<dyn BatchSource> =
-        Box::new(FileScan::open(file_source, &path, schema, &projection, range_start, range_length));
-    into_handle(source)
 }

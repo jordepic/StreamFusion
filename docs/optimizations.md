@@ -155,9 +155,11 @@ into a tape and walk it schema-driven into typed Arrow builders, replacing arrow
 byte-at-a-time tokenizer; semantics are pinned to the old path's coercions. +37% on a realistic
 Nexmark-bid document; moved the Rust decode to JSON's best rung across the Nexmark matrix.
 
-**DataFusion file scans with framework splits** (`ff98896`). Parquet/ORC read through DataFusion's
-file-scan (projection pushed into the decode, maintained readers, row-group/stripe split
-granularity) rather than hand-rolled readers; lifted the Parquet copy 4.68x → 4.97x.
+**DataFusion file scans with framework splits** (`ff98896`). Parquet read through DataFusion's
+file-scan (projection pushed into the decode, maintained readers, row-group split granularity)
+rather than hand-rolled readers; lifted the Parquet copy 4.68x → 4.97x. (ORC rode the same scan
+core until its source was removed —
+https://github.com/datafusion-contrib/StreamFusion/issues/19.)
 
 ## 4. Operator hot loops
 
