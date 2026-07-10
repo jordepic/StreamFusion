@@ -36,11 +36,14 @@ class ArrowBatchSerializerTest {
       VectorSchemaRoot root = RowDataArrowConverter.write(rows, SCHEMA, allocator);
 
       DataOutputSerializer out = new DataOutputSerializer(256);
-      serializer.serialize(new ArrowBatch(root), out);
+      serializer.serialize(new ArrowBatch(root, 3), out);
       root.close();
 
-      ArrowBatch back = serializer.deserialize(new DataInputDeserializer(out.getCopyOfBuffer()));
+      DataOutputSerializer copied = new DataOutputSerializer(256);
+      serializer.copy(new DataInputDeserializer(out.getCopyOfBuffer()), copied);
+      ArrowBatch back = serializer.deserialize(new DataInputDeserializer(copied.getCopyOfBuffer()));
       try (VectorSchemaRoot result = back.root()) {
+        assertEquals(3, back.destination());
         assertEquals(3, back.rowCount());
         List<RowData> readBack = RowDataArrowConverter.read(result, SCHEMA);
         assertEquals(3, readBack.size());

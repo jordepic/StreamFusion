@@ -62,11 +62,8 @@ final class FilterCalcMatcher {
   }
 
   /**
-   * Whether every input column has a type the Arrow boundary can carry. Unlike the scalar-only gate
-   * the stateful operators use ({@code RowDataArrowConverter.supports}), this admits nested
-   * ARRAY/MAP/ROW (recursively, down to supported leaf types) — a filter/projection only passes those
-   * columns through, never keying/sorting/aggregating on them, so the round-trip through
-   * {@code ArrowConversion} is all that's required (and it handles nested types).
+   * Whether every input column has a type the Arrow boundary can carry. Nested ARRAY/MAP/ROW values
+   * are admitted recursively because the boundary preserves their complete binary representation.
    */
   static boolean convertibleRow(RelDataType inputType) {
     return inputType.getFieldList().stream().allMatch(f -> isConvertibleType(f.getType()));
@@ -83,9 +80,25 @@ final class FilterCalcMatcher {
       case BOOLEAN:
       case CHAR:
       case VARCHAR:
+      case BINARY:
+      case VARBINARY:
       case TIMESTAMP:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
       case DATE:
+      case TIME:
+      case INTERVAL_YEAR:
+      case INTERVAL_YEAR_MONTH:
+      case INTERVAL_MONTH:
+      case INTERVAL_DAY:
+      case INTERVAL_DAY_HOUR:
+      case INTERVAL_DAY_MINUTE:
+      case INTERVAL_DAY_SECOND:
+      case INTERVAL_HOUR:
+      case INTERVAL_HOUR_MINUTE:
+      case INTERVAL_HOUR_SECOND:
+      case INTERVAL_MINUTE:
+      case INTERVAL_MINUTE_SECOND:
+      case INTERVAL_SECOND:
       case DECIMAL:
         return true;
       case ARRAY:

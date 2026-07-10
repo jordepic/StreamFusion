@@ -22,13 +22,18 @@ public class SplitByKeyGroupOperator extends AbstractStreamOperator<ArrowBatch>
     implements OneInputStreamOperator<ArrowBatch, ArrowBatch> {
 
   private final int[] keyColumns;
+  private final int[] timestampPrecisions;
+  private final int maxParallelism;
   private final int numChannels;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
 
-  public SplitByKeyGroupOperator(int[] keyColumns, int numChannels) {
+  public SplitByKeyGroupOperator(
+      int[] keyColumns, int[] timestampPrecisions, int maxParallelism, int numChannels) {
     this.keyColumns = keyColumns;
+    this.timestampPrecisions = timestampPrecisions;
+    this.maxParallelism = maxParallelism;
     this.numChannels = numChannels;
   }
 
@@ -55,7 +60,12 @@ public class SplitByKeyGroupOperator extends AbstractStreamOperator<ArrowBatch>
       Data.exportVectorSchemaRoot(inAllocator, in, dictionaries, inArray, inSchema);
       handle =
           Native.splitByKey(
-              inArray.memoryAddress(), inSchema.memoryAddress(), keyColumns, numChannels);
+              inArray.memoryAddress(),
+              inSchema.memoryAddress(),
+              keyColumns,
+              timestampPrecisions,
+              maxParallelism,
+              numChannels);
     } finally {
       in.close(); // the input batch is consumed by the split
     }

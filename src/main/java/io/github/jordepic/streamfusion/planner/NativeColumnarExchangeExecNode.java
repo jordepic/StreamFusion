@@ -31,13 +31,15 @@ public class NativeColumnarExchangeExecNode extends ExecNodeBase<ArrowBatch>
   private static final String TRANSFORMATION = "native-columnar-exchange-split";
 
   private final int[] keyColumns;
+  private final int[] timestampPrecisions;
 
   public NativeColumnarExchangeExecNode(
       ReadableConfig tableConfig,
       InputProperty inputProperty,
       RowType outputType,
       String description,
-      int[] keyColumns) {
+      int[] keyColumns,
+      int[] timestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-exchange_1"),
@@ -46,6 +48,7 @@ public class NativeColumnarExchangeExecNode extends ExecNodeBase<ArrowBatch>
         outputType,
         description);
     this.keyColumns = keyColumns;
+    this.timestampPrecisions = timestampPrecisions;
   }
 
   @Override
@@ -55,12 +58,14 @@ public class NativeColumnarExchangeExecNode extends ExecNodeBase<ArrowBatch>
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
     int numChannels = Math.max(1, input.getParallelism());
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(numChannels);
     // Split each batch into per-channel sub-batches (homogeneous in destination)...
     Transformation<ArrowBatch> split =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
-            new SplitByKeyGroupOperator(keyColumns, numChannels),
+            new SplitByKeyGroupOperator(
+                keyColumns, timestampPrecisions, maxParallelism, numChannels),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);

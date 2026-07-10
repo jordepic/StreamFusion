@@ -40,13 +40,6 @@ final class GlobalGroupAggregateMatcher {
       return "global group aggregate: an output column type the boundary cannot carry";
     }
     int[] grouping = agg.grouping();
-    for (int column : grouping) {
-      if (!WindowAggregateMatcher.supportedGroupingKeyType(
-          inputType.getFieldList().get(column).getType().getSqlTypeName())) {
-        return "global group aggregate: grouping keys must be bigint/int/string/boolean/date/"
-            + "timestamp/decimal";
-      }
-    }
     // A retracting local input: only COUNT and AVG keep their append-only accumulator layout under
     // retraction (Flink's SUM/MIN/MAX retract variants add fields the positional walk doesn't
     // model, and MIN/MAX may even be monotonicity-exempt from retracting — semantics the native

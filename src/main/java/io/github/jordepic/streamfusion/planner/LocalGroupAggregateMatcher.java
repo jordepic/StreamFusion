@@ -43,12 +43,6 @@ final class LocalGroupAggregateMatcher {
       return false;
     }
     int[] grouping = agg.grouping();
-    for (int column : grouping) {
-      if (!WindowAggregateMatcher.supportedGroupingKeyType(
-          inputType.getFieldList().get(column).getType().getSqlTypeName())) {
-        return false;
-      }
-    }
     RelDataType outputType = agg.getRowType(); // [grouping.., partial0..]
     Seq<AggregateCall> aggCalls = agg.aggCalls();
     // A retracting input (the aggregate consumes another aggregate's changelog, Nexmark q4's

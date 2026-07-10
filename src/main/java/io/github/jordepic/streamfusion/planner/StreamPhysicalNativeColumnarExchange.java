@@ -17,11 +17,11 @@ import org.apache.flink.table.planner.utils.ShortcutUtils;
  * A columnar keyed exchange: it stands in for a {@link
  * org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalExchange} whose downstream
  * is a native columnar operator, carrying Arrow batches across the shuffle instead of transposing to
- * rows. It splits each batch by key into per-channel sub-batches and routes them, co-locating every
- * row of a key on one channel — all the downstream native operator needs, since it re-groups by key
- * itself (operator state), so the shuffle hash need not match Flink's key-group hash. Schema- and
- * watermark-transparent ({@link ColumnarInput} and {@link ColumnarOutput}); the watermark flows
- * through the partition transformation as usual.
+ * rows. It splits each batch by Flink's BinaryRow key hash into per-channel sub-batches and routes
+ * them, co-locating every row of a key on one channel. Its destination therefore agrees with the
+ * raw keyed-state layout used for rescaling. Schema- and watermark-transparent ({@link
+ * ColumnarInput} and {@link ColumnarOutput}); the watermark flows through the partition
+ * transformation as usual.
  */
 public class StreamPhysicalNativeColumnarExchange extends SingleRel
     implements StreamPhysicalRel, ColumnarInput, ColumnarOutput {
@@ -63,7 +63,8 @@ public class StreamPhysicalNativeColumnarExchange extends SingleRel
         InputProperty.DEFAULT,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
-        keyColumns);
+        keyColumns,
+        FlinkKeyGroupUtils.timestampPrecisions(outputRowType, keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -74,4 +75,3 @@ public class StreamPhysicalNativeColumnarExchange extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

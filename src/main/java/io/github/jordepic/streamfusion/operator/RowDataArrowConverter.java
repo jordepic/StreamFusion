@@ -37,11 +37,9 @@ public final class RowDataArrowConverter {
   private RowDataArrowConverter() {}
 
   /**
-   * Whether every column is a type a native <em>stateful</em> operator (filter/projection, GROUP BY,
-   * join, Top-N) can carry through its row state. This is intentionally narrower than what the Arrow
-   * boundary can transport ({@link ArrowConversion} handles nested ROW/ARRAY/MAP and binary too) — those
-   * operators key and aggregate on scalar columns, so the planner gates them on this set and falls back
-   * otherwise.
+   * Whether every column is a type a native <em>stateful</em> operator can carry through its row state.
+   * This is deliberately aligned with {@link ArrowConversion}: an admitted type must make the full
+   * RowData → Arrow → RowData round trip before an operator is allowed to retain or key it.
    */
   public static boolean supports(RowType rowType) {
     return rowType.getChildren().stream().allMatch(RowDataArrowConverter::isSupportedType);
@@ -58,9 +56,14 @@ public final class RowDataArrowConverter {
       case BOOLEAN:
       case CHAR:
       case VARCHAR:
+      case BINARY:
+      case VARBINARY:
       case TIMESTAMP_WITHOUT_TIME_ZONE:
       case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
       case DATE:
+      case TIME_WITHOUT_TIME_ZONE:
+      case INTERVAL_YEAR_MONTH:
+      case INTERVAL_DAY_TIME:
       case DECIMAL:
         return true;
       case ARRAY:

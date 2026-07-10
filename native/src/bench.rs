@@ -34,7 +34,13 @@ pub struct Tumbling(TumblingAggregator);
 impl Tumbling {
     pub fn new(window_millis: i64, value_type: i64, kinds: Vec<i64>) -> Self {
         let value_types = vec![value_type; kinds.len()];
-        Tumbling(TumblingAggregator::new(window_millis, window_millis, false, value_types, kinds))
+        Tumbling(TumblingAggregator::new(
+            window_millis,
+            window_millis,
+            false,
+            value_types,
+            kinds,
+        ))
     }
 
     /// The accounted variant: state is tracked against `budget_bytes`, measuring the
@@ -97,7 +103,14 @@ impl Over {
             None => Vec::new(),
         };
         Over(OverWindowAggregator::new(
-            value_types, kinds, rt_column, value_columns, key_columns, 0, 0, false,
+            value_types,
+            kinds,
+            rt_column,
+            value_columns,
+            key_columns,
+            0,
+            0,
+            false,
         ))
     }
 
@@ -126,7 +139,14 @@ impl Over {
         let value_columns = vec![value_column; kinds.len()];
         let frame_kind = if rows_frame { 1 } else { 2 };
         Over(OverWindowAggregator::new(
-            value_types, kinds, rt_column, value_columns, key_columns, frame_kind, frame_offset, false,
+            value_types,
+            kinds,
+            rt_column,
+            value_columns,
+            key_columns,
+            frame_kind,
+            frame_offset,
+            false,
         ))
     }
 }
@@ -136,12 +156,26 @@ pub struct RetractTopN(RetractableTopNRanker);
 
 impl RetractTopN {
     /// `sort_columns` are (index, ascending) pairs (nulls-last).
-    pub fn new(partition_columns: Vec<usize>, sort_columns: Vec<(usize, bool)>, limit: i64) -> Self {
+    pub fn new(
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<(usize, bool)>,
+        limit: i64,
+    ) -> Self {
         let sort = sort_columns
             .into_iter()
-            .map(|(index, ascending)| SortColumn { index, ascending, nulls_first: false })
+            .map(|(index, ascending)| SortColumn {
+                index,
+                ascending,
+                nulls_first: false,
+            })
             .collect();
-        RetractTopN(RetractableTopNRanker::new(partition_columns, sort, 0, limit, false))
+        RetractTopN(RetractableTopNRanker::new(
+            partition_columns,
+            sort,
+            0,
+            limit,
+            false,
+        ))
     }
 
     pub fn push(&mut self, batch: &RecordBatch) -> RecordBatch {
@@ -172,7 +206,13 @@ pub fn split_by_key(
     key_columns: &[usize],
     num_partitions: usize,
 ) -> Vec<(usize, RecordBatch)> {
-    partition_batch(batch, key_columns, num_partitions)
+    partition_batch(
+        batch,
+        key_columns,
+        &vec![-1; key_columns.len()],
+        num_partitions,
+        num_partitions,
+    )
 }
 
 /// A source-edge JSON decoder (one document per input row -> a typed columnar batch).
@@ -198,7 +238,13 @@ impl GroupBy {
         value_columns: Vec<i64>,
         key_columns: Vec<usize>,
     ) -> Self {
-        GroupBy(GroupAggregator::new(kinds, value_types, value_columns, key_columns, true))
+        GroupBy(GroupAggregator::new(
+            kinds,
+            value_types,
+            value_columns,
+            key_columns,
+            true,
+        ))
     }
 
     pub fn update(&mut self, batch: &RecordBatch) -> RecordBatch {

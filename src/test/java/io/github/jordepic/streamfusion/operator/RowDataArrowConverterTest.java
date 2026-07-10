@@ -1,7 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
@@ -12,6 +11,7 @@ import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.StringData;
 import org.apache.flink.table.types.logical.BigIntType;
+import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
@@ -19,6 +19,7 @@ import org.apache.flink.table.types.logical.IntType;
 import java.math.BigDecimal;
 import org.apache.flink.table.data.DecimalData;
 import org.apache.flink.table.types.logical.DateType;
+import org.apache.flink.table.types.logical.DayTimeIntervalType;
 import org.apache.flink.table.types.logical.DecimalType;
 import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.TimeType;
@@ -27,6 +28,8 @@ import org.apache.flink.table.types.logical.SmallIntType;
 import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarCharType;
+import org.apache.flink.table.types.logical.VarBinaryType;
+import org.apache.flink.table.types.logical.YearMonthIntervalType;
 import org.apache.flink.table.data.TimestampData;
 import org.apache.flink.types.RowKind;
 import org.junit.jupiter.api.Test;
@@ -63,8 +66,8 @@ class RowDataArrowConverterTest {
     first.setField(5, 6.5);
     first.setField(6, true);
     first.setField(7, StringData.fromString("hello"));
-    // Sub-millisecond nanos verify the nanosecond round-trip preserves full precision.
-    first.setField(8, TimestampData.fromEpochMillis(1234L, 567000));
+    // Sub-millisecond nanos before the epoch verify floor-based timestamp reconstruction.
+    first.setField(8, TimestampData.fromEpochMillis(-1L, 999999));
     first.setField(9, 18000); // DATE as an epoch-day count
     first.setField(10, DecimalData.fromBigDecimal(new BigDecimal("123.45"), 10, 2));
 
@@ -128,10 +131,40 @@ class RowDataArrowConverterTest {
   }
 
   @Test
-  void reportsUnsupportedSchemas() {
+  void admitsTimeAndBinarySchemasTheBoundaryRoundTrips() {
     assertTrue(RowDataArrowConverter.supports(SCHEMA));
-    RowType withTime =
-        RowType.of(new LogicalType[] {new IntType(), new TimeType(0)}, new String[] {"a", "t"});
-    assertFalse(RowDataArrowConverter.supports(withTime));
+    RowType schema =
+        RowType.of(
+            new LogicalType[] {
+              new IntType(),
+              new TimeType(9),
+              new BinaryType(3),
+              new VarBinaryType(VarBinaryType.MAX_LENGTH),
+              new YearMonthIntervalType(YearMonthIntervalType.YearMonthResolution.YEAR_TO_MONTH),
+              new DayTimeIntervalType(DayTimeIntervalType.DayTimeResolution.DAY_TO_SECOND)
+            },
+            new String[] {"a", "time", "fixed", "variable", "months", "millis"});
+    assertTrue(RowDataArrowConverter.supports(schema));
+
+    GenericRowData row = new GenericRowData(6);
+    row.setField(0, 7);
+    // Flink's internal TIME representation is an int millisecond count for every declared precision.
+    row.setField(1, 86_399_123);
+    row.setField(2, new byte[] {1, 2, 3});
+    row.setField(3, new byte[] {4, 5, 6, 7});
+    row.setField(4, -14);
+    row.setField(5, -86_399_123L);
+
+    try (BufferAllocator allocator = new RootAllocator();
+        VectorSchemaRoot root = RowDataArrowConverter.write(List.of(row), schema, allocator)) {
+      RowData restored = RowDataArrowConverter.read(root, schema).get(0);
+      assertEquals(7, restored.getInt(0));
+      assertEquals(86_399_123, restored.getInt(1));
+      org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[] {1, 2, 3}, restored.getBinary(2));
+      org.junit.jupiter.api.Assertions.assertArrayEquals(
+          new byte[] {4, 5, 6, 7}, restored.getBinary(3));
+      assertEquals(-14, restored.getInt(4));
+      assertEquals(-86_399_123L, restored.getLong(5));
+    }
   }
 }

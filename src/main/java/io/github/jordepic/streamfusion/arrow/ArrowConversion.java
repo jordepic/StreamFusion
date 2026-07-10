@@ -96,10 +96,12 @@ import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.columnar.vector.ColumnVector;
 import org.apache.flink.table.types.logical.ArrayType;
 import org.apache.flink.table.types.logical.BigIntType;
+import org.apache.flink.table.types.logical.BinaryType;
 import org.apache.flink.table.types.logical.BooleanType;
 import org.apache.flink.table.types.logical.CharType;
 import org.apache.flink.table.types.logical.DateType;
 import org.apache.flink.table.types.logical.DecimalType;
+import org.apache.flink.table.types.logical.DayTimeIntervalType;
 import org.apache.flink.table.types.logical.DoubleType;
 import org.apache.flink.table.types.logical.FloatType;
 import org.apache.flink.table.types.logical.IntType;
@@ -114,6 +116,7 @@ import org.apache.flink.table.types.logical.TimestampType;
 import org.apache.flink.table.types.logical.TinyIntType;
 import org.apache.flink.table.types.logical.VarBinaryType;
 import org.apache.flink.table.types.logical.VarCharType;
+import org.apache.flink.table.types.logical.YearMonthIntervalType;
 import org.apache.flink.table.types.logical.utils.LogicalTypeDefaultVisitor;
 
 /**
@@ -470,6 +473,11 @@ public final class ArrowConversion {
     }
 
     @Override
+    public ArrowType visit(BinaryType binaryType) {
+      return new ArrowType.FixedSizeBinary(binaryType.getLength());
+    }
+
+    @Override
     public ArrowType visit(VarBinaryType varBinaryType) {
       return ArrowType.Binary.INSTANCE;
     }
@@ -495,6 +503,18 @@ public final class ArrowConversion {
       } else {
         return new ArrowType.Time(TimeUnit.NANOSECOND, 64);
       }
+    }
+
+    @Override
+    public ArrowType visit(YearMonthIntervalType yearMonthIntervalType) {
+      // Flink's internal form is the signed number of months.
+      return new ArrowType.Int(4 * 8, true);
+    }
+
+    @Override
+    public ArrowType visit(DayTimeIntervalType dayTimeIntervalType) {
+      // Flink's internal form is the signed number of milliseconds.
+      return new ArrowType.Int(8 * 8, true);
     }
 
     // Timestamps are pinned to nanoseconds (no timezone) to match the unit the native side uses,

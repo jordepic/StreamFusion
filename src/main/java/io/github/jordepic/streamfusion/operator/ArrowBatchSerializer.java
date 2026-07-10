@@ -21,9 +21,13 @@ import org.apache.flink.core.memory.DataOutputView;
  * Type serializer for {@link ArrowBatch}. Within a chained task it is never asked to serialize to
  * bytes — {@link #copy} is the only path, and it is identity because operators emit a fresh batch
  * per record and never retain or mutate it after emit. Across a network edge it serializes the batch
- * with Arrow's IPC stream format (length-framed so it composes with Flink's record stream).
+ * with Arrow's IPC stream format, preserving the columnar exchange's destination tag before the
+ * length-framed IPC payload.
  */
 public final class ArrowBatchSerializer extends TypeSerializer<ArrowBatch> {
+
+  // Negative so it cannot be confused with the non-negative IPC length in the legacy format.
+  private static final int DESTINATION_TAG = 0xD5A5_0001;
 
   private BufferAllocator allocator() {
     return NativeAllocator.SHARED;
@@ -73,13 +77,17 @@ public final class ArrowBatchSerializer extends TypeSerializer<ArrowBatch> {
       batch.root().close();
     }
     byte[] encoded = bytes.toByteArray();
+    target.writeInt(DESTINATION_TAG);
+    target.writeInt(batch.destination());
     target.writeInt(encoded.length);
     target.write(encoded);
   }
 
   @Override
   public ArrowBatch deserialize(DataInputView source) throws IOException {
-    int length = source.readInt();
+    int tagOrLength = source.readInt();
+    int destination = tagOrLength == DESTINATION_TAG ? source.readInt() : -1;
+    int length = tagOrLength == DESTINATION_TAG ? source.readInt() : tagOrLength;
     byte[] encoded = new byte[length];
     source.readFully(encoded);
     try (ArrowStreamReader reader =
@@ -96,7 +104,7 @@ public final class ArrowBatchSerializer extends TypeSerializer<ArrowBatch> {
       }
       VectorSchemaRoot root = new VectorSchemaRoot(transferred);
       root.setRowCount(read.getRowCount());
-      return new ArrowBatch(root);
+      return new ArrowBatch(root, destination);
     }
   }
 
@@ -107,9 +115,13 @@ public final class ArrowBatchSerializer extends TypeSerializer<ArrowBatch> {
 
   @Override
   public void copy(DataInputView source, DataOutputView target) throws IOException {
-    int length = source.readInt();
+    int tagOrLength = source.readInt();
+    int destination = tagOrLength == DESTINATION_TAG ? source.readInt() : -1;
+    int length = tagOrLength == DESTINATION_TAG ? source.readInt() : tagOrLength;
     byte[] encoded = new byte[length];
     source.readFully(encoded);
+    target.writeInt(DESTINATION_TAG);
+    target.writeInt(destination);
     target.writeInt(length);
     target.write(encoded);
   }

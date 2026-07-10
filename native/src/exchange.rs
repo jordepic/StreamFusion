@@ -1,34 +1,26 @@
 use crate::*;
 
-/// The partition a key's arrow-row bytes map to, by a consistent hash of the encoded key values.
-/// The hash is internal — it only distributes rows across partitions and need not match Flink's,
-/// because the downstream keyed consumer is our own native operator that re-groups internally (see
-/// todo 10). A fixed-seed hasher keeps the mapping identical across subtasks/processes, and the
-/// arrow-row encoding is a pure function of the key's type and value, so the two sides of a join
-/// co-locate equal keys exactly as the scalar hash did (divergences/10).
-pub(crate) fn partition_for_key(key: &[u8], num_partitions: usize) -> usize {
-    use std::hash::Hasher;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write(key);
-    (hasher.finish() % num_partitions as u64) as usize
-}
-
-/// Splits a batch into up to `num_partitions` sub-batches by a consistent hash of the given key
-/// columns, so every row with the same key lands in the same partition. Each sub-batch keeps the
-/// full input schema (a row subset); empty partitions are omitted. This is the by-key split the
-/// columnar shuffle routes to channels. The keys encode to arrow-row bytes in one vectorized pass;
-/// no per-row scalar materialization.
+/// Splits a batch into up to `num_partitions` sub-batches using Flink's key-group assignment:
+/// `BinaryRowData.hashCode()` → `MathUtils.murmurHash` → key group → operator index. Each
+/// sub-batch keeps the full input schema (a row subset); empty partitions are omitted. This makes
+/// the columnar exchange and raw keyed state agree during rescaling.
 pub(crate) fn partition_batch(
     batch: &RecordBatch,
     key_columns: &[usize],
+    timestamp_precisions: &[i32],
+    max_parallelism: usize,
     num_partitions: usize,
 ) -> Vec<(usize, RecordBatch)> {
-    let key_arrays: Vec<&ArrayRef> = key_columns.iter().map(|&i| batch.column(i)).collect();
-    let mut converter = None;
-    let keys_encoded = encode_keys(&mut converter, &key_arrays, batch.num_rows());
+    // The precision sidecar is a pre-order type tree, so a nested key contributes more than one
+    // descriptor; `binary_row_hash` validates that it is consumed exactly.
+    assert!(max_parallelism >= num_partitions);
     let mut rows_by_partition: Vec<Vec<u32>> = vec![Vec::new(); num_partitions];
     for row in 0..batch.num_rows() {
-        let partition = partition_for_key(keys_encoded.row(row).data(), num_partitions);
+        let key_group = flink_key_group(
+            binary_row_hash(batch, key_columns, row, timestamp_precisions),
+            max_parallelism,
+        );
+        let partition = key_group * num_partitions / max_parallelism;
         rows_by_partition[partition].push(row as u32);
     }
     let mut out = Vec::new();
@@ -37,9 +29,15 @@ pub(crate) fn partition_batch(
             continue;
         }
         let indices = UInt32Array::from(rows);
-        let columns: Vec<ArrayRef> =
-            batch.columns().iter().map(|c| take(c, &indices, None).expect("take")).collect();
-        out.push((partition, RecordBatch::try_new(batch.schema(), columns).expect("sub batch")));
+        let columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|c| take(c, &indices, None).expect("take"))
+            .collect();
+        out.push((
+            partition,
+            RecordBatch::try_new(batch.schema(), columns).expect("sub batch"),
+        ));
     }
     out
 }
@@ -59,12 +57,30 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_splitByKey<'l
     in_array_address: jlong,
     in_schema_address: jlong,
     key_columns: JIntArray<'local>,
+    timestamp_precisions: JIntArray<'local>,
+    max_parallelism: jint,
     num_partitions: jint,
 ) -> jlong {
     let batch = import_record_batch(in_array_address, in_schema_address);
-    let keys: Vec<usize> = read_int_array(&env, &key_columns).into_iter().map(|k| k as usize).collect();
-    let partitions = partition_batch(&batch, &keys, num_partitions as usize);
-    into_handle(SplitState { partitions, cursor: 0 })
+    let keys: Vec<usize> = read_int_array(&env, &key_columns)
+        .into_iter()
+        .map(|k| k as usize)
+        .collect();
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let partitions = partition_batch(
+        &batch,
+        &keys,
+        &precisions,
+        max_parallelism as usize,
+        num_partitions as usize,
+    );
+    into_handle(SplitState {
+        partitions,
+        cursor: 0,
+    })
 }
 
 /// Exports the next sub-batch into the consumer-allocated C structs and returns its partition, or

@@ -67,6 +67,17 @@ public final class Native {
   public static native long sumInt(long arrayAddress, long schemaAddress);
 
   /**
+   * Computes Flink's {@code BinaryRowData.hashCode()} for every Arrow row projected to the supplied
+   * key columns. Timestamp precision is carried separately because Arrow's timestamp type has no
+   * precision parameter; use {@code -1} for every non-timestamp key column.
+   */
+  public static native int[] flinkBinaryRowHashes(
+      long arrayAddress,
+      long schemaAddress,
+      int[] keyColumns,
+      int[] timestampPrecisions);
+
+  /**
    * Imports an int32 column the JVM exported and exports an equal column back into the
    * consumer-allocated C structs, exercising both directions of the boundary.
    *
@@ -386,18 +397,25 @@ public final class Native {
   public static native void closeSource(long handle);
 
   /**
-   * Splits a batch the JVM exported by a consistent hash of the {@code keyColumns} into up to {@code
-   * numPartitions} sub-batches (every row with a given key in one partition), returning a handle to
-   * pull them with {@link #nextSplit}; released with {@link #closeSplit}. The columnar shuffle's
-   * by-key routing.
+   * Splits a batch the JVM exported using Flink's BinaryRow key hash and key-group assignment into up
+   * to {@code numPartitions} sub-batches (every row with a given key in one partition), returning a
+   * handle to pull them with {@link #nextSplit}; released with {@link #closeSplit}. The columnar
+   * shuffle's by-key routing.
    *
    * @param inArrayAddress address of the input {@code ArrowArray} C struct
    * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
    * @param keyColumns indices of the key columns to hash
+   * @param timestampPrecisions logical timestamp precision per key column ({@code -1} for non-timestamp keys)
+   * @param maxParallelism number of Flink key groups
    * @param numPartitions number of partitions (downstream channels) to split into
    */
   public static native long splitByKey(
-      long inArrayAddress, long inSchemaAddress, int[] keyColumns, int numPartitions);
+      long inArrayAddress,
+      long inSchemaAddress,
+      int[] keyColumns,
+      int[] timestampPrecisions,
+      int maxParallelism,
+      int numPartitions);
 
   /**
    * Exports the next sub-batch of a split into the consumer-allocated C structs and returns its
