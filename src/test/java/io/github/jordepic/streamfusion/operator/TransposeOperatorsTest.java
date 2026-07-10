@@ -79,4 +79,23 @@ class TransposeOperatorsTest {
       }
     }
   }
+
+  @Test
+  void checkpointBarrierDrainsPartialRowToArrowBatch() throws Exception {
+    try (OneInputStreamOperatorTestHarness<RowData, ArrowBatch> harness =
+        new OneInputStreamOperatorTestHarness<>(new RowDataToArrowOperator(SCHEMA, 3, false, null))) {
+      harness.setup(new ArrowBatchSerializer());
+      harness.open();
+      harness.processElement(new StreamRecord<>(row(1L, 10)));
+      harness.processElement(new StreamRecord<>(row(2L, 20)));
+      assertEquals(List.of(), values(harness));
+
+      harness.prepareSnapshotPreBarrier(1L);
+      List<ArrowBatch> batches = values(harness);
+      assertEquals(1, batches.size());
+      try (var root = batches.get(0).root()) {
+        assertEquals(2, root.getRowCount());
+      }
+    }
+  }
 }

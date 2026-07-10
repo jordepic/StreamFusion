@@ -4,8 +4,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarTemporalSortOperator;
 import java.util.Collections;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -49,14 +52,21 @@ public class NativeTemporalSortExecNode extends ExecNodeBase<ArrowBatch>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
-    Transformation<ArrowBatch> transformation =
+    KeySelector<ArrowBatch, Integer> emptyKeySelector = batch -> 0;
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
             new NativeColumnarTemporalSortOperator(rowtimeColumn),
             ArrowBatchTypeInformation.INSTANCE,
-            input.getParallelism(),
+            1,
             false);
+    // Flink's RowTimeSortOperator is keyed by EmptyRowDataKeySelector and runs after a singleton
+    // exchange. Keep the same one logical key: its raw state can move on restore but cannot shard.
+    transformation.setParallelism(1);
+    transformation.setMaxParallelism(1);
+    transformation.setStateKeySelector(emptyKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

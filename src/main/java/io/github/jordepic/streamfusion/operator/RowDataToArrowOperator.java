@@ -69,6 +69,16 @@ public class RowDataToArrowOperator extends AbstractStreamOperator<ArrowBatch>
     flush();
   }
 
+  /**
+   * Drains rows accepted before the checkpoint barrier. The upstream source will restore past those
+   * rows from its checkpointed offset, while this boundary keeps no state of its own.
+   */
+  @Override
+  public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    flush();
+    super.prepareSnapshotPreBarrier(checkpointId);
+  }
+
   @Override
   public void close() throws Exception {
     super.close();

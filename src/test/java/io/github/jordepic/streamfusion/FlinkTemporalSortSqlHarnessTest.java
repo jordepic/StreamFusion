@@ -34,9 +34,19 @@ class FlinkTemporalSortSqlHarnessTest {
         "SELECT k, v + 1 AS v1, rt FROM src WHERE v > 10 ORDER BY rt");
   }
 
+  @Test
+  void eventTimeSortAtParallelismTwoMatchesHost() throws Exception {
+    NativeParity.assertParity(
+        () -> environment(2), "SELECT k, v, rt FROM src ORDER BY rt");
+  }
+
   private static TableEnvironment environment() {
+    return environment(1);
+  }
+
+  private static TableEnvironment environment(int parallelism) {
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-    env.setParallelism(1);
+    env.setParallelism(parallelism);
     StreamTableEnvironment tEnv = StreamTableEnvironment.create(env);
 
     // Out-of-order timestamps so the sort actually reorders; the 2s bounded-out-of-orderness keeps

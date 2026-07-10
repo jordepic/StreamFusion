@@ -75,6 +75,15 @@ public class NativeJsonBytesDecodeOperator extends AbstractStreamOperator<ArrowB
     }
   }
 
+  /** Drains messages accepted before the checkpoint barrier; this batching boundary has no state. */
+  @Override
+  public void prepareSnapshotPreBarrier(long checkpointId) throws Exception {
+    if (count > 0) {
+      flush();
+    }
+    super.prepareSnapshotPreBarrier(checkpointId);
+  }
+
   private void flush() {
     body.setValueCount(count);
     try (VectorSchemaRoot in = new VectorSchemaRoot(List.of(body));

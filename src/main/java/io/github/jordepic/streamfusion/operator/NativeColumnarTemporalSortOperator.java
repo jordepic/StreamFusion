@@ -7,9 +7,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -34,7 +31,6 @@ public class NativeColumnarTemporalSortOperator extends AbstractStreamOperator<A
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeColumnarTemporalSortOperator(int rowtimeColumn) {
@@ -42,19 +38,19 @@ public class NativeColumnarTemporalSortOperator extends AbstractStreamOperator<A
   }
 
   @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
+  }
+
+  @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-temporal-sort-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
+    java.util.List<byte[]> snapshots = RawKeyedState.restore(context);
+    if (snapshots.size() > 1) {
+      throw new IllegalStateException(
+          "temporal sort has one canonical empty key and cannot restore multiple key groups");
     }
+    byte[] snapshot = snapshots.isEmpty() ? null : snapshots.get(0);
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle =
         snapshot == null
@@ -113,8 +109,13 @@ public class NativeColumnarTemporalSortOperator extends AbstractStreamOperator<A
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotTemporalSorter(handle));
+    byte[] snapshot = Native.snapshotTemporalSorter(handle);
+    if (snapshot.length > 0) {
+      // Like Flink's EmptyRowDataKeySelector, temporal sort owns exactly one empty key. With a
+      // max parallelism of one, that key is raw key group zero and can move—but never split—on
+      // recovery or rescale.
+      RawKeyedState.snapshot(context, new int[] {0}, ignored -> snapshot);
+    }
   }
 
   @Override

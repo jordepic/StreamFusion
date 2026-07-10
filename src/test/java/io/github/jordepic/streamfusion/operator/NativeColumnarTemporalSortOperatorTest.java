@@ -7,8 +7,11 @@ import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -35,9 +38,8 @@ class NativeColumnarTemporalSortOperatorTest {
   @Test
   void releasesRowsInRowtimeOrderAsWatermarkAdvances() throws Exception {
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(
-                new NativeColumnarTemporalSortOperator(1), new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            harness()) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -53,6 +55,39 @@ class NativeColumnarTemporalSortOperatorTest {
       harness.processWatermark(new Watermark(3000));
       assertEquals(List.of(row(30, 2000)), collect(harness));
     }
+  }
+
+  @Test
+  void rawEmptyKeyStateSurvivesCheckpointRestore() throws Exception {
+    OperatorSubtaskState snapshot;
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> before =
+            harness()) {
+      before.setup(new ArrowBatchSerializer());
+      before.open();
+      before.processElement(
+          new StreamRecord<>(batch(allocator, event(30, 2000), event(10, 500))));
+      snapshot = before.snapshot(1L, 1L);
+      collect(before);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> restored =
+            harness()) {
+      restored.setup(new ArrowBatchSerializer());
+      restored.initializeState(snapshot);
+      restored.open();
+      restored.processWatermark(new Watermark(1500));
+      assertEquals(List.of(row(10, 500)), collect(restored));
+      restored.processWatermark(new Watermark(3000));
+      assertEquals(List.of(row(30, 2000)), collect(restored));
+    }
+  }
+
+  private static KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness()
+      throws Exception {
+    return new KeyedOneInputStreamOperatorTestHarness<>(
+        new NativeColumnarTemporalSortOperator(1), batch -> 0, Types.INT, 1, 1, 0);
   }
 
   private static RowData event(long v, long rtMillis) {

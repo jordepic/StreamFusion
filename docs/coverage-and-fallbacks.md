@@ -98,6 +98,20 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   local subtracts -U/-D rows, and the appended (or reused) count1 COUNT(*) partial drives per-key
   liveness in the global (`-D` and state drop when the merged count reaches zero, Flink's
   RecordCounter semantics).
+  The durable global `GROUP BY` state stays as a Rust hot map but checkpoints through Flink **raw
+  keyed state**: each non-empty Flink key group gets its own snapshot payload, and a rescaled task
+  restores exactly the payloads assigned to its new key-group range. The native columnar exchange
+  uses the same BinaryRow hash/key-group calculation, so the two layouts agree.
+  The same per-key-group raw state layout now covers every native state shape partitioned by user
+  keys: fixed and session windows, `OVER`, deduplication, Top-N/window rank, and regular, window,
+  interval, updating, and temporal joins. Event-time sort follows Flink's special case: raw keyed
+  state under one canonical empty key, so its global sort buffer can recover but cannot shard. Raw
+  processing-time operators copy their latest cleanup deadline into every raw key-group payload, so
+  Flink redistributes and re-arms cleanup after recovery without a separate operator-state fallback.
+  Row-to-Arrow and JSON decode batching boundaries likewise drain before their checkpoint barrier.
+  Raw payloads are a new checkpoint format, so they are not wire-compatible with the prior
+  development-only whole-handle snapshots; versioned native-state migration remains tracked in
+  [#22](https://github.com/datafusion-contrib/StreamFusion/issues/22).
   Still falling back: the opt-in `distinct-agg.split.enabled` incremental chain (a deliberate
   non-goal — `IncrementalGroupAggregate` above), MIN/MAX/AVG over DISTINCT under two-phase,
   smallint/tinyint/float SUM/MIN/MAX partials, and — under a retracting input — any aggregate
@@ -279,7 +293,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Windowing TVF** — not `TUMBLE`/`HOP`/`CUMULATE` (zero offset) over a local-time-zone time
   attribute. Both event-time (assign by rowtime) and proctime (assign by the clock) are native.
 - **Event-time sort** — a secondary order key beyond the leading ascending rowtime. (A descending or
-  non-time leading key is a non-temporal `Sort`, which Flink rejects in streaming — parity.)
+  non-time leading key is a non-temporal `Sort`, which Flink rejects in streaming — parity.) Its
+  global time-ordering buffer uses raw keyed state under Flink's one canonical empty key. It is
+  therefore checkpointed and restored by Flink, but deliberately cannot shard across subtasks—the
+  same singleton limitation as Flink's temporal sort; see
+  [#22](https://github.com/datafusion-contrib/StreamFusion/issues/22).
 - **Union** — a row type the converter can't carry. (`UNION` distinct is not a fallback — the host
   rewrites it to a `GROUP BY`, which routes through the aggregate path.)
 - **Expand** — any project cell that isn't a column ref, a NULL literal, or the integer expand id.
@@ -353,18 +371,21 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   ≥ 1); wrong arity for any admitted function.
 
 ### 4. Type level
-- **Scalar leaf types.** Every column (and every nested leaf) must be a type the boundary converter
-  carries: tinyint/smallint/int/bigint/float/double/boolean/char/varchar/timestamp/timestamp-ltz/date/decimal.
-  Anything outside that — `TIME`, interval, raw/binary — falls back as a **column** type (a day-time
-  `INTERVAL` *literal* inside an expression is admitted, though, so `TIMESTAMP - INTERVAL` arithmetic
-  works). Both gates
+- **Boundary leaf types.** Every column (and every nested leaf) must be a type the Arrow boundary
+  carries: tinyint/smallint/int/bigint/float/double/boolean/char/varchar/binary/varbinary/date/time,
+  year-month interval/day-time interval, timestamp/timestamp-ltz, or decimal. Both gates
   (`FilterCalcMatcher.convertibleRow` for filter/`Calc`, `RowDataArrowConverter.supports` for the
-  keyed/stateful operators) check this recursively.
+  keyed/stateful operators) check this recursively. Individual stateful operators can impose a
+  narrower key-type restriction while their native key encoder is being brought to parity.
+- **`RAW<T>` falls back as a column type.** A raw value's bytes, equality, and hash are defined by its
+  arbitrary Flink `TypeSerializer`; there is no generic Rust representation that can preserve those
+  semantics. Materializing it on the JVM for each native row would violate the native data-plane
+  contract, so `RAW<T>` stays on the host until a serializer-specific implementation is added.
 - **Nested `ARRAY`/`MAP`/`ROW`/`MULTISET` are supported** (recursively, down to supported leaves; a
   `MULTISET<E>` rides the Arrow boundary as a `MAP<E, INT>`): carried through filters/projections,
-  usable as a GROUP BY / join / dedup **key** (the nested value rides the row state as a DataFusion
-  `ScalarValue` and is cast back to its declared column type on emit), and as a `COUNT` value column
-  (counted for null-ness only). **Extracting a scalar field from a `ROW` column** in an expression
+  usable as a `GROUP BY` **key** (the native state uses the Flink BinaryRow bytes and gathers the
+  original Arrow key values on emit), and as a `COUNT` value column (counted for null-ness only).
+  **Extracting a scalar field from a `ROW` column** in an expression
   (`bid.price`, nested `a.b.c`) is native — the expression engine encodes it as DataFusion's
   `get_field`, returning NULL for a null struct, matching Flink. (This is what lets the Nexmark
   `person`/`auction`/`bid` views — `SELECT bid.price … FROM events WHERE event_type = N` — accelerate.)
@@ -374,8 +395,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   What still falls back for a nested column:
   - **Ordering a nested value** — `MAX`/`MIN` over it, `ORDER BY` it, or a Top-N/sort on it. Flink
     itself rejects `MAX(array)` and `ORDER BY array`, so this matches the host.
-- **Key types** outside bigint/int/string/boolean/date/timestamp/decimal **(plus the nested types
-  above)** for join/OVER/window/group keys.
+- **Composite `GROUP BY` keys** (`ARRAY`/`MAP`/`ROW`/`MULTISET`) use the recursive Rust
+  `BinaryRowData` writer for equality, exchange routing, and raw keyed-state partitioning. The
+  parity suite covers nested nulls, inline and long variable-width values, wide decimals,
+  precision-9 timestamps and times, and map/multiset layouts. `RAW<T>` is separately excluded above.
 - **Aggregate value types** outside the parity matrix in `aggregate-type-support.md`. The non-windowed
   `GROUP BY` (single-phase and the two-phase mini-batch split) and the single-phase windowed
   aggregates cover `DECIMAL` for `SUM`/`MIN`/`MAX`/`COUNT`/`AVG`; the windowed two-phase decimal
@@ -504,8 +527,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
     whose leaves are also whitelisted: the intersection of fluss-rs' Arrow export and what the
     vendored `ArrowConversion` readers accept, parity-pinned by `NativeFlussTypeParityTest`.
     Notable exclusions: **TIMESTAMP_LTZ** (fluss-rs exports a zoned timestamp vector, which
-    `ArrowConversion` currently rejects), **BINARY** (`ArrowConversion.toArrowSchema` has no
-    BINARY mapping), and **nested ARRAY/MAP** (unverified across the boundary).
+    `ArrowConversion` currently rejects), **BINARY** (the source's fixed-size-binary handover has
+    not yet been parity-tested), and **nested ARRAY/MAP** (unverified across the boundary).
   - **`table.log.format` other than `ARROW`** — fluss-rs' scan validation errors on any other log
     format.
   - **Client config the native client can't mirror** — an unrecognized `client.*` option; a known
