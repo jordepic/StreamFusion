@@ -4,8 +4,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarTopNOperator;
 import java.util.Collections;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -29,6 +32,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
   private final long limit;
   private final boolean outputRankNumber;
   private final boolean retracting;
+  private final int[] keyTimestampPrecisions;
 
   public NativeColumnarTopNExecNode(
       ReadableConfig tableConfig,
@@ -42,7 +46,8 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
       long offset,
       long limit,
       boolean outputRankNumber,
-      boolean retracting) {
+      boolean retracting,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-top-n_1"),
@@ -58,6 +63,7 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
     this.limit = limit;
     this.outputRankNumber = outputRankNumber;
     this.retracting = retracting;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -75,12 +81,17 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
         !retracting
             && config.get(
                 org.apache.flink.table.api.config.ExecutionConfigOptions.TABLE_EXEC_MINIBATCH_ENABLED);
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(input.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, input.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
             new NativeColumnarTopNOperator(
                 partitionColumns,
+                keyTimestampPrecisions,
                 sortIndices,
                 sortAscending,
                 sortNullsFirst,
@@ -88,10 +99,14 @@ public class NativeColumnarTopNExecNode extends ExecNodeBase<ArrowBatch>
                 limit,
                 outputRankNumber,
                 retracting,
-                netDiff),
+                netDiff,
+                maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelector(stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

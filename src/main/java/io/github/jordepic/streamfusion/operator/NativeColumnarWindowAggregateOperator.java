@@ -50,7 +50,9 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
       int[] aggregateKinds,
       String timeZoneId,
       RowType outputType,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     super(
         "streamfusion-window-aggregate-state",
         windowMillis,
@@ -58,7 +60,9 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
         valueTypes,
         aggregateKinds,
         timeZoneId,
-        outputType);
+        outputType,
+        keyTimestampPrecisions,
+        maxParallelism);
     this.cumulative = cumulative;
     this.timeColumn = timeColumn;
     this.valueColumns = valueColumns;
@@ -71,7 +75,15 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
   public void open() throws Exception {
     super.open();
     registeredTimer = Long.MIN_VALUE;
-    maxOpenEnd = Long.MIN_VALUE;
+    maxOpenEnd = restoredProcessingTimeTimerDeadline();
+    if (proctime && maxOpenEnd != Long.MIN_VALUE) {
+      long now = getProcessingTimeService().getCurrentProcessingTime();
+      if (maxOpenEnd <= now) {
+        emitClosedWindows(now);
+      } else {
+        scheduleNextTimer(now);
+      }
+    }
   }
 
   @Override
@@ -88,6 +100,18 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
         ? Native.restoreCumulativeAggregator(
             windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes())
         : super.restoreHandle(snapshot);
+  }
+
+  @Override
+  protected long restoreRawHandle(byte[][] snapshots) {
+    return Native.restoreTumblingAggregatorPartitions(
+        windowMillis,
+        slideMillis,
+        cumulative,
+        valueTypes,
+        aggregateKinds,
+        snapshots,
+        memoryBudgetBytes());
   }
 
   @Override
@@ -112,6 +136,11 @@ public class NativeColumnarWindowAggregateOperator extends NativeRowWindowOperat
     emitClosedWindows(now);
     scheduleNextTimer(now); // chain to the next slide boundary while windows remain open
     publishStateBytes();
+  }
+
+  @Override
+  protected long processingTimeTimerDeadlineForSnapshot() {
+    return proctime ? maxOpenEnd : Long.MIN_VALUE;
   }
 
   /**

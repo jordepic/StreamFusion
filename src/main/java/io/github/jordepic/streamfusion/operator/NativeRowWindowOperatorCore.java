@@ -37,8 +37,18 @@ public abstract class NativeRowWindowOperatorCore extends NativeWindowOperatorCo
       int[] valueTypes,
       int[] aggregateKinds,
       String timeZoneId,
-      RowType outputType) {
-    super(stateName, windowMillis, slideMillis, valueTypes, aggregateKinds, timeZoneId);
+      RowType outputType,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
+    super(
+        stateName,
+        windowMillis,
+        slideMillis,
+        valueTypes,
+        aggregateKinds,
+        timeZoneId,
+        keyTimestampPrecisions,
+        maxParallelism);
     this.outputType = outputType;
   }
 

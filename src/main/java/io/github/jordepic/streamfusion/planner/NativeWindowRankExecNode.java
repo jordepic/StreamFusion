@@ -4,8 +4,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarWindowRankOperator;
 import java.util.Collections;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -38,6 +41,7 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
   private final long windowMillis;
   private final long slideMillis;
   private final boolean cumulative;
+  private final int[] keyTimestampPrecisions;
 
   public NativeWindowRankExecNode(
       ReadableConfig tableConfig,
@@ -55,7 +59,8 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
       boolean proctime,
       long windowMillis,
       long slideMillis,
-      boolean cumulative) {
+      boolean cumulative,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-window-rank_1"),
@@ -75,6 +80,7 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.cumulative = cumulative;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -84,7 +90,11 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
     String timeZoneId = planner.getTableConfig().getLocalTimeZone().getId();
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(input.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, input.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
@@ -92,6 +102,7 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
                 windowStartColumn,
                 windowEndColumn,
                 partitionColumns,
+                keyTimestampPrecisions,
                 sortIndices,
                 sortAscending,
                 sortNullsFirst,
@@ -101,10 +112,14 @@ public class NativeWindowRankExecNode extends ExecNodeBase<ArrowBatch>
                 proctime,
                 windowMillis,
                 slideMillis,
-                cumulative),
+                cumulative,
+                maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelector(stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

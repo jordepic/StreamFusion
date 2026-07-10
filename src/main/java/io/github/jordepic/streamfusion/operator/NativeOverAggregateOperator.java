@@ -7,9 +7,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -36,11 +33,12 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<ArrowBat
   private final int frameKind;
   private final long frameOffset;
   private final boolean proctime;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeOverAggregateOperator(
@@ -51,7 +49,9 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<ArrowBat
       int[] aggregateKinds,
       int frameKind,
       long frameOffset,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.timeColumn = timeColumn;
     this.valueColumns = valueColumns;
     this.keyColumns = keyColumns;
@@ -60,26 +60,39 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<ArrowBat
     this.frameKind = frameKind;
     this.frameOffset = frameOffset;
     this.proctime = proctime;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native OVER state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-over-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> rawSnapshots = RawKeyedState.restore(context);
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
-    handle =
-        snapshot == null
-            ? Native.createOverAggregator(
+    if (!rawSnapshots.isEmpty()) {
+      handle =
+          Native.restoreOverAggregatorPartitions(
+              valueTypes,
+              aggregateKinds,
+              timeColumn,
+              valueColumns,
+              keyColumns,
+              frameKind,
+              frameOffset,
+              proctime,
+              rawSnapshots.toArray(new byte[0][]),
+              memoryBudget.bytes());
+    } else {
+      handle =
+          Native.createOverAggregator(
                 valueTypes,
                 aggregateKinds,
                 timeColumn,
@@ -88,18 +101,8 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<ArrowBat
                 frameKind,
                 frameOffset,
                 proctime,
-                memoryBudget.bytes())
-            : Native.restoreOverAggregator(
-                valueTypes,
-                aggregateKinds,
-                timeColumn,
-                valueColumns,
-                keyColumns,
-                frameKind,
-                frameOffset,
-                proctime,
-                snapshot,
-                memoryBudget.bytes());
+              memoryBudget.bytes());
+    }
   }
 
   @Override
@@ -177,8 +180,14 @@ public class NativeOverAggregateOperator extends AbstractStreamOperator<ArrowBat
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotOverAggregator(handle));
+    int[] keyGroups =
+        Native.overAggregatorSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotOverAggregatorKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

@@ -31,7 +31,9 @@ public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindow
       int[] valueTypes,
       int[] aggregateKinds,
       String timeZoneId,
-      RowType outputType) {
+      RowType outputType,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     super(
         "streamfusion-global-window-state",
         windowMillis,
@@ -39,7 +41,9 @@ public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindow
         valueTypes,
         aggregateKinds,
         timeZoneId,
-        outputType);
+        outputType,
+        keyTimestampPrecisions,
+        maxParallelism);
     this.cumulative = cumulative;
     this.keyTypes = keyTypes;
   }
@@ -60,6 +64,18 @@ public class NativeColumnarGlobalWindowAggregateOperator extends NativeRowWindow
         ? Native.restoreCumulativeAggregator(
             windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes())
         : super.restoreHandle(snapshot);
+  }
+
+  @Override
+  protected long restoreRawHandle(byte[][] snapshots) {
+    return Native.restoreTumblingAggregatorPartitions(
+        windowMillis,
+        slideMillis,
+        cumulative,
+        valueTypes,
+        aggregateKinds,
+        snapshots,
+        memoryBudgetBytes());
   }
 
   @Override

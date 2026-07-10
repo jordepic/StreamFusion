@@ -104,7 +104,8 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
         keyColumns,
         valueTypes,
         aggregateKinds,
-        timestampLtz);
+        timestampLtz,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -115,4 +116,3 @@ public class StreamPhysicalNativeColumnarLocalWindowAggregate extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

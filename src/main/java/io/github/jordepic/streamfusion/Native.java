@@ -538,6 +538,24 @@ public final class Native {
       byte[] snapshot,
       long memoryBudgetBytes);
 
+  /** Lists the non-empty Flink key groups in a fixed-window raw keyed-state checkpoint. */
+  public static native int[] tumblingAggregatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one fixed-window key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotTumblingAggregatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a tumbling, hopping, or cumulative window aggregator from assigned raw key groups. */
+  public static native long restoreTumblingAggregatorPartitions(
+      long windowMillis,
+      long slideMillis,
+      boolean cumulative,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
+
   /**
    * Creates a columnar event-time OVER aggregator (RANGE between unbounded preceding and current
    * row): it buffers input batches and, on a watermark, emits the completed rows with the running
@@ -591,6 +609,14 @@ public final class Native {
   /** Serializes an OVER aggregator's running state and buffered rows for a checkpoint. */
   public static native byte[] snapshotOverAggregator(long handle);
 
+  /** Lists the non-empty Flink key groups in an OVER raw keyed-state checkpoint. */
+  public static native int[] overAggregatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one OVER key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotOverAggregatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds an OVER aggregator from a snapshot and returns a fresh handle. */
   public static native long restoreOverAggregator(
       int[] valueTypes,
@@ -602,6 +628,19 @@ public final class Native {
       long frameOffset,
       boolean proctime,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Restores an OVER aggregator from raw keyed-state partitions assigned to this task. */
+  public static native long restoreOverAggregatorPartitions(
+      int[] valueTypes,
+      int[] aggregateKinds,
+      int rtColumn,
+      int[] valueColumns,
+      int[] keyColumns,
+      int frameKind,
+      long frameOffset,
+      boolean proctime,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -637,7 +676,7 @@ public final class Native {
    * row for the key. Released with {@link #closeKeepFirstDeduplicator}.
    */
   public static native long createKeepFirstDeduplicator(
-      int[] partitionColumns, int rtColumn, long memoryBudgetBytes);
+      int[] partitionColumns, int[] keyTimestampPrecisions, int rtColumn, long memoryBudgetBytes);
 
   /** Buffers an input batch; each key's first row is emitted on the watermark that reaches it. */
   public static native void pushKeepFirstDeduplicator(
@@ -657,6 +696,22 @@ public final class Native {
   public static native long restoreKeepFirstDeduplicator(
       int[] partitionColumns, int rtColumn, byte[] snapshot, long memoryBudgetBytes);
 
+  /** Lists the non-empty Flink key groups in a keep-first deduplication raw keyed-state checkpoint. */
+  public static native int[] keepFirstDeduplicatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one keep-first deduplication key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotKeepFirstDeduplicatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a keep-first deduplicator from raw keyed-state partitions assigned to this subtask. */
+  public static native long restoreKeepFirstDeduplicatorPartitions(
+      int[] partitionColumns,
+      int[] keyTimestampPrecisions,
+      int rtColumn,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
+
   /**
    * Creates an eager (push→emit) deduplicator and returns an opaque handle. Per partition key, keep-
    * last keeps the winning row and emits a retract changelog eagerly per input row (first row {@code
@@ -667,6 +722,7 @@ public final class Native {
    */
   public static native long createKeepLastDeduplicator(
       int[] partitionColumns,
+      int[] keyTimestampPrecisions,
       int rtColumn,
       boolean generateUpdateBefore,
       boolean rowtimeOrdered,
@@ -691,6 +747,25 @@ public final class Native {
       boolean rowtimeOrdered,
       boolean keepFirst,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Lists the non-empty Flink key groups in a keep-last deduplication raw keyed-state checkpoint. */
+  public static native int[] keepLastDeduplicatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one keep-last deduplication key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotKeepLastDeduplicatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a keep-last deduplicator from the raw keyed-state partitions assigned to this subtask. */
+  public static native long restoreKeepLastDeduplicatorPartitions(
+      int[] partitionColumns,
+      int[] keyTimestampPrecisions,
+      int rtColumn,
+      boolean generateUpdateBefore,
+      boolean rowtimeOrdered,
+      boolean keepFirst,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -738,6 +813,27 @@ public final class Native {
       byte[] snapshot,
       long memoryBudgetBytes);
 
+  /** Lists the non-empty Flink key groups in a window-rank raw keyed-state checkpoint. */
+  public static native int[] windowRankerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one window-rank key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotWindowRankerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a window ranker from raw keyed-state partitions assigned to this subtask. */
+  public static native long restoreWindowRankerPartitions(
+      int windowStartColumn,
+      int windowEndColumn,
+      int[] partitionColumns,
+      int[] sortIndices,
+      int[] sortAscending,
+      int[] sortNullsFirst,
+      long limit,
+      boolean outputRankNumber,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
+
   /**
    * Creates a non-windowed {@code GROUP BY} aggregator and returns an opaque handle. Each input batch
    * folds into per-key state and the aggregator exports the changelog rows it produces, with the row
@@ -747,6 +843,8 @@ public final class Native {
    * @param valueTypes per-aggregate value-column types (see {@link #createTumblingAggregator})
    * @param valueColumns per-aggregate value-column index in the input batch ({@code -1} for COUNT(*))
    * @param keyColumns grouping-key column indices in the input batch (empty for global aggregation)
+   * @param keyTimestampPrecisions pre-order logical key type descriptors (timestamp precision or
+   *     {@code -1}); this lets the native BinaryRow codec preserve nested timestamp layout
    * @param countColumns per-aggregate two-phase AVG count-partial column ({@code -1} otherwise): the
    *     value column is then the local's pre-summed sum partial, and each row bumps the count by this
    *     column instead of by one
@@ -764,6 +862,7 @@ public final class Native {
       int[] valueTypes,
       int[] valueColumns,
       int[] keyColumns,
+      int[] keyTimestampPrecisions,
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
@@ -784,18 +883,42 @@ public final class Native {
   /** Serializes a {@code GROUP BY} aggregator's per-key state for a checkpoint. */
   public static native byte[] snapshotGroupAggregator(long handle);
 
+  /** Lists the non-empty Flink key groups in the group aggregator's raw keyed-state checkpoint. */
+  public static native int[] groupAggregatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes the state of one group returned by {@link #groupAggregatorSnapshotKeyGroups}. */
+  public static native byte[] snapshotGroupAggregatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds a {@code GROUP BY} aggregator from a snapshot and returns a fresh handle. */
   public static native long restoreGroupAggregator(
       int[] aggregateKinds,
       int[] valueTypes,
       int[] valueColumns,
       int[] keyColumns,
+      int[] keyTimestampPrecisions,
       int[] filterColumns,
       int[] countColumns,
       int[] distinctViewColumns,
       int recordCountColumn,
       boolean generateUpdateBefore,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Rebuilds a group aggregator from every raw keyed-state partition assigned to this subtask. */
+  public static native long restoreGroupAggregatorPartitions(
+      int[] aggregateKinds,
+      int[] valueTypes,
+      int[] valueColumns,
+      int[] keyColumns,
+      int[] keyTimestampPrecisions,
+      int[] filterColumns,
+      int[] countColumns,
+      int[] distinctViewColumns,
+      int recordCountColumn,
+      boolean generateUpdateBefore,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -809,7 +932,10 @@ public final class Native {
    * @param memoryBudgetBytes managed-memory budget (see {@link #createTumblingAggregator})
    */
   public static native long createChangelogNormalizer(
-      int[] keyColumns, boolean generateUpdateBefore, long memoryBudgetBytes);
+      int[] keyColumns,
+      int[] keyTimestampPrecisions,
+      boolean generateUpdateBefore,
+      long memoryBudgetBytes);
 
   /**
    * Folds an input changelog batch into per-key keep-last state, exporting the normalized changelog
@@ -823,7 +949,27 @@ public final class Native {
 
   /** Rebuilds a changelog normalizer from a snapshot and returns a fresh handle. */
   public static native long restoreChangelogNormalizer(
-      int[] keyColumns, boolean generateUpdateBefore, byte[] snapshot, long memoryBudgetBytes);
+      int[] keyColumns,
+      int[] keyTimestampPrecisions,
+      boolean generateUpdateBefore,
+      byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Lists the non-empty Flink key groups in a normalizer raw keyed-state checkpoint. */
+  public static native int[] changelogNormalizerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one normalizer key-group payload for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotChangelogNormalizerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a normalizer from all raw keyed-state partitions assigned to this subtask. */
+  public static native long restoreChangelogNormalizerPartitions(
+      int[] keyColumns,
+      int[] keyTimestampPrecisions,
+      boolean generateUpdateBefore,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
 
   /** Releases a changelog normalizer handle. */
   public static native void closeChangelogNormalizer(long handle);
@@ -1184,6 +1330,14 @@ public final class Native {
   /** Serializes an interval joiner's buffered rows for a checkpoint. */
   public static native byte[] snapshotIntervalJoiner(long handle);
 
+  /** Lists the non-empty Flink key groups in an interval-join raw keyed-state checkpoint. */
+  public static native int[] intervalJoinerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one interval-join key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotIntervalJoinerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds an interval joiner from a snapshot and returns a fresh handle. */
   public static native long restoreIntervalJoiner(
       int[] leftKeys,
@@ -1202,6 +1356,26 @@ public final class Native {
       double[] predDoubles,
       String[] predStrings,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Restores an interval joiner from raw keyed-state partitions assigned to this task. */
+  public static native long restoreIntervalJoinerPartitions(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftTime,
+      int rightTime,
+      long lowerMillis,
+      long upperMillis,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -1258,6 +1432,14 @@ public final class Native {
   /** Serializes a temporal joiner's buffered probe rows and versioned build state for a checkpoint. */
   public static native byte[] snapshotTemporalJoiner(long handle);
 
+  /** Lists the non-empty Flink key groups in a temporal-join raw keyed-state checkpoint. */
+  public static native int[] temporalJoinerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one temporal-join key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotTemporalJoinerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds a temporal joiner from a snapshot and returns a fresh handle. */
   public static native long restoreTemporalJoiner(
       int[] leftKeys,
@@ -1274,6 +1456,24 @@ public final class Native {
       double[] predDoubles,
       String[] predStrings,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Restores a temporal joiner from raw keyed-state partitions assigned to this task. */
+  public static native long restoreTemporalJoinerPartitions(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftTime,
+      int rightTime,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -1322,6 +1522,14 @@ public final class Native {
   /** Serializes an updating joiner's per-side state for a checkpoint. */
   public static native byte[] snapshotUpdatingJoiner(long handle);
 
+  /** Lists the non-empty Flink key groups in an updating join raw keyed-state checkpoint. */
+  public static native int[] updatingJoinerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one updating join key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotUpdatingJoinerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds an updating joiner from a snapshot and returns a fresh handle. */
   public static native long restoreUpdatingJoiner(
       int[] leftKeys,
@@ -1336,6 +1544,22 @@ public final class Native {
       double[] predDoubles,
       String[] predStrings,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Restores an updating joiner from raw keyed-state partitions assigned to this task. */
+  public static native long restoreUpdatingJoinerPartitions(
+      int[] leftKeys,
+      int[] rightKeys,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -1394,6 +1618,28 @@ public final class Native {
       byte[] snapshot,
       long memoryBudgetBytes);
 
+  /** Lists the non-empty Flink key groups in a Top-N raw keyed-state checkpoint. */
+  public static native int[] topNRankerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one Top-N key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotTopNRankerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a Top-N ranker from raw keyed-state partitions assigned to this subtask. */
+  public static native long restoreTopNRankerPartitions(
+      int[] partitionColumns,
+      int[] sortIndices,
+      int[] sortAscending,
+      int[] sortNullsFirst,
+      long offset,
+      long limit,
+      boolean outputRankNumber,
+      boolean retracting,
+      boolean netDiff,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
+
   /**
    * Creates an event-time INNER window joiner and returns an opaque handle. It buffers both inputs
    * (whose rows carry matching {@code window_start}/{@code window_end} columns assigned upstream) and
@@ -1447,6 +1693,14 @@ public final class Native {
   /** Serializes a window joiner's buffered rows for a checkpoint. */
   public static native byte[] snapshotWindowJoiner(long handle);
 
+  /** Lists the non-empty Flink key groups in a window-join raw keyed-state checkpoint. */
+  public static native int[] windowJoinerSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one window-join key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotWindowJoinerKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
   /** Rebuilds a window joiner from a snapshot and returns a fresh handle. */
   public static native long restoreWindowJoiner(
       int[] leftKeys,
@@ -1465,6 +1719,26 @@ public final class Native {
       double[] predDoubles,
       String[] predStrings,
       byte[] snapshot,
+      long memoryBudgetBytes);
+
+  /** Restores a window joiner from raw keyed-state partitions assigned to this task. */
+  public static native long restoreWindowJoinerPartitions(
+      int[] leftKeys,
+      int[] rightKeys,
+      int leftWindowStart,
+      int leftWindowEnd,
+      int rightWindowStart,
+      int rightWindowEnd,
+      int joinType,
+      long leftSchemaAddress,
+      long rightSchemaAddress,
+      int[] predKinds,
+      int[] predPayload,
+      int[] predChildCounts,
+      long[] predLongs,
+      double[] predDoubles,
+      String[] predStrings,
+      byte[][] snapshots,
       long memoryBudgetBytes);
 
   /**
@@ -1541,4 +1815,20 @@ public final class Native {
    */
   public static native long restoreSessionAggregator(
       long gapMillis, int[] valueTypes, int[] aggregateKinds, byte[] snapshot, long memoryBudgetBytes);
+
+  /** Lists the non-empty Flink key groups in a session-window raw keyed-state checkpoint. */
+  public static native int[] sessionAggregatorSnapshotKeyGroups(
+      long handle, int maxParallelism, int[] timestampPrecisions);
+
+  /** Serializes one session-window key group for a raw keyed-state checkpoint. */
+  public static native byte[] snapshotSessionAggregatorKeyGroup(
+      long handle, int keyGroup, int maxParallelism, int[] timestampPrecisions);
+
+  /** Restores a session-window aggregator from raw keyed-state partitions assigned to this task. */
+  public static native long restoreSessionAggregatorPartitions(
+      long gapMillis,
+      int[] valueTypes,
+      int[] aggregateKinds,
+      byte[][] snapshots,
+      long memoryBudgetBytes);
 }

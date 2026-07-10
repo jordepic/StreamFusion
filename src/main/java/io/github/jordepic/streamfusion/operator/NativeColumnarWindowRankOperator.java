@@ -12,9 +12,6 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.TimeStampNanoVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -43,6 +40,7 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
   private final int windowStartColumn;
   private final int windowEndColumn;
   private final int[] partitionColumns;
+  private final int[] keyTimestampPrecisions;
   private final int[] sortIndices;
   private final int[] sortAscending;
   private final int[] sortNullsFirst;
@@ -53,13 +51,14 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
   private final long windowMillis;
   private final long slideMillis;
   private final boolean cumulative;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient ZoneId zone;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
+  private transient long restoredProcessingTimeTimerDeadline;
   private transient long registeredTimer;
   private transient long maxOpenEnd;
 
@@ -67,6 +66,7 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
       int windowStartColumn,
       int windowEndColumn,
       int[] partitionColumns,
+      int[] keyTimestampPrecisions,
       int[] sortIndices,
       int[] sortAscending,
       int[] sortNullsFirst,
@@ -76,10 +76,12 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
       boolean proctime,
       long windowMillis,
       long slideMillis,
-      boolean cumulative) {
+      boolean cumulative,
+      int maxParallelism) {
     this.windowStartColumn = windowStartColumn;
     this.windowEndColumn = windowEndColumn;
     this.partitionColumns = partitionColumns;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
     this.sortIndices = sortIndices;
     this.sortAscending = sortAscending;
     this.sortNullsFirst = sortNullsFirst;
@@ -90,25 +92,26 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.cumulative = cumulative;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native window-rank state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-window-rank-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    RawKeyedState.TimedRestore restored = RawKeyedState.restoreWithTimer(context);
+    java.util.List<byte[]> snapshots = restored.snapshots();
+    restoredProcessingTimeTimerDeadline = restored.deadline();
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle =
-        snapshot == null
+        snapshots.isEmpty()
             ? Native.createWindowRanker(
                 windowStartColumn,
                 windowEndColumn,
@@ -119,7 +122,7 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
                 limit,
                 outputRankNumber,
                 memoryBudget.bytes())
-            : Native.restoreWindowRanker(
+            : Native.restoreWindowRankerPartitions(
                 windowStartColumn,
                 windowEndColumn,
                 partitionColumns,
@@ -128,7 +131,7 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
                 sortNullsFirst,
                 limit,
                 outputRankNumber,
-                snapshot,
+                snapshots.toArray(new byte[0][]),
                 memoryBudget.bytes());
   }
 
@@ -139,7 +142,15 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
     dictionaries = NativeAllocator.DICTIONARIES;
     zone = ZoneId.of(timeZoneId);
     registeredTimer = Long.MIN_VALUE;
-    maxOpenEnd = Long.MIN_VALUE;
+    maxOpenEnd = restoredProcessingTimeTimerDeadline;
+    if (proctime && maxOpenEnd != Long.MIN_VALUE) {
+      long now = getProcessingTimeService().getCurrentProcessingTime();
+      if (maxOpenEnd <= now) {
+        flush(now);
+      } else {
+        scheduleNextTimer(now);
+      }
+    }
   }
 
   @Override
@@ -249,8 +260,15 @@ public class NativeColumnarWindowRankOperator extends AbstractStreamOperator<Arr
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotWindowRanker(handle));
+    int[] keyGroups =
+        Native.windowRankerSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshotWithTimer(
+        context,
+        keyGroups,
+        proctime ? maxOpenEnd : Long.MIN_VALUE,
+        keyGroup ->
+            Native.snapshotWindowRankerKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

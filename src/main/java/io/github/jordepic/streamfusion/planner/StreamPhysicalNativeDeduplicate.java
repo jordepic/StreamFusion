@@ -87,7 +87,8 @@ public class StreamPhysicalNativeDeduplicate extends SingleRel
         rowtimeColumn,
         keepLast,
         generateUpdateBefore,
-        proctime);
+        proctime,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), partitionColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -98,4 +99,3 @@ public class StreamPhysicalNativeDeduplicate extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

@@ -25,9 +25,6 @@ import org.apache.arrow.vector.TimeStampNanoVector;
 import org.apache.arrow.vector.TinyIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -107,7 +104,6 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   /** Aggregate kind code for COUNT, whose partial is always a bigint regardless of value type. */
   protected static final int KIND_COUNT = 3;
 
-  private final String stateName;
   private final String timeZoneId;
   protected final long slideMillis;
   protected final int[] aggregateKinds;
@@ -115,27 +111,39 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   // aggregate over different value columns.
   protected final int[] valueTypes;
   protected final long windowMillis;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient ZoneId zone;
-  private transient ListState<byte[]> windowState;
   protected transient BufferAllocator allocator;
   protected transient CDataDictionaryProvider dictionaries;
   protected transient long handle;
   private transient ManagedMemoryBudget memoryBudget;
+  private transient long restoredProcessingTimeTimerDeadline;
 
+  /**
+   * Creates a core backed by raw Flink keyed state. The timestamp descriptors describe the logical
+   * grouping key recursively, in BinaryRow field order.
+   */
   protected NativeWindowOperatorCore(
       String stateName,
       long windowMillis,
       long slideMillis,
       int[] valueTypes,
       int[] aggregateKinds,
-      String timeZoneId) {
-    this.stateName = stateName;
+      String timeZoneId,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
     this.timeZoneId = timeZoneId;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native window state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
   }
 
   /** Number of aggregates this window computes (and the partial columns it carries). */
@@ -161,12 +169,45 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
         windowMillis, slideMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes());
   }
 
+  /** Restores the fixed-window native state assigned to this task after a raw keyed-state rescale. */
+  protected long restoreRawHandle(byte[][] snapshots) {
+    return Native.restoreTumblingAggregatorPartitions(
+        windowMillis,
+        slideMillis,
+        false,
+        valueTypes,
+        aggregateKinds,
+        snapshots,
+        memoryBudgetBytes());
+  }
+
+  /** Lists non-empty raw key groups for this fixed-window handle. Stateful subclasses may override. */
+  protected int[] snapshotRawKeyGroups() {
+    return Native.tumblingAggregatorSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+  }
+
+  /** Serializes one raw key group for this handle. Stateful subclasses may override. */
+  protected byte[] snapshotRawKeyGroup(int keyGroup) {
+    return Native.snapshotTumblingAggregatorKeyGroup(
+        handle, keyGroup, maxParallelism, keyTimestampPrecisions);
+  }
+
   /**
    * The managed-memory budget bounding the native state (see {@link ManagedMemoryBudget}), for this
    * class's handle creation and any subclass override's.
    */
   protected final long memoryBudgetBytes() {
     return memoryBudget == null ? ManagedMemoryBudget.UNBOUNDED : memoryBudget.bytes();
+  }
+
+  /** The Flink max parallelism used to map native BinaryRow hashes to raw state key groups. */
+  protected final int maxParallelism() {
+    return maxParallelism;
+  }
+
+  /** Recursive logical timestamp descriptors for the grouping key's BinaryRow layout. */
+  protected final int[] keyTimestampPrecisions() {
+    return keyTimestampPrecisions;
   }
 
   /** Folds an exported batch into the native aggregator. */
@@ -184,6 +225,11 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
     return Native.snapshotTumblingAggregator(handle);
   }
 
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
+  }
+
   /** Releases the native aggregator handle. */
   protected void closeHandle() {
     Native.closeTumblingAggregator(handle);
@@ -192,6 +238,16 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   /** The native aggregator's tracked state footprint in bytes (zero when unaccounted). */
   protected long stateBytesHandle() {
     return Native.tumblingAggregatorStateBytes(handle);
+  }
+
+  /** The latest native processing-time cleanup deadline restored from the previous checkpoint. */
+  protected final long restoredProcessingTimeTimerDeadline() {
+    return restoredProcessingTimeTimerDeadline;
+  }
+
+  /** The latest cleanup deadline copied into every raw key group at checkpoint time. */
+  protected long processingTimeTimerDeadlineForSnapshot() {
+    return Long.MIN_VALUE;
   }
 
   /**
@@ -208,26 +264,22 @@ public abstract class NativeWindowOperatorCore<OUT> extends AbstractStreamOperat
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    windowState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    stateName, PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : windowState.get()) {
-      snapshot = entry;
-    }
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
-    handle = snapshot == null ? createHandle() : restoreHandle(snapshot);
+    RawKeyedState.TimedRestore restored = RawKeyedState.restoreWithTimer(context);
+    List<byte[]> snapshots = restored.snapshots();
+    restoredProcessingTimeTimerDeadline = restored.deadline();
+    handle = snapshots.isEmpty() ? createHandle() : restoreRawHandle(snapshots.toArray(new byte[0][]));
   }
 
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
     flushPending();
-    windowState.clear();
-    windowState.add(snapshotHandle());
+    RawKeyedState.snapshotWithTimer(
+        context,
+        snapshotRawKeyGroups(),
+        processingTimeTimerDeadlineForSnapshot(),
+        this::snapshotRawKeyGroup);
   }
 
   @Override

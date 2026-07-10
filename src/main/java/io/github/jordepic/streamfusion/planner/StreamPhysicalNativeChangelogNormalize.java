@@ -65,7 +65,8 @@ public class StreamPhysicalNativeChangelogNormalize extends SingleRel
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRowType()),
         getRelDetailedDescription(),
         keyColumns,
-        generateUpdateBefore);
+        generateUpdateBefore,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -76,4 +77,3 @@ public class StreamPhysicalNativeChangelogNormalize extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

@@ -134,6 +134,12 @@ pub(crate) struct AlignedWindow {
     keys: HashMap<OwnedRow, Vec<Box<dyn Accumulator>>>,
 }
 
+struct WindowSnapshotCache {
+    max_parallelism: usize,
+    timestamp_precisions: Vec<i32>,
+    snapshots: BTreeMap<i32, Vec<u8>>,
+}
+
 /// Event-time aligned-window aggregation that holds open windows across batches: tumbling and
 /// hopping (fixed-size windows at a slide interval) and cumulative (nested windows sharing a start,
 /// growing by a step up to a max size). Mirrors the upstream streaming engine's window operator:
@@ -154,6 +160,7 @@ pub(crate) struct TumblingAggregator {
     // The highest watermark flushed so far; a row whose window ends at or before it is late (its
     // window already closed) and is dropped, matching the host's per-row late-data handling.
     current_watermark: i64,
+    snapshot_cache: Option<WindowSnapshotCache>,
     // Managed-memory accounting: open-window footprint tracked per touched group (not by
     // rescanning all state) and resized against the reservation after every state change.
     pub(crate) memory: OperatorMemory,
@@ -176,6 +183,7 @@ impl TumblingAggregator {
             key_converter: None,
             key_types: Vec::new(),
             current_watermark: i64::MIN,
+            snapshot_cache: None,
             memory: OperatorMemory::unaccounted(),
         }
     }
@@ -246,6 +254,7 @@ impl TumblingAggregator {
     }
 
     pub(crate) fn update(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
+        self.snapshot_cache = None;
         let ts = column_i64(batch, "ts");
         // One value column per aggregate (value0, value1, …), so aggregates can read different
         // columns. Sliced by type-agnostic take, so each accumulator sees its column's own type.
@@ -282,6 +291,7 @@ impl TumblingAggregator {
     /// slice: the row folds into exactly the one window it names (dropping rows whose window the
     /// watermark has already closed). `flush_partial` then emits the partials keyed by window end.
     pub(crate) fn update_attached(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
+        self.snapshot_cache = None;
         let starts = column_i64(batch, "window_start");
         let ends = column_i64(batch, "window_end");
         let values: Vec<&ArrayRef> = (0..self.aggregates.len())
@@ -343,6 +353,7 @@ impl TumblingAggregator {
     /// cumulative windows sharing a start differ by it; each result column takes the aggregate's
     /// own output type.
     pub(crate) fn flush(&mut self, watermark: i64) -> RecordBatch {
+        self.snapshot_cache = None;
         self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
         let mut keys: Vec<OwnedRow> = Vec::new();
@@ -386,6 +397,7 @@ impl TumblingAggregator {
     /// Local half of two-phase aggregation: emits each closed window's per-aggregate partial state
     /// as `[key, partial0..partialN-1, slice_end]`. Single-field partials (sum/min/max/count).
     pub(crate) fn flush_partial(&mut self, watermark: i64) -> RecordBatch {
+        self.snapshot_cache = None;
         self.current_watermark = self.current_watermark.max(watermark);
         let n = self.aggregates.len();
         let mut keys: Vec<OwnedRow> = Vec::new();
@@ -426,6 +438,7 @@ impl TumblingAggregator {
     /// Global half of two-phase aggregation: merges incoming partials
     /// `[key, partial0..partialN-1, slice_end]` into the window each slice belongs to.
     pub(crate) fn update_partial(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
+        self.snapshot_cache = None;
         let n = self.aggregates.len();
         let key_arrays = key_arrays(batch);
         self.key_types = key_types(&key_arrays);
@@ -494,6 +507,10 @@ impl TumblingAggregator {
     /// key): window end, window start, key, then every accumulator's state fields in order), encoded
     /// with Arrow IPC. Carries arbitrary multi-aggregate, multi-field state through one path.
     pub(crate) fn snapshot(&mut self) -> Vec<u8> {
+        write_ipc(&self.snapshot_batch())
+    }
+
+    fn snapshot_batch(&mut self) -> RecordBatch {
         let state_fields: Vec<Field> =
             self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
 
@@ -538,16 +555,85 @@ impl TumblingAggregator {
             "current_watermark".to_string(),
             self.current_watermark.to_string(),
         )]);
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields).with_metadata(metadata)), columns)
-            .expect("failed to build snapshot batch");
+        RecordBatch::try_new(Arc::new(Schema::new(fields).with_metadata(metadata)), columns)
+            .expect("failed to build snapshot batch")
+    }
 
-        let mut buffer = Vec::new();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
-            .expect("failed to open snapshot writer");
-        writer.write(&batch).expect("failed to write snapshot");
-        writer.finish().expect("failed to finish snapshot");
-        drop(writer);
-        buffer
+    pub(crate) fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("window raw snapshot cache")
+            .snapshots
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("window raw snapshot cache")
+            .snapshots
+            .get(&key_group)
+            .cloned()
+            .expect("requested non-empty window raw key group")
+    }
+
+    fn materialize_raw_keyed_snapshots(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) {
+        if self.snapshot_cache.as_ref().is_some_and(|cache| {
+            cache.max_parallelism == max_parallelism
+                && cache.timestamp_precisions.as_slice() == timestamp_precisions
+        }) {
+            return;
+        }
+        let state_field_count: usize = self
+            .aggregates
+            .iter()
+            .map(|aggregate| aggregate.state_fields().len())
+            .sum();
+        let batch = self.snapshot_batch();
+        let key_count = batch.num_columns() - 2 - state_field_count;
+        let key_columns: Vec<usize> = (2..2 + key_count).collect();
+        let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for row in 0..batch.num_rows() {
+            let key_group = flink_key_group(
+                binary_row_hash(&batch, &key_columns, row, timestamp_precisions),
+                max_parallelism,
+            ) as i32;
+            rows_by_group.entry(key_group).or_default().push(row as u32);
+        }
+        let mut snapshots = BTreeMap::new();
+        for (key_group, rows) in rows_by_group {
+            let indices = UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column, &indices, None).expect("partition window snapshot"))
+                .collect();
+            let partition = RecordBatch::try_new(batch.schema(), columns)
+                .expect("partitioned window snapshot");
+            snapshots.insert(key_group, write_ipc(&partition));
+        }
+        self.snapshot_cache = Some(WindowSnapshotCache {
+            max_parallelism,
+            timestamp_precisions: timestamp_precisions.to_vec(),
+            snapshots,
+        });
     }
 
     pub(crate) fn restore(
@@ -597,6 +683,41 @@ impl TumblingAggregator {
             }
         }
         aggregator
+    }
+
+    pub(crate) fn restore_partitions(
+        window_millis: i64,
+        slide_millis: i64,
+        cumulative: bool,
+        value_types: Vec<i64>,
+        kinds: Vec<i64>,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut batches = Vec::new();
+        let mut watermark = i64::MIN;
+        for bytes in snapshots {
+            for batch in read_ipc_if_present(bytes) {
+                if let Some(current) = batch.schema().metadata().get("current_watermark") {
+                    watermark = watermark.max(current.parse().expect("watermark"));
+                }
+                batches.push(batch);
+            }
+        }
+        if batches.is_empty() {
+            return TumblingAggregator::new(window_millis, slide_millis, cumulative, value_types, kinds);
+        }
+        let schema = batches[0].schema();
+        let combined = concat_batches(&schema, batches.iter()).expect("merge window raw partitions");
+        let mut restored = TumblingAggregator::restore(
+            window_millis,
+            slide_millis,
+            cumulative,
+            value_types,
+            kinds,
+            &write_ipc(&combined),
+        );
+        restored.current_watermark = watermark;
+        restored
     }
 }
 
@@ -891,5 +1012,93 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreCumula
     let aggregator =
         TumblingAggregator::restore(max_size_millis, step_millis, true, value_types, kinds, &bytes)
             .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_tumblingAggregatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = aggregator.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate window raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write window raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTumblingAggregatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let aggregator = unsafe { &mut *(handle as *mut TumblingAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = aggregator.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate window raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTumblingAggregatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    window_millis: jlong,
+    slide_millis: jlong,
+    cumulative: jboolean,
+    value_types: JIntArray<'local>,
+    aggregate_kinds: JIntArray<'local>,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let kinds = read_int_array(&env, &aggregate_kinds);
+    let value_types = read_int_array(&env, &value_types);
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read window raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read window raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read window raw partition bytes"),
+        );
+    }
+    let aggregator = TumblingAggregator::restore_partitions(
+        window_millis,
+        slide_millis,
+        cumulative != 0,
+        value_types,
+        kinds,
+        &restored,
+    )
+    .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)
 }

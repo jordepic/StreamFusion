@@ -5,9 +5,12 @@ import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarDeduplicateOperator;
 import io.github.jordepic.streamfusion.operator.NativeColumnarKeepLastDeduplicateOperator;
 import java.util.Collections;
-import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -33,6 +36,7 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
   private final boolean keepLast;
   private final boolean generateUpdateBefore;
   private final boolean proctime;
+  private final int[] keyTimestampPrecisions;
 
   public NativeDeduplicateExecNode(
       ReadableConfig tableConfig,
@@ -43,7 +47,8 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
       int rowtimeColumn,
       boolean keepLast,
       boolean generateUpdateBefore,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-deduplicate_1"),
@@ -56,6 +61,7 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
     this.keepLast = keepLast;
     this.generateUpdateBefore = generateUpdateBefore;
     this.proctime = proctime;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -68,12 +74,23 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
     // rowtime keep-first is watermark-buffered (it emits a key's min-rowtime row once a watermark
     // completes it).
     boolean eager = proctime || keepLast;
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(input.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, input.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
     OneInputStreamOperator<ArrowBatch, ArrowBatch> operator =
         eager
             ? new NativeColumnarKeepLastDeduplicateOperator(
-                partitionColumns, rowtimeColumn, generateUpdateBefore, !proctime, !keepLast)
-            : new NativeColumnarDeduplicateOperator(partitionColumns, rowtimeColumn);
-    Transformation<ArrowBatch> transformation =
+                partitionColumns,
+                keyTimestampPrecisions,
+                rowtimeColumn,
+                generateUpdateBefore,
+                !proctime,
+                !keepLast,
+                maxParallelism)
+            : new NativeColumnarDeduplicateOperator(
+                partitionColumns, keyTimestampPrecisions, rowtimeColumn, maxParallelism);
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
@@ -81,6 +98,9 @@ public class NativeDeduplicateExecNode extends ExecNodeBase<ArrowBatch>
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelector(stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

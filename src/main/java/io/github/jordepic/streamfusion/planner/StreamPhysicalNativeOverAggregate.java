@@ -89,7 +89,8 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel
         aggregateKinds,
         frameKind,
         frameOffset,
-        proctime);
+        proctime,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -100,4 +101,3 @@ public class StreamPhysicalNativeOverAggregate extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

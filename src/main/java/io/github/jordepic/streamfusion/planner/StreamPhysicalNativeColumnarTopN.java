@@ -99,7 +99,8 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
         offset,
         limit,
         outputRankNumber,
-        retracting);
+        retracting,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), partitionColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -110,4 +111,3 @@ public class StreamPhysicalNativeColumnarTopN extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

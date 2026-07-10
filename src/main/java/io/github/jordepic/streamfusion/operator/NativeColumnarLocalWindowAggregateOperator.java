@@ -39,14 +39,18 @@ public class NativeColumnarLocalWindowAggregateOperator extends NativeWindowOper
       int[] keyTypes,
       int[] valueTypes,
       int[] aggregateKinds,
-      String timeZoneId) {
+      String timeZoneId,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     super(
         "streamfusion-local-window-state",
         windowMillis,
         slideMillis,
         valueTypes,
         aggregateKinds,
-        timeZoneId);
+        timeZoneId,
+        keyTimestampPrecisions,
+        maxParallelism);
     this.timeColumn = timeColumn;
     this.windowStartColumn = windowStartColumn;
     this.windowEndColumn = windowEndColumn;

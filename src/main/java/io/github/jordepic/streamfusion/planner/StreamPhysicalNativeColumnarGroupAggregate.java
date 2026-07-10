@@ -103,7 +103,8 @@ public class StreamPhysicalNativeColumnarGroupAggregate extends SingleRel
         countColumns,
         distinctViewColumns,
         recordCountColumn,
-        generateUpdateBefore);
+        generateUpdateBefore,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -114,4 +115,3 @@ public class StreamPhysicalNativeColumnarGroupAggregate extends SingleRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

@@ -7,9 +7,13 @@ import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.AbstractStreamOperatorTestHarness;
+import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -30,6 +34,8 @@ import org.junit.jupiter.api.Test;
  */
 class NativeColumnarWindowAggregateOperatorTest {
 
+  private static final int MAX_PARALLELISM = 128;
+
   // Input schema [value BIGINT, rt TIMESTAMP_LTZ(3)]; output [total BIGINT, window_start, window_end].
   private static final RowType SCHEMA =
       RowType.of(
@@ -41,15 +47,30 @@ class NativeColumnarWindowAggregateOperatorTest {
           new LogicalType[] {new BigIntType(), new TimestampType(3), new TimestampType(3)},
           new String[] {"total", "window_start", "window_end"});
 
+  // [key BIGINT, value BIGINT, rt TIMESTAMP_LTZ(3)] / [key, total, window_start, window_end].
+  private static final RowType KEYED_SCHEMA =
+      RowType.of(
+          new LogicalType[] {
+            new BigIntType(), new BigIntType(), new LocalZonedTimestampType(3)
+          },
+          new String[] {"key", "value", "rt"});
+
+  private static final RowType KEYED_OUTPUT =
+      RowType.of(
+          new LogicalType[] {
+            new BigIntType(), new BigIntType(), new TimestampType(3), new TimestampType(3)
+          },
+          new String[] {"key", "total", "window_start", "window_end"});
+
   @Test
   void emitsWindowAggregatesFromArrowBatches() throws Exception {
     NativeColumnarWindowAggregateOperator operator =
         new NativeColumnarWindowAggregateOperator(
             false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-            "UTC", OUTPUT, false);
+            "UTC", OUTPUT, false, new int[0], MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -74,10 +95,10 @@ class NativeColumnarWindowAggregateOperatorTest {
     NativeColumnarWindowAggregateOperator operator =
         new NativeColumnarWindowAggregateOperator(
             false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-            "UTC", OUTPUT, true);
+            "UTC", OUTPUT, true, new int[0], MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -105,10 +126,10 @@ class NativeColumnarWindowAggregateOperatorTest {
     NativeColumnarWindowAggregateOperator operator =
         new NativeColumnarWindowAggregateOperator(
             false, 1000, 500, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-            "UTC", OUTPUT, true);
+            "UTC", OUTPUT, true, new int[0], MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -132,10 +153,10 @@ class NativeColumnarWindowAggregateOperatorTest {
     NativeColumnarWindowAggregateOperator operator =
         new NativeColumnarWindowAggregateOperator(
             true, 3000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-            "UTC", OUTPUT, true);
+            "UTC", OUTPUT, true, new int[0], MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -148,6 +169,31 @@ class NativeColumnarWindowAggregateOperatorTest {
       assertEquals(List.of(row(10, 0, 2000)), collect(harness));
       harness.setProcessingTime(3000);
       assertEquals(List.of(row(10, 0, 3000)), collect(harness));
+    }
+  }
+
+  @Test
+  void rawKeyedProctimeWindowRearmsTimerAfterRestore() throws Exception {
+    OperatorSubtaskState snapshot;
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> before =
+            proctimeRawHarness()) {
+      before.setup(new ArrowBatchSerializer());
+      before.open();
+      before.setProcessingTime(500);
+      before.processElement(new StreamRecord<>(batch(allocator, event(6, 9999))));
+      snapshot = before.snapshot(1L, 1L);
+      collect(before);
+    }
+
+    try (KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> restored =
+        proctimeRawHarness()) {
+      restored.setup(new ArrowBatchSerializer());
+      restored.initializeState(snapshot);
+      restored.open();
+      // No input after recovery: the restored timer is solely responsible for closing the window.
+      restored.setProcessingTime(1000);
+      assertEquals(List.of(row(6, 0, 1000)), collect(restored));
     }
   }
 
@@ -164,8 +210,8 @@ class NativeColumnarWindowAggregateOperatorTest {
   void bufferedInputSurvivesCheckpointMidStream() throws Exception {
     OperatorSubtaskState snapshot;
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(eventTimeOperator(), new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(eventTimeOperator())) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
       // Rows land in window [0,1000); the watermark stays below 1000, so the window is still open and
@@ -178,8 +224,8 @@ class NativeColumnarWindowAggregateOperatorTest {
     // A fresh operator restored from that snapshot must resume the open window: a third row joins the
     // two that survived the checkpoint, and closing the window with a watermark emits their sum.
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(eventTimeOperator(), new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            rawHarness(eventTimeOperator())) {
       harness.setup(new ArrowBatchSerializer());
       harness.initializeState(snapshot);
       harness.open();
@@ -189,10 +235,65 @@ class NativeColumnarWindowAggregateOperatorTest {
     }
   }
 
+  /** Raw keyed window state must redistribute by BinaryRow/Flink key group across a rescale. */
+  @Test
+  void rawKeyedWindowStateRescalesAndContinuesAggregation() throws Exception {
+    long[] keys = keysForBothSubtasks();
+    OperatorSubtaskState snapshot;
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> before =
+            keyedHarness(1, 0)) {
+      before.setup(new ArrowBatchSerializer());
+      before.open();
+      before.processElement(
+          new StreamRecord<>(keyedBatch(allocator, keyedEvent(keys[0], 1, 0), keyedEvent(keys[1], 2, 0))));
+      snapshot = before.snapshot(1L, 1L);
+      keyedCollect(before);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> restored0 =
+            keyedHarness(2, 0);
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> restored1 =
+            keyedHarness(2, 1)) {
+      restored0.setup(new ArrowBatchSerializer());
+      restored1.setup(new ArrowBatchSerializer());
+      restored0.initializeState(
+          AbstractStreamOperatorTestHarness.repartitionOperatorState(
+              snapshot, MAX_PARALLELISM, 1, 2, 0));
+      restored1.initializeState(
+          AbstractStreamOperatorTestHarness.repartitionOperatorState(
+              snapshot, MAX_PARALLELISM, 1, 2, 1));
+      restored0.open();
+      restored1.open();
+      for (int index = 0; index < keys.length; index++) {
+        long key = keys[index];
+        int destination = destinationForKey(key);
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> restored =
+            destination == 0 ? restored0 : restored1;
+        restored.processElement(
+            new StreamRecord<>(
+                keyedBatch(allocator, destination, keyedEvent(key, (index + 1L) * 10, 500))));
+      }
+      restored0.processWatermark(new Watermark(1000));
+      restored1.processWatermark(new Watermark(1000));
+      List<List<Long>> actual = new ArrayList<>();
+      actual.addAll(keyedCollect(restored0));
+      actual.addAll(keyedCollect(restored1));
+      actual.sort(java.util.Comparator.comparing(row -> row.get(0)));
+      List<List<Long>> expected =
+          new ArrayList<>(
+              List.of(
+                  keyedRow(keys[0], 11, 0, 1000), keyedRow(keys[1], 22, 0, 1000)));
+      expected.sort(java.util.Comparator.comparing(row -> row.get(0)));
+      assertEquals(expected, actual);
+    }
+  }
+
   private static NativeColumnarWindowAggregateOperator eventTimeOperator() {
     return new NativeColumnarWindowAggregateOperator(
         false, 1000, 1000, 1, new int[] {0}, new int[0], new int[0], new int[] {0}, new int[] {0},
-        "UTC", OUTPUT, false);
+        "UTC", OUTPUT, false, new int[0], MAX_PARALLELISM);
   }
 
   private static RowData event(long value, long eventTimeMillis) {
@@ -202,13 +303,86 @@ class NativeColumnarWindowAggregateOperatorTest {
     return row;
   }
 
+  private static RowData keyedEvent(long key, long value, long eventTimeMillis) {
+    GenericRowData row = new GenericRowData(3);
+    row.setField(0, key);
+    row.setField(1, value);
+    row.setField(2, TimestampData.fromEpochMillis(eventTimeMillis));
+    return row;
+  }
+
   private static ArrowBatch batch(BufferAllocator allocator, RowData... rows) {
     VectorSchemaRoot root = RowDataArrowConverter.write(List.of(rows), SCHEMA, allocator);
     return new ArrowBatch(root);
   }
 
+  private static ArrowBatch keyedBatch(BufferAllocator allocator, RowData... rows) {
+    return new ArrowBatch(RowDataArrowConverter.write(List.of(rows), KEYED_SCHEMA, allocator));
+  }
+
+  private static ArrowBatch keyedBatch(BufferAllocator allocator, int destination, RowData... rows) {
+    return new ArrowBatch(
+        RowDataArrowConverter.write(List.of(rows), KEYED_SCHEMA, allocator), destination);
+  }
+
   private static List<Long> row(long total, long start, long end) {
     return List.of(total, start, end);
+  }
+
+  private static List<Long> keyedRow(long key, long total, long start, long end) {
+    return List.of(key, total, start, end);
+  }
+
+  private static KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> keyedHarness(
+      int parallelism, int subtask) throws Exception {
+    int[] stateKeys = stateKeysForSubtasks(parallelism);
+    return new KeyedOneInputStreamOperatorTestHarness<>(
+        new NativeColumnarWindowAggregateOperator(
+            false,
+            1000,
+            1000,
+            2,
+            new int[] {1},
+            new int[] {0},
+            new int[] {0},
+            new int[] {0},
+            new int[] {0},
+            "UTC",
+            KEYED_OUTPUT,
+            false,
+            new int[] {-1},
+            MAX_PARALLELISM),
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0],
+        Types.INT,
+        MAX_PARALLELISM,
+        parallelism,
+        subtask);
+  }
+
+  private static KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch>
+      proctimeRawHarness() throws Exception {
+    return rawHarness(
+        new NativeColumnarWindowAggregateOperator(
+            false,
+            1000,
+            1000,
+            1,
+            new int[] {0},
+            new int[0],
+            new int[0],
+            new int[] {0},
+            new int[] {0},
+            "UTC",
+            OUTPUT,
+            true,
+            new int[0],
+            MAX_PARALLELISM));
+  }
+
+  private static KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> rawHarness(
+      NativeColumnarWindowAggregateOperator operator) throws Exception {
+    return new KeyedOneInputStreamOperatorTestHarness<>(
+        operator, batch -> 0, Types.INT, MAX_PARALLELISM, 1, 0);
   }
 
   private static List<List<Long>> collect(
@@ -229,5 +403,72 @@ class NativeColumnarWindowAggregateOperatorTest {
       }
     }
     return rows;
+  }
+
+  private static List<List<Long>> keyedCollect(
+      OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness) {
+    List<List<Long>> rows = new ArrayList<>();
+    while (!harness.getOutput().isEmpty()) {
+      Object event = harness.getOutput().poll();
+      if (event instanceof StreamRecord) {
+        try (VectorSchemaRoot root = ((ArrowBatch) ((StreamRecord<?>) event).getValue()).root()) {
+          for (RowData r : RowDataArrowConverter.read(root, KEYED_OUTPUT)) {
+            rows.add(
+                List.of(
+                    r.getLong(0),
+                    r.getLong(1),
+                    r.getTimestamp(2, 3).getMillisecond(),
+                    r.getTimestamp(3, 3).getMillisecond()));
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
+  private static long[] keysForBothSubtasks() {
+    long[] keys = new long[] {Long.MIN_VALUE, Long.MIN_VALUE};
+    for (long candidate = 0;
+        candidate < 10_000 && (keys[0] == Long.MIN_VALUE || keys[1] == Long.MIN_VALUE);
+        candidate++) {
+      int subtask = destinationForKey(candidate);
+      if (keys[subtask] == Long.MIN_VALUE) {
+        keys[subtask] = candidate;
+      }
+    }
+    if (keys[0] == Long.MIN_VALUE || keys[1] == Long.MIN_VALUE) {
+      throw new AssertionError("did not find one key for each rescaled subtask");
+    }
+    return keys;
+  }
+
+  private static int destinationForKey(long key) {
+    int keyGroup =
+        KeyGroupRangeAssignment.computeKeyGroupForKeyHash(
+            new org.apache.flink.table.runtime.typeutils.RowDataSerializer(
+                    RowType.of(new BigIntType()))
+                .toBinaryRow(GenericRowData.of(key))
+                .hashCode(),
+            MAX_PARALLELISM);
+    return KeyGroupRangeAssignment.computeOperatorIndexForKeyGroup(MAX_PARALLELISM, 2, keyGroup);
+  }
+
+  private static int[] stateKeysForSubtasks(int parallelism) {
+    int[] keys = new int[parallelism];
+    boolean[] found = new boolean[parallelism];
+    int remaining = parallelism;
+    for (int candidate = 0; remaining > 0; candidate++) {
+      int keyGroup =
+          KeyGroupRangeAssignment.computeKeyGroupForKeyHash(candidate, MAX_PARALLELISM);
+      int subtask =
+          KeyGroupRangeAssignment.computeOperatorIndexForKeyGroup(
+              MAX_PARALLELISM, parallelism, keyGroup);
+      if (!found[subtask]) {
+        keys[subtask] = candidate;
+        found[subtask] = true;
+        remaining--;
+      }
+    }
+    return keys;
   }
 }

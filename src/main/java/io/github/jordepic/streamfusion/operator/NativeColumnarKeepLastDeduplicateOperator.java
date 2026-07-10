@@ -7,9 +7,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -32,61 +29,66 @@ public class NativeColumnarKeepLastDeduplicateOperator extends AbstractStreamOpe
     implements OneInputStreamOperator<ArrowBatch, ArrowBatch> {
 
   private final int[] partitionColumns;
+  private final int[] keyTimestampPrecisions;
   private final int rowtimeColumn;
   private final boolean generateUpdateBefore;
   private final boolean rowtimeOrdered;
   private final boolean keepFirst;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeColumnarKeepLastDeduplicateOperator(
       int[] partitionColumns,
+      int[] keyTimestampPrecisions,
       int rowtimeColumn,
       boolean generateUpdateBefore,
       boolean rowtimeOrdered,
-      boolean keepFirst) {
+      boolean keepFirst,
+      int maxParallelism) {
     this.partitionColumns = partitionColumns;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
     this.rowtimeColumn = rowtimeColumn;
     this.generateUpdateBefore = generateUpdateBefore;
     this.rowtimeOrdered = rowtimeOrdered;
     this.keepFirst = keepFirst;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native keep-last state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-keep-last-deduplicate-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> snapshots = RawKeyedState.restore(context);
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle =
-        snapshot == null
+        snapshots.isEmpty()
             ? Native.createKeepLastDeduplicator(
                 partitionColumns,
+                keyTimestampPrecisions,
                 rowtimeColumn,
                 generateUpdateBefore,
                 rowtimeOrdered,
                 keepFirst,
                 memoryBudget.bytes())
-            : Native.restoreKeepLastDeduplicator(
+            : Native.restoreKeepLastDeduplicatorPartitions(
                 partitionColumns,
+                keyTimestampPrecisions,
                 rowtimeColumn,
                 generateUpdateBefore,
                 rowtimeOrdered,
                 keepFirst,
-                snapshot,
+                snapshots.toArray(new byte[0][]),
                 memoryBudget.bytes());
   }
 
@@ -136,8 +138,15 @@ public class NativeColumnarKeepLastDeduplicateOperator extends AbstractStreamOpe
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotKeepLastDeduplicator(handle));
+    int[] keyGroups =
+        Native.keepLastDeduplicatorSnapshotKeyGroups(
+            handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotKeepLastDeduplicatorKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

@@ -5,8 +5,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarLocalWindowAggregateOperator;
 import io.github.jordepic.streamfusion.operator.NativeWindowOperatorCore;
 import java.util.Collections;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -32,6 +35,7 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
   private final int[] valueTypes;
   private final int[] aggregateKinds;
   private final boolean timestampLtz;
+  private final int[] keyTimestampPrecisions;
 
   public NativeColumnarLocalWindowAggExecNode(
       ReadableConfig tableConfig,
@@ -46,7 +50,8 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
       int[] keyColumns,
       int[] valueTypes,
       int[] aggregateKinds,
-      boolean timestampLtz) {
+      boolean timestampLtz,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-columnar-local-window-aggregate_1"),
@@ -63,6 +68,7 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
     this.valueTypes = valueTypes;
     this.aggregateKinds = aggregateKinds;
     this.timestampLtz = timestampLtz;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -77,7 +83,11 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
     // aggregate's boundary rendering applied.
     String timeZoneId =
         timestampLtz ? planner.getTableConfig().getLocalTimeZone().getId() : "UTC";
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(input.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, input.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
@@ -92,10 +102,15 @@ public class NativeColumnarLocalWindowAggExecNode extends ExecNodeBase<ArrowBatc
                 NativeWindowOperatorCore.keyTypes((RowType) getOutputType(), keyColumns.length),
                 valueTypes,
                 aggregateKinds,
-                timeZoneId),
+                timeZoneId,
+                keyTimestampPrecisions,
+                maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelector(stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

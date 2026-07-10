@@ -13,6 +13,7 @@ use crate::*;
 /// the key (for grouping) and the rowtime (i64) are read per row, as any keyed reduction must.
 pub(crate) struct KeepFirstDeduplicator {
     partition_columns: Vec<usize>,
+    key_timestamp_precisions: Vec<i32>,
     rt_column: usize,
     current_watermark: i64,
     /// One row per pending key — that key's minimum-rowtime candidate — awaiting its release.
@@ -23,13 +24,16 @@ pub(crate) struct KeepFirstDeduplicator {
     key_converter: Option<RowConverter>,
     key_types: Vec<DataType>,
     schema: Option<SchemaRef>,
+    snapshot_cache: Option<DedupSnapshotCache>,
     memory: OperatorMemory,
 }
 
 impl KeepFirstDeduplicator {
     pub(crate) fn new(partition_columns: Vec<usize>, rt_column: usize) -> Self {
+        let key_arity = partition_columns.len();
         KeepFirstDeduplicator {
             partition_columns,
+            key_timestamp_precisions: vec![-1; key_arity],
             rt_column,
             current_watermark: i64::MIN,
             pending: None,
@@ -37,6 +41,7 @@ impl KeepFirstDeduplicator {
             key_converter: None,
             key_types: Vec::new(),
             schema: None,
+            snapshot_cache: None,
             memory: OperatorMemory::unaccounted(),
         }
     }
@@ -50,7 +55,13 @@ impl KeepFirstDeduplicator {
         Ok(self)
     }
 
+    fn with_key_timestamp_precisions(mut self, key_timestamp_precisions: Vec<i32>) -> Self {
+        self.key_timestamp_precisions = key_timestamp_precisions;
+        self
+    }
+
     pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<(), DataFusionError> {
+        self.snapshot_cache = None;
         let schema = batch.schema();
         self.schema = Some(schema.clone());
         // Drop late rows (rowtime already below the watermark) with a columnar filter.
@@ -117,6 +128,7 @@ impl KeepFirstDeduplicator {
     /// Emits each pending key's candidate whose rowtime the watermark has now reached (insert-only),
     /// records those keys as emitted, and keeps the rest. Both partitions are columnar filters.
     pub(crate) fn flush(&mut self, watermark: i64) -> Result<RecordBatch, DataFusionError> {
+        self.snapshot_cache = None;
         self.current_watermark = watermark;
         let Some(pending) = self.pending.take() else {
             return Ok(self.empty());
@@ -165,26 +177,137 @@ impl KeepFirstDeduplicator {
     }
 
     fn snapshot(&self) -> Vec<u8> {
+        self.snapshot_parts(self.pending.clone(), self.emitted_batch())
+    }
+
+    fn snapshot_parts(
+        &self,
+        pending_batch: Option<RecordBatch>,
+        emitted_batch: Option<RecordBatch>,
+    ) -> Vec<u8> {
         let mut out = self.current_watermark.to_le_bytes().to_vec();
-        let pending = match &self.pending {
-            Some(batch) if batch.num_rows() > 0 => write_ipc(batch),
-            _ => Vec::new(),
-        };
+        let pending = pending_batch.map(|batch| write_ipc(&batch)).unwrap_or_default();
         out.extend_from_slice(&(pending.len() as u32).to_le_bytes());
         out.extend_from_slice(&pending);
-        out.extend_from_slice(&self.snapshot_emitted());
+        out.extend_from_slice(
+            &emitted_batch.map(|batch| write_ipc(&batch)).unwrap_or_default(),
+        );
         out
     }
 
     /// The emitted keys as an IPC batch of just the key columns (decoded from the stored key bytes).
-    fn snapshot_emitted(&self) -> Vec<u8> {
+    fn emitted_batch(&self) -> Option<RecordBatch> {
         if self.emitted.is_empty() {
-            return Vec::new();
+            return None;
         }
         let keys: Vec<&[u8]> = self.emitted.iter().map(|k| k.0.as_ref()).collect();
         let fields = key_fields(&self.key_types);
         let columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
-        write_ipc(&RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("dedup emitted"))
+        Some(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("dedup emitted"))
+    }
+
+    fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("dedup raw snapshot cache")
+            .snapshots
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("dedup raw snapshot cache")
+            .snapshots
+            .get(&key_group)
+            .cloned()
+            .expect("requested non-empty dedup raw key group")
+    }
+
+    fn materialize_raw_keyed_snapshots(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) {
+        assert_eq!(self.key_timestamp_precisions, timestamp_precisions);
+        if self.snapshot_cache.as_ref().is_some_and(|cache| {
+            cache.max_parallelism == max_parallelism
+                && cache.timestamp_precisions.as_slice() == timestamp_precisions
+        }) {
+            return;
+        }
+        let pending = self.pending.clone();
+        let emitted = self.emitted_batch();
+        let mut pending_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        let mut emitted_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        if let Some(batch) = &pending {
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(
+                        batch,
+                        &self.partition_columns,
+                        row,
+                        timestamp_precisions,
+                    ),
+                    max_parallelism,
+                ) as i32;
+                pending_by_group.entry(key_group).or_default().push(row as u32);
+            }
+        }
+        if let Some(batch) = &emitted {
+            let key_columns: Vec<usize> = (0..batch.num_columns()).collect();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(batch, &key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                emitted_by_group.entry(key_group).or_default().push(row as u32);
+            }
+        }
+        let mut groups: Vec<i32> = pending_by_group
+            .keys()
+            .chain(emitted_by_group.keys())
+            .copied()
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut snapshots = BTreeMap::new();
+        for key_group in groups {
+            let subset = |batch: &RecordBatch, rows: &[u32]| {
+                let indices = UInt32Array::from(rows.to_vec());
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition dedup snapshot"))
+                    .collect();
+                RecordBatch::try_new(batch.schema(), columns).expect("partitioned dedup snapshot")
+            };
+            let pending_part = pending_by_group
+                .get(&key_group)
+                .map(|rows| subset(pending.as_ref().expect("pending rows have a batch"), rows));
+            let emitted_part = emitted_by_group
+                .get(&key_group)
+                .map(|rows| subset(emitted.as_ref().expect("emitted rows have a batch"), rows));
+            snapshots.insert(key_group, self.snapshot_parts(pending_part, emitted_part));
+        }
+        self.snapshot_cache = Some(DedupSnapshotCache {
+            max_parallelism,
+            timestamp_precisions: timestamp_precisions.to_vec(),
+            snapshots,
+        });
     }
 
     fn restore(partition_columns: Vec<usize>, rt_column: usize, bytes: &[u8]) -> Self {
@@ -208,6 +331,44 @@ impl KeepFirstDeduplicator {
         }
         dedup
     }
+
+    fn restore_partitions(
+        partition_columns: Vec<usize>,
+        rt_column: usize,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut watermark = i64::MIN;
+        let mut pending = Vec::new();
+        let mut emitted = Vec::new();
+        for bytes in snapshots {
+            if bytes.len() < 12 {
+                continue;
+            }
+            watermark = watermark.max(i64::from_le_bytes(bytes[0..8].try_into().expect("dedup watermark")));
+            let pending_len =
+                u32::from_le_bytes(bytes[8..12].try_into().expect("dedup pending len")) as usize;
+            assert!(12 + pending_len <= bytes.len(), "truncated dedup raw key-group snapshot");
+            pending.extend(read_ipc_if_present(&bytes[12..12 + pending_len]));
+            emitted.extend(read_ipc_if_present(&bytes[12 + pending_len..]));
+        }
+        // Arrow rows carry the RowConverter that created them.  Coalesce every raw-key-group IPC
+        // payload before one normal restore so pending keys and emitted-key bytes share a converter.
+        let merge = |batches: Vec<RecordBatch>| {
+            batches.first().map(|first| {
+                write_ipc(
+                    &concat_batches(&first.schema(), batches.iter())
+                        .expect("merge dedup raw partitions"),
+                )
+            })
+        };
+        let pending = merge(pending).unwrap_or_default();
+        let emitted = merge(emitted).unwrap_or_default();
+        let mut bytes = watermark.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&(pending.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&pending);
+        bytes.extend_from_slice(&emitted);
+        KeepFirstDeduplicator::restore(partition_columns, rt_column, &bytes)
+    }
 }
 
 /// Eager (push→emit, no watermark buffering) deduplication keyed by a partition key. Serves three of
@@ -224,6 +385,7 @@ impl KeepFirstDeduplicator {
 /// `scalars_to_array` on emit, like the changelog normalizer below.
 pub(crate) struct KeepLastDeduplicator {
     partition_columns: Vec<usize>,
+    key_timestamp_precisions: Vec<i32>,
     rt_column: usize,
     generate_update_before: bool,
     /// Whether the order is a rowtime (read + compared) or proctime (arrival order; rt ignored).
@@ -240,7 +402,14 @@ pub(crate) struct KeepLastDeduplicator {
     /// row is copied once into state, emitting it (and retracting the previous row) just bumps the
     /// refcount — the `-U` moves the replaced payload out of the map, never re-copying it.
     rows: HashMap<ByteKey, (i64, Arc<[u8]>)>,
+    snapshot_cache: Option<DedupSnapshotCache>,
     memory: OperatorMemory,
+}
+
+struct DedupSnapshotCache {
+    max_parallelism: usize,
+    timestamp_precisions: Vec<i32>,
+    snapshots: BTreeMap<i32, Vec<u8>>,
 }
 
 /// Estimated footprint of one stored last-row entry (arrow-row key + payload + map entry).
@@ -256,8 +425,10 @@ impl KeepLastDeduplicator {
         rowtime_ordered: bool,
         keep_first: bool,
     ) -> Self {
+        let key_arity = partition_columns.len();
         KeepLastDeduplicator {
             partition_columns,
+            key_timestamp_precisions: vec![-1; key_arity],
             rt_column,
             generate_update_before,
             rowtime_ordered,
@@ -266,6 +437,7 @@ impl KeepLastDeduplicator {
             partition_converter: None,
             payload_converter: None,
             rows: HashMap::default(),
+            snapshot_cache: None,
             memory: OperatorMemory::unaccounted(),
         }
     }
@@ -277,6 +449,11 @@ impl KeepLastDeduplicator {
             self.rows.iter().map(|(key, (_, payload))| dedup_entry_bytes(&key.0, payload)).sum();
         self.memory.attach("deduplicate", budget_bytes, state)?;
         Ok(self)
+    }
+
+    fn with_key_timestamp_precisions(mut self, key_timestamp_precisions: Vec<i32>) -> Self {
+        self.key_timestamp_precisions = key_timestamp_precisions;
+        self
     }
 
     /// Builds the partition-key and full-row arrow-row converters from a batch's column types, once.
@@ -302,6 +479,7 @@ impl KeepLastDeduplicator {
     }
 
     pub(crate) fn push(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+        self.snapshot_cache = None;
         let arity = data_arity(batch);
         self.schema = Some(data_schema(batch));
         self.ensure_converters(batch, arity);
@@ -401,16 +579,99 @@ impl KeepLastDeduplicator {
 
     /// Serializes the stored last-row-per-key set; the rowtime is re-derived from each row on restore.
     fn snapshot(&self) -> Vec<u8> {
-        let Some(schema) = &self.schema else { return Vec::new() };
-        let Some(conv) = &self.payload_converter else { return Vec::new() };
+        self.snapshot_batch()
+            .map(|batch| write_ipc(&batch))
+            .unwrap_or_default()
+    }
+
+    fn snapshot_batch(&self) -> Option<RecordBatch> {
+        let Some(schema) = &self.schema else { return None };
+        let Some(conv) = &self.payload_converter else { return None };
         if self.rows.is_empty() {
-            return Vec::new();
+            return None;
         }
         let parser = conv.parser();
         let columns = conv
             .convert_rows(self.rows.values().map(|(_, row)| parser.parse(row)))
             .expect("decode dedup snapshot payloads");
-        write_ipc(&RecordBatch::try_new(schema.clone(), columns).expect("keep-last snapshot"))
+        Some(RecordBatch::try_new(schema.clone(), columns).expect("keep-last snapshot"))
+    }
+
+    fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("dedup raw snapshot cache")
+            .snapshots
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("dedup raw snapshot cache")
+            .snapshots
+            .get(&key_group)
+            .cloned()
+            .expect("requested non-empty dedup raw key group")
+    }
+
+    fn materialize_raw_keyed_snapshots(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) {
+        assert_eq!(self.key_timestamp_precisions, timestamp_precisions);
+        if self.snapshot_cache.as_ref().is_some_and(|cache| {
+            cache.max_parallelism == max_parallelism
+                && cache.timestamp_precisions.as_slice() == timestamp_precisions
+        }) {
+            return;
+        }
+        let mut snapshots = BTreeMap::new();
+        if let Some(batch) = self.snapshot_batch() {
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(
+                        &batch,
+                        &self.partition_columns,
+                        row,
+                        timestamp_precisions,
+                    ),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition dedup snapshot"))
+                    .collect();
+                let partition = RecordBatch::try_new(batch.schema(), columns)
+                    .expect("partitioned dedup snapshot");
+                snapshots.insert(key_group, write_ipc(&partition));
+            }
+        }
+        self.snapshot_cache = Some(DedupSnapshotCache {
+            max_parallelism,
+            timestamp_precisions: timestamp_precisions.to_vec(),
+            snapshots,
+        });
     }
 
     fn restore(
@@ -451,6 +712,34 @@ impl KeepLastDeduplicator {
         }
         dedup
     }
+
+    fn restore_partitions(
+        partition_columns: Vec<usize>,
+        rt_column: usize,
+        generate_update_before: bool,
+        rowtime_ordered: bool,
+        keep_first: bool,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let batches: Vec<RecordBatch> = snapshots
+            .iter()
+            .flat_map(|bytes| read_ipc_if_present(bytes))
+            .collect();
+        let snapshot = batches.first().map(|first| {
+            write_ipc(
+                &concat_batches(&first.schema(), batches.iter())
+                    .expect("merge dedup raw partitions"),
+            )
+        });
+        KeepLastDeduplicator::restore(
+            partition_columns,
+            rt_column,
+            generate_update_before,
+            rowtime_ordered,
+            keep_first,
+            snapshot.as_deref().unwrap_or_default(),
+        )
+    }
 }
 
 state_bytes_getter!(Java_io_github_jordepic_streamfusion_Native_keepFirstDeduplicatorStateBytes, KeepFirstDeduplicator);
@@ -463,11 +752,17 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createKeepFir
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     partition_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
     rt_column: jint,
     memory_budget_bytes: jlong,
 ) -> jlong {
     let partitions = read_columns(&env, &partition_columns);
+    let timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
     let dedup = KeepFirstDeduplicator::new(partitions, rt_column as usize)
+        .with_key_timestamp_precisions(timestamp_precisions)
         .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, dedup)
 }
@@ -553,6 +848,93 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepFi
     boxed_or_throw(&mut env, dedup)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_keepFirstDeduplicatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let dedup = unsafe { &mut *(handle as *mut KeepFirstDeduplicator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = dedup.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate keep-first dedup raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write keep-first dedup raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotKeepFirstDeduplicatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let dedup = unsafe { &mut *(handle as *mut KeepFirstDeduplicator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = dedup.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate keep-first dedup raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepFirstDeduplicatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
+    rt_column: jint,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read keep-first dedup raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read keep-first dedup raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read keep-first dedup raw partition bytes"),
+        );
+    }
+    let dedup = KeepFirstDeduplicator::restore_partitions(
+        partitions,
+        rt_column as usize,
+        &restored,
+    )
+    .with_key_timestamp_precisions(timestamp_precisions)
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, dedup)
+}
+
 /// Creates an eager deduplicator (rowtime/proctime keep-last, or proctime keep-first) and returns an
 /// opaque handle.
 #[no_mangle]
@@ -560,6 +942,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createKeepLas
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     partition_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
     rt_column: jint,
     generate_update_before: jboolean,
     rowtime_ordered: jboolean,
@@ -567,6 +950,10 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createKeepLas
     memory_budget_bytes: jlong,
 ) -> jlong {
     let partitions = read_columns(&env, &partition_columns);
+    let timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
     let dedup = KeepLastDeduplicator::new(
         partitions,
         rt_column as usize,
@@ -574,6 +961,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createKeepLas
         rowtime_ordered != 0,
         keep_first != 0,
     )
+    .with_key_timestamp_precisions(timestamp_precisions)
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, dedup)
 }
@@ -648,6 +1036,99 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepLa
         keep_first != 0,
         &bytes,
     )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, dedup)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_keepLastDeduplicatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let dedup = unsafe { &mut *(handle as *mut KeepLastDeduplicator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = dedup.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate keep-last dedup raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write keep-last dedup raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotKeepLastDeduplicatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let dedup = unsafe { &mut *(handle as *mut KeepLastDeduplicator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = dedup.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate keep-last dedup raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreKeepLastDeduplicatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
+    rt_column: jint,
+    generate_update_before: jboolean,
+    rowtime_ordered: jboolean,
+    keep_first: jboolean,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read keep-last dedup raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read keep-last dedup raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read keep-last dedup raw partition bytes"),
+        );
+    }
+    let dedup = KeepLastDeduplicator::restore_partitions(
+        partitions,
+        rt_column as usize,
+        generate_update_before != 0,
+        rowtime_ordered != 0,
+        keep_first != 0,
+        &restored,
+    )
+    .with_key_timestamp_precisions(timestamp_precisions)
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, dedup)
 }

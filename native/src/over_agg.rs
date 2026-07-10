@@ -734,6 +734,19 @@ impl OverInner {
             ))
         }
     }
+
+    /// Number of trailing snapshot columns that are state rather than the partition key.
+    fn snapshot_state_columns(&self) -> usize {
+        match self {
+            OverInner::Aggregates(inner) => inner.kinds.len(),
+            OverInner::Bounded(inner) => 1 + inner.kinds.len(), // rt plus one value per aggregate
+            OverInner::WindowFunctions(inner) => inner
+                .kinds
+                .iter()
+                .map(|&kind| WindowFnState::new(kind).state_types().len())
+                .sum(),
+        }
+    }
 }
 
 /// Columnar OVER: buffers whole input batches, and on a watermark emits the rows it has completed
@@ -894,25 +907,167 @@ impl OverWindowAggregator {
 
     fn snapshot(&mut self) -> Vec<u8> {
         let accumulators = self.inner.snapshot();
-        let buffer = match (&self.input_schema, self.buffered.is_empty()) {
+        let buffer = self.snapshot_buffer();
+        Self::snapshot_parts(self.next_seq, accumulators, buffer)
+    }
+
+    fn snapshot_buffer(&self) -> Vec<u8> {
+        match (&self.input_schema, self.buffered.is_empty()) {
             (Some(schema), false) => {
-                let all = concat_batches(schema, &self.buffered).expect("concat over buffer");
-                let mut bytes = Vec::new();
-                let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &all.schema())
-                    .expect("over buffer writer");
-                writer.write(&all).expect("write over buffer");
-                writer.finish().expect("finish over buffer");
-                drop(writer);
-                bytes
+                write_ipc(&concat_batches(schema, &self.buffered).expect("concat over buffer"))
             }
             _ => Vec::new(),
-        };
+        }
+    }
+
+    fn snapshot_parts(next_seq: i64, accumulators: Vec<u8>, buffer: Vec<u8>) -> Vec<u8> {
         // Prefix the proctime arrival counter so the sequence continues across a checkpoint.
-        let mut out = self.next_seq.to_le_bytes().to_vec();
+        let mut out = next_seq.to_le_bytes().to_vec();
         out.extend_from_slice(&(accumulators.len() as u32).to_le_bytes());
         out.extend_from_slice(&accumulators);
         out.extend_from_slice(&buffer);
         out
+    }
+
+    pub(crate) fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty over raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let accumulators = self.inner.snapshot();
+        let accumulators = Self::partition_snapshot(
+            &accumulators,
+            self.inner.snapshot_state_columns(),
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let buffer = Self::partition_buffer_snapshot(
+            &self.snapshot_buffer(),
+            &self.key_columns,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let mut groups: Vec<i32> = accumulators.keys().chain(buffer.keys()).copied().collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut snapshots = BTreeMap::new();
+        for key_group in groups {
+            snapshots.insert(
+                key_group,
+                Self::snapshot_parts(
+                    self.next_seq,
+                    accumulators
+                        .get(&key_group)
+                        .map(Self::merge_snapshot_batches)
+                        .unwrap_or_default(),
+                    buffer
+                        .get(&key_group)
+                        .map(Self::merge_snapshot_batches)
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        snapshots
+    }
+
+    fn partition_snapshot(
+        bytes: &[u8],
+        state_columns: usize,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<RecordBatch>> {
+        let mut partitions = BTreeMap::new();
+        for batch in read_ipc_if_present(bytes) {
+            let key_count = batch.num_columns() - state_columns;
+            let key_columns: Vec<usize> = (0..key_count).collect();
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(&batch, &key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition over snapshot"))
+                    .collect();
+                partitions
+                    .entry(key_group)
+                    .or_insert_with(Vec::new)
+                    .push(
+                        RecordBatch::try_new(batch.schema(), columns)
+                            .expect("partitioned over snapshot"),
+                    );
+            }
+        }
+        partitions
+    }
+
+    fn partition_buffer_snapshot(
+        bytes: &[u8],
+        key_columns: &[usize],
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<RecordBatch>> {
+        let mut partitions = BTreeMap::new();
+        for batch in read_ipc_if_present(bytes) {
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(&batch, key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition over buffer"))
+                    .collect();
+                partitions
+                    .entry(key_group)
+                    .or_insert_with(Vec::new)
+                    .push(
+                        RecordBatch::try_new(batch.schema(), columns)
+                            .expect("partitioned over buffer"),
+                    );
+            }
+        }
+        partitions
+    }
+
+    fn merge_snapshot_batches(batches: &Vec<RecordBatch>) -> Vec<u8> {
+        write_ipc(
+            &concat_batches(&batches[0].schema(), batches.iter()).expect("merge over raw partitions"),
+        )
     }
 
     fn restore(
@@ -926,15 +1081,32 @@ impl OverWindowAggregator {
         proctime: bool,
         bytes: &[u8],
     ) -> Self {
+        if bytes.is_empty() {
+            return OverWindowAggregator::new(
+                value_types,
+                kinds,
+                rt_column,
+                value_columns,
+                key_columns,
+                frame_kind,
+                frame_offset,
+                proctime,
+            );
+        }
         let next_seq = i64::from_le_bytes(bytes[0..8].try_into().expect("next_seq"));
         let accumulators_len = u32::from_le_bytes(bytes[8..12].try_into().expect("len")) as usize;
-        let inner = OverInner::restore(
-            value_types,
-            kinds,
-            frame_kind,
-            frame_offset,
-            &bytes[12..12 + accumulators_len],
-        );
+        assert!(12 + accumulators_len <= bytes.len(), "truncated over snapshot");
+        let inner = if accumulators_len == 0 {
+            OverInner::new(value_types.clone(), kinds.clone(), frame_kind, frame_offset)
+        } else {
+            OverInner::restore(
+                value_types.clone(),
+                kinds.clone(),
+                frame_kind,
+                frame_offset,
+                &bytes[12..12 + accumulators_len],
+            )
+        };
         let mut aggregator = OverWindowAggregator {
             inner,
             rt_column,
@@ -957,6 +1129,50 @@ impl OverWindowAggregator {
             }
         }
         aggregator
+    }
+
+    pub(crate) fn restore_partitions(
+        value_types: Vec<i64>,
+        kinds: Vec<i64>,
+        rt_column: usize,
+        value_columns: Vec<usize>,
+        key_columns: Vec<usize>,
+        frame_kind: i64,
+        frame_offset: i64,
+        proctime: bool,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut next_seq = 0i64;
+        let mut accumulator_batches = Vec::new();
+        let mut buffer_batches = Vec::new();
+        for bytes in snapshots {
+            if bytes.len() < 12 {
+                continue;
+            }
+            next_seq = next_seq.max(i64::from_le_bytes(bytes[0..8].try_into().expect("next_seq")));
+            let accumulator_len =
+                u32::from_le_bytes(bytes[8..12].try_into().expect("accumulator len")) as usize;
+            assert!(12 + accumulator_len <= bytes.len(), "truncated over raw key-group snapshot");
+            accumulator_batches.extend(read_ipc_if_present(&bytes[12..12 + accumulator_len]));
+            buffer_batches.extend(read_ipc_if_present(&bytes[12 + accumulator_len..]));
+        }
+        let accumulators = (!accumulator_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&accumulator_batches))
+            .unwrap_or_default();
+        let buffer = (!buffer_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&buffer_batches))
+            .unwrap_or_default();
+        OverWindowAggregator::restore(
+            value_types,
+            kinds,
+            rt_column,
+            value_columns,
+            key_columns,
+            frame_kind,
+            frame_offset,
+            proctime,
+            &Self::snapshot_parts(next_seq, accumulators, buffer),
+        )
     }
 }
 
@@ -1082,6 +1298,52 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotOverA
         .into_raw()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_overAggregatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let aggregator = unsafe { &mut *(handle as *mut OverWindowAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = aggregator.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate over raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write over raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotOverAggregatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let aggregator = unsafe { &mut *(handle as *mut OverWindowAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = aggregator.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate over raw key-group snapshot")
+        .into_raw()
+}
+
 /// Rebuilds an OVER aggregator from a snapshot taken by a prior run and returns a fresh handle.
 #[no_mangle]
 pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAggregator<'local>(
@@ -1113,6 +1375,56 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAg
         frame_offset,
         proctime != 0,
         &bytes,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreOverAggregatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    value_types: JIntArray<'local>,
+    aggregate_kinds: JIntArray<'local>,
+    rt_column: jint,
+    value_columns: JIntArray<'local>,
+    key_columns: JIntArray<'local>,
+    frame_kind: jint,
+    frame_offset: jlong,
+    proctime: jboolean,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let kinds = read_int_array(&env, &aggregate_kinds);
+    let value_types = read_int_array(&env, &value_types);
+    let values = read_columns(&env, &value_columns);
+    let keys = read_columns(&env, &key_columns);
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read over raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read over raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read over raw partition bytes"),
+        );
+    }
+    let aggregator = OverWindowAggregator::restore_partitions(
+        value_types,
+        kinds,
+        rt_column as usize,
+        values,
+        keys,
+        frame_kind as i64,
+        frame_offset,
+        proctime != 0,
+        &restored,
     )
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)

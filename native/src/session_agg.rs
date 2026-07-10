@@ -218,6 +218,10 @@ impl SessionAggregator {
     /// Serializes every open session (one row per (key, session): key, start, end, then each
     /// accumulator's state fields) with Arrow IPC, mirroring the tumbling checkpoint path.
     fn snapshot(&mut self) -> Vec<u8> {
+        write_ipc(&self.snapshot_batch())
+    }
+
+    fn snapshot_batch(&mut self) -> RecordBatch {
         let state_fields: Vec<Field> =
             self.aggregates.iter().flat_map(WindowAggregate::state_fields).collect();
 
@@ -255,19 +259,73 @@ impl SessionAggregator {
             });
         }
 
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("failed to build snapshot batch");
-        let mut buffer = Vec::new();
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
-            .expect("failed to open snapshot writer");
-        writer.write(&batch).expect("failed to write snapshot");
-        writer.finish().expect("failed to finish snapshot");
-        drop(writer);
-        buffer
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("failed to build snapshot batch")
+    }
+
+    pub(crate) fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty session raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let batch = self.snapshot_batch();
+        let state_field_count: usize = self
+            .aggregates
+            .iter()
+            .map(|aggregate| aggregate.state_fields().len())
+            .sum();
+        let key_count = batch.num_columns() - 2 - state_field_count;
+        let key_columns: Vec<usize> = (0..key_count).collect();
+        let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for row in 0..batch.num_rows() {
+            let key_group = flink_key_group(
+                binary_row_hash(&batch, &key_columns, row, timestamp_precisions),
+                max_parallelism,
+            ) as i32;
+            rows_by_group.entry(key_group).or_default().push(row as u32);
+        }
+        let mut snapshots = BTreeMap::new();
+        for (key_group, rows) in rows_by_group {
+            let indices = UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column, &indices, None).expect("partition session snapshot"))
+                .collect();
+            let partition = RecordBatch::try_new(batch.schema(), columns)
+                .expect("partitioned session snapshot");
+            snapshots.insert(key_group, write_ipc(&partition));
+        }
+        snapshots
     }
 
     fn restore(gap_millis: i64, value_types: Vec<i64>, kinds: Vec<i64>, bytes: &[u8]) -> Self {
         let mut aggregator = SessionAggregator::new(gap_millis, value_types, kinds);
+        if bytes.is_empty() {
+            return aggregator;
+        }
         let field_counts: Vec<usize> =
             aggregator.aggregates.iter().map(|a| a.state_fields().len()).collect();
         let state_field_total: usize = field_counts.iter().sum();
@@ -310,6 +368,30 @@ impl SessionAggregator {
             }
         }
         aggregator
+    }
+
+    pub(crate) fn restore_partitions(
+        gap_millis: i64,
+        value_types: Vec<i64>,
+        kinds: Vec<i64>,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let batches: Vec<RecordBatch> = snapshots
+            .iter()
+            .flat_map(|bytes| read_ipc_if_present(bytes))
+            .collect();
+        let snapshot = batches.first().map(|first| {
+            write_ipc(
+                &concat_batches(&first.schema(), batches.iter())
+                    .expect("merge session raw partitions"),
+            )
+        });
+        SessionAggregator::restore(
+            gap_millis,
+            value_types,
+            kinds,
+            snapshot.as_deref().unwrap_or_default(),
+        )
     }
 }
 
@@ -408,6 +490,86 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreSessio
     let value_types = read_int_array(&env, &value_types);
     let bytes = env.convert_byte_array(&snapshot).expect("failed to read snapshot");
     let aggregator = SessionAggregator::restore(gap_millis, value_types, kinds, &bytes)
+        .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_sessionAggregatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let aggregator = unsafe { &mut *(handle as *mut SessionAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = aggregator.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate session raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write session raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotSessionAggregatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let aggregator = unsafe { &mut *(handle as *mut SessionAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot =
+        aggregator.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate session raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreSessionAggregatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    gap_millis: jlong,
+    value_types: JIntArray<'local>,
+    aggregate_kinds: JIntArray<'local>,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let kinds = read_int_array(&env, &aggregate_kinds);
+    let value_types = read_int_array(&env, &value_types);
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read session raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read session raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read session raw partition bytes"),
+        );
+    }
+    let aggregator = SessionAggregator::restore_partitions(gap_millis, value_types, kinds, &restored)
         .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)
 }

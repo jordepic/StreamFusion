@@ -45,9 +45,20 @@ public class NativeColumnarSessionWindowAggregateOperator extends NativeRowWindo
       int[] aggregateKinds,
       String timeZoneId,
       RowType outputType,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     // Sessions have no fixed size or slide; the gap is the only window parameter, carried separately.
-    super("streamfusion-session-aggregate-state", 0, 0, valueTypes, aggregateKinds, timeZoneId, outputType);
+    super(
+        "streamfusion-session-aggregate-state",
+        0,
+        0,
+        valueTypes,
+        aggregateKinds,
+        timeZoneId,
+        outputType,
+        keyTimestampPrecisions,
+        maxParallelism);
     this.gapMillis = gapMillis;
     this.timeColumn = timeColumn;
     this.valueColumns = valueColumns;
@@ -60,6 +71,16 @@ public class NativeColumnarSessionWindowAggregateOperator extends NativeRowWindo
   public void open() throws Exception {
     super.open();
     registeredTimer = Long.MIN_VALUE;
+    if (proctime && restoredProcessingTimeTimerDeadline() != Long.MIN_VALUE) {
+      long deadline = restoredProcessingTimeTimerDeadline();
+      long now = getProcessingTimeService().getCurrentProcessingTime();
+      if (deadline <= now) {
+        emitClosedWindows(now);
+      } else {
+        getProcessingTimeService().registerTimer(deadline, this);
+        registeredTimer = deadline;
+      }
+    }
   }
 
   @Override
@@ -71,6 +92,23 @@ public class NativeColumnarSessionWindowAggregateOperator extends NativeRowWindo
   protected long restoreHandle(byte[] snapshot) {
     return Native.restoreSessionAggregator(
         gapMillis, valueTypes, aggregateKinds, snapshot, memoryBudgetBytes());
+  }
+
+  @Override
+  protected long restoreRawHandle(byte[][] snapshots) {
+    return Native.restoreSessionAggregatorPartitions(
+        gapMillis, valueTypes, aggregateKinds, snapshots, memoryBudgetBytes());
+  }
+
+  @Override
+  protected int[] snapshotRawKeyGroups() {
+    return Native.sessionAggregatorSnapshotKeyGroups(handle, maxParallelism(), keyTimestampPrecisions());
+  }
+
+  @Override
+  protected byte[] snapshotRawKeyGroup(int keyGroup) {
+    return Native.snapshotSessionAggregatorKeyGroup(
+        handle, keyGroup, maxParallelism(), keyTimestampPrecisions());
   }
 
   @Override
@@ -125,6 +163,11 @@ public class NativeColumnarSessionWindowAggregateOperator extends NativeRowWindo
     // Every open session was extended by an element that registered its own `now + gap` timer, so a
     // flush at the current clock is enough — no re-registration is needed here.
     emitClosedWindows(getProcessingTimeService().getCurrentProcessingTime());
+  }
+
+  @Override
+  protected long processingTimeTimerDeadlineForSnapshot() {
+    return proctime ? registeredTimer : Long.MIN_VALUE;
   }
 
   @Override

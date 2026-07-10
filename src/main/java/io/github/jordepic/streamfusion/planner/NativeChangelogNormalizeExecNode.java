@@ -4,8 +4,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarChangelogNormalizeOperator;
 import java.util.Collections;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.OneInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -27,6 +30,7 @@ public class NativeChangelogNormalizeExecNode extends ExecNodeBase<ArrowBatch>
 
   private final int[] keyColumns;
   private final boolean generateUpdateBefore;
+  private final int[] keyTimestampPrecisions;
 
   public NativeChangelogNormalizeExecNode(
       ReadableConfig tableConfig,
@@ -34,7 +38,8 @@ public class NativeChangelogNormalizeExecNode extends ExecNodeBase<ArrowBatch>
       RowType outputType,
       String description,
       int[] keyColumns,
-      boolean generateUpdateBefore) {
+      boolean generateUpdateBefore,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-changelog-normalize_1"),
@@ -44,6 +49,7 @@ public class NativeChangelogNormalizeExecNode extends ExecNodeBase<ArrowBatch>
         description);
     this.keyColumns = keyColumns;
     this.generateUpdateBefore = generateUpdateBefore;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -52,14 +58,22 @@ public class NativeChangelogNormalizeExecNode extends ExecNodeBase<ArrowBatch>
       PlannerBase planner, ExecNodeConfig config) {
     Transformation<ArrowBatch> input =
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(input.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, input.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    OneInputTransformation<ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createOneInputTransformation(
             input,
             createTransformationMeta(TRANSFORMATION, config),
-            new NativeColumnarChangelogNormalizeOperator(keyColumns, generateUpdateBefore),
+            new NativeColumnarChangelogNormalizeOperator(
+                keyColumns, keyTimestampPrecisions, generateUpdateBefore, maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             input.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelector(stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

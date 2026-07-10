@@ -99,7 +99,8 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
         valueTypes,
         aggregateKinds,
         proctime,
-        timestampLtz);
+        timestampLtz,
+        FlinkKeyGroupUtils.timestampPrecisions(getInput().getRowType(), keyColumns));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -110,4 +111,3 @@ public class StreamPhysicalNativeColumnarSessionWindowAggregate extends SingleRe
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

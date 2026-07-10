@@ -2,6 +2,7 @@ use crate::*;
 
 /// One ORDER BY column for the Top-N comparator: which column, ascending vs descending, and whether
 /// nulls sort first (independent of direction, as in SQL `NULLS FIRST`/`LAST`).
+#[derive(Clone)]
 pub(crate) struct SortColumn {
     pub(crate) index: usize,
     pub(crate) ascending: bool,
@@ -825,6 +826,121 @@ impl TopNHandle {
             TopNHandle::Retract(r) => r.snapshot(),
         }
     }
+
+    fn snapshot_key_groups(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        topn_snapshot_partitions(
+            &self.snapshot(),
+            self.partition_columns(),
+            max_parallelism,
+            timestamp_precisions,
+        )
+        .keys()
+        .copied()
+        .collect()
+    }
+
+    fn snapshot_key_group(
+        &self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        topn_snapshot_partitions(
+            &self.snapshot(),
+            self.partition_columns(),
+            max_parallelism,
+            timestamp_precisions,
+        )
+        .remove(&key_group)
+        .expect("requested non-empty top-n raw key group")
+    }
+
+    fn partition_columns(&self) -> &[usize] {
+        match self {
+            TopNHandle::Append(r) => &r.partition_columns,
+            TopNHandle::Retract(r) => &r.partition_columns,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_partitions(
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        offset: i64,
+        limit: i64,
+        output_rank_number: bool,
+        retracting: bool,
+        net_diff: bool,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        // `OwnedRow` values retain the RowConverter that created them.  Restoring every raw key
+        // group separately and then extending the maps would therefore mix rows produced by
+        // different converters, which Arrow rejects when we later decode the state.  Reassemble
+        // the independent IPC payloads first, then run the normal restore once.
+        let batches: Vec<RecordBatch> = snapshots
+            .iter()
+            .flat_map(|bytes| read_ipc_if_present(bytes))
+            .collect();
+        let snapshot = batches.first().map(|first| {
+            let combined = concat_batches(&first.schema(), batches.iter())
+                .expect("merge top-n raw partitions");
+            write_ipc(&combined)
+        });
+        if retracting {
+            TopNHandle::Retract(RetractableTopNRanker::restore(
+                partition_columns,
+                sort_columns,
+                offset,
+                limit,
+                output_rank_number,
+                snapshot.as_deref().unwrap_or_default(),
+            ))
+        } else {
+            TopNHandle::Append(TopNRanker::restore(
+                partition_columns,
+                sort_columns,
+                limit,
+                output_rank_number,
+                net_diff,
+                snapshot.as_deref().unwrap_or_default(),
+            ))
+        }
+    }
+}
+
+fn topn_snapshot_partitions(
+    bytes: &[u8],
+    partition_columns: &[usize],
+    max_parallelism: usize,
+    timestamp_precisions: &[i32],
+) -> BTreeMap<i32, Vec<u8>> {
+    let mut partitions = BTreeMap::new();
+    for batch in read_ipc_if_present(bytes) {
+        let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for row in 0..batch.num_rows() {
+            let key_group = flink_key_group(
+                binary_row_hash(&batch, partition_columns, row, timestamp_precisions),
+                max_parallelism,
+            ) as i32;
+            rows_by_group.entry(key_group).or_default().push(row as u32);
+        }
+        for (key_group, rows) in rows_by_group {
+            let indices = UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column, &indices, None).expect("partition top-n snapshot"))
+                .collect();
+            let partition = RecordBatch::try_new(batch.schema(), columns)
+                .expect("partitioned top-n snapshot");
+            partitions.insert(key_group, write_ipc(&partition));
+        }
+    }
+    partitions
 }
 
 /// Window Top-N / window deduplication over a windowing-TVF input (Flink's `WindowRank` /
@@ -979,20 +1095,78 @@ impl WindowRanker {
     }
 
     fn snapshot(&self) -> Vec<u8> {
+        self.snapshot_parts(self.snapshot_batch())
+    }
+
+    fn snapshot_parts(&self, batch: Option<RecordBatch>) -> Vec<u8> {
         let mut out = self.current_watermark.to_le_bytes().to_vec();
-        let Some(schema) = &self.schema else { return out };
+        let Some(batch) = batch else { return out };
+        out.extend_from_slice(&write_ipc(&batch));
+        out
+    }
+
+    fn snapshot_batch(&self) -> Option<RecordBatch> {
+        let Some(schema) = &self.schema else { return None };
         let rows: Vec<&JoinRow> = self.groups.values().flatten().collect();
         if rows.is_empty() {
-            return out;
+            return None;
         }
         let fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
         let columns: Vec<ArrayRef> = (0..fields.len())
             .map(|j| scalars_to_array(rows.iter().map(|r| r[j].clone()).collect(), fields[j].data_type()))
             .collect();
-        out.extend_from_slice(&write_ipc(
-            &RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("window-rank snapshot"),
-        ));
-        out
+        Some(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("window-rank snapshot"))
+    }
+
+    fn snapshot_key_groups(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    fn snapshot_key_group(
+        &self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty window-rank raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let mut snapshots = BTreeMap::new();
+        let Some(batch) = self.snapshot_batch() else { return snapshots };
+        let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+        for row in 0..batch.num_rows() {
+            let key_group = flink_key_group(
+                binary_row_hash(&batch, &self.partition_columns, row, timestamp_precisions),
+                max_parallelism,
+            ) as i32;
+            rows_by_group.entry(key_group).or_default().push(row as u32);
+        }
+        for (key_group, rows) in rows_by_group {
+            let indices = UInt32Array::from(rows);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| take(column, &indices, None).expect("partition window-rank snapshot"))
+                .collect();
+            let partition = RecordBatch::try_new(batch.schema(), columns)
+                .expect("partitioned window-rank snapshot");
+            snapshots.insert(key_group, self.snapshot_parts(Some(partition)));
+        }
+        snapshots
     }
 
     fn restore(
@@ -1022,6 +1196,54 @@ impl WindowRanker {
             ranker.push(&batch);
         }
         ranker
+    }
+
+    fn restore_partitions(
+        window_start_col: usize,
+        window_end_col: usize,
+        partition_columns: Vec<usize>,
+        sort_columns: Vec<SortColumn>,
+        limit: i64,
+        output_rank_number: bool,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut watermark = i64::MIN;
+        let mut batches = Vec::new();
+        for bytes in snapshots {
+            if bytes.len() >= 8 {
+                watermark = watermark.max(i64::from_le_bytes(
+                    bytes[0..8].try_into().expect("window-rank watermark"),
+                ));
+                batches.extend(read_ipc_if_present(&bytes[8..]));
+            }
+        }
+        if batches.is_empty() {
+            let mut empty = WindowRanker::new(
+                window_start_col,
+                window_end_col,
+                partition_columns,
+                sort_columns,
+                limit,
+                output_rank_number,
+            );
+            empty.current_watermark = watermark;
+            return empty;
+        }
+        // See TopNHandle::restore_partitions: `GroupKey` owns Arrow row bytes and must be made by
+        // one RowConverter.  Concatenating raw key-group payloads before restore preserves that.
+        let combined = concat_batches(&batches[0].schema(), batches.iter())
+            .expect("merge window-rank raw partitions");
+        let mut bytes = watermark.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&write_ipc(&combined));
+        WindowRanker::restore(
+            window_start_col,
+            window_end_col,
+            partition_columns,
+            sort_columns,
+            limit,
+            output_rank_number,
+            &bytes,
+        )
     }
 }
 
@@ -1160,6 +1382,98 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindow
         limit,
         output_rank_number != 0,
         &bytes,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, ranker)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_windowRankerSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let ranker = unsafe { &*(handle as *const WindowRanker) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = ranker.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate window-rank raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write window-rank raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotWindowRankerKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let ranker = unsafe { &*(handle as *const WindowRanker) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = ranker.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate window-rank raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindowRankerPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    window_start_col: jint,
+    window_end_col: jint,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    limit: jlong,
+    output_rank_number: jboolean,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read window-rank raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read window-rank raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read window-rank raw partition bytes"),
+        );
+    }
+    let ranker = WindowRanker::restore_partitions(
+        window_start_col as usize,
+        window_end_col as usize,
+        partitions,
+        sort,
+        limit,
+        output_rank_number != 0,
+        &restored,
     )
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, ranker)
@@ -1304,6 +1618,100 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRa
         ))
     };
     boxed_or_throw(&mut env, handle.with_memory_budget(memory_budget_bytes))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_topNRankerSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let ranker = unsafe { &*(handle as *const TopNHandle) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = ranker.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate top-n raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write top-n raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotTopNRankerKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let ranker = unsafe { &*(handle as *const TopNHandle) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = ranker.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate top-n raw key-group snapshot")
+        .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreTopNRankerPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    partition_columns: JIntArray<'local>,
+    sort_indices: JIntArray<'local>,
+    sort_ascending: JIntArray<'local>,
+    sort_nulls_first: JIntArray<'local>,
+    offset: jlong,
+    limit: jlong,
+    output_rank_number: jboolean,
+    retracting: jboolean,
+    net_diff: jboolean,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let partitions = read_columns(&env, &partition_columns);
+    let sort = read_sort_columns(&env, &sort_indices, &sort_ascending, &sort_nulls_first);
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read top-n raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read top-n raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read top-n raw partition bytes"),
+        );
+    }
+    let ranker = TopNHandle::restore_partitions(
+        partitions,
+        sort,
+        offset,
+        limit,
+        output_rank_number != 0,
+        retracting != 0,
+        net_diff != 0,
+        &restored,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, ranker)
 }
 
 /// Releases a Top-N ranker handle.

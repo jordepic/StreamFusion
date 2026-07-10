@@ -7,9 +7,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -31,40 +28,46 @@ public class NativeColumnarDeduplicateOperator extends AbstractStreamOperator<Ar
     implements OneInputStreamOperator<ArrowBatch, ArrowBatch> {
 
   private final int[] partitionColumns;
+  private final int[] keyTimestampPrecisions;
   private final int rowtimeColumn;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
-  public NativeColumnarDeduplicateOperator(int[] partitionColumns, int rowtimeColumn) {
+  public NativeColumnarDeduplicateOperator(
+      int[] partitionColumns, int[] keyTimestampPrecisions, int rowtimeColumn, int maxParallelism) {
     this.partitionColumns = partitionColumns;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
     this.rowtimeColumn = rowtimeColumn;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native deduplication state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-deduplicate-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> snapshots = RawKeyedState.restore(context);
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle =
-        snapshot == null
+        snapshots.isEmpty()
             ? Native.createKeepFirstDeduplicator(
-                partitionColumns, rowtimeColumn, memoryBudget.bytes())
-            : Native.restoreKeepFirstDeduplicator(
-                partitionColumns, rowtimeColumn, snapshot, memoryBudget.bytes());
+                partitionColumns, keyTimestampPrecisions, rowtimeColumn, memoryBudget.bytes())
+            : Native.restoreKeepFirstDeduplicatorPartitions(
+                partitionColumns,
+                keyTimestampPrecisions,
+                rowtimeColumn,
+                snapshots.toArray(new byte[0][]),
+                memoryBudget.bytes());
   }
 
   @Override
@@ -116,8 +119,15 @@ public class NativeColumnarDeduplicateOperator extends AbstractStreamOperator<Ar
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotKeepFirstDeduplicator(handle));
+    int[] keyGroups =
+        Native.keepFirstDeduplicatorSnapshotKeyGroups(
+            handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotKeepFirstDeduplicatorKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

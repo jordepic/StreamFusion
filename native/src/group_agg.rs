@@ -203,9 +203,10 @@ impl DistinctSet {
     /// typed specialization.
     fn scalar_entries(&self) -> Vec<(ScalarValue, i64)> {
         match self {
-            DistinctSet::I64(m) => {
-                m.iter().map(|(v, c)| (ScalarValue::Int64(Some(*v)), *c)).collect()
-            }
+            DistinctSet::I64(m) => m
+                .iter()
+                .map(|(v, c)| (ScalarValue::Int64(Some(*v)), *c))
+                .collect(),
             DistinctSet::Scalar(m) => m.iter().map(|(v, c)| (v.clone(), *c)).collect(),
         }
     }
@@ -231,8 +232,14 @@ impl DistinctSet {
 /// value, so they keep a value→count multiset and read the extreme off its ends — what makes them
 /// retractable (Flink's `*WithRetractAccumulator` uses a `MapView`; Arroyo calls this the batch state).
 pub(crate) enum GroupAggState {
-    Running { agg: RunningAgg, non_null: i64 },
-    Extremes { is_min: bool, counts: BTreeMap<MinMaxKey, i64> },
+    Running {
+        agg: RunningAgg,
+        non_null: i64,
+    },
+    Extremes {
+        is_min: bool,
+        counts: BTreeMap<MinMaxKey, i64>,
+    },
     // COUNT(DISTINCT x): a value→multiplicity map (Flink's DistinctAccumulator MapView). The count is
     // the number of live entries; a value's multiplicity tracks how many input rows carry it so a
     // retraction removes it only when the last one is retracted. Nulls are never inserted.
@@ -240,21 +247,33 @@ pub(crate) enum GroupAggState {
     // SUM(DISTINCT x): the same value→multiplicity map plus a running SUM folded only when a value
     // enters the set and retracted only when its last occurrence leaves — Flink's DistinctAccumulator
     // wrapping the SUM accumulator, kept incremental so the emit stays O(1).
-    DistinctRunning { counts: DistinctSet, agg: RunningAgg },
+    DistinctRunning {
+        counts: DistinctSet,
+        agg: RunningAgg,
+    },
 }
 
 impl GroupAggState {
     fn new(kind: i64, value_type: &DataType) -> Self {
         match kind {
-            1 => GroupAggState::Extremes { is_min: true, counts: BTreeMap::new() }, // MIN
-            2 => GroupAggState::Extremes { is_min: false, counts: BTreeMap::new() }, // MAX
+            1 => GroupAggState::Extremes {
+                is_min: true,
+                counts: BTreeMap::new(),
+            }, // MIN
+            2 => GroupAggState::Extremes {
+                is_min: false,
+                counts: BTreeMap::new(),
+            }, // MAX
             7 => GroupAggState::Distinct(DistinctSet::new(value_type)), // COUNT(DISTINCT)
             // SUM(DISTINCT): the inner running aggregate is a plain SUM (kind 0) over the value type.
             9 => GroupAggState::DistinctRunning {
                 counts: DistinctSet::new(value_type),
                 agg: RunningAgg::new(0, value_type),
             },
-            _ => GroupAggState::Running { agg: RunningAgg::new(kind, value_type), non_null: 0 },
+            _ => GroupAggState::Running {
+                agg: RunningAgg::new(kind, value_type),
+                non_null: 0,
+            },
         }
     }
 
@@ -486,7 +505,11 @@ impl GroupAggState {
                 // Decimal AVG divides with Flink's exact decimal division (38-significant-digit
                 // quotient, HALF_UP) and reports DECIMAL(38, max(6, s)) — findAvgAggType's type. An
                 // overflowed sum reports NULL, like SUM.
-                RunningAgg::AvgDecimal { sum, scale, overflow } => {
+                RunningAgg::AvgDecimal {
+                    sum,
+                    scale,
+                    overflow,
+                } => {
                     let result_scale = (*scale).max(6);
                     if *overflow {
                         ScalarValue::Decimal128(None, 38, result_scale)
@@ -503,7 +526,11 @@ impl GroupAggState {
                 _ => agg.emit(),
             },
             GroupAggState::Extremes { is_min, counts } => {
-                let extreme = if *is_min { counts.keys().next() } else { counts.keys().next_back() };
+                let extreme = if *is_min {
+                    counts.keys().next()
+                } else {
+                    counts.keys().next_back()
+                };
                 extreme.map_or_else(|| null_scalar(result_type), |k| k.scalar(result_type))
             }
             // COUNT(DISTINCT) is the number of live distinct values (never NULL — empty is 0).
@@ -564,18 +591,21 @@ pub(crate) struct GroupAggregator {
     // the local's netted retractions — Flink's RecordCounter over indexOfCountStar.
     record_count_column: i64,
     key_columns: Vec<usize>,
+    key_timestamp_precisions: Vec<i32>,
     generate_update_before: bool,
-    // The group map is keyed by the arrow-row memcomparable encoding of the key columns, not a
-    // `Vec<ScalarValue>`: a native-vs-Flink differential on q17 showed the scalar key's hash/alloc/drop
-    // (ScalarValue::hash, per-row Vec churn) was the dominant cost native paid and Flink (byte keys)
-    // did not. `ByteKey` lets the per-row probe hash the BORROWED encoded bytes (`Borrow<[u8]>`), so
-    // the steady state — the key already in the map — allocates nothing; the bytes are copied only
-    // when a group is first inserted. `key_converter` encodes the key columns per batch and decodes
-    // them back for the output.
+    // The group map uses Flink BinaryRow bytes. Besides giving equality the same representation as
+    // the keyed exchange, this admits Arrow MAP values, which arrow-row cannot encode.
     keys: ahash::HashMap<ByteKey, GroupKeyState>,
-    key_converter: Option<RowConverter>,
-    key_types: Vec<DataType>,
+    // Materialized once per checkpoint so the JVM can write one raw keyed-state payload per Flink
+    // key group without repeatedly traversing the full native map.
+    snapshot_cache: Option<GroupSnapshotCache>,
     pub(crate) memory: OperatorMemory,
+}
+
+struct GroupSnapshotCache {
+    max_parallelism: usize,
+    timestamp_precisions: Vec<i32>,
+    snapshots: std::collections::BTreeMap<i32, Vec<u8>>,
 }
 
 /// Estimated per-entry footprint of a MIN/MAX or DISTINCT multiset node (key enum + count + node
@@ -597,13 +627,21 @@ pub(crate) fn group_agg_state_bytes(state: &GroupAggState) -> usize {
 /// Estimated footprint of one group's full state (all aggregates plus the record counter).
 pub(crate) fn group_key_state_bytes(state: &GroupKeyState) -> usize {
     state.aggs.iter().map(group_agg_state_bytes).sum::<usize>()
-        + state.last_output.as_ref().map_or(0, |v| scalar_row_bytes(v))
+        + state
+            .last_output
+            .as_ref()
+            .map_or(0, |v| scalar_row_bytes(v))
         + std::mem::size_of::<GroupKeyState>()
 }
 
 /// A group's current output tuple (each aggregate reports NULL while it has no live input).
 fn output_of(state: &GroupKeyState, result_types: &[DataType]) -> Vec<ScalarValue> {
-    state.aggs.iter().zip(result_types).map(|(agg, rt)| agg.emit(rt)).collect()
+    state
+        .aggs
+        .iter()
+        .zip(result_types)
+        .map(|(agg, rt)| agg.emit(rt))
+        .collect()
 }
 
 /// Estimated footprint of an arrow-row byte key plus its map entry.
@@ -619,7 +657,10 @@ impl GroupAggregator {
         key_columns: Vec<usize>,
         generate_update_before: bool,
     ) -> Self {
-        let value_types: Vec<DataType> = value_types.iter().map(|&code| value_data_type(code)).collect();
+        let value_types: Vec<DataType> = value_types
+            .iter()
+            .map(|&code| value_data_type(code))
+            .collect();
         let result_types = kinds
             .iter()
             .zip(&value_types)
@@ -639,11 +680,11 @@ impl GroupAggregator {
             result_types,
             state_types,
             value_columns,
+            key_timestamp_precisions: vec![-1; key_columns.len()],
             key_columns,
             generate_update_before,
             keys: ahash::HashMap::default(),
-            key_converter: None,
-            key_types: Vec::new(),
+            snapshot_cache: None,
             filter_columns,
             count_columns,
             distinct_view_columns,
@@ -662,6 +703,11 @@ impl GroupAggregator {
             .sum();
         self.memory.attach("group-aggregate", budget_bytes, state)?;
         Ok(self)
+    }
+
+    fn with_key_timestamp_precisions(mut self, key_timestamp_precisions: Vec<i32>) -> Self {
+        self.key_timestamp_precisions = key_timestamp_precisions;
+        self
     }
 
     /// Sets the per-aggregate FILTER columns (-1 = unfiltered). A builder so the many existing
@@ -702,17 +748,20 @@ impl GroupAggregator {
     fn state(&mut self, key: ByteKey) -> &mut GroupKeyState {
         let (kinds, value_types) = (&self.kinds, &self.value_types);
         self.keys.entry(key).or_insert_with(|| GroupKeyState {
-            aggs: kinds.iter().zip(value_types).map(|(&kind, vt)| GroupAggState::new(kind, vt)).collect(),
+            aggs: kinds
+                .iter()
+                .zip(value_types)
+                .map(|(&kind, vt)| GroupAggState::new(kind, vt))
+                .collect(),
             records: 0,
             last_output: None,
         })
     }
 
-
-
     /// Folds the batch's rows into per-key state in input order, honoring each row's `RowKind`, and
     /// returns the changelog rows produced, in emission order.
     pub(crate) fn update(&mut self, batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+        self.snapshot_cache = None;
         let n = batch.num_rows();
         let num_agg = self.kinds.len();
         // `None` is a COUNT(*) aggregate (no argument column): it counts every row. A present column
@@ -744,27 +793,31 @@ impl GroupAggregator {
                     DataType::Float32 => {
                         ValueColumn::F32(column.as_any().downcast_ref().expect("float32 value"))
                     }
-                    DataType::Decimal128(_, _) => {
-                        ValueColumn::Decimal128(column.as_any().downcast_ref().expect("decimal128 value"))
-                    }
+                    DataType::Decimal128(_, _) => ValueColumn::Decimal128(
+                        column.as_any().downcast_ref().expect("decimal128 value"),
+                    ),
                     _ => ValueColumn::NullOnly(column),
                 })
             })
             .collect();
-        let key_arrays: Vec<&ArrayRef> = self.key_columns.iter().map(|&i| batch.column(i)).collect();
-        self.key_types = key_types(&key_arrays);
-        if self.key_converter.is_none() {
-            self.key_converter = Some(key_row_converter(&key_arrays));
-        }
-        // Encode all key columns to memcomparable byte rows in one pass; the per-row group key is then
-        // a byte slice, not a freshly allocated Vec<ScalarValue>.
-        let key_owned: Vec<ArrayRef> = key_arrays.iter().map(|a| (*a).clone()).collect();
-        let keys_encoded =
-            encode_group_keys(self.key_converter.as_ref().unwrap(), &key_owned, n);
+        let binary_keys: Vec<ByteKey> = (0..n)
+            .map(|row| {
+                ByteKey::from(
+                    binary_row_bytes(
+                        batch,
+                        &self.key_columns,
+                        row,
+                        &self.key_timestamp_precisions,
+                    )
+                    .as_slice(),
+                )
+            })
+            .collect();
         let row_kinds = row_kind_column(batch);
         // Per aggregate, a two-phase distinct-view column: the local bundle's (value, count)
         // entries as a list of structs, merged with multiplicities instead of per-row values.
-        let view_cols: Vec<Option<(&arrow::array::ListArray, &ArrayRef, &Int64Array)>> = (0..num_agg)
+        let view_cols: Vec<Option<(&arrow::array::ListArray, &ArrayRef, &Int64Array)>> = (0
+            ..num_agg)
             .map(|i| {
                 (self.distinct_view_columns[i] >= 0).then(|| {
                     let list = batch
@@ -855,14 +908,13 @@ impl GroupAggregator {
                 .expect("record count partial column must be bigint")
         });
 
-        let mut out_keys: Vec<&[u8]> = Vec::new();
+        let mut out_rows: Vec<u32> = Vec::new();
         let mut out_results: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut out_kinds: Vec<i8> = Vec::new();
-        // Emitted keys are borrowed from the batch's encoded rows (decoded once at the end), so an
-        // emit allocates nothing per row either. (No lifetime annotation on `key`: inference must
-        // unify it with `out_keys`' element lifetime, not a fresh higher-ranked one.)
-        let mut push = |kind: i8, key, values: Vec<ScalarValue>| {
-            out_keys.push(key);
+        // Every output is caused by one input row, so its original Arrow key values can be gathered
+        // directly. This avoids making Flink BinaryRow bytes decodable just to emit a changelog row.
+        let mut push = |kind: i8, row: usize, values: Vec<ScalarValue>| {
+            out_rows.push(row as u32);
             for (i, v) in values.into_iter().enumerate() {
                 out_results[i].push(v);
             }
@@ -871,10 +923,7 @@ impl GroupAggregator {
 
         let track = self.memory.tracking();
         for row in 0..n {
-            // The borrowed encoded bytes probe the map directly (ByteKey's Borrow<[u8]>); the key is
-            // copied into the map only when a new group is inserted. (`data()` keeps the batch's
-            // lifetime, so emitted keys can be stored until the decode below.)
-            let key = keys_encoded.row(row).data();
+            let key = binary_keys[row].0.as_ref();
             // RowKind: 0 +I, 1 -U, 2 +U, 3 -D (absent column ⇒ INSERT). UB/delete retract; I/UA add.
             let kind = row_kinds.map_or(0, |kinds| kinds.value(row));
             let retract = kind == 1 || kind == 3;
@@ -916,7 +965,11 @@ impl GroupAggregator {
                     // sum NULL (the lost magnitude cannot be recovered).
                     if let Some(counts) = merge_count_cols[i] {
                         if let Some(column) = &value_columns[i] {
-                            let count = if counts.is_null(row) { 0 } else { counts.value(row) };
+                            let count = if counts.is_null(row) {
+                                0
+                            } else {
+                                counts.value(row)
+                            };
                             match column.at(row) {
                                 Some(num) => {
                                     if retract {
@@ -936,8 +989,8 @@ impl GroupAggregator {
                     if let Some(col_idx) = extreme_str_cols[i] {
                         let column = batch.column(col_idx);
                         if !column.is_null(row) {
-                            let scalar =
-                                ScalarValue::try_from_array(column, row).expect("extreme string scalar");
+                            let scalar = ScalarValue::try_from_array(column, row)
+                                .expect("extreme string scalar");
                             if retract {
                                 state.aggs[i].retract_extreme(scalar);
                             } else {
@@ -981,8 +1034,8 @@ impl GroupAggregator {
                         }
                         let column = batch.column(col_idx);
                         if !column.is_null(row) {
-                            let scalar =
-                                ScalarValue::try_from_array(column, row).expect("distinct value scalar");
+                            let scalar = ScalarValue::try_from_array(column, row)
+                                .expect("distinct value scalar");
                             if retract {
                                 state.aggs[i].retract_distinct(scalar);
                             } else {
@@ -1036,14 +1089,14 @@ impl GroupAggregator {
                     None => {
                         // +I — first row for the key; the emitted tuple seeds the cache.
                         state.last_output = Some(new.clone());
-                        push(0, key, new);
+                        push(0, row, new);
                     }
                     Some(prev) if new != prev => {
                         state.last_output = Some(new.clone());
                         if self.generate_update_before {
-                            push(1, key, prev); // -U — moved out of the cache, not recomputed
+                            push(1, row, prev); // -U — moved out of the cache, not recomputed
                         }
-                        push(2, key, new); // +U
+                        push(2, row, new); // +U
                     }
                     Some(prev) => {
                         state.last_output = Some(prev); // unchanged result — suppressed
@@ -1054,7 +1107,7 @@ impl GroupAggregator {
                 // the key ever emitted (a new key whose first merged count1 nets to zero — Flink's
                 // firstRow-and-empty case — is dropped silently).
                 if let Some(prev) = prev {
-                    push(3, key, prev); // -D
+                    push(3, row, prev); // -D
                 }
                 self.keys.remove(key);
             }
@@ -1075,8 +1128,26 @@ impl GroupAggregator {
         drop(push);
         self.memory.account()?;
 
-        let mut fields = key_fields(&self.key_types);
-        let mut columns = decode_byte_keys(self.key_converter.as_ref(), &out_keys, &self.key_types);
+        let indices = UInt32Array::from(out_rows);
+        let mut fields: Vec<Field> = self
+            .key_columns
+            .iter()
+            .enumerate()
+            .map(|(position, &column)| {
+                Field::new(
+                    format!("key{position}"),
+                    batch.column(column).data_type().clone(),
+                    true,
+                )
+            })
+            .collect();
+        let mut columns: Vec<ArrayRef> = self
+            .key_columns
+            .iter()
+            .map(|&column| {
+                take(batch.column(column), &indices, None).expect("take group output key")
+            })
+            .collect();
         for (i, rt) in self.result_types.iter().enumerate() {
             fields.push(Field::new(format!("result{i}"), rt.clone(), true));
             columns.push(scalars_to_array(std::mem::take(&mut out_results[i]), rt));
@@ -1091,16 +1162,25 @@ impl GroupAggregator {
     /// raw running value and non-null count for SUM/COUNT; a NULL placeholder for MIN/MAX), and a side
     /// batch per MIN/MAX aggregate carries its `[key0.., value, count]` multiset rows.
     pub(crate) fn snapshot(&mut self) -> Vec<u8> {
+        let selected: Vec<ByteKey> = self.keys.keys().cloned().collect();
+        self.snapshot_keys(&selected)
+    }
+
+    fn snapshot_keys(&self, selected: &[ByteKey]) -> Vec<u8> {
         let num_agg = self.kinds.len();
-        let mut keys: Vec<&[u8]> = Vec::new();
+        let mut encoded_keys: Vec<&[u8]> = Vec::new();
         let mut records: Vec<i64> = Vec::new();
         let mut state_columns: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut non_null_columns: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
         let mut multiset_keys: Vec<Vec<&[u8]>> = vec![Vec::new(); num_agg];
         let mut multiset_values: Vec<Vec<ScalarValue>> = vec![Vec::new(); num_agg];
         let mut multiset_counts: Vec<Vec<i64>> = vec![Vec::new(); num_agg];
-        for (key, state) in self.keys.iter() {
-            keys.push(&key.0);
+        for key in selected {
+            let state = self
+                .keys
+                .get(key)
+                .expect("snapshot key remains in group state");
+            encoded_keys.push(&key.0);
             records.push(state.records);
             for i in 0..num_agg {
                 match &state.aggs[i] {
@@ -1141,22 +1221,36 @@ impl GroupAggregator {
             }
         }
 
-        let mut fields = key_fields(&self.key_types);
-        let mut columns = decode_byte_keys(self.key_converter.as_ref(), &keys, &self.key_types);
+        let mut fields = vec![Field::new("binary_key", DataType::Binary, false)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(
+            arrow::array::BinaryArray::from_iter_values(encoded_keys.iter().copied()),
+        )];
         fields.push(Field::new("records", DataType::Int64, false));
         columns.push(Arc::new(Int64Array::from(records)));
         for i in 0..num_agg {
-            fields.push(Field::new(format!("state{i}"), self.state_types[i].clone(), true));
-            columns.push(scalars_to_array(std::mem::take(&mut state_columns[i]), &self.state_types[i]));
+            fields.push(Field::new(
+                format!("state{i}"),
+                self.state_types[i].clone(),
+                true,
+            ));
+            columns.push(scalars_to_array(
+                std::mem::take(&mut state_columns[i]),
+                &self.state_types[i],
+            ));
             fields.push(Field::new(format!("nonnull{i}"), DataType::Int64, false));
-            columns.push(Arc::new(Int64Array::from(std::mem::take(&mut non_null_columns[i]))));
+            columns.push(Arc::new(Int64Array::from(std::mem::take(
+                &mut non_null_columns[i],
+            ))));
         }
         let mut batches =
-            vec![RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("main snapshot")];
+            vec![RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .expect("main snapshot")];
         for i in 0..num_agg {
             if matches!(self.kinds[i], 1 | 2 | 7 | 9) {
-                let mut f = key_fields(&self.key_types);
-                let mut c = decode_byte_keys(self.key_converter.as_ref(), &multiset_keys[i], &self.key_types);
+                let mut f = vec![Field::new("binary_key", DataType::Binary, false)];
+                let mut c: Vec<ArrayRef> = vec![Arc::new(
+                    arrow::array::BinaryArray::from_iter_values(multiset_keys[i].iter().copied()),
+                )];
                 // MIN/MAX values take the aggregate's result type; a distinct value keeps its own type
                 // (a COUNT's bigint result type does not describe it), inferred from the scalars.
                 let values = std::mem::take(&mut multiset_values[i]);
@@ -1172,11 +1266,82 @@ impl GroupAggregator {
                 f.push(Field::new("value", value_array.data_type().clone(), true));
                 c.push(value_array);
                 f.push(Field::new("count", DataType::Int64, false));
-                c.push(Arc::new(Int64Array::from(std::mem::take(&mut multiset_counts[i]))));
-                batches.push(RecordBatch::try_new(Arc::new(Schema::new(f)), c).expect("multiset snapshot"));
+                c.push(Arc::new(Int64Array::from(std::mem::take(
+                    &mut multiset_counts[i],
+                ))));
+                batches.push(
+                    RecordBatch::try_new(Arc::new(Schema::new(f)), c).expect("multiset snapshot"),
+                );
             }
         }
         write_framed(&batches)
+    }
+
+    /// Returns the non-empty Flink key groups in this checkpoint. The companion payload method
+    /// reuses the materialized map, so the JVM writes each raw key group without re-walking state.
+    pub(crate) fn snapshot_key_groups(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("raw keyed snapshot cache")
+            .snapshots
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Returns one previously materialized key-group payload. Calling this for an empty group is a
+    /// caller error: raw keyed state deliberately omits empty key groups from a checkpoint.
+    pub(crate) fn snapshot_key_group(
+        &mut self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.materialize_raw_keyed_snapshots(max_parallelism, timestamp_precisions);
+        self.snapshot_cache
+            .as_ref()
+            .expect("raw keyed snapshot cache")
+            .snapshots
+            .get(&key_group)
+            .cloned()
+            .expect("requested non-empty raw keyed group")
+    }
+
+    fn materialize_raw_keyed_snapshots(
+        &mut self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) {
+        assert_eq!(self.key_timestamp_precisions, timestamp_precisions);
+        if self.snapshot_cache.as_ref().is_some_and(|cache| {
+            cache.max_parallelism == max_parallelism
+                && cache.timestamp_precisions.as_slice() == timestamp_precisions
+        }) {
+            return;
+        }
+
+        let selected: Vec<ByteKey> = self.keys.keys().cloned().collect();
+        let mut keys_by_group: std::collections::BTreeMap<i32, Vec<ByteKey>> =
+            std::collections::BTreeMap::new();
+        for key in selected {
+            let group = flink_key_group(hash_bytes_by_words(&key.0), max_parallelism) as i32;
+            keys_by_group.entry(group).or_default().push(key);
+        }
+
+        let snapshots = keys_by_group
+            .iter()
+            .map(|(&group, keys)| (group, self.snapshot_keys(keys)))
+            .collect();
+        self.snapshot_cache = Some(GroupSnapshotCache {
+            max_parallelism,
+            timestamp_precisions: timestamp_precisions.to_vec(),
+            snapshots,
+        });
     }
 
     pub(crate) fn restore(
@@ -1187,34 +1352,38 @@ impl GroupAggregator {
         generate_update_before: bool,
         bytes: &[u8],
     ) -> Self {
-        let mut aggregator =
-            GroupAggregator::new(kinds, value_types, value_columns, key_columns, generate_update_before);
+        let mut aggregator = GroupAggregator::new(
+            kinds,
+            value_types,
+            value_columns,
+            key_columns,
+            generate_update_before,
+        );
         let num_agg = aggregator.kinds.len();
         let batches = read_framed(bytes);
         if batches.is_empty() {
             return aggregator;
         }
-        // Main batch: key0.., records, then (state, nonnull) per aggregate.
+        // Main batch: BinaryRow key, records, then (state, nonnull) per aggregate.
         let main = &batches[0];
-        let arity = main.num_columns() - 1 - 2 * num_agg;
-        let key_arrays: Vec<&ArrayRef> = (0..arity).map(|j| main.column(j)).collect();
-        aggregator.key_types = key_types(&key_arrays);
-        aggregator.key_converter = Some(key_row_converter(&key_arrays));
-        let key_owned: Vec<ArrayRef> = key_arrays.iter().map(|a| (*a).clone()).collect();
-        let keys_encoded =
-            encode_group_keys(aggregator.key_converter.as_ref().unwrap(), &key_owned, main.num_rows());
+        assert_eq!(main.num_columns(), 2 + 2 * num_agg, "group snapshot schema");
+        let keys = main
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("group snapshot binary keys");
         let records = column_i64(main, "records");
         for row in 0..main.num_rows() {
-            let key = ByteKey::from(keys_encoded.row(row).as_ref());
+            let key = ByteKey::from(keys.value(row));
             let state = aggregator.state(key);
             state.records = records.value(row);
             for i in 0..num_agg {
                 if let GroupAggState::Running { agg, non_null } = &mut state.aggs[i] {
-                    let scalar = ScalarValue::try_from_array(main.column(arity + 1 + 2 * i), row)
+                    let scalar = ScalarValue::try_from_array(main.column(2 + 2 * i), row)
                         .expect("group state scalar");
                     agg.restore_value(&scalar);
                     *non_null = main
-                        .column(arity + 2 + 2 * i)
+                        .column(3 + 2 * i)
                         .as_any()
                         .downcast_ref::<Int64Array>()
                         .expect("nonnull int64")
@@ -1222,7 +1391,7 @@ impl GroupAggregator {
                 }
             }
         }
-        // One side batch per MIN/MAX or DISTINCT aggregate, in aggregate order: key0.., value, count.
+        // One side batch per MIN/MAX or DISTINCT aggregate: BinaryRow key, value, count.
         let mut frame = 1;
         for i in 0..num_agg {
             if !matches!(aggregator.kinds[i], 1 | 2 | 7 | 9) {
@@ -1230,20 +1399,18 @@ impl GroupAggregator {
             }
             let side = &batches[frame];
             frame += 1;
-            let side_arity = side.num_columns() - 2;
-            let side_keys: Vec<&ArrayRef> = (0..side_arity).map(|j| side.column(j)).collect();
-            let side_key_owned: Vec<ArrayRef> = side_keys.iter().map(|a| (*a).clone()).collect();
-            let side_keys_enc = encode_group_keys(
-                aggregator.key_converter.as_ref().expect("key converter set by the main batch"),
-                &side_key_owned,
-                side.num_rows(),
-            );
-            let values = side.column(side_arity);
+            assert_eq!(side.num_columns(), 3, "group side snapshot schema");
+            let keys = side
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .expect("group side snapshot binary keys");
+            let values = side.column(1);
             let counts = column_i64(side, "count");
             for row in 0..side.num_rows() {
-                let key = side_keys_enc.row(row);
+                let key = keys.value(row);
                 let value = ScalarValue::try_from_array(values, row).expect("multiset value");
-                match aggregator.keys.get_mut(key.as_ref()).map(|s| &mut s.aggs[i]) {
+                match aggregator.keys.get_mut(key).map(|s| &mut s.aggs[i]) {
                     Some(GroupAggState::Extremes { counts: map, .. }) => {
                         map.insert(MinMaxKey::from_scalar(&value), counts.value(row));
                     }
@@ -1260,6 +1427,37 @@ impl GroupAggregator {
             }
         }
         aggregator
+    }
+
+    /// Rebuilds a single in-memory aggregator from the disjoint raw keyed-state payloads assigned
+    /// to this subtask after restore/rescale.
+    pub(crate) fn restore_partitions(
+        kinds: Vec<i64>,
+        value_types: Vec<i64>,
+        value_columns: Vec<i64>,
+        key_columns: Vec<usize>,
+        generate_update_before: bool,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut merged = GroupAggregator::new(
+            kinds.clone(),
+            value_types.clone(),
+            value_columns.clone(),
+            key_columns.clone(),
+            generate_update_before,
+        );
+        for bytes in snapshots {
+            let restored = GroupAggregator::restore(
+                kinds.clone(),
+                value_types.clone(),
+                value_columns.clone(),
+                key_columns.clone(),
+                generate_update_before,
+                bytes,
+            );
+            merged.keys.extend(restored.keys);
+        }
+        merged
     }
 }
 
@@ -1322,8 +1520,11 @@ impl LocalGroupAggregator {
             .zip(&value_types)
             .map(|(&kind, vt)| RunningAgg::new(kind, vt).result_type())
             .collect();
-        let filter_columns =
-            if filter_columns.is_empty() { vec![-1; kinds.len()] } else { filter_columns };
+        let filter_columns = if filter_columns.is_empty() {
+            vec![-1; kinds.len()]
+        } else {
+            filter_columns
+        };
         LocalGroupAggregator {
             kinds,
             value_types,
@@ -1342,9 +1543,13 @@ impl LocalGroupAggregator {
     /// Bounds the buffered partials by a managed-memory budget (negative = unaccounted). The buffer
     /// drains at every mini-batch flush, but a high-cardinality interval can still spike.
     pub(crate) fn with_memory_budget(mut self, budget_bytes: i64) -> Result<Self, DataFusionError> {
-        let current =
-            self.states.iter().map(|(key, states)| local_entry_bytes(key, states)).sum();
-        self.memory.attach("local-group-aggregate", budget_bytes, current)?;
+        let current = self
+            .states
+            .iter()
+            .map(|(key, states)| local_entry_bytes(key, states))
+            .sum();
+        self.memory
+            .attach("local-group-aggregate", budget_bytes, current)?;
         Ok(self)
     }
 
@@ -1364,20 +1569,33 @@ impl LocalGroupAggregator {
                 }
                 let column = batch.column(self.value_columns[i] as usize);
                 Some(match column.data_type() {
-                    DataType::Int64 => ValueColumn::I64(column.as_any().downcast_ref().expect("int64 value")),
-                    DataType::Int32 => ValueColumn::I32(column.as_any().downcast_ref().expect("int32 value")),
-                    DataType::Int16 => ValueColumn::I16(column.as_any().downcast_ref().expect("int16 value")),
-                    DataType::Int8 => ValueColumn::I8(column.as_any().downcast_ref().expect("int8 value")),
-                    DataType::Float64 => ValueColumn::F64(column.as_any().downcast_ref().expect("float64 value")),
-                    DataType::Float32 => ValueColumn::F32(column.as_any().downcast_ref().expect("float32 value")),
-                    DataType::Decimal128(_, _) => {
-                        ValueColumn::Decimal128(column.as_any().downcast_ref().expect("decimal128 value"))
+                    DataType::Int64 => {
+                        ValueColumn::I64(column.as_any().downcast_ref().expect("int64 value"))
                     }
+                    DataType::Int32 => {
+                        ValueColumn::I32(column.as_any().downcast_ref().expect("int32 value"))
+                    }
+                    DataType::Int16 => {
+                        ValueColumn::I16(column.as_any().downcast_ref().expect("int16 value"))
+                    }
+                    DataType::Int8 => {
+                        ValueColumn::I8(column.as_any().downcast_ref().expect("int8 value"))
+                    }
+                    DataType::Float64 => {
+                        ValueColumn::F64(column.as_any().downcast_ref().expect("float64 value"))
+                    }
+                    DataType::Float32 => {
+                        ValueColumn::F32(column.as_any().downcast_ref().expect("float32 value"))
+                    }
+                    DataType::Decimal128(_, _) => ValueColumn::Decimal128(
+                        column.as_any().downcast_ref().expect("decimal128 value"),
+                    ),
                     _ => ValueColumn::NullOnly(column),
                 })
             })
             .collect();
-        let key_arrays: Vec<&ArrayRef> = self.key_columns.iter().map(|&i| batch.column(i)).collect();
+        let key_arrays: Vec<&ArrayRef> =
+            self.key_columns.iter().map(|&i| batch.column(i)).collect();
         self.key_types = key_types(&key_arrays);
         // Distinct aggregates (kind 7/9) fold the value itself into their per-bundle set, not a Num;
         // a BIGINT value column takes the primitive fast path.
@@ -1451,8 +1669,8 @@ impl LocalGroupAggregator {
                 if let Some(col_idx) = extreme_str_cols[i] {
                     let column = batch.column(col_idx);
                     if !column.is_null(row) {
-                        let scalar =
-                            ScalarValue::try_from_array(column, row).expect("extreme string scalar");
+                        let scalar = ScalarValue::try_from_array(column, row)
+                            .expect("extreme string scalar");
                         if retract {
                             entry[i].retract_extreme(scalar);
                         } else {
@@ -1474,8 +1692,8 @@ impl LocalGroupAggregator {
                     }
                     let column = batch.column(col_idx);
                     if !column.is_null(row) {
-                        let scalar =
-                            ScalarValue::try_from_array(column, row).expect("distinct value scalar");
+                        let scalar = ScalarValue::try_from_array(column, row)
+                            .expect("distinct value scalar");
                         if retract {
                             entry[i].retract_distinct(scalar);
                         } else {
@@ -1524,7 +1742,8 @@ impl LocalGroupAggregator {
         let mut fields = key_fields(&self.key_types);
         let mut columns = key_columns(&order, &self.key_types);
         for (i, rt) in self.result_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> = order.iter().map(|key| states[key][i].emit(rt)).collect();
+            let scalars: Vec<ScalarValue> =
+                order.iter().map(|key| states[key][i].emit(rt)).collect();
             fields.push(Field::new(format!("partial{i}"), rt.clone(), true));
             columns.push(scalars_to_array(scalars, rt));
         }
@@ -1544,7 +1763,10 @@ impl LocalGroupAggregator {
             }
             let entries = arrow::array::StructArray::new(
                 distinct_entry_fields(value_type),
-                vec![scalars_to_array(values, value_type), Arc::new(Int64Array::from(counts))],
+                vec![
+                    scalars_to_array(values, value_type),
+                    Arc::new(Int64Array::from(counts)),
+                ],
                 None,
             );
             let list = arrow::array::ListArray::new(
@@ -1553,7 +1775,11 @@ impl LocalGroupAggregator {
                 Arc::new(entries),
                 None,
             );
-            fields.push(Field::new(format!("distinct{v}"), list.data_type().clone(), false));
+            fields.push(Field::new(
+                format!("distinct{v}"),
+                list.data_type().clone(),
+                false,
+            ));
             columns.push(Arc::new(list));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -1561,15 +1787,23 @@ impl LocalGroupAggregator {
     }
 }
 
-state_bytes_getter!(Java_io_github_jordepic_streamfusion_Native_groupAggregatorStateBytes, GroupAggregator);
+state_bytes_getter!(
+    Java_io_github_jordepic_streamfusion_Native_groupAggregatorStateBytes,
+    GroupAggregator
+);
 
-state_bytes_getter!(Java_io_github_jordepic_streamfusion_Native_localGroupAggregatorStateBytes, LocalGroupAggregator);
+state_bytes_getter!(
+    Java_io_github_jordepic_streamfusion_Native_localGroupAggregatorStateBytes,
+    LocalGroupAggregator
+);
 
 /// Creates a buffering local two-phase GROUP BY pre-aggregate and returns an opaque handle. It
 /// accumulates across batches in memory until flushed; the buffer is transient (drained before each
 /// checkpoint on the JVM side), so there is no snapshot/restore.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createLocalGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createLocalGroupAggregator<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     aggregate_kinds: JIntArray<'local>,
@@ -1600,7 +1834,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createLocalGr
 
 /// Folds an Arrow batch the JVM exported into the buffered per-key accumulators; emits nothing.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateLocalGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateLocalGroupAggregator<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -1621,7 +1857,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateLocalGr
 
 /// Emits the buffered partials (one row per key) and clears the buffer.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushLocalGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushLocalGroupAggregator<
+    'local,
+>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -1634,7 +1872,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flushLocalGro
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeLocalGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeLocalGroupAggregator<
+    'local,
+>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -1655,6 +1895,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createGroupAg
     value_types: JIntArray<'local>,
     value_columns: JIntArray<'local>,
     key_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
     filter_columns: JIntArray<'local>,
     count_columns: JIntArray<'local>,
     distinct_view_columns: JIntArray<'local>,
@@ -1669,13 +1910,23 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_createGroupAg
     let count_columns = read_int_array(&env, &count_columns);
     let distinct_view_columns = read_int_array(&env, &distinct_view_columns);
     let key_columns = read_columns(&env, &key_columns);
-    let aggregator =
-        GroupAggregator::new(kinds, value_types, value_columns, key_columns, generate_update_before != 0)
-            .with_filter_columns(filter_columns)
-            .with_count_columns(count_columns)
-            .with_distinct_view_columns(distinct_view_columns)
-            .with_record_count_column(record_count_column as i64)
-            .with_memory_budget(memory_budget_bytes);
+    let key_timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let aggregator = GroupAggregator::new(
+        kinds,
+        value_types,
+        value_columns,
+        key_columns,
+        generate_update_before != 0,
+    )
+    .with_key_timestamp_precisions(key_timestamp_precisions)
+    .with_filter_columns(filter_columns)
+    .with_count_columns(count_columns)
+    .with_distinct_view_columns(distinct_view_columns)
+    .with_record_count_column(record_count_column as i64)
+    .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, aggregator)
 }
 
@@ -1705,7 +1956,9 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updateGroupAg
 
 /// Serializes the aggregator's per-key state for a checkpoint.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotGroupAggregator<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -1716,15 +1969,67 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotGroup
         .into_raw()
 }
 
+/// Lists the non-empty Flink key groups represented by this group aggregator's current state.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_groupAggregatorSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let aggregator = unsafe { &mut *(handle as *mut GroupAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = aggregator.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate raw group key-group list");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write raw group key-group list");
+    output.into_raw()
+}
+
+/// Returns one raw keyed-state payload after `groupAggregatorSnapshotKeyGroups` materialized the
+/// checkpoint's disjoint group snapshots.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotGroupAggregatorKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let aggregator = unsafe { &mut *(handle as *mut GroupAggregator) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = aggregator.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate raw group key-group snapshot")
+        .into_raw()
+}
+
 /// Rebuilds a `GROUP BY` aggregator from a snapshot taken by a prior run and returns a fresh handle.
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupAggregator<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupAggregator<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     aggregate_kinds: JIntArray<'local>,
     value_types: JIntArray<'local>,
     value_columns: JIntArray<'local>,
     key_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
     filter_columns: JIntArray<'local>,
     count_columns: JIntArray<'local>,
     distinct_view_columns: JIntArray<'local>,
@@ -1740,7 +2045,13 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupA
     let count_columns = read_int_array(&env, &count_columns);
     let distinct_view_columns = read_int_array(&env, &distinct_view_columns);
     let key_columns = read_columns(&env, &key_columns);
-    let bytes = env.convert_byte_array(&snapshot).expect("failed to read group-by snapshot");
+    let key_timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let bytes = env
+        .convert_byte_array(&snapshot)
+        .expect("failed to read group-by snapshot");
     let aggregator = GroupAggregator::restore(
         kinds,
         value_types,
@@ -1749,6 +2060,69 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupA
         generate_update_before != 0,
         &bytes,
     )
+    .with_key_timestamp_precisions(key_timestamp_precisions)
+    .with_filter_columns(filter_columns)
+    .with_count_columns(count_columns)
+    .with_distinct_view_columns(distinct_view_columns)
+    .with_record_count_column(record_count_column as i64)
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, aggregator)
+}
+
+/// Rebuilds a `GROUP BY` aggregator from all raw keyed-state partitions assigned to this subtask.
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreGroupAggregatorPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    aggregate_kinds: JIntArray<'local>,
+    value_types: JIntArray<'local>,
+    value_columns: JIntArray<'local>,
+    key_columns: JIntArray<'local>,
+    key_timestamp_precisions: JIntArray<'local>,
+    filter_columns: JIntArray<'local>,
+    count_columns: JIntArray<'local>,
+    distinct_view_columns: JIntArray<'local>,
+    record_count_column: jint,
+    generate_update_before: jboolean,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let kinds = read_int_array(&env, &aggregate_kinds);
+    let value_types = read_int_array(&env, &value_types);
+    let value_columns = read_int_array(&env, &value_columns);
+    let filter_columns = read_int_array(&env, &filter_columns);
+    let count_columns = read_int_array(&env, &count_columns);
+    let distinct_view_columns = read_int_array(&env, &distinct_view_columns);
+    let key_columns = read_columns(&env, &key_columns);
+    let key_timestamp_precisions: Vec<i32> = read_int_array(&env, &key_timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read raw group partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let object = env
+            .get_object_array_element(&snapshots, index)
+            .expect("read raw group partition");
+        let bytes = JByteArray::from(object);
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read raw group partition bytes"),
+        );
+    }
+    let aggregator = GroupAggregator::restore_partitions(
+        kinds,
+        value_types,
+        value_columns,
+        key_columns,
+        generate_update_before != 0,
+        &restored,
+    )
+    .with_key_timestamp_precisions(key_timestamp_precisions)
     .with_filter_columns(filter_columns)
     .with_count_columns(count_columns)
     .with_distinct_view_columns(distinct_view_columns)

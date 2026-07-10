@@ -7,9 +7,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -35,11 +32,12 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
   private final int[] distinctViewColumns;
   private final int recordCountColumn;
   private final boolean generateUpdateBefore;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeColumnarGroupAggregateOperator(
@@ -51,7 +49,9 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
       int[] countColumns,
       int[] distinctViewColumns,
       int recordCountColumn,
-      boolean generateUpdateBefore) {
+      boolean generateUpdateBefore,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.aggregateKinds = aggregateKinds;
     this.valueTypes = valueTypes;
     this.valueColumns = valueColumns;
@@ -61,31 +61,33 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
     this.distinctViewColumns = distinctViewColumns;
     this.recordCountColumn = recordCountColumn;
     this.generateUpdateBefore = generateUpdateBefore;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native group aggregate state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-group-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> snapshots = RawKeyedState.restore(context);
     memoryBudget = ManagedMemoryBudget.reserveFor(this);
     handle =
-        snapshot == null
+        snapshots.isEmpty()
             ? Native.createGroupAggregator(
-                aggregateKinds, valueTypes, valueColumns, keyColumns, filterColumns, countColumns,
-                distinctViewColumns, recordCountColumn, generateUpdateBefore, memoryBudget.bytes())
-            : Native.restoreGroupAggregator(
-                aggregateKinds, valueTypes, valueColumns, keyColumns, filterColumns, countColumns,
-                distinctViewColumns, recordCountColumn, generateUpdateBefore, snapshot,
+                aggregateKinds, valueTypes, valueColumns, keyColumns, keyTimestampPrecisions,
+                filterColumns, countColumns, distinctViewColumns, recordCountColumn,
+                generateUpdateBefore, memoryBudget.bytes())
+            : Native.restoreGroupAggregatorPartitions(
+                aggregateKinds, valueTypes, valueColumns, keyColumns, keyTimestampPrecisions,
+                filterColumns, countColumns, distinctViewColumns, recordCountColumn, generateUpdateBefore,
+                snapshots.toArray(new byte[0][]),
                 memoryBudget.bytes());
   }
 
@@ -135,8 +137,14 @@ public class NativeColumnarGroupAggregateOperator extends AbstractStreamOperator
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotGroupAggregator(handle));
+    int[] keyGroups =
+        Native.groupAggregatorSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotGroupAggregatorKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

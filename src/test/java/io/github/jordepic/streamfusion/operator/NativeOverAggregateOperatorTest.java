@@ -7,8 +7,10 @@ import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.KeyedOneInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.OneInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -25,6 +27,8 @@ import org.junit.jupiter.api.Test;
  */
 class NativeOverAggregateOperatorTest {
 
+  private static final int MAX_PARALLELISM = 128;
+
   // Input schema [v BIGINT, rt TIMESTAMP_LTZ(3)]; output appends the running SUM (BIGINT).
   private static final RowType INPUT =
       RowType.of(
@@ -35,10 +39,19 @@ class NativeOverAggregateOperatorTest {
   void emitsRunningSumWithPassthrough() throws Exception {
     NativeOverAggregateOperator operator =
         new NativeOverAggregateOperator(
-            1, new int[] {0}, new int[0], new int[] {0}, new int[] {0}, 0, 0, false);
+            1,
+            new int[] {0},
+            new int[0],
+            new int[] {0},
+            new int[] {0},
+            0,
+            0,
+            false,
+            new int[0],
+            MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
-            new OneInputStreamOperatorTestHarness<>(operator, new ArrowBatchSerializer())) {
+        KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -82,6 +95,12 @@ class NativeOverAggregateOperatorTest {
       }
     }
     return rows;
+  }
+
+  private static KeyedOneInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch> keyedHarness(
+      NativeOverAggregateOperator operator) throws Exception {
+    return new KeyedOneInputStreamOperatorTestHarness<>(
+        operator, batch -> 0, Types.INT, MAX_PARALLELISM, 1, 0);
   }
 
   private static void closeForwarded(
