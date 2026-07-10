@@ -38,12 +38,11 @@ change the first end-to-end benchmarks demanded: a lone native operator paid two
 batch and ran below Flink (filter 0.58x, window 0.81x); a fully-columnar Parquet copy runs 3–5x.
 
 **Native columnar keyed shuffle** (`3cd772f`, `b65b128`, `645ddfc`). A keyed exchange splits each
-Arrow batch by a hash of the key columns into per-channel sub-batches, so a keyed operator's input
-stays columnar across the shuffle instead of transposing to rows and back. The hash is a plain
-consistent hash, not Flink's key-group hash — safe because the downstream keyed consumer is our own
-operator that re-groups internally (`8037aba`), which deleted the hardest part of the design. The
-fully-columnar windowed pipeline (source → watermark → shuffle → window) measured 1.91x vs Flink
-where the row-fed window was 1.21x (`27ca674`).
+Arrow batch by the projected key's Flink BinaryRow hash, Murmur key-group mix, and channel mapping,
+so a keyed operator's input stays columnar across the shuffle instead of transposing to rows and
+back. Matching the host key-group layout now lets native raw keyed state rescale safely while the
+hot map stays in Rust. The fully-columnar windowed pipeline (source → watermark → shuffle → window)
+measured 1.91x vs Flink where the row-fed window was 1.21x (`27ca674`).
 
 **All native operators are columnar; changelog operators converted** (`37bde74`, `2203269`). A
 row-fed native operator forces a transpose on every batch even inside an all-native chain, so

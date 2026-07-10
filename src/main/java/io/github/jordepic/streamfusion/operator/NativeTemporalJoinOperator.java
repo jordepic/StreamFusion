@@ -8,9 +8,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -50,11 +47,12 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
   private final RowType leftType;
   private final RowType rightType;
   private final EncodedPredicate predicate;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeTemporalJoinOperator(
@@ -65,7 +63,9 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
       int joinType,
       RowType leftType,
       RowType rightType,
-      EncodedPredicate predicate) {
+      EncodedPredicate predicate,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.leftTime = leftTime;
@@ -74,22 +74,22 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
     this.leftType = leftType;
     this.rightType = rightType;
     this.predicate = predicate;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native temporal join state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-temporal-join-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> rawSnapshots = RawKeyedState.restore(context);
     // Hand both sides' Arrow schemas to the joiner up front so a LEFT join can type the null-padding
     // for the build side before that side's first batch arrives.
     BufferAllocator alloc = NativeAllocator.SHARED;
@@ -100,9 +100,27 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
       predicate.bind();
       memoryBudget = ManagedMemoryBudget.reserveFor(this);
-      handle =
-          snapshot == null
-              ? Native.createTemporalJoiner(
+      if (!rawSnapshots.isEmpty()) {
+        handle =
+            Native.restoreTemporalJoinerPartitions(
+                leftKeys,
+                rightKeys,
+                leftTime,
+                rightTime,
+                joinType,
+                leftSchema.memoryAddress(),
+                rightSchema.memoryAddress(),
+                predicate.kinds,
+                predicate.payload,
+                predicate.childCounts,
+                predicate.boundLongs(),
+                predicate.doubles,
+                predicate.strings,
+                rawSnapshots.toArray(new byte[0][]),
+                memoryBudget.bytes());
+      } else {
+        handle =
+            Native.createTemporalJoiner(
                   leftKeys,
                   rightKeys,
                   leftTime,
@@ -116,23 +134,8 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
-                  memoryBudget.bytes())
-              : Native.restoreTemporalJoiner(
-                  leftKeys,
-                  rightKeys,
-                  leftTime,
-                  rightTime,
-                  joinType,
-                  leftSchema.memoryAddress(),
-                  rightSchema.memoryAddress(),
-                  predicate.kinds,
-                  predicate.payload,
-                  predicate.childCounts,
-                  predicate.boundLongs(),
-                  predicate.doubles,
-                  predicate.strings,
-                  snapshot,
                   memoryBudget.bytes());
+      }
     }
   }
 
@@ -210,8 +213,14 @@ public class NativeTemporalJoinOperator extends AbstractStreamOperator<ArrowBatc
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotTemporalJoiner(handle));
+    int[] keyGroups =
+        Native.temporalJoinerSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotTemporalJoinerKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

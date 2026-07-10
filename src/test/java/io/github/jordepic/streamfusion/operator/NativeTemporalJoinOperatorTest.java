@@ -8,8 +8,10 @@ import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.KeyedTwoInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.TwoInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -29,6 +31,8 @@ import org.junit.jupiter.api.Test;
  * null-pads. Emission is watermark-gated, so the result is deterministic and value-checked here.
  */
 class NativeTemporalJoinOperatorTest {
+
+  private static final int MAX_PARALLELISM = 128;
 
   // Probe: [k BIGINT, amount BIGINT, rt TIMESTAMP_LTZ(3)]; build: [k BIGINT, rate BIGINT, rt ...].
   private static final RowType PROBE =
@@ -54,14 +58,23 @@ class NativeTemporalJoinOperatorTest {
 
   private static NativeTemporalJoinOperator operator(int joinType) {
     return new NativeTemporalJoinOperator(
-        new int[] {0}, new int[] {0}, 2, 2, joinType, PROBE, BUILD, EncodedPredicate.NONE);
+        new int[] {0},
+        new int[] {0},
+        2,
+        2,
+        joinType,
+        PROBE,
+        BUILD,
+        EncodedPredicate.NONE,
+        new int[] {-1},
+        MAX_PARALLELISM);
   }
 
   @Test
   void joinsTheVersionValidAtTheProbeTime() throws Exception {
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator(0))) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator(0))) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -93,8 +106,8 @@ class NativeTemporalJoinOperatorTest {
   @Test
   void leftJoinNullPadsWhenNoValidVersion() throws Exception {
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator(1))) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator(1))) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -131,8 +144,8 @@ class NativeTemporalJoinOperatorTest {
   @Test
   void buffersProbeRowsUntilTheWatermarkPasses() throws Exception {
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator(0))) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator(0))) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -221,6 +234,12 @@ class NativeTemporalJoinOperatorTest {
     List<List<Object>> copy = new ArrayList<>(rows);
     copy.sort(Comparator.comparing(Object::toString));
     return copy;
+  }
+
+  private static KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch>
+      keyedHarness(NativeTemporalJoinOperator operator) throws Exception {
+    return new KeyedTwoInputStreamOperatorTestHarness<>(
+        operator, batch -> 0, batch -> 0, Types.INT, MAX_PARALLELISM, 1, 0);
   }
 
   private static void closeForwarded(

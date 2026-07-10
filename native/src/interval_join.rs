@@ -342,17 +342,204 @@ impl IntervalJoiner {
                 write_ipc(&concat_batches(&self.buf_schema(is_left), buffered.iter()).expect("concat buf"))
             }
         };
-        let mut out = Vec::new();
-        for section in [
+        Self::snapshot_parts([
             buf(true, &self.left_buffered),
             buf(false, &self.right_buffered),
             serialize_id_set(&self.left_matched),
             serialize_id_set(&self.right_matched),
-        ] {
+        ])
+    }
+
+    fn snapshot_parts(sections: [Vec<u8>; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for section in sections {
             out.extend_from_slice(&(section.len() as u32).to_le_bytes());
             out.extend_from_slice(&section);
         }
         out
+    }
+
+    pub(crate) fn snapshot_key_groups(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty interval-join raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let sections = read_framed_sections(&self.snapshot());
+        let left = Self::side_raw_partitions(
+            &sections[0],
+            &self.left_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let right = Self::side_raw_partitions(
+            &sections[1],
+            &self.right_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let left_matched = Self::matched_raw_partitions(&left, &self.left_matched);
+        let right_matched = Self::matched_raw_partitions(&right, &self.right_matched);
+        let mut groups: Vec<i32> = left
+            .keys()
+            .chain(right.keys())
+            .chain(left_matched.keys())
+            .chain(right_matched.keys())
+            .copied()
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut snapshots = BTreeMap::new();
+        for key_group in groups {
+            snapshots.insert(
+                key_group,
+                Self::snapshot_parts([
+                    left.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                    right.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                    left_matched.get(&key_group).cloned().unwrap_or_default(),
+                    right_matched.get(&key_group).cloned().unwrap_or_default(),
+                ]),
+            );
+        }
+        snapshots
+    }
+
+    fn side_raw_partitions(
+        bytes: &[u8],
+        key_columns: &[usize],
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<RecordBatch>> {
+        let mut partitions = BTreeMap::new();
+        for batch in read_ipc_if_present(bytes) {
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(&batch, key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition interval snapshot"))
+                    .collect();
+                partitions
+                    .entry(key_group)
+                    .or_insert_with(Vec::new)
+                    .push(
+                        RecordBatch::try_new(batch.schema(), columns)
+                            .expect("partitioned interval snapshot"),
+                    );
+            }
+        }
+        partitions
+    }
+
+    fn matched_raw_partitions(
+        partitions: &BTreeMap<i32, Vec<RecordBatch>>,
+        matched: &HashSet<i64>,
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let mut by_group = BTreeMap::new();
+        if matched.is_empty() {
+            return by_group;
+        }
+        for (key_group, batches) in partitions {
+            let mut ids = HashSet::default();
+            for batch in batches {
+                let rowids = batch
+                    .column(batch.num_columns() - 1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("interval row id");
+                for row in 0..rowids.len() {
+                    let id = rowids.value(row);
+                    if matched.contains(&id) {
+                        ids.insert(id);
+                    }
+                }
+            }
+            let bytes = serialize_id_set(&ids);
+            if !bytes.is_empty() {
+                by_group.insert(*key_group, bytes);
+            }
+        }
+        by_group
+    }
+
+    fn merge_snapshot_batches(batches: &Vec<RecordBatch>) -> Vec<u8> {
+        write_ipc(
+            &concat_batches(&batches[0].schema(), batches.iter())
+                .expect("merge interval raw partitions"),
+        )
+    }
+
+    /// Gives each outer-join row a handle-local id again while combining raw key groups.
+    ///
+    /// Row ids identify whether a buffered outer row has already produced a match. They are
+    /// allocated independently by every subtask, so two raw key groups from different subtasks
+    /// may both contain (for example) row id zero after a scale-down. Remap one raw partition at a
+    /// time before combining it with the others, keeping its matched-id set aligned with its rows.
+    fn remap_outer_rowids(
+        batches: Vec<RecordBatch>,
+        matched: HashSet<i64>,
+        next_id: &mut i64,
+    ) -> (Vec<RecordBatch>, HashSet<i64>) {
+        let mut remapped_ids = HashMap::default();
+        let mut remapped_batches = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let rowid_column = batch.num_columns() - 1;
+            let rowids = batch
+                .column(rowid_column)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("interval row id");
+            let mut new_ids = Vec::with_capacity(rowids.len());
+            for row in 0..rowids.len() {
+                let new_id = *next_id;
+                *next_id = next_id.checked_add(1).expect("interval row id overflow");
+                remapped_ids.insert(rowids.value(row), new_id);
+                new_ids.push(new_id);
+            }
+            let mut columns = batch.columns().to_vec();
+            columns[rowid_column] = Arc::new(Int64Array::from(new_ids));
+            remapped_batches.push(
+                RecordBatch::try_new(batch.schema(), columns).expect("remap interval row ids"),
+            );
+        }
+        let remapped_matched = matched
+            .into_iter()
+            .map(|id| {
+                *remapped_ids
+                    .get(&id)
+                    .expect("matched interval row missing from its buffer")
+            })
+            .collect();
+        (remapped_batches, remapped_matched)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -381,6 +568,9 @@ impl IntervalJoiner {
             left_data_schema,
             right_data_schema,
         );
+        if bytes.is_empty() {
+            return joiner;
+        }
         let sections = read_framed_sections(bytes);
         joiner.left_buffered = read_ipc_if_present(&sections[0]);
         joiner.right_buffered = read_ipc_if_present(&sections[1]);
@@ -390,6 +580,78 @@ impl IntervalJoiner {
         joiner.left_next_id = max_rowid(&joiner.left_buffered) + 1;
         joiner.right_next_id = max_rowid(&joiner.right_buffered) + 1;
         joiner
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_partitions(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_time: usize,
+        right_time: usize,
+        lower: i64,
+        upper: i64,
+        predicate: Option<JoinPredicate>,
+        join_type: JoinKind,
+        left_data_schema: SchemaRef,
+        right_data_schema: SchemaRef,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut left_batches = Vec::new();
+        let mut right_batches = Vec::new();
+        let mut left_matched = HashSet::default();
+        let mut right_matched = HashSet::default();
+        let mut left_next_id = 0;
+        let mut right_next_id = 0;
+        for bytes in snapshots {
+            let sections = read_framed_sections(bytes);
+            if sections.len() == 4 {
+                let left = read_ipc_if_present(&sections[0]);
+                let right = read_ipc_if_present(&sections[1]);
+                if join_type == JoinKind::Inner {
+                    left_batches.extend(left);
+                    right_batches.extend(right);
+                } else {
+                    let (left, matched) = Self::remap_outer_rowids(
+                        left,
+                        deserialize_id_set(&sections[2]),
+                        &mut left_next_id,
+                    );
+                    let (right, matched_right) = Self::remap_outer_rowids(
+                        right,
+                        deserialize_id_set(&sections[3]),
+                        &mut right_next_id,
+                    );
+                    left_batches.extend(left);
+                    right_batches.extend(right);
+                    left_matched.extend(matched);
+                    right_matched.extend(matched_right);
+                }
+            }
+        }
+        let left = (!left_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&left_batches))
+            .unwrap_or_default();
+        let right = (!right_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&right_batches))
+            .unwrap_or_default();
+        IntervalJoiner::restore(
+            left_keys,
+            right_keys,
+            left_time,
+            right_time,
+            lower,
+            upper,
+            predicate,
+            join_type,
+            left_data_schema,
+            right_data_schema,
+            &Self::snapshot_parts([
+                left,
+                right,
+                serialize_id_set(&left_matched),
+                serialize_id_set(&right_matched),
+            ]),
+        )
     }
 }
 
@@ -579,6 +841,52 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotInter
         .into_raw()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_intervalJoinerSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let joiner = unsafe { &*(handle as *const IntervalJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = joiner.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate interval raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write interval raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotIntervalJoinerKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let joiner = unsafe { &*(handle as *const IntervalJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = joiner.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate interval raw key-group snapshot")
+        .into_raw()
+}
+
 /// Rebuilds an interval joiner from a snapshot taken by a prior run and returns a fresh handle.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -629,6 +937,75 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreInterv
         left_schema,
         right_schema,
         &bytes,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, joiner)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreIntervalJoinerPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_time: jint,
+    right_time: jint,
+    lower_bound: jlong,
+    upper_bound: jlong,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
+    pred_kinds: JIntArray<'local>,
+    pred_payload: JIntArray<'local>,
+    pred_child_counts: JIntArray<'local>,
+    pred_longs: JLongArray<'local>,
+    pred_doubles: JDoubleArray<'local>,
+    pred_strings: JObjectArray<'local>,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
+    let predicate = read_join_predicate(
+        &mut env,
+        &pred_kinds,
+        &pred_payload,
+        &pred_child_counts,
+        &pred_longs,
+        &pred_doubles,
+        &pred_strings,
+    );
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read interval raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read interval raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read interval raw partition bytes"),
+        );
+    }
+    let joiner = IntervalJoiner::restore_partitions(
+        left,
+        right,
+        left_time as usize,
+        right_time as usize,
+        lower_bound,
+        upper_bound,
+        predicate,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
+        &restored,
     )
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, joiner)

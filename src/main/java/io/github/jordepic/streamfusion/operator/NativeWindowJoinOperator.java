@@ -9,9 +9,6 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -55,12 +52,14 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
   private final long windowMillis;
   private final long slideMillis;
   private final boolean cumulative;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
+  private transient long restoredProcessingTimeTimerDeadline;
   private transient long registeredTimer;
   private transient long maxOpenEnd;
 
@@ -78,7 +77,9 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
       boolean proctime,
       long windowMillis,
       long slideMillis,
-      boolean cumulative) {
+      boolean cumulative,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.leftWindowStart = leftWindowStart;
@@ -93,22 +94,24 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
     this.windowMillis = windowMillis;
     this.slideMillis = slideMillis;
     this.cumulative = cumulative;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native window join state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-window-join-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    RawKeyedState.TimedRestore restored = RawKeyedState.restoreWithTimer(context);
+    java.util.List<byte[]> rawSnapshots = restored.snapshots();
+    restoredProcessingTimeTimerDeadline = restored.deadline();
     BufferAllocator alloc = NativeAllocator.SHARED;
     CDataDictionaryProvider dicts = NativeAllocator.DICTIONARIES;
     try (ArrowSchema leftSchema = ArrowSchema.allocateNew(alloc);
@@ -117,9 +120,29 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
       predicate.bind();
       memoryBudget = ManagedMemoryBudget.reserveFor(this);
-      handle =
-          snapshot == null
-              ? Native.createWindowJoiner(
+      if (!rawSnapshots.isEmpty()) {
+        handle =
+            Native.restoreWindowJoinerPartitions(
+                leftKeys,
+                rightKeys,
+                leftWindowStart,
+                leftWindowEnd,
+                rightWindowStart,
+                rightWindowEnd,
+                joinType,
+                leftSchema.memoryAddress(),
+                rightSchema.memoryAddress(),
+                predicate.kinds,
+                predicate.payload,
+                predicate.childCounts,
+                predicate.boundLongs(),
+                predicate.doubles,
+                predicate.strings,
+                rawSnapshots.toArray(new byte[0][]),
+                memoryBudget.bytes());
+      } else {
+        handle =
+            Native.createWindowJoiner(
                   leftKeys,
                   rightKeys,
                   leftWindowStart,
@@ -135,25 +158,8 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
                   predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
-                  memoryBudget.bytes())
-              : Native.restoreWindowJoiner(
-                  leftKeys,
-                  rightKeys,
-                  leftWindowStart,
-                  leftWindowEnd,
-                  rightWindowStart,
-                  rightWindowEnd,
-                  joinType,
-                  leftSchema.memoryAddress(),
-                  rightSchema.memoryAddress(),
-                  predicate.kinds,
-                  predicate.payload,
-                  predicate.childCounts,
-                  predicate.boundLongs(),
-                  predicate.doubles,
-                  predicate.strings,
-                  snapshot,
                   memoryBudget.bytes());
+      }
     }
   }
 
@@ -163,7 +169,15 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
     allocator = NativeAllocator.SHARED;
     dictionaries = NativeAllocator.DICTIONARIES;
     registeredTimer = Long.MIN_VALUE;
-    maxOpenEnd = Long.MIN_VALUE;
+    maxOpenEnd = restoredProcessingTimeTimerDeadline;
+    if (proctime && maxOpenEnd != Long.MIN_VALUE) {
+      long now = getProcessingTimeService().getCurrentProcessingTime();
+      if (maxOpenEnd <= now) {
+        flush(now);
+      } else {
+        scheduleNextTimer(now);
+      }
+    }
   }
 
   @Override
@@ -277,8 +291,15 @@ public class NativeWindowJoinOperator extends AbstractStreamOperator<ArrowBatch>
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotWindowJoiner(handle));
+    int[] keyGroups =
+        Native.windowJoinerSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshotWithTimer(
+        context,
+        keyGroups,
+        proctime ? maxOpenEnd : Long.MIN_VALUE,
+        keyGroup ->
+            Native.snapshotWindowJoinerKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

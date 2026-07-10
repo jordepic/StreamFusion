@@ -9,8 +9,11 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.TimeStampNanoVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.KeyedTwoInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.TwoInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -27,6 +30,8 @@ import org.junit.jupiter.api.Test;
  */
 class NativeIntervalJoinOperatorTest {
 
+  private static final int MAX_PARALLELISM = 128;
+
   // Both inputs share the schema [k BIGINT, v BIGINT, rt TIMESTAMP_LTZ(3)].
   private static final RowType INPUT =
       RowType.of(
@@ -39,10 +44,10 @@ class NativeIntervalJoinOperatorTest {
     NativeIntervalJoinOperator operator =
         new NativeIntervalJoinOperator(
             new int[] {0}, new int[] {0}, 2, 2, -1000L, 1000L, 0, INPUT, INPUT, EncodedPredicate.NONE,
-            false);
+            false, new int[] {-1}, MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator)) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -66,10 +71,10 @@ class NativeIntervalJoinOperatorTest {
     NativeIntervalJoinOperator operator =
         new NativeIntervalJoinOperator(
             new int[] {0}, new int[] {0}, 2, 2, -1000L, 1000L, 0, INPUT, INPUT, EncodedPredicate.NONE,
-            false);
+            false, new int[] {-1}, MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator)) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -96,10 +101,10 @@ class NativeIntervalJoinOperatorTest {
     NativeIntervalJoinOperator operator =
         new NativeIntervalJoinOperator(
             new int[] {0}, new int[] {0}, 2, 2, -1000L, 1000L, 0, INPUT, INPUT, EncodedPredicate.NONE,
-            true);
+            true, new int[] {-1}, MAX_PARALLELISM);
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator)) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            keyedHarness(operator)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
 
@@ -114,6 +119,56 @@ class NativeIntervalJoinOperatorTest {
       harness.setProcessingTime(7000); // past 5500 + max(upper,-lower); buffers drain (no-op for INNER)
       closeForwarded(harness);
     }
+  }
+
+  @Test
+  void rawKeyedProctimeOuterJoinRearmsCleanupAfterRestore() throws Exception {
+    OperatorSubtaskState snapshot;
+    try (KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> before =
+        rawKeyedProctimeOuterHarness()) {
+      before.setup(new ArrowBatchSerializer());
+      before.open();
+      before.setProcessingTime(500);
+      before.processElement1(new StreamRecord<>(batch(NativeAllocator.SHARED, row(1, 10, 0))));
+      snapshot = before.snapshot(1L, 1L);
+      closeForwarded(before);
+    }
+
+    try (KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> restored =
+        rawKeyedProctimeOuterHarness()) {
+      restored.setup(new ArrowBatchSerializer());
+      restored.initializeState(snapshot);
+      restored.open();
+      // No new input: the restored 1500ms cleanup timer must evict and null-pad this left outer row.
+      restored.setProcessingTime(1500);
+      assertEquals(
+          List.of(java.util.Arrays.asList(1L, 10L, 500L, null, null, null)), collectNullable(restored));
+    }
+  }
+
+  private static KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch>
+      rawKeyedProctimeOuterHarness() throws Exception {
+    return keyedHarness(
+        new NativeIntervalJoinOperator(
+            new int[] {0},
+            new int[] {0},
+            2,
+            2,
+            -1000L,
+            1000L,
+            1,
+            INPUT,
+            INPUT,
+            EncodedPredicate.NONE,
+            true,
+            new int[] {-1},
+            MAX_PARALLELISM));
+  }
+
+  private static KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch>
+      keyedHarness(NativeIntervalJoinOperator operator) throws Exception {
+    return new KeyedTwoInputStreamOperatorTestHarness<>(
+        operator, batch -> 0, batch -> 0, Types.INT, MAX_PARALLELISM, 1, 0);
   }
 
   private static RowData row(long k, long v, long rtMillis) {
@@ -154,6 +209,43 @@ class NativeIntervalJoinOperatorTest {
       }
     }
     return rows;
+  }
+
+  private static List<List<Long>> collectNullable(
+      TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness) {
+    List<List<Long>> rows = new ArrayList<>();
+    while (!harness.getOutput().isEmpty()) {
+      Object event = harness.getOutput().poll();
+      if (event instanceof StreamRecord) {
+        try (VectorSchemaRoot root = ((ArrowBatch) ((StreamRecord<?>) event).getValue()).root()) {
+          BigIntVector lk = (BigIntVector) root.getVector(0);
+          BigIntVector lv = (BigIntVector) root.getVector(1);
+          TimeStampNanoVector lrt = (TimeStampNanoVector) root.getVector(2);
+          BigIntVector rk = (BigIntVector) root.getVector(3);
+          BigIntVector rv = (BigIntVector) root.getVector(4);
+          TimeStampNanoVector rrt = (TimeStampNanoVector) root.getVector(5);
+          for (int i = 0; i < root.getRowCount(); i++) {
+            rows.add(
+                java.util.Arrays.asList(
+                    nullable(lk, i),
+                    nullable(lv, i),
+                    nullableTimestamp(lrt, i),
+                    nullable(rk, i),
+                    nullable(rv, i),
+                    nullableTimestamp(rrt, i)));
+          }
+        }
+      }
+    }
+    return rows;
+  }
+
+  private static Long nullable(BigIntVector vector, int index) {
+    return vector.isNull(index) ? null : vector.get(index);
+  }
+
+  private static Long nullableTimestamp(TimeStampNanoVector vector, int index) {
+    return vector.isNull(index) ? null : vector.get(index) / 1_000_000L;
   }
 
   private static void closeForwarded(

@@ -124,7 +124,8 @@ public class StreamPhysicalNativeWindowJoin extends BiRel
         proctime,
         windowMillis,
         slideMillis,
-        cumulative);
+        cumulative,
+        FlinkKeyGroupUtils.timestampPrecisions(getLeft().getRowType(), leftKeys));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -135,4 +136,3 @@ public class StreamPhysicalNativeWindowJoin extends BiRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

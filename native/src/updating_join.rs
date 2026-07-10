@@ -699,10 +699,111 @@ impl UpdatingJoiner {
     pub(crate) fn snapshot(&self) -> Vec<u8> {
         let left = self.serialize_side(true);
         let right = self.serialize_side(false);
+        Self::snapshot_parts(left, right)
+    }
+
+    fn snapshot_parts(left: Vec<u8>, right: Vec<u8>) -> Vec<u8> {
         let mut out = (left.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(&left);
         out.extend_from_slice(&right);
         out
+    }
+
+    pub(crate) fn snapshot_key_groups(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty updating-join raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let left = self.side_raw_partitions(
+            &self.serialize_side(true),
+            &self.left_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let right = self.side_raw_partitions(
+            &self.serialize_side(false),
+            &self.right_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let mut groups: Vec<i32> = left.keys().chain(right.keys()).copied().collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut snapshots = BTreeMap::new();
+        for key_group in groups {
+            snapshots.insert(
+                key_group,
+                Self::snapshot_parts(
+                    left.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                    right.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                ),
+            );
+        }
+        snapshots
+    }
+
+    fn side_raw_partitions(
+        &self,
+        bytes: &[u8],
+        key_columns: &[usize],
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<RecordBatch>> {
+        let mut partitions = BTreeMap::new();
+        for batch in read_ipc_if_present(bytes) {
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(&batch, key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition join snapshot"))
+                    .collect();
+                partitions
+                    .entry(key_group)
+                    .or_insert_with(Vec::new)
+                    .push(
+                        RecordBatch::try_new(batch.schema(), columns)
+                            .expect("partitioned join snapshot"),
+                    );
+            }
+        }
+        partitions
+    }
+
+    fn merge_snapshot_batches(batches: &Vec<RecordBatch>) -> Vec<u8> {
+        let combined = concat_batches(&batches[0].schema(), batches.iter())
+            .expect("merge updating-join raw partitions");
+        write_ipc(&combined)
     }
 
     pub(crate) fn restore(
@@ -716,10 +817,51 @@ impl UpdatingJoiner {
     ) -> Self {
         let mut joiner =
             UpdatingJoiner::new(left_keys, right_keys, kind, left_schema, right_schema, predicate);
+        if bytes.is_empty() {
+            return joiner;
+        }
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
         joiner.load_side(true, &bytes[4..4 + left_len]);
         joiner.load_side(false, &bytes[4 + left_len..]);
         joiner
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_partitions(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        kind: JoinKind,
+        left_schema: SchemaRef,
+        right_schema: SchemaRef,
+        predicate: Option<JoinPredicate>,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut left_batches = Vec::new();
+        let mut right_batches = Vec::new();
+        for bytes in snapshots {
+            if bytes.len() < 4 {
+                continue;
+            }
+            let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
+            assert!(4 + left_len <= bytes.len(), "truncated updating-join raw key-group snapshot");
+            left_batches.extend(read_ipc_if_present(&bytes[4..4 + left_len]));
+            right_batches.extend(read_ipc_if_present(&bytes[4 + left_len..]));
+        }
+        let left = (!left_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&left_batches))
+            .unwrap_or_default();
+        let right = (!right_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&right_batches))
+            .unwrap_or_default();
+        UpdatingJoiner::restore(
+            left_keys,
+            right_keys,
+            kind,
+            left_schema,
+            right_schema,
+            predicate,
+            &Self::snapshot_parts(left, right),
+        )
     }
 
     fn load_side(&mut self, is_left: bool, bytes: &[u8]) {
@@ -857,6 +999,52 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotUpdat
         .into_raw()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_updatingJoinerSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let joiner = unsafe { &*(handle as *const UpdatingJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = joiner.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate updating-join raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write updating-join raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotUpdatingJoinerKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let joiner = unsafe { &*(handle as *const UpdatingJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = joiner.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate updating-join raw key-group snapshot")
+        .into_raw()
+}
+
 /// Rebuilds an updating joiner from a snapshot and returns a fresh handle.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -899,6 +1087,67 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreUpdati
         right_schema,
         predicate,
         &bytes,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, joiner)
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreUpdatingJoinerPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
+    pred_kinds: JIntArray<'local>,
+    pred_payload: JIntArray<'local>,
+    pred_child_counts: JIntArray<'local>,
+    pred_longs: JLongArray<'local>,
+    pred_doubles: JDoubleArray<'local>,
+    pred_strings: JObjectArray<'local>,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
+    let predicate = read_join_predicate(
+        &mut env,
+        &pred_kinds,
+        &pred_payload,
+        &pred_child_counts,
+        &pred_longs,
+        &pred_doubles,
+        &pred_strings,
+    );
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read updating-join raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read updating-join raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read updating-join raw partition bytes"),
+        );
+    }
+    let joiner = UpdatingJoiner::restore_partitions(
+        left,
+        right,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
+        predicate,
+        &restored,
     )
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, joiner)

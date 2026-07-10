@@ -84,7 +84,8 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
         joinType,
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getLeft().getRowType()),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRight().getRowType()),
-        predicate);
+        predicate,
+        FlinkKeyGroupUtils.timestampPrecisions(getLeft().getRowType(), leftKeys));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -95,4 +96,3 @@ public class StreamPhysicalNativeColumnarUpdatingJoin extends BiRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

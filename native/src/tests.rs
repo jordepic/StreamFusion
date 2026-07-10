@@ -964,6 +964,41 @@ fn over_window_buffers_and_passes_through() {
     assert_eq!(values(&rest, 3), vec![70]); // key 1 running sum 10+20+40
 }
 
+#[test]
+fn over_state_partitions_and_restores_by_flink_key_group() {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("rt", DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None), false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2])),
+            Arc::new(Int64Array::from(vec![10i64, 20])),
+            Arc::new(TimestampNanosecondArray::from(vec![0i64, 0])),
+        ],
+    )
+    .unwrap();
+    let mut before = OverWindowAggregator::new(vec![0], vec![0], 2, vec![1], vec![0], 0, 0, false);
+    before.push(batch).unwrap();
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(groups.len() >= 2, "test keys should cover distinct raw key groups");
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+    let mut restored = OverWindowAggregator::restore_partitions(
+        vec![0], vec![0], 2, vec![1], vec![0], 0, 0, false, &snapshots,
+    );
+    let out = restored.flush(0).unwrap();
+    let mut rows: Vec<(i64, i64)> = values(&out, 0)
+        .into_iter()
+        .zip(values(&out, 3))
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+}
+
 // Bounded ROWS frame (1 PRECEDING): each row's SUM covers only itself and the row before it
 // within its partition, recomputed over the frame slice — and the trailing edge drops older rows.
 #[test]
@@ -1163,6 +1198,40 @@ fn window_state_reserves_and_releases_memory() {
     assert_eq!(pool.reserved(), 0);
 }
 
+#[test]
+fn window_state_partitions_and_restores_by_flink_key_group() {
+    let mut before = TumblingAggregator::new(1000, 1000, false, vec![0], vec![0]);
+    before.update(&keyed_window_batch(0, vec![1, 2])).unwrap();
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(!groups.is_empty());
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+
+    let mut restored =
+        TumblingAggregator::restore_partitions(1000, 1000, false, vec![0], vec![0], &snapshots);
+    let out = restored.flush(1000);
+    let keys = out
+        .column_by_name("key0")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    let sums = out
+        .column_by_name("result0")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(keys, vec![1, 2]);
+    assert_eq!(sums, vec![1, 1]);
+}
+
 // Exceeding the budget is a clear, attributable failure — not a container OOM.
 #[test]
 fn window_state_over_budget_fails_clearly() {
@@ -1182,6 +1251,23 @@ fn session_state_over_budget_fails_clearly() {
         .unwrap();
     let err = agg.update(&keyed_window_batch(0, (0..100).collect())).unwrap_err();
     assert!(err.to_string().contains("managed-memory budget"), "{err}");
+}
+
+#[test]
+fn session_state_partitions_and_restores_by_flink_key_group() {
+    let mut before = SessionAggregator::new(1000, vec![0], vec![0]);
+    before.update(&keyed_window_batch(0, vec![1, 2])).unwrap();
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(groups.len() >= 2, "test keys should cover distinct raw key groups");
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+
+    let mut restored = SessionAggregator::restore_partitions(1000, vec![0], vec![0], &snapshots);
+    let out = restored.flush(1000);
+    assert_eq!(values(&out, 0), vec![1, 2]);
+    assert_eq!(values(&out, 3), vec![1, 1]);
 }
 
 #[test]
@@ -1785,6 +1871,43 @@ fn updating_join_state_survives_snapshot_restore() {
     assert_eq!(values(&out, 3), vec![100]);
 }
 
+#[test]
+fn updating_join_state_partitions_and_restores_by_flink_key_group() {
+    let schema = kv_schema();
+    let mut before = UpdatingJoiner::new(
+        vec![0],
+        vec![0],
+        JoinKind::Inner,
+        schema.clone(),
+        schema.clone(),
+        None,
+    );
+    before
+        .push(&changelog_join_batch(vec![1, 2], vec![10, 20], vec![0, 0]), true)
+        .unwrap();
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(groups.len() >= 2, "test keys should cover distinct raw key groups");
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+    let mut restored = UpdatingJoiner::restore_partitions(
+        vec![0],
+        vec![0],
+        JoinKind::Inner,
+        schema.clone(),
+        schema,
+        None,
+        &snapshots,
+    );
+    let out = restored
+        .push(&changelog_join_batch(vec![1, 2], vec![100, 200], vec![0, 0]), false)
+        .unwrap();
+    assert_eq!(values(&out, 0), vec![1, 2]);
+    assert_eq!(values(&out, 1), vec![10, 20]);
+    assert_eq!(values(&out, 3), vec![100, 200]);
+}
+
 // LEFT OUTER: a left row with no right match emits a null-padded row immediately; when a right
 // row later matches, the null-pad is retracted (-D) and the matched pair emitted (+I).
 #[test]
@@ -1939,6 +2062,35 @@ fn temporal_join_buffers_and_survives_snapshot_restore() {
     let out = restored.advance(i64::MAX);
     assert_eq!(out.num_rows(), 1);
     assert_eq!(values(&out, 4), vec![20]); // resolves to the version valid at 500 (rate 20 @300)
+}
+
+#[test]
+fn temporal_join_state_partitions_and_restores_by_flink_key_group() {
+    let mut before = temporal_joiner(JoinKind::Inner);
+    let _ = before.push_right(&temporal_build_batch(vec![1, 2], vec![10, 20], vec![100, 100], vec![0, 0]));
+    let _ = before.push_left(&temporal_probe_batch(vec![1, 2], vec![1, 2], vec![500, 500]));
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(groups.len() >= 2, "test keys should cover distinct raw key groups");
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+
+    let mut restored = TemporalJoiner::restore_partitions(
+        vec![0],
+        vec![0],
+        2,
+        2,
+        JoinKind::Inner,
+        temporal_schema(),
+        temporal_schema(),
+        None,
+        &snapshots,
+    );
+    let out = restored.advance(i64::MAX);
+    let mut rates = values(&out, 4);
+    rates.sort_unstable();
+    assert_eq!(rates, vec![10, 20]);
 }
 
 // A residual non-equi predicate gates the version match: the version valid at the probe time is
@@ -2183,6 +2335,40 @@ fn window_join_restores_buffered_rows() {
     assert_eq!(left_right_values(&out), vec![(10, 100)]);
 }
 
+#[test]
+fn window_join_state_partitions_and_restores_by_flink_key_group() {
+    let mut before = window_joiner(JoinKind::Inner);
+    let _ = before.push_left(window_batch(vec![1, 2], vec![10, 20], vec![0, 0], vec![1000, 1000]));
+    let _ = before.push_right(window_batch(
+        vec![1, 2],
+        vec![100, 200],
+        vec![0, 0],
+        vec![1000, 1000],
+    ));
+    let groups = before.snapshot_key_groups(128, &[-1]);
+    assert!(groups.len() >= 2, "test keys should cover distinct raw key groups");
+    let snapshots: Vec<Vec<u8>> = groups
+        .iter()
+        .map(|&group| before.snapshot_key_group(group, 128, &[-1]))
+        .collect();
+
+    let mut restored = WindowJoiner::restore_partitions(
+        vec![0],
+        vec![0],
+        2,
+        3,
+        2,
+        3,
+        None,
+        JoinKind::Inner,
+        window_schema(),
+        window_schema(),
+        &snapshots,
+    );
+    let out = restored.flush(1000).unwrap();
+    assert_eq!(left_right_values(&out), vec![(10, 100), (20, 200)]);
+}
+
 // LEFT window join: a left row whose window has no matching right row is null-padded when the
 // window closes (append-only — emitted once at flush).
 #[test]
@@ -2296,6 +2482,47 @@ fn interval_left_join_match_flags_survive_restore() {
     );
     // Evicting the (matched) left row post-restore must emit no null-pad.
     assert_eq!(restored.advance(10000).num_rows(), 0);
+}
+
+// Raw keyed state can merge key groups that originated on different subtasks. Outer-join row ids
+// are subtask-local, so two such groups may each contain id zero; their matched flags must remain
+// attached to the row from their original key group after restore.
+#[test]
+fn interval_outer_raw_state_remaps_subtask_local_row_ids() {
+    let mut matched = left_interval_joiner(-1000, 1000);
+    let _ = matched.push_left(join_batch(vec![1], vec![10], vec![5000]), None);
+    let _ = matched.push_right(join_batch(vec![1], vec![100], vec![5000]), None);
+    let matched_groups = matched.snapshot_key_groups(128, &[-1]);
+    assert_eq!(matched_groups.len(), 1);
+
+    let mut unmatched = left_interval_joiner(-1000, 1000);
+    let _ = unmatched.push_left(join_batch(vec![2], vec![20], vec![5000]), None);
+    let unmatched_groups = unmatched.snapshot_key_groups(128, &[-1]);
+    assert_eq!(unmatched_groups.len(), 1);
+    assert_ne!(matched_groups, unmatched_groups, "test keys need distinct raw key groups");
+
+    let snapshots = vec![
+        matched.snapshot_key_group(matched_groups[0], 128, &[-1]),
+        unmatched.snapshot_key_group(unmatched_groups[0], 128, &[-1]),
+    ];
+    let mut restored = IntervalJoiner::restore_partitions(
+        vec![0],
+        vec![0],
+        2,
+        2,
+        -1000,
+        1000,
+        None,
+        JoinKind::LeftOuter,
+        interval_schema(),
+        interval_schema(),
+        &snapshots,
+    );
+    let out = restored.advance(10_000);
+    assert_eq!(out.num_rows(), 1);
+    assert_eq!(values(&out, 0), vec![2]);
+    assert_eq!(values(&out, 1), vec![20]);
+    assert!(out.column(4).is_null(0));
 }
 
 // ROW_NUMBER over (PARTITION BY key0 ORDER BY rt): a per-key counter in rowtime order, surviving
@@ -2791,7 +3018,7 @@ fn partitions_a_batch_by_key() {
     .unwrap();
 
     for num_partitions in [1usize, 3, 8] {
-        let parts = partition_batch(&batch, &[0], num_partitions);
+        let parts = partition_batch(&batch, &[0], &[-1], num_partitions, num_partitions);
         let mut rows = 0usize;
         let mut key_to_partition: HashMap<i64, usize> = HashMap::default();
         for (partition, sub) in &parts {

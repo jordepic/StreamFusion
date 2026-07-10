@@ -4,8 +4,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeIntervalJoinOperator;
 import java.util.Arrays;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.TwoInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -32,6 +35,7 @@ public class NativeIntervalJoinExecNode extends ExecNodeBase<ArrowBatch>
   private final RowType rightType;
   private final RexExpression predicate;
   private final boolean proctime;
+  private final int[] keyTimestampPrecisions;
 
   public NativeIntervalJoinExecNode(
       ReadableConfig tableConfig,
@@ -49,7 +53,8 @@ public class NativeIntervalJoinExecNode extends ExecNodeBase<ArrowBatch>
       RowType leftType,
       RowType rightType,
       RexExpression predicate,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-interval-join_1"),
@@ -68,6 +73,7 @@ public class NativeIntervalJoinExecNode extends ExecNodeBase<ArrowBatch>
     this.rightType = rightType;
     this.predicate = predicate;
     this.proctime = proctime;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -78,7 +84,11 @@ public class NativeIntervalJoinExecNode extends ExecNodeBase<ArrowBatch>
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
     Transformation<ArrowBatch> right =
         (Transformation<ArrowBatch>) getInputEdges().get(1).translateToPlan(planner);
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(left.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, left.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    TwoInputTransformation<ArrowBatch, ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createTwoInputTransformation(
             left,
             right,
@@ -94,10 +104,15 @@ public class NativeIntervalJoinExecNode extends ExecNodeBase<ArrowBatch>
                 leftType,
                 rightType,
                 RexExpression.toEncodedPredicate(predicate),
-                proctime),
+                proctime,
+                keyTimestampPrecisions,
+                maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             left.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelectors(stateKeySelector, stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

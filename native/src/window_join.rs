@@ -216,10 +216,113 @@ impl WindowJoiner {
         };
         let left = serialize(&self.left_schema, &self.left_buffered);
         let right = serialize(&self.right_schema, &self.right_buffered);
+        Self::snapshot_parts(left, right)
+    }
+
+    fn snapshot_parts(left: Vec<u8>, right: Vec<u8>) -> Vec<u8> {
         let mut out = (left.len() as u32).to_le_bytes().to_vec();
         out.extend_from_slice(&left);
         out.extend_from_slice(&right);
         out
+    }
+
+    pub(crate) fn snapshot_key_groups(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<i32> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn snapshot_key_group(
+        &self,
+        key_group: i32,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> Vec<u8> {
+        self.raw_snapshot_partitions(max_parallelism, timestamp_precisions)
+            .remove(&key_group)
+            .expect("requested non-empty window-join raw key group")
+    }
+
+    fn raw_snapshot_partitions(
+        &self,
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<u8>> {
+        let snapshot = self.snapshot();
+        let left_len = u32::from_le_bytes(snapshot[0..4].try_into().expect("snapshot len")) as usize;
+        let left = Self::side_raw_partitions(
+            &snapshot[4..4 + left_len],
+            &self.left_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let right = Self::side_raw_partitions(
+            &snapshot[4 + left_len..],
+            &self.right_keys,
+            max_parallelism,
+            timestamp_precisions,
+        );
+        let mut groups: Vec<i32> = left.keys().chain(right.keys()).copied().collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let mut snapshots = BTreeMap::new();
+        for key_group in groups {
+            snapshots.insert(
+                key_group,
+                Self::snapshot_parts(
+                    left.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                    right.get(&key_group).map(Self::merge_snapshot_batches).unwrap_or_default(),
+                ),
+            );
+        }
+        snapshots
+    }
+
+    fn side_raw_partitions(
+        bytes: &[u8],
+        key_columns: &[usize],
+        max_parallelism: usize,
+        timestamp_precisions: &[i32],
+    ) -> BTreeMap<i32, Vec<RecordBatch>> {
+        let mut partitions = BTreeMap::new();
+        for batch in read_ipc_if_present(bytes) {
+            let mut rows_by_group: BTreeMap<i32, Vec<u32>> = BTreeMap::new();
+            for row in 0..batch.num_rows() {
+                let key_group = flink_key_group(
+                    binary_row_hash(&batch, key_columns, row, timestamp_precisions),
+                    max_parallelism,
+                ) as i32;
+                rows_by_group.entry(key_group).or_default().push(row as u32);
+            }
+            for (key_group, rows) in rows_by_group {
+                let indices = UInt32Array::from(rows);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|column| take(column, &indices, None).expect("partition window-join snapshot"))
+                    .collect();
+                partitions
+                    .entry(key_group)
+                    .or_insert_with(Vec::new)
+                    .push(
+                        RecordBatch::try_new(batch.schema(), columns)
+                            .expect("partitioned window-join snapshot"),
+                    );
+            }
+        }
+        partitions
+    }
+
+    fn merge_snapshot_batches(batches: &Vec<RecordBatch>) -> Vec<u8> {
+        write_ipc(
+            &concat_batches(&batches[0].schema(), batches.iter())
+                .expect("merge window-join raw partitions"),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -248,6 +351,9 @@ impl WindowJoiner {
             left_data_schema,
             right_data_schema,
         );
+        if bytes.is_empty() {
+            return joiner;
+        }
         let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
         for batch in read_ipc_if_present(&bytes[4..4 + left_len]) {
             joiner.left_schema = Some(batch.schema());
@@ -258,6 +364,52 @@ impl WindowJoiner {
             joiner.right_buffered.push(batch);
         }
         joiner
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_partitions(
+        left_keys: Vec<usize>,
+        right_keys: Vec<usize>,
+        left_wstart: usize,
+        left_wend: usize,
+        right_wstart: usize,
+        right_wend: usize,
+        predicate: Option<JoinPredicate>,
+        join_type: JoinKind,
+        left_data_schema: SchemaRef,
+        right_data_schema: SchemaRef,
+        snapshots: &[Vec<u8>],
+    ) -> Self {
+        let mut left_batches = Vec::new();
+        let mut right_batches = Vec::new();
+        for bytes in snapshots {
+            if bytes.len() < 4 {
+                continue;
+            }
+            let left_len = u32::from_le_bytes(bytes[0..4].try_into().expect("snapshot len")) as usize;
+            assert!(4 + left_len <= bytes.len(), "truncated window-join raw key-group snapshot");
+            left_batches.extend(read_ipc_if_present(&bytes[4..4 + left_len]));
+            right_batches.extend(read_ipc_if_present(&bytes[4 + left_len..]));
+        }
+        let left = (!left_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&left_batches))
+            .unwrap_or_default();
+        let right = (!right_batches.is_empty())
+            .then(|| Self::merge_snapshot_batches(&right_batches))
+            .unwrap_or_default();
+        WindowJoiner::restore(
+            left_keys,
+            right_keys,
+            left_wstart,
+            left_wend,
+            right_wstart,
+            right_wend,
+            predicate,
+            join_type,
+            left_data_schema,
+            right_data_schema,
+            &Self::snapshot_parts(left, right),
+        )
     }
 }
 
@@ -395,6 +547,52 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotWindo
         .into_raw()
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_windowJoinerSnapshotKeyGroups<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jni::sys::jintArray {
+    let joiner = unsafe { &*(handle as *const WindowJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let groups = joiner.snapshot_key_groups(max_parallelism as usize, &precisions);
+    let output = env
+        .new_int_array(groups.len() as i32)
+        .expect("allocate window-join raw key groups");
+    env.set_int_array_region(&output, 0, &groups)
+        .expect("write window-join raw key groups");
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_snapshotWindowJoinerKeyGroup<
+    'local,
+>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key_group: jint,
+    max_parallelism: jint,
+    timestamp_precisions: JIntArray<'local>,
+) -> jbyteArray {
+    let joiner = unsafe { &*(handle as *const WindowJoiner) };
+    let precisions: Vec<i32> = read_int_array(&env, &timestamp_precisions)
+        .into_iter()
+        .map(|precision| precision as i32)
+        .collect();
+    let snapshot = joiner.snapshot_key_group(key_group, max_parallelism as usize, &precisions);
+    env.byte_array_from_slice(&snapshot)
+        .expect("allocate window-join raw key-group snapshot")
+        .into_raw()
+}
+
 /// Rebuilds a window joiner from a snapshot taken by a prior run and returns a fresh handle.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
@@ -445,6 +643,75 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindow
         left_schema,
         right_schema,
         &bytes,
+    )
+    .with_memory_budget(memory_budget_bytes);
+    boxed_or_throw(&mut env, joiner)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_restoreWindowJoinerPartitions<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    left_keys: JIntArray<'local>,
+    right_keys: JIntArray<'local>,
+    left_window_start: jint,
+    left_window_end: jint,
+    right_window_start: jint,
+    right_window_end: jint,
+    join_type: jint,
+    left_schema_address: jlong,
+    right_schema_address: jlong,
+    pred_kinds: JIntArray<'local>,
+    pred_payload: JIntArray<'local>,
+    pred_child_counts: JIntArray<'local>,
+    pred_longs: JLongArray<'local>,
+    pred_doubles: JDoubleArray<'local>,
+    pred_strings: JObjectArray<'local>,
+    snapshots: JObjectArray<'local>,
+    memory_budget_bytes: jlong,
+) -> jlong {
+    let left = read_columns(&env, &left_keys);
+    let right = read_columns(&env, &right_keys);
+    let left_schema = import_schema(left_schema_address);
+    let right_schema = import_schema(right_schema_address);
+    let predicate = read_join_predicate(
+        &mut env,
+        &pred_kinds,
+        &pred_payload,
+        &pred_child_counts,
+        &pred_longs,
+        &pred_doubles,
+        &pred_strings,
+    );
+    let count = env
+        .get_array_length(&snapshots)
+        .expect("read window-join raw partition count");
+    let mut restored = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let bytes = JByteArray::from(
+            env.get_object_array_element(&snapshots, index)
+                .expect("read window-join raw partition"),
+        );
+        restored.push(
+            env.convert_byte_array(&bytes)
+                .expect("read window-join raw partition bytes"),
+        );
+    }
+    let joiner = WindowJoiner::restore_partitions(
+        left,
+        right,
+        left_window_start as usize,
+        left_window_end as usize,
+        right_window_start as usize,
+        right_window_end as usize,
+        predicate,
+        JoinKind::from_code(join_type),
+        left_schema,
+        right_schema,
+        &restored,
     )
     .with_memory_budget(memory_budget_bytes);
     boxed_or_throw(&mut env, joiner)

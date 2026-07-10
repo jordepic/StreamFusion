@@ -5,8 +5,11 @@ import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeColumnarUpdatingJoinOperator;
 import io.github.jordepic.streamfusion.operator.NativeUdf;
 import java.util.Arrays;
+import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.dag.Transformation;
+import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.streaming.api.transformations.TwoInputTransformation;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecNodeConfig;
@@ -35,6 +38,7 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
   private final RowType leftType;
   private final RowType rightType;
   private final RexExpression predicate;
+  private final int[] keyTimestampPrecisions;
 
   public NativeColumnarUpdatingJoinExecNode(
       ReadableConfig tableConfig,
@@ -47,7 +51,8 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
       int joinType,
       RowType leftType,
       RowType rightType,
-      RexExpression predicate) {
+      RexExpression predicate,
+      int[] keyTimestampPrecisions) {
     super(
         ExecNodeContext.newNodeId(),
         new ExecNodeContext("stream-exec-native-updating-join_1"),
@@ -61,6 +66,7 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
     this.leftType = leftType;
     this.rightType = rightType;
     this.predicate = predicate;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
   }
 
   @Override
@@ -71,7 +77,11 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
         (Transformation<ArrowBatch>) getInputEdges().get(0).translateToPlan(planner);
     Transformation<ArrowBatch> right =
         (Transformation<ArrowBatch>) getInputEdges().get(1).translateToPlan(planner);
-    Transformation<ArrowBatch> transformation =
+    int maxParallelism = FlinkKeyGroupUtils.defaultMaxParallelism(left.getParallelism());
+    int[] stateKeys = FlinkKeyGroupUtils.stateKeysForSubtasks(maxParallelism, left.getParallelism());
+    KeySelector<ArrowBatch, Integer> stateKeySelector =
+        batch -> stateKeys[batch.destination() >= 0 ? batch.destination() : 0];
+    TwoInputTransformation<ArrowBatch, ArrowBatch, ArrowBatch> transformation =
         ExecNodeUtil.createTwoInputTransformation(
             left,
             right,
@@ -88,10 +98,15 @@ public class NativeColumnarUpdatingJoinExecNode extends ExecNodeBase<ArrowBatch>
                 predicate == null ? EMPTY_LONG : predicate.longs(),
                 predicate == null ? EMPTY_DOUBLE : predicate.doubles(),
                 predicate == null ? EMPTY_STRING : predicate.strings(),
-                predicate == null ? NativeUdf.Binding.EMPTY : predicate.udfBinding()),
+                predicate == null ? NativeUdf.Binding.EMPTY : predicate.udfBinding(),
+                keyTimestampPrecisions,
+                maxParallelism),
             ArrowBatchTypeInformation.INSTANCE,
             left.getParallelism(),
             false);
+    transformation.setMaxParallelism(maxParallelism);
+    transformation.setStateKeySelectors(stateKeySelector, stateKeySelector);
+    transformation.setStateKeyType(Types.INT);
     NativeManagedMemory.declareOperatorWeight(transformation);
     return transformation;
   }

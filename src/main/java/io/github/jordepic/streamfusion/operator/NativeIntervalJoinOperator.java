@@ -9,9 +9,6 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.operators.ProcessingTimeService.ProcessingTimeCallback;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -54,12 +51,14 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
   private final RowType rightType;
   private final EncodedPredicate predicate;
   private final boolean proctime;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
+  private transient long restoredProcessingTimeTimerDeadline;
   private transient long registeredTimer;
 
   public NativeIntervalJoinOperator(
@@ -73,7 +72,9 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
       RowType leftType,
       RowType rightType,
       EncodedPredicate predicate,
-      boolean proctime) {
+      boolean proctime,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.leftTime = leftTime;
@@ -85,22 +86,24 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
     this.rightType = rightType;
     this.predicate = predicate;
     this.proctime = proctime;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native interval join state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-interval-join-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    RawKeyedState.TimedRestore restored = RawKeyedState.restoreWithTimer(context);
+    java.util.List<byte[]> rawSnapshots = restored.snapshots();
+    restoredProcessingTimeTimerDeadline = restored.deadline();
     // Hand both sides' Arrow schemas to the joiner up front so an outer join can type the null-padding
     // for a side before that side's first batch arrives.
     BufferAllocator alloc = NativeAllocator.SHARED;
@@ -111,9 +114,29 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
       predicate.bind();
       memoryBudget = ManagedMemoryBudget.reserveFor(this);
-      handle =
-          snapshot == null
-              ? Native.createIntervalJoiner(
+      if (!rawSnapshots.isEmpty()) {
+        handle =
+            Native.restoreIntervalJoinerPartitions(
+                leftKeys,
+                rightKeys,
+                leftTime,
+                rightTime,
+                lowerMillis,
+                upperMillis,
+                joinType,
+                leftSchema.memoryAddress(),
+                rightSchema.memoryAddress(),
+                predicate.kinds,
+                predicate.payload,
+                predicate.childCounts,
+                predicate.boundLongs(),
+                predicate.doubles,
+                predicate.strings,
+                rawSnapshots.toArray(new byte[0][]),
+                memoryBudget.bytes());
+      } else {
+        handle =
+            Native.createIntervalJoiner(
                   leftKeys,
                   rightKeys,
                   leftTime,
@@ -129,25 +152,8 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
                   predicate.boundLongs(),
                   predicate.doubles,
                   predicate.strings,
-                  memoryBudget.bytes())
-              : Native.restoreIntervalJoiner(
-                  leftKeys,
-                  rightKeys,
-                  leftTime,
-                  rightTime,
-                  lowerMillis,
-                  upperMillis,
-                  joinType,
-                  leftSchema.memoryAddress(),
-                  rightSchema.memoryAddress(),
-                  predicate.kinds,
-                  predicate.payload,
-                  predicate.childCounts,
-                  predicate.boundLongs(),
-                  predicate.doubles,
-                  predicate.strings,
-                  snapshot,
                   memoryBudget.bytes());
+      }
     }
   }
 
@@ -157,6 +163,16 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
     allocator = NativeAllocator.SHARED;
     dictionaries = NativeAllocator.DICTIONARIES;
     registeredTimer = Long.MIN_VALUE;
+    if (proctime && restoredProcessingTimeTimerDeadline != Long.MIN_VALUE) {
+      long deadline = restoredProcessingTimeTimerDeadline;
+      long now = getProcessingTimeService().getCurrentProcessingTime();
+      if (deadline <= now) {
+        advance(now);
+      } else {
+        getProcessingTimeService().registerTimer(deadline, this);
+        registeredTimer = deadline;
+      }
+    }
   }
 
   @Override
@@ -273,8 +289,15 @@ public class NativeIntervalJoinOperator extends AbstractStreamOperator<ArrowBatc
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotIntervalJoiner(handle));
+    int[] keyGroups =
+        Native.intervalJoinerSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshotWithTimer(
+        context,
+        keyGroups,
+        proctime ? registeredTimer : Long.MIN_VALUE,
+        keyGroup ->
+            Native.snapshotIntervalJoinerKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

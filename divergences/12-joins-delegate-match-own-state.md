@@ -45,11 +45,10 @@ choice — a keyed multiset probed incrementally rather than a batch hash join �
 the reason recorded in [divergences/14](14-standalone-streaming-engines.md): a
 changelog join needs per-row retract bookkeeping a batch join can't give.
 
-## Shared divergences that still apply
-- The per-input keyed shuffle uses our own hash, not Flink's key-group hash
-  ([10](10-columnar-exchange-own-hash.md)) — safe because the join re-groups by key
-  itself; for two inputs, a matching left/right key co-locates on both sides because
-  the hash is over key *values*, not column positions.
+## Shared parity guarantees that apply
+- The per-input keyed shuffle follows Flink's BinaryRow/key-group assignment
+  ([10](10-columnar-exchange-own-hash.md)); matching left/right key values therefore co-locate on
+  the same channel and key group.
 - Late-data dropping on out-of-order streams follows the watermark caveat
   ([09](09-per-batch-watermark-assignment.md)); the parity tests use a lagging
   watermark so nothing is dropped and the result is the full match set.

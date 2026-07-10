@@ -109,7 +109,8 @@ public class StreamPhysicalNativeIntervalJoin extends BiRel
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getLeft().getRowType()),
         FlinkTypeFactory$.MODULE$.toLogicalRowType(getRight().getRowType()),
         predicate,
-        proctime);
+        proctime,
+        FlinkKeyGroupUtils.timestampPrecisions(getLeft().getRowType(), leftKeys));
   }
 
   /** Digest-only reuse barrier — see {@link NativeRelDigests}. */
@@ -120,4 +121,3 @@ public class StreamPhysicalNativeIntervalJoin extends BiRel
     return NativeRelDigests.withBarrier(super.explainTerms(pw), reuseBarrier);
   }
 }
-

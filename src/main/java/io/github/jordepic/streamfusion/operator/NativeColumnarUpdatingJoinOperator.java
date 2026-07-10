@@ -8,9 +8,6 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.flink.api.common.state.ListState;
-import org.apache.flink.api.common.state.ListStateDescriptor;
-import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.runtime.state.StateInitializationContext;
 import org.apache.flink.runtime.state.StateSnapshotContext;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
@@ -49,11 +46,12 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
   private final double[] predDoubles;
   private final String[] predStrings;
   private final NativeUdf.Binding predBinding;
+  private final int[] keyTimestampPrecisions;
+  private final int maxParallelism;
 
   private transient BufferAllocator allocator;
   private transient CDataDictionaryProvider dictionaries;
   private transient long handle;
-  private transient ListState<byte[]> handleState;
   private transient ManagedMemoryBudget memoryBudget;
 
   public NativeColumnarUpdatingJoinOperator(
@@ -68,7 +66,9 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
       long[] predLongs,
       double[] predDoubles,
       String[] predStrings,
-      NativeUdf.Binding predBinding) {
+      NativeUdf.Binding predBinding,
+      int[] keyTimestampPrecisions,
+      int maxParallelism) {
     this.leftKeys = leftKeys;
     this.rightKeys = rightKeys;
     this.joinType = joinType;
@@ -81,22 +81,22 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
     this.predDoubles = predDoubles;
     this.predStrings = predStrings;
     this.predBinding = predBinding;
+    this.keyTimestampPrecisions = keyTimestampPrecisions;
+    if (maxParallelism <= 0) {
+      throw new IllegalArgumentException("native updating join state requires a positive max parallelism");
+    }
+    this.maxParallelism = maxParallelism;
+  }
+
+  @Override
+  protected boolean isUsingCustomRawKeyedState() {
+    return true;
   }
 
   @Override
   public void initializeState(StateInitializationContext context) throws Exception {
     super.initializeState(context);
-    handleState =
-        context
-            .getOperatorStateStore()
-            .getListState(
-                new ListStateDescriptor<>(
-                    "streamfusion-updating-join-handle",
-                    PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO));
-    byte[] snapshot = null;
-    for (byte[] entry : handleState.get()) {
-      snapshot = entry;
-    }
+    java.util.List<byte[]> rawSnapshots = RawKeyedState.restore(context);
     // The joiner needs both sides' Arrow schemas up front (to type outer null-padding); export them
     // through the C Data Interface for the create/restore call to import.
     BufferAllocator alloc = NativeAllocator.SHARED;
@@ -107,9 +107,25 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
       Data.exportSchema(alloc, ArrowConversion.toArrowSchema(rightType), dicts, rightSchema);
       long[] boundPredLongs = predBinding.bind(predLongs);
       memoryBudget = ManagedMemoryBudget.reserveFor(this);
-      handle =
-          snapshot == null
-              ? Native.createUpdatingJoiner(
+      if (!rawSnapshots.isEmpty()) {
+        handle =
+            Native.restoreUpdatingJoinerPartitions(
+                leftKeys,
+                rightKeys,
+                joinType,
+                leftSchema.memoryAddress(),
+                rightSchema.memoryAddress(),
+                predKinds,
+                predPayload,
+                predChildCounts,
+                boundPredLongs,
+                predDoubles,
+                predStrings,
+                rawSnapshots.toArray(new byte[0][]),
+                memoryBudget.bytes());
+      } else {
+        handle =
+            Native.createUpdatingJoiner(
                   leftKeys,
                   rightKeys,
                   joinType,
@@ -121,21 +137,8 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
                   boundPredLongs,
                   predDoubles,
                   predStrings,
-                  memoryBudget.bytes())
-              : Native.restoreUpdatingJoiner(
-                  leftKeys,
-                  rightKeys,
-                  joinType,
-                  leftSchema.memoryAddress(),
-                  rightSchema.memoryAddress(),
-                  predKinds,
-                  predPayload,
-                  predChildCounts,
-                  boundPredLongs,
-                  predDoubles,
-                  predStrings,
-                  snapshot,
                   memoryBudget.bytes());
+      }
     }
   }
 
@@ -198,8 +201,14 @@ public class NativeColumnarUpdatingJoinOperator extends AbstractStreamOperator<A
   @Override
   public void snapshotState(StateSnapshotContext context) throws Exception {
     super.snapshotState(context);
-    handleState.clear();
-    handleState.add(Native.snapshotUpdatingJoiner(handle));
+    int[] keyGroups =
+        Native.updatingJoinerSnapshotKeyGroups(handle, maxParallelism, keyTimestampPrecisions);
+    RawKeyedState.snapshot(
+        context,
+        keyGroups,
+        keyGroup ->
+            Native.snapshotUpdatingJoinerKeyGroup(
+                handle, keyGroup, maxParallelism, keyTimestampPrecisions));
   }
 
   @Override

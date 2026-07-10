@@ -7,7 +7,10 @@ import java.util.List;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.util.KeyedTwoInputStreamOperatorTestHarness;
 import org.apache.flink.streaming.util.TwoInputStreamOperatorTestHarness;
 import org.apache.flink.table.data.GenericRowData;
 import org.apache.flink.table.data.RowData;
@@ -20,6 +23,8 @@ import org.junit.jupiter.api.Test;
 /** The columnar updating INNER join: Arrow batches in on both sides, a changelog of batches out. */
 class NativeColumnarUpdatingJoinOperatorTest {
 
+  private static final int MAX_PARALLELISM = 128;
+
   private static final RowType LEFT =
       RowType.of(new LogicalType[] {new BigIntType(), new BigIntType()}, new String[] {"k", "lv"});
   private static final RowType RIGHT =
@@ -31,6 +36,10 @@ class NativeColumnarUpdatingJoinOperatorTest {
           new String[] {"k", "lv", "k0", "rv"});
 
   private static NativeColumnarUpdatingJoinOperator operator() {
+    return rawKeyedOperator();
+  }
+
+  private static NativeColumnarUpdatingJoinOperator rawKeyedOperator() {
     return new NativeColumnarUpdatingJoinOperator(
         new int[] {0},
         new int[] {0},
@@ -43,14 +52,16 @@ class NativeColumnarUpdatingJoinOperatorTest {
         new long[0],
         new double[0],
         new String[0],
-        NativeUdf.Binding.EMPTY);
+        NativeUdf.Binding.EMPTY,
+        new int[] {-1},
+        MAX_PARALLELISM);
   }
 
   @Test
   void emitsMatchesAndRetractsFromArrowBatches() throws Exception {
     try (BufferAllocator allocator = new RootAllocator();
-        TwoInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch, ArrowBatch> harness =
-            new TwoInputStreamOperatorTestHarness<>(operator())) {
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> harness =
+            rawKeyedHarness()) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
       // Right (k=1, rv=100), then left (k=1, lv=10) → +I match; then retract the left → -D match.
@@ -61,6 +72,42 @@ class NativeColumnarUpdatingJoinOperatorTest {
           List.of(change(RowKind.INSERT, 1, 10, 1, 100), change(RowKind.DELETE, 1, 10, 1, 100)),
           collect(harness));
     }
+  }
+
+  @Test
+  void rawKeyedStateRestoresAllNativeJoinKeyGroups() throws Exception {
+    OperatorSubtaskState snapshot;
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> before =
+            rawKeyedHarness()) {
+      before.setup(new ArrowBatchSerializer());
+      before.open();
+      before.processElement2(
+          new StreamRecord<>(
+              batch(allocator, RIGHT, row(RowKind.INSERT, 1, 100), row(RowKind.INSERT, 2, 200))));
+      snapshot = before.snapshot(1L, 1L);
+      collect(before);
+    }
+
+    try (BufferAllocator allocator = new RootAllocator();
+        KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch> restored =
+            rawKeyedHarness()) {
+      restored.setup(new ArrowBatchSerializer());
+      restored.initializeState(snapshot);
+      restored.open();
+      restored.processElement1(
+          new StreamRecord<>(
+              batch(allocator, LEFT, row(RowKind.INSERT, 1, 10), row(RowKind.INSERT, 2, 20))));
+      assertEquals(
+          List.of(change(RowKind.INSERT, 1, 10, 1, 100), change(RowKind.INSERT, 2, 20, 2, 200)),
+          collect(restored));
+    }
+  }
+
+  private static KeyedTwoInputStreamOperatorTestHarness<Integer, ArrowBatch, ArrowBatch, ArrowBatch>
+      rawKeyedHarness() throws Exception {
+    return new KeyedTwoInputStreamOperatorTestHarness<>(
+        rawKeyedOperator(), batch -> 0, batch -> 0, Types.INT, MAX_PARALLELISM, 1, 0);
   }
 
   private static RowData row(RowKind kind, long key, long value) {
