@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion;
 
-import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.kafka.NativeKafka;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -190,7 +190,7 @@ class KafkaIngestBenchmark {
    */
   private static long nativeConsumeOnly(String brokers) {
     String[][] config = nativeConfig(brokers, "bench-raw-native-" + System.nanoTime());
-    return Native.benchmarkConsumeOnly(config[0], config[1], TOPIC, MESSAGES);
+    return NativeKafka.benchmarkConsumeOnly(config[0], config[1], TOPIC, MESSAGES);
   }
 
   /**
@@ -374,9 +374,9 @@ class KafkaIngestBenchmark {
           dictionaries,
           (arrayAddress, schemaAddress) ->
               serial
-                  ? Native.benchmarkNativeConsumeSerial(
+                  ? NativeKafka.benchmarkNativeConsumeSerial(
                       keys, values, TOPIC, 0, arrayAddress, schemaAddress, "", 0, MESSAGES)
-                  : Native.benchmarkNativeConsume(
+                  : NativeKafka.benchmarkNativeConsume(
                       keys, values, TOPIC, 0, arrayAddress, schemaAddress, "", 0, MESSAGES));
     }
   }
@@ -488,10 +488,10 @@ class KafkaIngestBenchmark {
           dictionaries,
           (arrayAddress, schemaAddress) ->
               serial
-                  ? Native.benchmarkNativeConsumeSerial(
+                  ? NativeKafka.benchmarkNativeConsumeSerial(
                       keys, values, AVRO_TOPIC, 1, arrayAddress, schemaAddress, avroSchema, SCHEMA_ID,
                       MESSAGES)
-                  : Native.benchmarkNativeConsume(
+                  : NativeKafka.benchmarkNativeConsume(
                       keys, values, AVRO_TOPIC, 1, arrayAddress, schemaAddress, avroSchema, SCHEMA_ID,
                       MESSAGES));
     }

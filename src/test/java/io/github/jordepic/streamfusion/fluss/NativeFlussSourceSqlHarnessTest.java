@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
 import java.time.LocalDateTime;
@@ -474,7 +473,11 @@ class NativeFlussSourceSqlHarnessTest {
   }
 
   static boolean nativeFlussFeatureBuilt() {
-    return Native.flussFeatureBuilt();
+    try {
+      return NativeFluss.featureBuilt();
+    } catch (LinkageError ignored) {
+      return false;
+    }
   }
 
   @Test

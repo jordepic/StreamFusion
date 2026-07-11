@@ -14,18 +14,10 @@ import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalR
 import org.apache.flink.table.planner.utils.ShortcutUtils;
 
 /**
- * Leaf physical node standing in for a Kafka source the native rdkafka reader runs. It emits the
- * topic's records as Arrow batches decoded in Rust, so the data starts columnar and never becomes rows
- * — the read side of a fully columnar pipeline. Carries the raw table options (the exec node builds the
- * FLIP-27 source from them) and two row types: the {@code writerRowType} the decoder parses against (the
- * full table schema) and the {@code outputRowType} it emits. They differ when a downstream Calc's
- * projection is pushed into the source ({@link #withProjection}): the decode then builds only the read
- * columns/sub-fields straight from the bytes (a narrowed JSON output schema, a bare-Avro reader schema,
- * or a pruned protobuf descriptor), the source's columnar analog of the entry-transpose pruning.
- *
- * <p>A watermarked table additionally carries its parsed {@link ScanWatermarkSpec}: the table's
- * {@code WATERMARK} clause was pushed into the scan this node replaces, so the source itself must
- * regenerate the per-split watermarks (the exec node wires the strategy).
+ * Leaf physical node standing in for a native rdkafka reader. It emits Arrow batches of raw Kafka value
+ * bodies; the next transformation invokes the selected format provider, so data enters the rest of the
+ * plan columnar without becoming rows. Carries the raw table options and two row types: the full writer
+ * schema and the projected output schema the format decoder parses into.
  */
 public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
     implements StreamPhysicalRel, ColumnarOutput {
@@ -64,9 +56,8 @@ public class StreamPhysicalNativeKafkaSource extends AbstractRelNode
   }
 
   /**
-   * Whether a projection to {@code projected} can be pushed into the decode: a watermarked source must
-   * keep decoding its rowtime column (the watermark reads it), so a projection dropping that column is
-   * not pushed (the Calc still runs natively over the unpruned output).
+   * Whether a projection can be pushed into the downstream format decoder. Watermarked Kafka sources
+   * are not admitted, so every accepted source can project normally.
    */
   boolean projectionKeepsRowtime(RelDataType projected) {
     return watermark == null || projected.getFieldNames().contains(watermark.rowtimeFieldName);

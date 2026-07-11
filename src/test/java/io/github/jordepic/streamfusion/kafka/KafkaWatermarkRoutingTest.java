@@ -15,8 +15,8 @@ import org.junit.jupiter.api.Test;
  * Plan-time routing for watermarked Kafka tables (no broker needed — the source is built at execution,
  * not planning). Flink pushes a table's {@code WATERMARK} clause into the Kafka scan (the connector
  * supports watermark push-down), so no assigner node survives in the plan: whatever replaces the scan
- * must regenerate the watermarks. The native source does (per-split, via the FLIP-27 machinery); the
- * decode path doesn't, so a watermarked table must stay on Flink rather than silently losing its
+ * must regenerate the watermarks. The modular Kafka body source and format decoder deliberately do not
+ * share rowtime state, so a watermarked table must stay on Flink rather than silently losing its
  * watermarks — the bug this pins down was masked by bounded runs, where the final MAX_WATERMARK closes
  * all windows regardless.
  */
@@ -32,18 +32,16 @@ class KafkaWatermarkRoutingTest {
   }
 
   @Test
-  void watermarkedTableRoutesToNativeSourceWhichRegeneratesWatermarks() {
-    // Default configuration: the native source is on by default and takes the watermarked table.
+  void watermarkedTableFallsBackAtTheConnectorFormatBoundary() {
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(watermarkedTable(""));
     String plan = NativePlanner.explain(tEnv, QUERY);
     assertTrue(
-        plan.contains("NativeKafkaSource(topic="),
-        "watermarked JSON table should route to the native source:\n" + plan);
+        !plan.contains("NativeKafkaSource(topic=") && !plan.contains("NativeKafkaDecode"),
+        "watermarked JSON table must stay on Flink:\n" + plan);
     assertTrue(
-        plan.contains("watermark=[ts - 4000ms]"),
-        "the source should carry the parsed watermark spec:\n" + plan);
-    assertTrue(plan.contains("No operators fell back"), "expected a fully native plan:\n" + plan);
+        plan.contains("connector/format boundary does not regenerate source watermarks"),
+        "expected the precise watermark fallback reason:\n" + plan);
   }
 
   @Test
@@ -59,12 +57,12 @@ class KafkaWatermarkRoutingTest {
         !plan.contains("NativeKafkaDecode") && !plan.contains("NativeKafkaSource"),
         "a watermarked table must not route without watermark regeneration:\n" + plan);
     assertTrue(
-        plan.contains("only the native Kafka source regenerates per-partition source watermarks"),
+        plan.contains("connector/format boundary does not regenerate source watermarks"),
         "expected the precise watermark fallback reason:\n" + plan);
   }
 
   @Test
-  void computedEpochMillisRowtimeRoutesToNativeSource() {
+  void computedEpochMillisRowtimeAlsoFallsBack() {
     // The common Kafka-table idiom (and the Nexmark harness's): a physical BIGINT of epoch millis
     // with `rowtime AS TO_TIMESTAMP_LTZ(dateTime, 3)`. The push-down leaves the scan emitting only
     // physical columns; the watermark reads the bigint verbatim (it already is the rowtime millis).
@@ -82,18 +80,13 @@ class KafkaWatermarkRoutingTest {
             "SELECT window_start, SUM(price) FROM TABLE(TUMBLE(TABLE events, DESCRIPTOR(rowtime),"
                 + " INTERVAL '1' MINUTE)) GROUP BY window_start");
     assertTrue(
-        plan.contains("NativeKafkaSource(topic="),
-        "computed-rowtime table should route to the native source:\n" + plan);
-    assertTrue(
-        plan.contains("watermark=[dateTime - 4000ms]"),
-        "the watermark should read the epoch-millis column:\n" + plan);
-    assertTrue(plan.contains("No operators fell back"), "expected a fully native plan:\n" + plan);
+        !plan.contains("NativeKafkaSource(topic=") && !plan.contains("NativeKafkaDecode"),
+        "computed-rowtime table must stay on Flink:\n" + plan);
   }
 
   @Test
   void onEventEmitStrategyIsDeclinedEvenWithNativeSourceOn() {
-    // The native source generates watermarks per batch, so the on-event strategy (a watermark after
-    // every row) is not reproducible; the table must stay on Flink.
+    // Every pushed watermark strategy stays on Flink until the Arrow-level source watermark contract exists.
     StreamTableEnvironment tEnv = env();
     tEnv.executeSql(watermarkedTable(", 'scan.watermark.emit.strategy' = 'on-event'"));
     String plan = NativePlanner.explain(tEnv, QUERY);

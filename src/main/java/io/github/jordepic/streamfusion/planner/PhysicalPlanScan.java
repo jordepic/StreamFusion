@@ -67,6 +67,18 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
   private static final boolean LOG_FALLBACK_REASONS =
       Boolean.getBoolean("streamfusion.logFallbackReasons");
 
+  // The Flink distribution intentionally does not ship every connector or format. Connector-specific
+  // rewrites live in optional StreamFusion extension JARs and must never be linked by the core image.
+  private static final String KAFKA_EXTENSION =
+      "io.github.jordepic.streamfusion.planner.KafkaTables";
+  private static final String KAFKA_OFFSETS_INITIALIZER =
+      "org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer";
+  private static final String FLUSS_EXTENSION =
+      "io.github.jordepic.streamfusion.planner.FlussTables";
+  private static final String FLUSS_TABLE_SOURCE = "org.apache.fluss.flink.source.FlinkTableSource";
+  private static final String PARQUET_EXTENSION =
+      "io.github.jordepic.streamfusion.planner.ParquetSourceMatcher";
+
   @Override
   public RelNode optimize(RelNode root, StreamOptimizeContext context) {
     record(root);
@@ -162,10 +174,15 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       changed |= rewritten != input;
     }
     RelNode current = changed ? node.copy(node.getTraitSet(), inputs) : node;
+    boolean kafkaExtensionAvailable =
+        extensionAvailable(KAFKA_EXTENSION, KAFKA_OFFSETS_INITIALIZER);
+    boolean flussExtensionAvailable = extensionAvailable(FLUSS_EXTENSION, FLUSS_TABLE_SOURCE);
+    boolean parquetExtensionAvailable = extensionAvailable(PARQUET_EXTENSION);
 
     // A sink is terminal, so the changelog guard below (which protects operator substitution within a
     // stream) does not apply; it is eligible as long as its input is insert-only.
-    if (current instanceof StreamPhysicalSink
+    if (parquetExtensionAvailable
+        && current instanceof StreamPhysicalSink
         && ParquetSinkMatcher.appliesTo((StreamPhysicalSink) current)) {
       StreamPhysicalSink sink = (StreamPhysicalSink) current;
       if (!ChangelogPlanUtils.isInsertOnly((StreamPhysicalRel) current.getInputs().get(0))) {
@@ -417,13 +434,15 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     // above, it is therefore exempt from the insert-only guard below. (Append decode formats — JSON via
     // the native source, CSV/raw via the insert-only decode branch below — are insert-only and handled
     // after the guard.)
-    if (KafkaTables.isCdcDecode(current) && NativeConfig.operatorEnabled("kafkaDecode")) {
-      return kafkaDecode(current);
-    }
-    if (KafkaTables.watermarkBlocksCdcDecode(current)) {
-      fallbackReasons.add(
-          "kafka CDC decode: the table's WATERMARK is pushed into the scan, and the decode path does"
-              + " not regenerate source watermarks — the table stays on Flink");
+    if (kafkaExtensionAvailable) {
+      if (KafkaTables.isCdcDecode(current) && NativeConfig.operatorEnabled("kafkaDecode")) {
+        return kafkaDecode(current);
+      }
+      if (KafkaTables.watermarkBlocksCdcDecode(current)) {
+        fallbackReasons.add(
+            "kafka CDC decode: the table's WATERMARK is pushed into the scan, and the connector/format"
+                + " boundary does not regenerate source watermarks — the table stays on Flink");
+      }
     }
 
     // A Calc transforms each row independently — a per-row projection plus an optional deterministic
@@ -466,7 +485,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       // then converts only the read fields of each wide source row to Arrow. (A columnar producer is
       // left alone — its batch is already built; nested access stays by name, so it needs no remap.)
       CalcProjectionPruner.Pruned pruned = CalcProjectionPruner.compute(calc);
-      if (pruned != null && input instanceof StreamPhysicalNativeKafkaDecode) {
+      if (kafkaExtensionAvailable
+          && pruned != null
+          && input instanceof StreamPhysicalNativeKafkaDecode) {
         // The native decode is itself a (Rust) row→Arrow transpose: pushing the projection into it
         // makes the decoder build only the read columns/fields straight from the bytes, so a wide
         // record's unread fields are never decoded. Only for decoders that honor a pruned schema.
@@ -480,7 +501,9 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
               encoded.remapInputs(pruned.remap));
         }
       }
-      if (pruned != null && input instanceof StreamPhysicalNativeKafkaSource) {
+      if (kafkaExtensionAvailable
+          && pruned != null
+          && input instanceof StreamPhysicalNativeKafkaSource) {
         // The fully-native rdkafka source decodes in Rust too: push the projection in so the in-Rust
         // decode builds only the read columns/fields straight from the bytes (the columnar-source analog
         // of pruning the entry transpose). Only for formats whose decoder honors a pruned schema.
@@ -660,7 +683,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       return current;
     }
 
-    if (ParquetSourceMatcher.matches(current)) {
+    if (parquetExtensionAvailable && ParquetSourceMatcher.matches(current)) {
       if (!NativeConfig.operatorEnabled("parquetSource")) {
         return noteDisabled(current, "parquetSource");
       }
@@ -674,7 +697,7 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
           ParquetSourceMatcher.utcTimestamp(scan));
     }
 
-    if (current instanceof StreamPhysicalTableSourceScan) {
+    if (flussExtensionAvailable && current instanceof StreamPhysicalTableSourceScan) {
       StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
       Map<String, String> options = FilesystemTables.options(scan);
       boolean flussConnectorOption = options != null && "fluss".equals(options.get("connector"));
@@ -690,38 +713,34 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
       }
     }
 
-    // The fully-native rdkafka source (Rust owns the consume) is the default Kafka path for the
-    // formats it decodes (JSON/bare-Avro/protobuf): the consume fast path made it decisively faster
-    // than the decode path (divergences/19), and it is the only path that regenerates a pushed-down
-    // watermark. Tables it can't run (other formats, untranslatable config, an opt-out native build)
-    // fall through to the decode path below.
-    if (KafkaTables.isNativeKafka(current) && NativeConfig.operatorEnabled("kafkaSource")) {
-      StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
-      substitutions++;
-      return new StreamPhysicalNativeKafkaSource(
-          scan.getCluster(),
-          scan.getTraitSet(),
-          scan.getRowType(),
-          FilesystemTables.options(scan),
-          ScanWatermarkSpec.of(scan));
-    }
+    // The native rdkafka source owns consumption only: it emits binary Arrow body batches, then the
+    // installed format provider decodes them in the next columnar transformation. A pushed Kafka
+    // watermark stays on Flink because neither DSO owns decoded rowtime state.
+    if (kafkaExtensionAvailable) {
+      if (KafkaTables.isNativeKafka(current) && NativeConfig.operatorEnabled("kafkaSource")) {
+        StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) current;
+        substitutions++;
+        return new StreamPhysicalNativeKafkaSource(
+            scan.getCluster(),
+            scan.getTraitSet(),
+            scan.getRowType(),
+            FilesystemTables.options(scan),
+            ScanWatermarkSpec.of(scan));
+      }
 
-    // Shallow native-decode path (the default for every value format): Flink's KafkaSource consumes raw
-    // bytes, a native operator decodes them to Arrow, skipping Flink's RowData decode. JSON/CSV/raw/Avro
-    // and protobuf all route here; CDC changelog formats are handled by the branch above the guard.
-    if (KafkaTables.isNativeKafkaDecode(current) && NativeConfig.operatorEnabled("kafkaDecode")) {
-      return kafkaDecode(current);
-    }
-    // A watermarked Kafka table is only accelerable by the native source (the WATERMARK clause is
-    // pushed into the scan, so whatever replaces the scan must regenerate per-partition watermarks —
-    // the decode operator can't). Reaching here means the native-source branch above didn't take it:
-    // record the precise reason instead of silently leaving the query on Flink.
-    if (KafkaTables.watermarkBlocksAppendDecode(current)) {
-      fallbackReasons.add(
-          "kafka decode: the table's WATERMARK is pushed into the scan, and only the native Kafka"
-              + " source regenerates per-partition source watermarks — enable operator kafkaSource"
-              + " (with a kafka-feature native build) for a supported format/watermark shape, or the"
-              + " table stays on Flink");
+      // Shallow native-decode path (the default for every value format): Flink's KafkaSource consumes raw
+      // bytes, a native operator decodes them to Arrow, skipping Flink's RowData decode. JSON/CSV/raw/Avro
+      // and protobuf all route here; CDC changelog formats are handled by the branch above the guard.
+      if (KafkaTables.isNativeKafkaDecode(current) && NativeConfig.operatorEnabled("kafkaDecode")) {
+        return kafkaDecode(current);
+      }
+      // A pushed Kafka WATERMARK cannot cross the connector/format boundary yet. Record the precise
+      // reason rather than silently replacing the scan and stalling event-time timers.
+      if (KafkaTables.watermarkBlocksAppendDecode(current)) {
+        fallbackReasons.add(
+            "kafka decode: the table's WATERMARK is pushed into the scan, and the connector/format"
+                + " boundary does not regenerate source watermarks — the table stays on Flink");
+      }
     }
 
     // Substitute a watermark assigner only when its (already-rewritten) input is columnar — i.e. it
@@ -1366,6 +1385,27 @@ public final class PhysicalPlanScan implements FlinkOptimizeProgram<StreamOptimi
     substitutions++;
     return new StreamPhysicalNativeKafkaDecode(
         scan.getCluster(), scan.getTraitSet(), scan.getRowType(), FilesystemTables.options(scan));
+  }
+
+  private static boolean extensionAvailable(String extensionClass, String... prerequisites) {
+    if (!classAvailable(extensionClass)) {
+      return false;
+    }
+    for (String prerequisite : prerequisites) {
+      if (!classAvailable(prerequisite)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static boolean classAvailable(String className) {
+    try {
+      Class.forName(className, false, PhysicalPlanScan.class.getClassLoader());
+      return true;
+    } catch (ClassNotFoundException | LinkageError e) {
+      return false;
+    }
   }
 
   private static boolean isFlussTableSource(StreamPhysicalTableSourceScan scan) {

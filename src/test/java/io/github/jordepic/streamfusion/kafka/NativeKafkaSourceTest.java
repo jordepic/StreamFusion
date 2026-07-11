@@ -3,10 +3,8 @@ package io.github.jordepic.streamfusion.kafka;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.github.jordepic.streamfusion.Native;
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import org.apache.arrow.c.ArrowArray;
@@ -15,10 +13,7 @@ import org.apache.arrow.c.CDataDictionaryProvider;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.FieldVector;
-import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -30,12 +25,13 @@ import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.utility.DockerImageName;
 
 /**
- * End-to-end test of the production native Kafka split reader (assign+seek+poll → decoded Arrow with
+ * End-to-end test of the production native Kafka split reader (assign+seek+poll → Arrow body batches with
  * checkpointable offsets), exercising the part the FLIP-27 source delegates to native code. It proves
  * the offset semantics that make the source correct: a reader assigned to a partition at an explicit
  * offset reads forward from exactly there, reports the next offset to resume from, and a *second*
  * reader opened at that reported offset continues with no gap and no overlap — i.e. exactly-once across
- * a simulated checkpoint/restore. Decode is the same native JSON path the shallow operator uses.
+ * a simulated checkpoint/restore. The test deliberately observes raw bodies: JSON decoding belongs to
+ * the separate format artifact.
  *
  * <p>Opt-in via {@code SF_BENCHMARK=true} (Docker for Testcontainers Kafka, and a native build with
  * the {@code kafka} cargo feature, which statically links a bundled librdkafka). The default build
@@ -61,19 +57,19 @@ class NativeKafkaSourceTest {
 
         // Session 1: open at offset 0, read only the first ~half, then "checkpoint" the next offset.
         long[] checkpoint = {0};
-        long handle = open(allocator, dictionaries, brokers, checkpoint[0]);
+        long handle = open(brokers, checkpoint[0]);
         try {
           while (ids.size() < MESSAGES / 2) {
             poll(handle, allocator, dictionaries, ids, checkpoint);
           }
         } finally {
-          Native.closeKafkaConsumer(handle);
+          NativeKafka.closeKafkaConsumer(handle);
         }
         long resumeFrom = checkpoint[0];
         assertEquals(ids.size(), resumeFrom, "next offset must equal rows read on a single partition");
 
         // Session 2: a fresh reader restored at the checkpointed offset finishes the topic.
-        handle = open(allocator, dictionaries, brokers, resumeFrom);
+        handle = open(brokers, resumeFrom);
         try {
           long emptyPolls = 0;
           while (ids.size() < MESSAGES && emptyPolls < 3) {
@@ -82,7 +78,7 @@ class NativeKafkaSourceTest {
             emptyPolls = ids.size() == before ? emptyPolls + 1 : 0;
           }
         } finally {
-          Native.closeKafkaConsumer(handle);
+          NativeKafka.closeKafkaConsumer(handle);
         }
       }
 
@@ -95,11 +91,7 @@ class NativeKafkaSourceTest {
   }
 
   /** Opens a native reader and assigns it {@code (TOPIC, 0)} starting at {@code startOffset}. */
-  private static long open(
-      BufferAllocator allocator,
-      CDataDictionaryProvider dictionaries,
-      String brokers,
-      long startOffset) {
+  private static long open(String brokers, long startOffset) {
     Properties props = new Properties();
     props.setProperty("bootstrap.servers", brokers);
     props.setProperty("group.id", "native-source-it");
@@ -111,36 +103,9 @@ class NativeKafkaSourceTest {
     for (int i = 0; i < keys.length; i++) {
       values[i] = config.config().get(keys[i]);
     }
-    try (BigIntVector id = new BigIntVector("id", allocator);
-        VarCharVector name = new VarCharVector("name", allocator);
-        Float8Vector score = new Float8Vector("score", allocator)) {
-      for (FieldVector vector : List.of(id, name, score)) {
-        vector.allocateNew();
-        vector.setValueCount(0);
-      }
-      try (VectorSchemaRoot template = new VectorSchemaRoot(List.of(id, name, score));
-          ArrowArray array = ArrowArray.allocateNew(allocator);
-          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-        template.setRowCount(0);
-        Data.exportVectorSchemaRoot(allocator, template, dictionaries, array, schema);
-        long handle =
-            Native.openKafkaConsumer(
-                keys,
-                values,
-                0,
-                array.memoryAddress(),
-                schema.memoryAddress(),
-                "",
-                "",
-                0,
-                null,
-                "",
-                -1,
-                "");
-        Native.assignKafkaSplits(handle, new String[] {TOPIC}, new long[] {0}, new long[] {startOffset});
-        return handle;
-      }
-    }
+    long handle = NativeKafka.openKafkaConsumer(keys, values);
+    NativeKafka.assignKafkaSplits(handle, new String[] {TOPIC}, new long[] {0}, new long[] {startOffset});
+    return handle;
   }
 
   /** Polls a cycle, draining each per-partition batch's ids and the (single) split's next offset. */
@@ -150,22 +115,25 @@ class NativeKafkaSourceTest {
       CDataDictionaryProvider dictionaries,
       Set<Long> ids,
       long[] checkpoint) {
-    int pending = Native.pollKafkaBatch(handle, 1024, 2000);
+    int pending = NativeKafka.pollKafkaBatch(handle, 1024, 2000);
     for (int p = 0; p < pending; p++) {
       try (ArrowArray outArray = ArrowArray.allocateNew(allocator);
           ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
-        long[] meta = new long[3];
+        long[] meta = new long[2];
         String[] topic = new String[1];
         int rows =
-            Native.drainKafkaSplit(
+            NativeKafka.drainKafkaSplit(
                 handle, meta, topic, outArray.memoryAddress(), outSchema.memoryAddress());
         checkpoint[0] = meta[1]; // single partition in this test
         try (VectorSchemaRoot out =
             Data.importVectorSchemaRoot(allocator, outArray, outSchema, dictionaries)) {
           assertEquals(rows, out.getRowCount());
-          BigIntVector id = (BigIntVector) out.getVector("id");
+          VarBinaryVector body = (VarBinaryVector) out.getVector("body");
           for (int i = 0; i < out.getRowCount(); i++) {
-            ids.add(id.get(i));
+            String message = new String(body.get(i), StandardCharsets.UTF_8);
+            int start = message.indexOf(":") + 1;
+            int end = message.indexOf(",", start);
+            ids.add(Long.parseLong(message.substring(start, end).trim()));
           }
         }
       }

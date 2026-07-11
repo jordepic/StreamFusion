@@ -2,11 +2,13 @@ package io.github.jordepic.streamfusion.operator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.json.JsonFormatProvider;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -19,8 +21,8 @@ import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.VarCharType;
 import org.junit.jupiter.api.Test;
 
-/** The columnar JSON decode operator: a batch of raw JSON bodies in, a typed Arrow batch out. */
-class NativeColumnarJsonDecodeOperatorTest {
+/** The generic body-batch decoder delegates its JSON decode to the installed format provider. */
+class NativeBodyBatchJsonDecodeOperatorTest {
 
   private static final RowType OUTPUT =
       RowType.of(
@@ -29,16 +31,15 @@ class NativeColumnarJsonDecodeOperatorTest {
 
   @Test
   void decodesJsonBodiesToTypedBatch() throws Exception {
-    try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+    try (OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
             new OneInputStreamOperatorTestHarness<>(
-                new NativeColumnarJsonDecodeOperator(OUTPUT), new ArrowBatchSerializer())) {
+                decoder(), new ArrowBatchSerializer())) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
       harness.processElement(
           new StreamRecord<>(
               bodies(
-                  allocator,
+                  NativeAllocator.SHARED,
                   "{\"id\": 1, \"name\": \"a\", \"score\": 1.5}",
                   "{\"id\": 2, \"name\": \"b\", \"score\": 2.5}",
                   "{\"id\": 3, \"name\": \"c\", \"score\": 3.5}")));
@@ -54,15 +55,21 @@ class NativeColumnarJsonDecodeOperatorTest {
   /** Fields absent from a document decode as SQL NULLs, matching the host JSON format. */
   @Test
   void missingFieldsBecomeNull() throws Exception {
-    try (BufferAllocator allocator = new RootAllocator();
-        OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
+    try (OneInputStreamOperatorTestHarness<ArrowBatch, ArrowBatch> harness =
             new OneInputStreamOperatorTestHarness<>(
-                new NativeColumnarJsonDecodeOperator(OUTPUT), new ArrowBatchSerializer())) {
+                decoder(), new ArrowBatchSerializer())) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
-      harness.processElement(new StreamRecord<>(bodies(allocator, "{\"id\": 7}")));
+      harness.processElement(new StreamRecord<>(bodies(NativeAllocator.SHARED, "{\"id\": 7}")));
       assertEquals(List.of(List.of(7L)), collect(harness));
     }
+  }
+
+  private static NativeBodyBatchDecodeOperator decoder() {
+    return new NativeBodyBatchDecodeOperator(
+        OUTPUT,
+        new JsonFormatProvider()
+            .createDecoder(new NativeFormatContext(OUTPUT, OUTPUT, Map.of("format", "json"), false)));
   }
 
   /** Builds an Arrow batch of one binary column ("body") holding the raw JSON documents. */

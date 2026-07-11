@@ -2,6 +2,9 @@ package io.github.jordepic.streamfusion.kafka;
 
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
+import io.github.jordepic.streamfusion.operator.NativeBytesDecodeOperator;
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.json.JsonFormatProvider;
 import java.io.ByteArrayOutputStream;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
@@ -191,8 +194,8 @@ class NativeKafkaSourceBenchmark {
 
   /**
    * Shallow path: Flink/Java polls Kafka for raw value bytes, which are batched and handed to the same
-   * native JSON decoder the native source uses — so this and the native source end at identical Arrow
-   * batches and differ only in who polls Kafka (Java + a heap->native byte copy vs librdkafka in Rust).
+   * native JSON format provider the native source uses — so this and the native source end at identical
+   * Arrow batches and differ only in who polls Kafka (Java + a heap->native byte copy vs librdkafka in Rust).
    */
   private long runShallowJsonSource(String brokers) throws Exception {
     KafkaSource<byte[]> source =
@@ -211,7 +214,13 @@ class NativeKafkaSourceBenchmark {
         .transform(
             "shallow-decode",
             ArrowBatchTypeInformation.INSTANCE,
-            new io.github.jordepic.streamfusion.operator.NativeJsonBytesDecodeOperator(ROW_TYPE, BATCH))
+            new NativeBytesDecodeOperator(
+                ROW_TYPE,
+                BATCH,
+                new JsonFormatProvider()
+                    .createDecoder(
+                        new NativeFormatContext(ROW_TYPE, ROW_TYPE, Map.of("format", "json"), false)),
+                0))
         .map(new CountingMap<>(batch -> (long) batch.rowCount()), ArrowBatchTypeInformation.INSTANCE)
         .sinkTo(new DiscardingSink<>());
     env.execute();
@@ -283,17 +292,8 @@ class NativeKafkaSourceBenchmark {
             sharedConsumerProperties(brokers),
             keys,
             values,
-            format,
-            ROW_TYPE,
-            avroSchema,
-            "",
-            schemaId,
-            null,
-            "",
             BATCH,
-            pollTimeout,
-            -1,
-            "");
+            pollTimeout);
     StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
     env.setParallelism(1);
     COUNTER.set(0);

@@ -34,9 +34,9 @@ Native coverage is broad — most of the streaming SQL surface:
 - **Connectors:** a Parquet file source (native Arrow scan, local paths) and a Parquet sink that
   writes to any filesystem Flink supports (`s3:`/`gs:`/`abfs:`/`hdfs:`/…, `PARTITIONED BY` and
   partition commit included — native encoding drained into Flink's own recoverable streams); Kafka
-  source decode for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC — JSON/Avro/protobuf via a
-  fully native rdkafka source (the default path; it also regenerates the table's watermark
-  per partition, exactly as Flink's source does).
+  source ingest for JSON/CSV/raw/Avro/protobuf and Debezium/OGG CDC — native rdkafka produces Arrow
+  value-body batches and the independently installed format artifact decodes them. Watermarked Kafka
+  tables remain on Flink for now.
 - **UDFs:** a Flink `ScalarFunction` the expression engine can't implement itself is invoked over
   Arrow columns by a native→JVM upcall (Comet's `JvmScalarUdfExpr` pattern), one JNI crossing per
   batch, so the pipeline stays native *through* the UDF and the result is byte-identical.
@@ -48,7 +48,7 @@ for what does and doesn't run natively. The short version of what stays on Flink
 functions and `MATCH_RECOGNIZE`, PyFlink UDFs, the three-phase distinct aggregate, remote
 (`hdfs:`/`s3:`) file paths, a handful of expression/type edges where native execution would
 diverge from the JVM (opt-in behind `allowIncompatible`), and connector options we can't yet
-reproduce bit-identically (registry-framed Avro, Maxwell/Canal CDC, some protobuf field types).
+reproduce bit-identically (Maxwell/Canal CDC, some protobuf field types).
 
 **Determinism.** Results are byte-identical to stock Flink for everything admitted. The one caveat
 is late-data dropping on out-of-order event-time streams, where Flink is itself non-deterministic
@@ -86,19 +86,18 @@ engines (standard tuned-prod setting).
 StreamFusion runs **every runnable Nexmark query** (q0–q5, q7–q23) natively end-to-end with no
 fallback and no flags; only q6 stays out, because Flink SQL itself can't run it
 ([analysis](.claude/wontdos/39-nexmark-q6-exclusion.md)). Native vs. stock Flink, 500K events, on the
-recommended `mimalloc` native build (the Kafka feature is a default), from a rowwise `RowData` source, a local Parquet file
+recommended `mimalloc` native build (with the Kafka extension installed for Kafka sources), from a rowwise `RowData` source, a local Parquet file
 (Snappy-compressed — Flink's writer default), a Fluss log table (ZSTD-compressed — Fluss's default; the opt-in `fluss` cargo
 feature), and each Kafka value format, ordered by query number. Both engines decode the same compressed bytes on those rungs. Both engines run Flink's **default configuration**
 (mini-batch off) apart from the object reuse noted above; the mini-batch-tuned comparison is a
 separate table in [docs/benchmarks.md](docs/benchmarks.md):
 
-Each Kafka cell is the fully native rdkafka source — Rust owns the consume *and* the decode. Since
-the consume fast path ([divergences/19](divergences/19-kafka-consume-fast-path.md)) it beats the
-other source rungs (JVM transpose, Rust decode over a JVM poll) on every single query, so the best
-rung is always the same rung. Several queries run a byte-parity default with a faster opt-in path that can
-diverge from Flink at an edge; where the two differ enough to matter (**q21**) both are shown as
-separate rows, and where the opt-in measures within noise (**‡ q1**, **§ q10/q14/q15/q16/q17**) it stays
-one row with a footnote.
+The Kafka cells below are a historical baseline from the pre-format-artifact source path. The current
+deployment decouples Kafka consumption and message formats, so these numbers are retained for context
+only and must be refreshed before being used as a release-performance claim. Several queries run a
+byte-parity default with a faster opt-in path that can diverge from Flink at an edge; where the two
+differ enough to matter (**q21**) both are shown as separate rows, and where the opt-in measures within
+noise (**‡ q1**, **§ q10/q14/q15/q16/q17**) it stays one row with a footnote.
 
 | Query | Shape | From RowData | From Parquet file | From Fluss | From JSON on Kafka | From Avro on Kafka | From Protobuf on Kafka |
 |---|---|---|---|---|---|---|---|
@@ -171,23 +170,75 @@ changelog row *count* varies with join-input interleaving even between two stock
 and q21 (zero output rows over this generator's channels/URLs). All of them stay measured on
 the bounded rungs, which run to end-of-input and need no row target.
 
-**From a Kafka source, owning the consume in Rust compounds the operator verdict**: with the native
-rdkafka source every query on every format clears **1.65×**, all but a handful clear **2×**, and the
-peak is q11's **3.9–5.6×**. Queries whose operators trail on the bare generator (the updating joins,
-q21's parity upcall) are pulled well past 1× by the consume+decode saving — even the changelog-bound
-q9/q19, which no earlier rung could lift, land at **1.85–2.35×**. And **under production tuning the
-margins widen**: with `table.exec.mini-batch.*` enabled on both engines (5M events, the full suite),
-native beats the tuned Flink baseline on 20 of 23 — q23 3.01×, q11 3.01×, q4 2.85×, q19 2.36×,
-q9 2.15×, q18 2.02× — because the native Top-N emits the net per-batch diff under mini-batch plans
-while stateless perimeter costs amortize away. The full per-rung ladder,
-method, tuned table, and end-to-end tables are in **[docs/benchmarks.md](docs/benchmarks.md)**.
+The Kafka values are preserved as the historical fused-source baseline. The modular Kafka-plus-format
+deployment needs a fresh release benchmark before making a current throughput claim. The full method,
+per-rung ladder, tuned table, and end-to-end tables are in **[docs/benchmarks.md](docs/benchmarks.md)**.
 
 _Apple M1 Max; numbers are comparable only within a machine._
 
 ## Running and configuration
 
-Install acceleration by hooking the planner once (`NativePlanner.install(env)`), then run Flink SQL
-as normal. Two things to set in a real deployment:
+### Install
+
+#### Kubernetes or Docker
+
+Build the universal release artifacts, then build and publish a job-neutral Flink base image:
+
+```sh
+bin/build-release.sh
+bin/build-flink-image.sh --tag registry.example/streamfusion-flink:dev --push
+```
+
+Use that image as `spec.image` in a Flink Kubernetes Operator `FlinkDeployment`, or as
+`kubernetes.container.image.ref` for Flink's native Kubernetes deployment. It works for either
+Session or Application mode:
+
+- **Session:** run the JobManager, TaskManagers, and the SQL/client process from the StreamFusion
+  image; submit job JARs through your normal REST, SQL Gateway, or `FlinkSessionJob` path.
+- **Application:** derive a job image from the StreamFusion base image, place the job JAR in
+  `/opt/flink/usrlib`, and use that image in the Application deployment. Remote job-artifact
+  delivery remains supported too.
+
+The pushed tag is a Linux x86_64/ARM64 manifest. The runtime picks the matching native library
+inside each pod automatically. StreamFusion itself is in Flink's `lib` directory; do not add it to
+the job JAR.
+
+The base image is connector- and format-neutral. Derive a small image and install Flink's connector
+and format JARs, the matching StreamFusion connector JAR, and only the StreamFusion format JARs your
+jobs use into `/opt/flink/lib`; use that same image for the JobManager, TaskManagers, and submission
+client. For example, JSON on Kafka needs four JARs:
+
+```Dockerfile
+FROM registry.example/streamfusion-flink:dev
+COPY flink-connector-kafka-5.0.0-2.2.jar /opt/flink/lib/
+COPY flink-json-2.2.1.jar /opt/flink/lib/
+COPY streamfusion-kafka/target/streamfusion-kafka-1.0-SNAPSHOT.jar /opt/flink/lib/
+COPY streamfusion-json/target/streamfusion-json-1.0-SNAPSHOT.jar /opt/flink/lib/
+```
+
+Replace `streamfusion-json` with `streamfusion-csv`, `streamfusion-raw`, `streamfusion-avro`, or
+`streamfusion-protobuf` and add Flink's like-named format JAR. `avro-confluent` uses the standalone
+`streamfusion-avro-confluent-registry` JAR with Flink's `flink-avro-confluent-registry`. Use
+`fluss-flink-2.2` with `streamfusion-fluss`, or `flink-parquet` with `streamfusion-parquet`, the
+same way. The core image does not require any of them.
+
+#### Bare metal
+
+For a local Flink distribution instead:
+
+```sh
+bin/build-release.sh
+sh bin/install-flink.sh "$FLINK_HOME"
+```
+
+Restart Flink after installation, then submit ordinary streaming SQL jobs as usual—no application
+dependency or `NativePlanner.install(...)` call is needed.
+
+StreamFusion currently supports **Flink 2.2.x**. The release build enables `mimalloc` by default.
+
+For local development, `mvn compile` is Java-only and does not invoke Cargo. `mvn test` builds the
+host debug native library once before executing tests. Build the portable optimized artifacts only
+when needed for an image or release with `bin/build-release.sh`.
 
 **Deployment JVM flags** — run the TaskManager JVM with Arrow's safety checks off (as Comet/Spark
 do); profiling showed ~1/3 of the transpose CPU was per-accessor bounds/refcount checks:
@@ -209,9 +260,9 @@ do); profiling showed ~1/3 of the transpose CPU was per-accessor bounds/refcount
   state by it, failing with a `NativeMemoryLimitException` naming the remedy rather than an
   unattributed OOM ([divergences/16](divergences/16-upfront-managed-memory-reservation.md)).
 
-**Seeing why a query fell back** — substitution is silent by default. `NativePlanner`'s
-`fallbackReasons()` lists each node that stayed on Flink and why; `-Dstreamfusion.logFallbackReasons=true`
-logs each reason as it's decided.
+**Seeing why a query fell back** — substitution is silent by default.
+`-Dstreamfusion.logFallbackReasons=true` logs each node that stayed on Flink and why as the plan is
+decided. `EXPLAIN` shows native nodes such as `NativeCalc` for an accelerated plan.
 
 **Benchmarks** — the end-to-end suites (`ThroughputBenchmark`, `NexmarkBenchmark`,
 `NexmarkKafkaBenchmark`, `NexmarkMatrixBenchmark`) run under `SF_BENCHMARK=true mvn test -Pbench`;

@@ -1,0 +1,22 @@
+ARG FLINK_IMAGE=flink:2.2.1-scala_2.12-java17
+FROM ${FLINK_IMAGE}
+
+ARG FLINK_IMAGE
+
+LABEL org.opencontainers.image.title="StreamFusion Flink base image" \
+      org.opencontainers.image.description="Flink 2.2 with StreamFusion's native planner and runtime" \
+      io.github.jordepic.streamfusion.flink-base-image="${FLINK_IMAGE}"
+
+# The release library links mimalloc inside its own DSO. Reserve enough static TLS before the JVM
+# starts so glibc can load that library safely from Flink task threads without a process-wide
+# allocator override. The stock glibc default is 512 bytes; an optimized native DSO needs just
+# under 16 KiB. Reserve 128 KiB per thread so the core plus several optional extensions can be
+# loaded safely from Flink task threads without a process-wide allocator override.
+ENV GLIBC_TUNABLES=glibc.rtld.optional_static_tls=131072
+
+# These are Flink runtime extensions, not user-job dependencies. Keep the loader first so its
+# PlannerModule shadow is resolved before Flink's stock planner loader.
+COPY streamfusion-loader/target/streamfusion-loader-1.0-SNAPSHOT.jar \
+     /opt/flink/lib/00-streamfusion-loader.jar
+COPY streamfusion-core/target/streamfusion-core-1.0-SNAPSHOT.jar \
+     /opt/flink/lib/streamfusion-core.jar

@@ -1,7 +1,7 @@
 package io.github.jordepic.streamfusion.planner;
 
-import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.fluss.FlussConfigTranslator;
+import io.github.jordepic.streamfusion.fluss.NativeFluss;
 import io.github.jordepic.streamfusion.fluss.NativeFlussSource;
 import java.lang.reflect.Field;
 import java.util.Map;
@@ -27,8 +27,12 @@ final class FlussTables {
 
   /** Null when the native Fluss source can faithfully run this scan, else the fallback reason. */
   static String fallbackReason(StreamPhysicalTableSourceScan scan) {
-    if (!Native.flussFeatureBuilt()) {
-      return "the native library was built without the fluss feature";
+    try {
+      if (!NativeFluss.featureBuilt()) {
+        return "the native Fluss extension is unavailable";
+      }
+    } catch (LinkageError ignored) {
+      return "the native Fluss extension is unavailable";
     }
     return plan(scan).fallbackReason;
   }

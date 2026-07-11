@@ -24,6 +24,18 @@ environment. Never bake in personal absolute paths, hostnames, credentials, or i
 keep those out of the codebase and tests. When a choice trades convenience-for-me against works-for-everyone, choose
 works-for-everyone.
 
+### Deployment modules
+
+Follow Flink's Kafka connector and format-module structure for deployable integrations. `streamfusion-core` stays
+connector- and format-neutral; each optional connector or format is its own `streamfusion-*` artifact, with only its
+Java implementation, service-provider registration, and matching native library. A deployment installs Flink's
+normal connector/format JARs plus the corresponding StreamFusion JARs in Flink's `lib` directory. Do not make a
+connector pull every serialization format into its native DSO, and do not add a format implementation to the base
+image just because another connector happens to use it. Missing optional modules must be a normal planner fallback,
+never a linkage failure. When Flink already has distinct artifacts (for example JSON, CSV, Avro,
+Avro-Confluent-Registry, Protobuf, Parquet, and ORC), mirror that split unless StreamFusion has no native
+implementation yet.
+
 For each commit, I want small, targeted diffs with a clear purpose. Commit messages should be used as the sole source
 of truth for developer-facing documentation. They should be more architectural in nature - do not name specific
 classes that the average developer does not know off the top of their head, but instead concisely explain the "why"

@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
-import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.parquet.NativeParquet;
 import io.github.jordepic.streamfusion.arrow.ArrowConversion;
 import java.io.IOException;
 import java.lang.ref.Cleaner;
@@ -47,7 +47,7 @@ public final class NativeParquetBulkWriterFactory
       Data.exportSchema(
           allocator, ArrowConversion.toArrowSchema(rowType), NativeAllocator.DICTIONARIES, schema);
       encoder =
-          Native.createParquetEncoder(
+          NativeParquet.createParquetEncoder(
               schema.memoryAddress(), partitionColumns, configKeys, configValues);
     }
     return new NativeParquetBulkWriter(encoder, out);
@@ -82,7 +82,7 @@ public final class NativeParquetBulkWriterFactory
           ArrowSchema schema = ArrowSchema.allocateNew(batchAllocator)) {
         Data.exportVectorSchemaRoot(
             batchAllocator, batch, NativeAllocator.DICTIONARIES, array, schema);
-        Native.parquetEncoderWrite(encoder, array.memoryAddress(), schema.memoryAddress());
+        NativeParquet.parquetEncoderWrite(encoder, array.memoryAddress(), schema.memoryAddress());
       } finally {
         batch.close();
       }
@@ -96,15 +96,15 @@ public final class NativeParquetBulkWriterFactory
 
     @Override
     public void finish() throws IOException {
-      Native.parquetEncoderFinish(encoder);
+      NativeParquet.parquetEncoderFinish(encoder);
       drain();
       backstop.released = true;
-      Native.closeParquetEncoder(encoder);
+      NativeParquet.closeParquetEncoder(encoder);
     }
 
     private void drain() throws IOException {
       int filled;
-      while ((filled = Native.parquetEncoderDrain(encoder, chunk)) > 0) {
+      while ((filled = NativeParquet.parquetEncoderDrain(encoder, chunk)) > 0) {
         out.write(chunk, 0, filled);
       }
     }
@@ -122,7 +122,7 @@ public final class NativeParquetBulkWriterFactory
       @Override
       public void run() {
         if (!released) {
-          Native.closeParquetEncoder(encoder);
+          NativeParquet.closeParquetEncoder(encoder);
         }
       }
     }

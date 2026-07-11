@@ -1,6 +1,8 @@
 package io.github.jordepic.streamfusion.planner;
 
-import io.github.jordepic.streamfusion.kafka.ConfluentSchemaRegistry;
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.NativeFormatProvider;
+import io.github.jordepic.streamfusion.format.NativeFormatProviders;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.ArrowBatchTypeInformation;
 import io.github.jordepic.streamfusion.operator.NativeBytesDecodeOperator;
@@ -11,7 +13,6 @@ import org.apache.flink.api.common.typeinfo.PrimitiveArrayTypeInfo;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.connector.kafka.source.KafkaSource;
-import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -40,12 +41,6 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
   // trades against per-batch decode efficiency (the native Kafka source's poll timeout is the same
   // order, so both ingest paths cap tail latency alike).
   private static final long FLUSH_INTERVAL_MILLIS = 100;
-  // The MessageDecoder codes for the formats whose decode needs a derived Avro schema.
-  private static final int CONFLUENT_AVRO = 1;
-  private static final int BARE_AVRO = 4;
-  // The operator's protobuf sentinel (decoder built from the message-class-name's descriptor).
-  private static final int PROTOBUF = 5;
-
   private final RowType outputType;
   private final RowType writerType;
   private final Map<String, String> options;
@@ -79,39 +74,15 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
             WatermarkStrategy.noWatermarks(),
             SOURCE_TRANSFORMATION,
             PrimitiveArrayTypeInfo.BYTE_PRIMITIVE_ARRAY_TYPE_INFO);
-    int format = KafkaTables.decodeFormatCode(options);
-    // Bare Avro decodes against the writer schema (its datums are schema-less): derive it from the full
-    // writer RowType with the same converter Flink's own `avro` format uses, so the decode matches. The
-    // row is forced non-null first (a record, never a `["null", record]` union — which both Flink's own
-    // format and the Arrow reader treat as a record, the row itself never being null). When the output
-    // is a pruned subset of the writer, also pass a reader schema (the narrowed output) so Avro
-    // resolution materializes only the read fields.
-    boolean pruned = !writerType.equals(outputType);
-    String avroSchema =
-        format == BARE_AVRO
-            ? AvroSchemaConverter.convertToSchema(writerType.copy(false)).toString()
-            : "";
-    // Confluent Avro has no plan-time writer schema at all — each message names its writer by
-    // registry id, fetched and registered by the operator as ids first appear. It therefore always
-    // decodes through a reader schema (the possibly-pruned output), the same resolution Flink's
-    // deserializer applies against the table-derived schema.
-    String readerAvroSchema =
-        format == CONFLUENT_AVRO || (format == BARE_AVRO && pruned)
-            ? AvroSchemaConverter.convertToSchema(outputType.copy(false)).toString()
-            : "";
-    ConfluentSchemaRegistry registry =
-        format == CONFLUENT_AVRO ? ConfluentSchemaRegistry.fromOptions(options) : null;
-    // Flink's ignore-parse-errors: the native decode skips an undecodable message the way Flink's
-    // catch-everything-per-message does (CSV applies Flink's finer per-field granularity itself).
-    // Honored by JSON, the CDC envelopes, and CSV; the planner only routes other formats with it off.
-    boolean skipParseErrors = KafkaTables.ignoreParseErrors(options);
-    // Protobuf decodes against the descriptor of the generated message class the table names — extracted
-    // by reflection so this carries no compile-time protobuf-java dependency (the class and its runtime
-    // are supplied by the Flink distribution, like the protobuf format itself).
-    String messageClass = options.get("protobuf.message-class-name");
-    byte[] protoDescriptor =
-        format == PROTOBUF ? ProtobufDescriptors.descriptorSet(messageClass) : null;
-    String protoMessageName = format == PROTOBUF ? ProtobufDescriptors.messageName(messageClass) : null;
+    NativeFormatContext formatContext =
+        new NativeFormatContext(outputType, writerType, options, KafkaTables.ignoreParseErrors(options));
+    NativeFormatProvider formatProvider =
+        NativeFormatProviders.find(formatContext)
+            .orElseThrow(
+                () ->
+                    new IllegalStateException(
+                        "No installed StreamFusion provider for format "
+                            + NativeFormatProviders.formatIdentifier(options)));
     DataStream<ArrowBatch> decoded =
         bytes.transform(
             DECODE_TRANSFORMATION,
@@ -119,16 +90,8 @@ public class NativeKafkaDecodeExecNode extends ExecNodeBase<ArrowBatch>
             new NativeBytesDecodeOperator(
                 outputType,
                 BATCH_SIZE,
-                format,
-                avroSchema,
-                readerAvroSchema,
-                0,
-                protoDescriptor,
-                protoMessageName,
-                registry,
-                skipParseErrors,
-                FLUSH_INTERVAL_MILLIS,
-                KafkaTables.encodeFormatOptions(options)));
+                formatProvider.createDecoder(formatContext),
+                FLUSH_INTERVAL_MILLIS));
     return decoded.getTransformation();
   }
 }

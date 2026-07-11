@@ -56,26 +56,34 @@ mod aggregates;
 mod bridge;
 mod calc;
 mod changelog;
+#[cfg(any(feature = "json", feature = "csv", feature = "raw", feature = "avro", feature = "protobuf", test))]
 mod csv;
 mod dedup;
 mod exchange;
 mod expr;
+#[cfg(feature = "parquet")]
 mod files;
 mod flink_key;
 mod flatten;
+#[cfg(any(feature = "json", feature = "csv", feature = "raw", feature = "avro", feature = "protobuf", test))]
 mod flink_text;
+#[cfg(feature = "fluss")]
 mod fluss;
+#[cfg(any(feature = "json", feature = "csv", feature = "raw", feature = "avro", feature = "protobuf", test))]
 mod formats;
 mod group_agg;
 mod interval_join;
 mod ipc;
 mod join_common;
+#[cfg(any(feature = "json", feature = "csv", feature = "raw", feature = "avro", feature = "protobuf", test))]
 mod json;
+#[cfg(feature = "kafka")]
 mod kafka;
 mod keys;
 mod memory;
 mod normalizer;
 mod over_agg;
+mod rowtime;
 mod session_agg;
 mod sorter;
 mod temporal_join;
@@ -89,11 +97,24 @@ mod window_join;
 // operator's re-export is "unused" outside `cfg(test)`, hence the allow.
 #[allow(unused_imports)]
 pub(crate) use {
-    aggregates::*, bridge::*, calc::*, changelog::*, dedup::*, exchange::*, expr::*, files::*,
-    flink_key::*, flatten::*, fluss::*, formats::*, group_agg::*, interval_join::*, ipc::*, join_common::*, json::*,
-    kafka::*, keys::*, memory::*, normalizer::*, over_agg::*, session_agg::*, sorter::*,
+    aggregates::*, bridge::*, calc::*, changelog::*, dedup::*, exchange::*, expr::*,
+    flink_key::*, flatten::*, group_agg::*, interval_join::*, ipc::*, join_common::*,
+    keys::*, memory::*, normalizer::*, over_agg::*, rowtime::*, session_agg::*, sorter::*,
     temporal_join::*, topn::*, updating_join::*, window_agg::*, window_join::*,
 };
+
+#[cfg(any(feature = "json", feature = "csv", feature = "raw", feature = "avro", feature = "protobuf", test))]
+#[allow(unused_imports)]
+pub(crate) use {formats::*, json::*};
+
+#[cfg(feature = "parquet")]
+pub(crate) use files::*;
+
+#[cfg(feature = "fluss")]
+pub(crate) use fluss::*;
+
+#[cfg(feature = "kafka")]
+pub(crate) use kafka::*;
 
 /// Thin wrappers exposing the engine hot paths to the Criterion benchmark harness, without leaking
 /// the JNI internals or the Arrow-FFI plumbing. Not used by the JVM bridge.

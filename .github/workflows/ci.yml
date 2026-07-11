@@ -30,7 +30,7 @@ jobs:
 
       - name: Run native test suite
         working-directory: native
-        run: cargo test
+        run: cargo test --features kafka,parquet
 
   java-tests:
     name: Java tests (debug native build)
@@ -65,7 +65,54 @@ jobs:
       - name: Run Java test suite
         run: mvn -B -ntp test
 
-  # The jobs above build without `--features fluss`, so Native.flussFeatureBuilt() is false and
+  image-integration:
+    name: Flink image integration (optimized native build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      # The release native payload, Maven repository, and Docker image need more than the runner's
+      # default free space. This is intentionally the same cleanup as the Java test jobs.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      # Host-only is still a production Linux/x86_64 release (including mimalloc); cross-platform
+      # manifest assembly is covered by the release builder, but does not belong on this smoke path.
+      - name: Build optimized core image
+        run: |
+          bin/build-release.sh --host-only
+          jar tf streamfusion-kafka/target/streamfusion-kafka-1.0-SNAPSHOT.jar | grep -q 'native/kafka/linux/x86_64/libstreamfusion_kafka.so'
+          jar tf streamfusion-json/target/streamfusion-json-1.0-SNAPSHOT.jar | grep -q 'native/json/linux/x86_64/libstreamfusion_json.so'
+          jar tf streamfusion-csv/target/streamfusion-csv-1.0-SNAPSHOT.jar | grep -q 'native/csv/linux/x86_64/libstreamfusion_csv.so'
+          jar tf streamfusion-raw/target/streamfusion-raw-1.0-SNAPSHOT.jar | grep -q 'native/raw/linux/x86_64/libstreamfusion_raw.so'
+          jar tf streamfusion-avro/target/streamfusion-avro-1.0-SNAPSHOT.jar | grep -q 'native/avro/linux/x86_64/libstreamfusion_avro.so'
+          jar tf streamfusion-avro-confluent-registry/target/streamfusion-avro-confluent-registry-1.0-SNAPSHOT.jar | grep -q 'native/avro/linux/x86_64/libstreamfusion_avro.so'
+          jar tf streamfusion-protobuf/target/streamfusion-protobuf-1.0-SNAPSHOT.jar | grep -q 'native/protobuf/linux/x86_64/libstreamfusion_protobuf.so'
+          jar tf streamfusion-fluss/target/streamfusion-fluss-1.0-SNAPSHOT.jar | grep -q 'native/fluss/linux/x86_64/libstreamfusion_fluss.so'
+          jar tf streamfusion-parquet/target/streamfusion-parquet-1.0-SNAPSHOT.jar | grep -q 'native/parquet/linux/x86_64/libstreamfusion_parquet.so'
+          bin/build-flink-image.sh --tag streamfusion-flink:image-it --load --skip-release-build
+
+      - name: Run Flink Session-cluster image smoke test
+        run: >
+          mvn -B -ntp -Pimage-it -pl :streamfusion-image-it verify
+          -Dstreamfusion.image.name=streamfusion-flink:image-it
+
+  # The jobs above build without the Fluss extension, so NativeFluss.featureBuilt() is unavailable and
   # every @EnabledIf-gated Fluss test silently skips there. This leg builds the native library
   # with the fluss feature and actually runs them: the Rust unit tests under the feature, then
   # the Fluss JUnit classes against a fluss-feature debug build (the Fluss harness uses an
@@ -101,7 +148,7 @@ jobs:
 
       - name: Run native test suite (fluss feature)
         working-directory: native
-        run: cargo test --features fluss
+        run: cargo test --features fluss,parquet
 
       - name: Run Fluss Java tests (fluss-feature native build)
-        run: mvn -B -ntp -Dnative.cargo.args="build --features fluss" -Dtest='*Fluss*' test
+        run: mvn -B -ntp -Dnative.cargo.args="build --features fluss,parquet" -Dtest='*Fluss*' test

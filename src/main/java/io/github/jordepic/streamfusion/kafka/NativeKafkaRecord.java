@@ -3,21 +3,17 @@ package io.github.jordepic.streamfusion.kafka;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 
 /**
- * One per-partition decoded batch as it flows from the native {@link NativeKafkaSplitReader} through
- * the source reader's queue to the emitter. It carries the split's next offset alongside the batch so
- * the emitter can advance that split's checkpoint state after collecting the batch downstream, and the
- * batch's max rowtime so the emitter can timestamp it for per-split source watermarks.
+ * One per-partition binary body batch as it flows from the native {@link NativeKafkaSplitReader} through
+ * the source reader's queue to the emitter. It carries the split's next offset so the emitter can
+ * advance that split's checkpoint state after collecting the batch downstream.
  */
 final class NativeKafkaRecord {
 
   private final ArrowBatch batch;
   private final long nextOffset;
-  private final long maxRowtimeMillis;
-
-  NativeKafkaRecord(ArrowBatch batch, long nextOffset, long maxRowtimeMillis) {
+  NativeKafkaRecord(ArrowBatch batch, long nextOffset) {
     this.batch = batch;
     this.nextOffset = nextOffset;
-    this.maxRowtimeMillis = maxRowtimeMillis;
   }
 
   ArrowBatch batch() {
@@ -29,12 +25,4 @@ final class NativeKafkaRecord {
     return nextOffset;
   }
 
-  /**
-   * Max of the batch's rowtime column in epoch millis, or {@code Long.MIN_VALUE} when the table has no
-   * watermark (or every rowtime in the batch is null). Emitted as the batch's record timestamp so
-   * Flink's per-split watermark generator sees it.
-   */
-  long maxRowtimeMillis() {
-    return maxRowtimeMillis;
-  }
 }

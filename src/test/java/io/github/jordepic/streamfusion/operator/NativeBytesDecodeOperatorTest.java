@@ -3,9 +3,13 @@ package io.github.jordepic.streamfusion.operator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.json.JsonFormatProvider;
+import io.github.jordepic.streamfusion.format.json.NativeJsonFormat;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.typeutils.base.array.BytePrimitiveArraySerializer;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -30,6 +34,7 @@ class NativeBytesDecodeOperatorTest {
 
   @Test
   void timerFlushesPartialBatch() throws Exception {
+    assertTrue(NativeJsonFormat.isLoaded(), "the JSON format DSO must resolve its own JNI probe");
     try (OneInputStreamOperatorTestHarness<byte[], ArrowBatch> harness = harness()) {
       harness.setProcessingTime(0);
       harness.processElement(record("{\"id\": 1}"));
@@ -60,7 +65,12 @@ class NativeBytesDecodeOperatorTest {
     OneInputStreamOperatorTestHarness<byte[], ArrowBatch> harness =
         new OneInputStreamOperatorTestHarness<>(
             new NativeBytesDecodeOperator(
-                OUTPUT, BATCH_SIZE, 0, "", "", 0, null, null, null, false, FLUSH_INTERVAL, ""),
+                OUTPUT,
+                BATCH_SIZE,
+                new JsonFormatProvider()
+                    .createDecoder(
+                        new NativeFormatContext(OUTPUT, OUTPUT, Map.of("format", "json"), false)),
+                FLUSH_INTERVAL),
             BytePrimitiveArraySerializer.INSTANCE);
     harness.setup(new ArrowBatchSerializer());
     harness.open();

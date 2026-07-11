@@ -2,31 +2,23 @@ use crate::*;
 
 /// The production native Kafka consumer for one Flink subtask: a single rdkafka `BaseConsumer` that
 /// multiplexes all of the subtask's assigned partitions (Flink-parity — one consumer, not one per
-/// split). Each `poll` buckets the drained payloads by partition and decodes them to typed Arrow
-/// INLINE on the fetcher thread: a separate decode thread was benchmarked slower on every format —
-/// Flink already pipelines the fetcher thread against the task thread, so the extra hop only added
-/// channel/wakeup overhead. Manual `assign()`+seek, never `subscribe()`/rebalance.
+/// split). Each `poll` buckets the drained payloads by partition directly into Arrow binary body batches.
+/// A separately loaded format DSO decodes those bodies after the JVM Arrow C Data handoff; manual
+/// `assign()`+seek, never `subscribe()`/rebalance.
 #[cfg(feature = "kafka")]
 pub(crate) struct KafkaSplitReader {
     consumer: rdkafka::consumer::BaseConsumer,
     /// The consumer's message queue, drained via the callback API (see `poll`).
     consumer_queue: *mut rdkafka::bindings::rd_kafka_queue_t,
     body_schema: SchemaRef,
-    /// The same format-dispatched decoder the shallow path uses; only who produces the body batch
-    /// (rdkafka vs Flink) differs. Owned here and driven only from the fetcher thread.
-    decoder: MessageDecoder,
     /// Next offset to consume per assigned partition — the split's checkpoint position.
     next_offsets: HashMap<(String, i32), i64>,
     /// Topics whose broker metadata has been primed (see `reassign`).
     warmed_topics: std::collections::HashSet<String>,
-    /// Index of the rowtime column in the decoded batch, or -1 when the table declares no watermark.
-    /// When set, each pending batch carries the column's max (epoch millis) so the JVM source emits it
-    /// as the batch's record timestamp, feeding Flink's per-split source watermarks.
-    rowtime_index: i32,
-    /// Decoded batches ready for the JVM to drain one split at a time, in arrival (offset) order so a
+    /// Binary body batches ready for the JVM to drain one split at a time, in arrival (offset) order so a
     /// split's offset never goes backwards when several of its batches are drained in one cycle. Fields:
-    /// (topic, partition, next offset, max rowtime millis or i64::MIN, batch).
-    pending: std::collections::VecDeque<(String, i32, i64, i64, RecordBatch)>,
+    /// (topic, partition, next offset, batch).
+    pending: std::collections::VecDeque<(String, i32, i64, RecordBatch)>,
 }
 
 #[cfg(feature = "kafka")]
@@ -40,23 +32,7 @@ impl Drop for KafkaSplitReader {
 
 #[cfg(feature = "kafka")]
 impl KafkaSplitReader {
-    /// `format` selects the decoder, the same dispatch the shallow decode path uses: JSON (0) decodes
-    /// against `output_schema`; bare Avro (4) / Confluent Avro (1) build a schema store mapping
-    /// `schema_id` → `avro_schema` (the writer schema JSON), optionally projecting to `reader_avro_schema`
-    /// (the narrowed output) via Avro resolution; protobuf (5) decodes against `proto_descriptor` (an
-    /// encoded `FileDescriptorSet`) / `proto_message_name`.
-    fn open(
-        config: &[(String, String)],
-        format: i32,
-        output_schema: SchemaRef,
-        avro_schema: &str,
-        reader_avro_schema: &str,
-        schema_id: i32,
-        proto_descriptor: Vec<u8>,
-        proto_message_name: String,
-        rowtime_index: i32,
-        format_options: &str,
-    ) -> KafkaSplitReader {
+    fn open(config: &[(String, String)]) -> KafkaSplitReader {
         use rdkafka::config::ClientConfig;
 
         let mut client = ClientConfig::new();
@@ -71,36 +47,12 @@ impl KafkaSplitReader {
             rdkafka::bindings::rd_kafka_queue_get_consumer(consumer.client().native_ptr())
         };
 
-        // Protobuf is built straight from the descriptor (not in MessageDecoder::new, like the shallow
-        // path's createProtobufDecoder); every other format dispatches through MessageDecoder::new.
-        let decoder = if format == 5 {
-            // Prune the descriptor to the output schema's fields so ptars builds only those columns
-            // (projection pushed into the source); a no-op when the schema is the full message.
-            let pruned = prune_descriptor_set(&proto_descriptor, &proto_message_name, &output_schema);
-            MessageDecoder {
-                decoder: FormatDecoder::Protobuf(ProtobufDecoder::new(&pruned, &proto_message_name)),
-                skip_errors: false,
-            }
-        } else {
-            MessageDecoder::new(
-                format,
-                output_schema,
-                avro_schema,
-                reader_avro_schema,
-                schema_id,
-                false,
-                format_options,
-            )
-        };
-
         KafkaSplitReader {
             consumer,
             consumer_queue,
             body_schema: Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)])),
-            decoder,
             next_offsets: HashMap::default(),
             warmed_topics: std::collections::HashSet::default(),
-            rowtime_index,
             pending: std::collections::VecDeque::new(),
         }
     }
@@ -263,55 +215,23 @@ impl KafkaSplitReader {
                 &mut context as *mut PollContext as *mut std::os::raw::c_void,
             )
         };
-        // Decode inline: one typed batch per partition, straight into `pending` (the JVM drains all
-        // of them right after this returns, so nothing is ever left behind on a bounded finish).
+        // One binary body batch per partition, straight into `pending` (the JVM drains all of them right
+        // after this returns, so nothing is ever left behind on a bounded finish).
         self.pending.clear();
         for (partition, topic, mut builder, next_offset) in context.buckets {
             let body = RecordBatch::try_new(self.body_schema.clone(), vec![Arc::new(builder.finish())])
                 .expect("failed to build kafka body batch");
             self.next_offsets.insert((topic.clone(), partition), next_offset);
-            let batch = self.decoder.decode(&body);
-            let max_rowtime = if self.rowtime_index >= 0 {
-                max_rowtime_millis(&batch, self.rowtime_index as usize)
-            } else {
-                i64::MIN
-            };
-            self.pending.push_back((topic, partition, next_offset, max_rowtime, batch));
+            self.pending.push_back((topic, partition, next_offset, body));
         }
         self.pending.len()
     }
 }
 
-/// Max of a rowtime column in epoch millis, or `i64::MIN` when every value is null — the JVM side
-/// treats `i64::MIN` as "no timestamp" (Flink's `NO_TIMESTAMP` sentinel). Two column shapes, matching
-/// the two watermark forms the planner admits: a nanosecond timestamp (floor-divided to millis, so
-/// pre-epoch values round down like Flink's `TimestampData.getMillisecond`), and a bigint already
-/// holding epoch millis (a `TO_TIMESTAMP_LTZ(col, 3)` computed rowtime reads the column verbatim).
-#[cfg(any(feature = "kafka", feature = "fluss", test))]
-pub(crate) fn max_rowtime_millis(batch: &RecordBatch, index: usize) -> i64 {
-    use arrow::array::TimestampNanosecondArray;
-    let column = batch.column(index);
-    match column.data_type() {
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
-            let array = column
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .expect("nanosecond timestamp downcast");
-            arrow::compute::max(array).map(|ns| ns.div_euclid(1_000_000)).unwrap_or(i64::MIN)
-        }
-        DataType::Int64 => {
-            let array =
-                column.as_any().downcast_ref::<Int64Array>().expect("bigint rowtime downcast");
-            arrow::compute::max(array).unwrap_or(i64::MIN)
-        }
-        other => panic!("unsupported rowtime column type {other}"),
-    }
-}
-
-/// Whether this build carries the native Kafka source (the `kafka` cargo feature). Compiled into
-/// every build so the planner can probe before routing a table to a source the library can't run.
+/// Whether this extension library carries the native Kafka source.
+#[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_kafkaFeatureBuilt<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_featureBuilt<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::sys::jboolean {
@@ -320,58 +240,20 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_kafkaFeatureB
 
 /// Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
 /// `closeKafkaConsumer`. `configKeys`/`configValues` are the translated librdkafka config (applied
-/// verbatim). `format` selects the decoder (the same codes the shallow decode path uses): 0 JSON
-/// (decoded against the schema in the C structs), 1 Confluent / 4 bare Avro (decoded against
-/// `avroSchema` registered at `schemaId`, optionally projected to `readerAvroSchema`), 5 protobuf
-/// (decoded against `descriptor`/`messageName`). `rowtimeIndex` is the decoded batch's rowtime column
-/// for per-split source watermarks, or -1 when the table declares none. Splits are added later via
-/// `assignKafkaSplits`.
+/// verbatim). It produces raw Kafka value bodies as Arrow binary batches; the following format extension
+/// owns decoding. Splits are added later via `assignKafkaSplits`.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaConsumer<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_openKafkaConsumer<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_keys: JObjectArray<'local>,
     config_values: JObjectArray<'local>,
-    format: jint,
-    schema_array_address: jlong,
-    schema_address: jlong,
-    avro_schema: JString<'local>,
-    reader_avro_schema: JString<'local>,
-    schema_id: jint,
-    descriptor: JByteArray<'local>,
-    message_name: JString<'local>,
-    rowtime_index: jint,
-    format_options: JString<'local>,
 ) -> jlong {
     let keys = read_string_array(&mut env, &config_keys);
     let values = read_string_array(&mut env, &config_values);
     let config: Vec<(String, String)> = keys.into_iter().zip(values).collect();
-    let schema = import_record_batch(schema_array_address, schema_address).schema();
-    let avro_schema: String =
-        env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
-    // Empty unless the planner pushed a projection into a bare-Avro decode (the narrowed reader schema).
-    let reader_avro_schema: String =
-        env.get_string(&reader_avro_schema).map(Into::into).unwrap_or_default();
-    // The protobuf FileDescriptorSet + message name; empty for non-protobuf formats (JByteArray is null).
-    let proto_descriptor: Vec<u8> =
-        if descriptor.is_null() { Vec::new() } else { env.convert_byte_array(&descriptor).unwrap_or_default() };
-    let proto_message_name: String =
-        env.get_string(&message_name).map(Into::into).unwrap_or_default();
-    let format_options: String =
-        env.get_string(&format_options).map(Into::into).unwrap_or_default();
-    let reader = KafkaSplitReader::open(
-        &config,
-        format,
-        schema,
-        &avro_schema,
-        &reader_avro_schema,
-        schema_id,
-        proto_descriptor,
-        proto_message_name,
-        rowtime_index,
-        &format_options,
-    );
+    let reader = KafkaSplitReader::open(&config);
     into_handle(reader)
 }
 
@@ -379,7 +261,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openKafkaCons
 /// new partitions seek to their start offset, existing ones keep their tracked position.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignKafkaSplits<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_assignKafkaSplits<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -398,7 +280,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignKafkaSp
 /// stops fetching/blocking on them. Index-aligned `topics`/`partitions`.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unassignKafkaSplits<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_unassignKafkaSplits<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -411,11 +293,11 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unassignKafka
     reader.unassign_splits(&topics, &partitions);
 }
 
-/// Polls one cycle, decoding one Arrow batch per partition that had messages. Returns the number of
+/// Polls one cycle, producing one Arrow binary-body batch per partition that had messages. Returns the number of
 /// per-partition batches now pending; the JVM drains each with `drainKafkaSplit`.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pollKafkaBatch<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_pollKafkaBatch<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -429,14 +311,11 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pollKafkaBatc
     ) as jint
 }
 
-/// Drains one pending per-partition batch: exports the decoded typed Arrow into the consumer C structs,
-/// writes `[partition, nextOffset, maxRowtimeMillis]` into `splitMeta` (the last is `i64::MIN` when the
-/// table has no watermark or the batch's rowtimes are all null), and the topic into `outTopic[0]`, so
-/// the JVM can form the split id, advance that split's checkpoint offset, and timestamp the batch for
-/// per-split watermarks. Returns the decoded row count; call it `pollKafkaBatch`'s return-value times.
+/// Drains one pending per-partition body batch, writes `[partition, nextOffset]` into `splitMeta`, and
+/// the topic into `outTopic[0]`, so the JVM can form the split id and advance its checkpoint offset.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainKafkaSplit<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_drainKafkaSplit<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -446,10 +325,10 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainKafkaSpl
     out_schema_address: jlong,
 ) -> jint {
     let reader = unsafe { &mut *(handle as *mut KafkaSplitReader) };
-    let (topic, partition, next_offset, max_rowtime, batch) =
+    let (topic, partition, next_offset, batch) =
         reader.pending.pop_front().expect("drainKafkaSplit called with no pending batch");
     let rows = batch.num_rows() as jint;
-    env.set_long_array_region(&split_meta, 0, &[partition as i64, next_offset, max_rowtime])
+    env.set_long_array_region(&split_meta, 0, &[partition as i64, next_offset])
         .expect("failed to write split meta");
     let topic_jstr = env.new_string(&topic).expect("failed to make topic string");
     env.set_object_array_element(&out_topic, 0, &topic_jstr)
@@ -461,7 +340,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainKafkaSpl
 /// Releases a native Kafka split reader, dropping the rdkafka consumer (which closes its connections).
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKafkaConsumer<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_closeKafkaConsumer<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -478,7 +357,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeKafkaCon
 /// excludes the per-batch JVM export that the FLIP-27 DataStream wrapper forces. Returns the row count.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNativeConsume<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_benchmarkNativeConsume<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_keys: JObjectArray<'local>,
@@ -495,11 +374,8 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let values = read_string_array(&mut env, &config_values);
     let config: Vec<(String, String)> = keys.into_iter().zip(values).collect();
     let topic: String = env.get_string(&topic).expect("failed to read topic").into();
-    let schema = import_record_batch(schema_array_address, schema_address).schema();
-    let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
-
-    let mut reader =
-        KafkaSplitReader::open(&config, format, schema, &avro_schema, "", schema_id, Vec::new(), String::new(), -1, "");
+    let _ = (format, schema_array_address, schema_address, avro_schema, schema_id);
+    let mut reader = KafkaSplitReader::open(&config);
     reader.assign_splits(&[topic], &[0], &[-2]); // partition 0, earliest
 
     let timeout = std::time::Duration::from_millis(250);
@@ -520,7 +396,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
             continue;
         }
         idle = 0;
-        for (_topic, _partition, _next_offset, _max_rowtime, batch) in reader.pending.drain(..) {
+        for (_topic, _partition, _next_offset, batch) in reader.pending.drain(..) {
             rows += batch.num_rows() as i64; // consumed in Rust; no JVM export
         }
     }
@@ -532,7 +408,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
 /// Compared against the Java client's raw poll to answer "is librdkafka delivery actually slower here".
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkConsumeOnly<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_benchmarkConsumeOnly<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_keys: JObjectArray<'local>,
@@ -611,14 +487,12 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkCons
     context.count
 }
 
-/// Benchmark-only: a hand-rolled consume+decode loop with none of the split-reader machinery (no
-/// per-partition bucketing, no offset tracking, no pending queue) — the ideal-case floor the
-/// production reader is validated against. The decode-thread experiment this leg once judged is
-/// settled: inline decode won on every format, and the production reader now decodes inline too.
-/// Returns the decoded row count.
+/// Benchmark-only: a hand-rolled raw-consume loop with none of the split-reader machinery (no
+/// per-partition bucketing, no offset tracking, no pending queue). Kept for comparisons with the Java
+/// client; format decode is now deliberately owned by a separate format DSO.
 #[cfg(feature = "kafka")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNativeConsumeSerial<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_benchmarkNativeConsumeSerial<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_keys: JObjectArray<'local>,
@@ -631,7 +505,6 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     schema_id: jint,
     max_messages: jlong,
 ) -> jlong {
-    use arrow::array::BinaryBuilder;
     use rdkafka::bindings as rdsys;
     use rdkafka::config::ClientConfig;
     use rdkafka::consumer::{BaseConsumer, Consumer};
@@ -640,8 +513,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     let keys = read_string_array(&mut env, &config_keys);
     let values = read_string_array(&mut env, &config_values);
     let topic: String = env.get_string(&topic).expect("failed to read topic").into();
-    let schema = import_record_batch(schema_array_address, schema_address).schema();
-    let avro_schema: String = env.get_string(&avro_schema).map(Into::into).unwrap_or_default();
+    let _ = (format, schema_array_address, schema_address, avro_schema, schema_id);
 
     let mut client = ClientConfig::new();
     for (key, value) in keys.iter().zip(&values) {
@@ -658,15 +530,10 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
     consumer.assign(&tpl).expect("assign");
     let queue = unsafe { rdsys::rd_kafka_queue_get_consumer(consumer.client().native_ptr()) };
 
-    // The same decoder the pipelined path builds, just driven inline.
-    let decoder = MessageDecoder::new(format, schema, &avro_schema, "", schema_id, false, "");
-    let body_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Binary, true)]));
-
-    // Callback drain (one queue lock per poll, not per message — see benchmarkConsumeOnly); each
-    // payload is copied into the Arrow binary builder from the callback, librdkafka frees the op after.
+    // Callback drain (one queue lock per poll, not per message — see benchmarkConsumeOnly). No payload
+    // copy occurs here: this benchmark measures the connector DSO's raw delivery floor.
     struct SerialCtx {
-        builder: BinaryBuilder,
-        appended: usize,
+        appended: i64,
     }
     unsafe extern "C" fn append_payload(
         message: *mut rdsys::rd_kafka_message_t,
@@ -677,16 +544,13 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
         if message.err == rdsys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR
             && !message.payload.is_null()
         {
-            let payload = std::slice::from_raw_parts(message.payload as *const u8, message.len);
-            context.builder.append_value(payload);
             context.appended += 1;
         }
     }
     let mut rows: i64 = 0;
     let mut idle = 0;
     while rows < max_messages && idle < 40 {
-        let mut context =
-            SerialCtx { builder: BinaryBuilder::with_capacity(8192, 8192 * 64), appended: 0 };
+        let mut context = SerialCtx { appended: 0 };
         let served = unsafe {
             rdsys::rd_kafka_consume_callback_queue(
                 queue,
@@ -700,11 +564,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
             continue;
         }
         idle = 0;
-        // Decode INLINE — the next batch is not fetched until this returns.
-        let body =
-            RecordBatch::try_new(body_schema.clone(), vec![Arc::new(context.builder.finish())])
-                .expect("failed to build kafka body batch");
-        rows += decoder.decode(&body).num_rows() as i64;
+        rows += context.appended;
     }
     unsafe { rdsys::rd_kafka_queue_destroy(queue) };
     rows
@@ -718,7 +578,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkNati
 /// FLIP-27 source (remaining source tails: https://github.com/datafusion-contrib/StreamFusion/issues/16).
 #[cfg(feature = "kafka-bench")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_benchmarkKafkaConsume<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_kafka_NativeKafka_benchmarkKafkaConsume<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     brokers: JString<'local>,

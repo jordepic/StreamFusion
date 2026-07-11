@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
-import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.parquet.NativeParquet;
 import java.util.List;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowSchema;
@@ -105,7 +105,7 @@ abstract class NativeFileArrowBulkFormat implements BulkFormat<ArrowBatch, FileS
       BufferAllocator allocator = NativeAllocator.SHARED;
       try (ArrowArray array = ArrowArray.allocateNew(allocator);
           ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-        if (!Native.nextBatch(handle, array.memoryAddress(), schema.memoryAddress())) {
+        if (!NativeParquet.nextBatch(handle, array.memoryAddress(), schema.memoryAddress())) {
           return null;
         }
         VectorSchemaRoot root =
@@ -120,7 +120,7 @@ abstract class NativeFileArrowBulkFormat implements BulkFormat<ArrowBatch, FileS
       // the native handle twice would be a double-free, so closing is idempotent. The allocator is the
       // format's, not the reader's, so it is not closed here.
       if (handle != 0) {
-        Native.closeSource(handle);
+        NativeParquet.closeSource(handle);
         handle = 0;
       }
     }

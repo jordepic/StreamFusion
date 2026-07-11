@@ -1,9 +1,7 @@
 package io.github.jordepic.streamfusion.kafka;
 
-import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.NativeAllocator;
-import io.github.jordepic.streamfusion.operator.RowDataArrowConverter;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -19,7 +17,6 @@ import org.apache.flink.connector.base.source.reader.RecordsWithSplitIds;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitReader;
 import org.apache.flink.connector.base.source.reader.splitreader.SplitsChange;
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
-import org.apache.flink.table.types.logical.RowType;
 import org.apache.kafka.common.TopicPartition;
 
 /**
@@ -27,11 +24,11 @@ import org.apache.kafka.common.TopicPartition;
  * subtask's partitions) wrapped behind the FLIP-27 {@link SplitReader} contract, so it slots into the
  * standard {@code SingleThreadMultiplexSourceReaderBase} machinery in place of Flink's
  * {@code KafkaPartitionSplitReader}. Splits handed over by the enumerator are assigned+seeked natively
- * ({@code assignKafkaSplits}); each {@link #fetch()} polls one cycle and turns the per-partition decoded
- * Arrow batches into per-split records so the reader updates each split's offset state independently.
+ * ({@code assignKafkaSplits}); each {@link #fetch()} polls one cycle and turns the per-partition binary
+ * body batches into per-split records so the reader updates each split's offset state independently.
  *
- * <p>Decode happens in Rust (the consumer feeds payloads straight into an Arrow builder and decodes to
- * {@code outputType}), so no {@code RowData}/{@code ConsumerRecord} is ever materialized on the JVM.
+ * <p>The consumer feeds payloads directly into Arrow binary builders, so no {@code ConsumerRecord} or
+ * JVM {@code byte[]} is materialized. A following format artifact decodes the body batches.
  */
 final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, KafkaPartitionSplit> {
 
@@ -49,59 +46,30 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
   NativeKafkaSplitReader(
       String[] configKeys,
       String[] configValues,
-      int format,
-      RowType outputType,
-      String avroSchema,
-      String readerAvroSchema,
-      int schemaId,
-      byte[] protoDescriptor,
-      String protoMessageName,
       int maxRecords,
-      long pollTimeoutMillis,
-      int rowtimeIndex,
-      String formatOptions) {
+      long pollTimeoutMillis) {
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
-    // Export an empty batch of the decoder's output schema so the native side can build the JSON
-    // decoder (Avro/protobuf derive their own schema); the consumer is created here, partitions later.
-    try (VectorSchemaRoot template = RowDataArrowConverter.write(List.of(), outputType, allocator);
-        ArrowArray array = ArrowArray.allocateNew(allocator);
-        ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
-      Data.exportVectorSchemaRoot(allocator, template, NativeAllocator.DICTIONARIES, array, schema);
-      this.handle =
-          Native.openKafkaConsumer(
-              configKeys,
-              configValues,
-              format,
-              array.memoryAddress(),
-              schema.memoryAddress(),
-              avroSchema == null ? "" : avroSchema,
-              readerAvroSchema == null ? "" : readerAvroSchema,
-              schemaId,
-              protoDescriptor,
-              protoMessageName == null ? "" : protoMessageName,
-              rowtimeIndex,
-              formatOptions == null ? "" : formatOptions);
-    }
+    this.handle = NativeKafka.openKafkaConsumer(configKeys, configValues);
   }
 
   @Override
   public RecordsWithSplitIds<NativeKafkaRecord> fetch() {
-    int pending = Native.pollKafkaBatch(handle, maxRecords, pollTimeoutMillis);
+    int pending = NativeKafka.pollKafkaBatch(handle, maxRecords, pollTimeoutMillis);
     RecordsBySplits.Builder<NativeKafkaRecord> builder = new RecordsBySplits.Builder<>();
     for (int i = 0; i < pending; i++) {
       try (ArrowArray outArray = ArrowArray.allocateNew(allocator);
           ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
         long[] meta = new long[3];
         String[] topic = new String[1];
-        Native.drainKafkaSplit(
+        NativeKafka.drainKafkaSplit(
             handle, meta, topic, outArray.memoryAddress(), outSchema.memoryAddress());
         VectorSchemaRoot root =
             Data.importVectorSchemaRoot(allocator, outArray, outSchema, NativeAllocator.DICTIONARIES);
         String splitId =
             KafkaPartitionSplit.toSplitId(new TopicPartition(topic[0], (int) meta[0]));
         positions.put(splitId, meta[1]);
-        builder.add(splitId, new NativeKafkaRecord(new ArrowBatch(root), meta[1], meta[2]));
+        builder.add(splitId, new NativeKafkaRecord(new ArrowBatch(root), meta[1]));
       }
     }
     // Bounded mode: a split is done once its next offset reaches its stopping offset. (No data exists
@@ -124,7 +92,7 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
         topics[i] = justFinished.get(i).topic();
         partitions[i] = justFinished.get(i).partition();
       }
-      Native.unassignKafkaSplits(handle, topics, partitions);
+      NativeKafka.unassignKafkaSplits(handle, topics, partitions);
     }
     return builder.build();
   }
@@ -146,7 +114,7 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
           .filter(stop -> stop != KafkaPartitionSplit.NO_STOPPING_OFFSET)
           .ifPresent(stop -> stoppingOffsets.put(split.splitId(), stop));
     }
-    Native.assignKafkaSplits(handle, topics, partitions, offsets);
+    NativeKafka.assignKafkaSplits(handle, topics, partitions, offsets);
   }
 
   @Override
@@ -157,6 +125,6 @@ final class NativeKafkaSplitReader implements SplitReader<NativeKafkaRecord, Kaf
 
   @Override
   public void close() {
-    Native.closeKafkaConsumer(handle);
+    NativeKafka.closeKafkaConsumer(handle);
   }
 }

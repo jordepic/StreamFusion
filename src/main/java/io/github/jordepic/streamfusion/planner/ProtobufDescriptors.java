@@ -17,7 +17,7 @@ import java.util.Set;
  * format against them. The set is framed by hand (each file's serialized {@code FileDescriptorProto} as a
  * length-delimited field 1) so the descriptor types never have to be referenced at compile time.
  */
-final class ProtobufDescriptors {
+public final class ProtobufDescriptors {
 
   private ProtobufDescriptors() {}
 
@@ -37,7 +37,7 @@ final class ProtobufDescriptors {
    * (decoded differently here than in Flink), {@code bytes} (decode is fine but {@code byte[]} parity is
    * not yet test-covered), and the well-known types ({@code google.protobuf.*}), which the Arrow decoder
    * maps to dedicated Arrow types while Flink treats them as ordinary nested rows. */
-  static boolean isSupportedMessage(String messageClassName) {
+  public static boolean isSupportedMessage(String messageClassName) {
     try {
       Object descriptor = Class.forName(messageClassName).getMethod("getDescriptor").invoke(null);
       return isSupportedMessageDescriptor(descriptor, new HashSet<>());
@@ -89,7 +89,7 @@ final class ProtobufDescriptors {
   }
 
   /** The fully-qualified name of the message the named class describes. */
-  static String messageName(String messageClassName) {
+  public static String messageName(String messageClassName) {
     try {
       Object descriptor = Class.forName(messageClassName).getMethod("getDescriptor").invoke(null);
       return (String) descriptor.getClass().getMethod("getFullName").invoke(descriptor);
@@ -99,7 +99,7 @@ final class ProtobufDescriptors {
   }
 
   /** An encoded {@code FileDescriptorSet}: the message's file plus its transitive dependencies. */
-  static byte[] descriptorSet(String messageClassName) {
+  public static byte[] descriptorSet(String messageClassName) {
     try {
       Object descriptor = Class.forName(messageClassName).getMethod("getDescriptor").invoke(null);
       Object rootFile = descriptor.getClass().getMethod("getFile").invoke(descriptor);

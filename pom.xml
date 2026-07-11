@@ -7,6 +7,22 @@
     <groupId>io.github.jordepic</groupId>
     <artifactId>StreamFusion</artifactId>
     <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>streamfusion-runtime</module>
+        <module>streamfusion-core</module>
+        <module>streamfusion-kafka</module>
+        <module>streamfusion-json</module>
+        <module>streamfusion-csv</module>
+        <module>streamfusion-raw</module>
+        <module>streamfusion-avro</module>
+        <module>streamfusion-avro-confluent-registry</module>
+        <module>streamfusion-protobuf</module>
+        <module>streamfusion-fluss</module>
+        <module>streamfusion-parquet</module>
+        <module>streamfusion-loader</module>
+    </modules>
 
     <licenses>
         <license>
@@ -36,7 +52,14 @@
         <!-- Native build: debug by default for a fast correctness loop. The `bench` profile flips
              both of these to a release build, which benchmarks must use (debug Rust is far slower). -->
         <native.profile>debug</native.profile>
-        <native.cargo.args>build</native.cargo.args>
+        <!-- The full Java test suite exercises Kafka. Fluss source tests are optional local-cluster
+             integration tests, enabled explicitly by adding the fluss feature to native.cargo.args.
+             Deployment packaging builds a
+             connector-free core and feature-specific extension DSOs separately in
+             bin/build-release.sh. -->
+        <native.cargo.args>build --features kafka,parquet,json,csv,raw,avro,protobuf</native.cargo.args>
+        <native.build.skip>false</native.build.skip>
+        <native.resource.directory>${project.basedir}/../native/target/${native.profile}</native.resource.directory>
         <!-- Extra JVM args appended to the Surefire fork's argLine; empty by default. Used to attach a
              sampler to a profile-loop test, e.g. -Dsf.extraJvmArgs=-agentpath:.../libasyncProfiler.dylib=... -->
         <sf.extraJvmArgs></sf.extraJvmArgs>
@@ -316,6 +339,22 @@
     </repositories>
 
     <build>
+        <resources>
+            <resource>
+                <directory>${project.basedir}/../src/main/resources</directory>
+            </resource>
+            <!-- The local-development resource. The universal release profile replaces this with
+                 its OS/architecture tree, while Native keeps this location as a development fallback. -->
+            <resource>
+                <directory>${native.resource.directory}</directory>
+                <targetPath>io/github/jordepic/streamfusion/native</targetPath>
+                <includes>
+                    <include>libstreamfusion.so</include>
+                    <include>libstreamfusion.dylib</include>
+                    <include>streamfusion.dll</include>
+                </includes>
+            </resource>
+        </resources>
         <extensions>
             <!-- Resolves the OS classifier for the protoc binary artifact below. -->
             <extension>
@@ -324,6 +363,7 @@
                 <version>1.7.1</version>
             </extension>
         </extensions>
+        <pluginManagement>
         <plugins>
             <!-- Generates the protobuf message class a `protobuf`-format table names (and that the host
                  baseline parses with), from a test .proto, using the same protoc Flink's format uses. -->
@@ -345,8 +385,9 @@
                 </executions>
             </plugin>
 
-            <!-- The native library is the data plane; Maven drives its build so a single
-                 `mvn test` exercises the whole JVM<->Rust toolchain. -->
+            <!-- Keep normal Java edit/compile loops free of Cargo. Native code is built only
+                 for test execution, while the explicit release script builds the portable
+                 optimized payloads. -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
@@ -354,13 +395,14 @@
                 <executions>
                     <execution>
                         <id>build-native</id>
-                        <phase>generate-test-resources</phase>
+                        <phase>test-compile</phase>
                         <goals>
                             <goal>exec</goal>
                         </goals>
                         <configuration>
+                            <skip>${native.build.skip}</skip>
                             <executable>cargo</executable>
-                            <workingDirectory>${project.basedir}/native</workingDirectory>
+                            <workingDirectory>${project.basedir}/../native</workingDirectory>
                             <commandlineArgs>${native.cargo.args}</commandlineArgs>
                         </configuration>
                     </execution>
@@ -380,21 +422,92 @@
                          Arrow's per-accessor bounds + refcount checks (Comet/Spark run with these):
                          profiling the row<->Arrow transpose showed ~1/3 of native CPU was those
                          checks (ArrowBuf.checkIndex/ensureAccessible/refCnt on every setSafe). -->
-                    <argLine>-Djava.library.path=${project.basedir}/native/target/${native.profile} -Darrow.enable_unsafe_memory_access=true -Darrow.enable_null_check_for_get=false --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED ${sf.extraJvmArgs}</argLine>
+                    <argLine>-Djava.library.path=${project.basedir}/../native/target/${native.profile} -Darrow.enable_unsafe_memory_access=true -Darrow.enable_null_check_for_get=false --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED ${sf.extraJvmArgs}</argLine>
                 </configuration>
             </plugin>
+            <!-- The thin artifact remains useful to applications that manage dependencies themselves.
+                 The attached runtime artifact is the self-contained payload embedded by the Flink loader. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <id>attach-runtime-payload</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>runtime</shadedClassifierName>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
+        </pluginManagement>
     </build>
 
     <profiles>
-        <!-- Build and load the optimized native library. Benchmarks must run under this profile;
-             debug Rust is far slower and gives misleading throughput numbers. -->
+        <!-- Build and load the production native library. The allocator feature is part of the
+             measured default: it removes the cross-thread allocation bottleneck in the native
+             Kafka path and also reduces native state churn. -->
         <profile>
             <id>bench</id>
             <properties>
                 <native.profile>release</native.profile>
-                <native.cargo.args>build --release</native.cargo.args>
+                <native.cargo.args>build --release --features mimalloc,kafka,parquet,json,csv,raw,avro,protobuf</native.cargo.args>
             </properties>
+        </profile>
+        <!-- Produces the deployable, performance-oriented runtime payload. Callers may override
+             native.cargo.args for a deliberately smaller development build or to add test features. -->
+        <profile>
+            <id>dist</id>
+            <properties>
+                <native.profile>release</native.profile>
+                <native.cargo.args>build --release --no-default-features --features mimalloc</native.cargo.args>
+            </properties>
+        </profile>
+        <!-- Packages the resource tree staged by bin/build-release.sh. It deliberately does not
+             invoke cargo: the script has already built each supported target in its own environment. -->
+        <profile>
+            <id>universal</id>
+            <properties>
+                <native.build.skip>true</native.build.skip>
+                <native.resource.directory>${project.basedir}/../native/target/no-local-payload</native.resource.directory>
+            </properties>
+            <build>
+                <resources>
+                    <resource>
+                        <directory>${project.basedir}/../native/target/universal</directory>
+                        <targetPath>io/github/jordepic/streamfusion/native</targetPath>
+                        <includes>
+                            <include>**/libstreamfusion.so</include>
+                            <include>**/libstreamfusion.dylib</include>
+                        </includes>
+                    </resource>
+                </resources>
+            </build>
+        </profile>
+        <!-- The image test creates Docker containers, so keep its fixture module out of the normal
+             unit-test reactor. It is selected explicitly with -Pimage-it. -->
+        <profile>
+            <id>image-it</id>
+            <modules>
+                <module>streamfusion-image-it</module>
+            </modules>
         </profile>
     </profiles>
 

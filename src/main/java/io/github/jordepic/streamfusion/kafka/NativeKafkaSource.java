@@ -20,20 +20,11 @@ import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscr
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplitSerializer;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
-import org.apache.flink.table.types.logical.RowType;
 
 /**
- * A FLIP-27 Kafka source that emits {@link ArrowBatch}es decoded natively. It reuses the standard
- * connector's {@link KafkaSourceEnumerator} (partition discovery + offset resolution + split assignment)
- * and its split / enumerator-state serializers verbatim — that coordination is on the JobManager, not
- * the hot path — and swaps only the per-subtask reader for the native rdkafka one
- * ({@link NativeKafkaSourceReader} over {@link NativeKafkaSplitReader}). The enumerator hands concrete
- * starting offsets to the readers, which assign+seek natively, so checkpoint/restore semantics match
- * Flink's Kafka source.
- *
- * <p>Constructed by the planner ({@code NativeKafkaSourceExecNode}) only when the table's consumer
- * settings translate to librdkafka and the format is one the native decoder supports; otherwise the
- * planner leaves Flink's own Kafka source in place (the fallback).
+ * FLIP-27 Kafka source that emits Arrow batches with one binary {@code body} column. The native reader
+ * owns rdkafka consumption while a subsequent format-provider transformation performs decode; connector
+ * and format DSOs therefore share Arrow C Data rather than private Rust handles.
  */
 public final class NativeKafkaSource
     implements Source<ArrowBatch, KafkaPartitionSplit, KafkaSourceEnumState> {
@@ -47,18 +38,8 @@ public final class NativeKafkaSource
   private final Properties props;
   private final String[] configKeys;
   private final String[] configValues;
-  private final int format;
-  private final RowType outputType;
-  private final String avroSchema;
-  private final String readerAvroSchema;
-  private final int schemaId;
-  private final byte[] protoDescriptor;
-  private final String protoMessageName;
   private final int maxRecords;
   private final long pollTimeoutMillis;
-  private final int rowtimeIndex;
-  // Decode-relevant format options as key=value lines (see KafkaTables.encodeFormatOptions).
-  private final String formatOptions;
 
   public NativeKafkaSource(
       KafkaSubscriber subscriber,
@@ -68,40 +49,20 @@ public final class NativeKafkaSource
       Properties props,
       String[] configKeys,
       String[] configValues,
-      int format,
-      RowType outputType,
-      String avroSchema,
-      String readerAvroSchema,
-      int schemaId,
-      byte[] protoDescriptor,
-      String protoMessageName,
       int maxRecords,
-      long pollTimeoutMillis,
-      int rowtimeIndex,
-      String formatOptions) {
+      long pollTimeoutMillis) {
     this.subscriber = subscriber;
     this.startingOffsets = startingOffsets;
     this.stoppingOffsets = stoppingOffsets;
     this.boundedness = boundedness;
     this.props = props;
-    // Match KafkaSourceBuilder: a bounded source must disable periodic partition discovery, otherwise
-    // the enumerator never signals no-more-splits and the job never terminates. (Default is 5 minutes.)
     if (boundedness == Boundedness.BOUNDED) {
       props.setProperty("partition.discovery.interval.ms", "-1");
     }
     this.configKeys = configKeys;
     this.configValues = configValues;
-    this.format = format;
-    this.outputType = outputType;
-    this.avroSchema = avroSchema;
-    this.readerAvroSchema = readerAvroSchema;
-    this.schemaId = schemaId;
-    this.protoDescriptor = protoDescriptor;
-    this.protoMessageName = protoMessageName;
     this.maxRecords = maxRecords;
     this.pollTimeoutMillis = pollTimeoutMillis;
-    this.rowtimeIndex = rowtimeIndex;
-    this.formatOptions = formatOptions;
   }
 
   @Override
@@ -112,21 +73,7 @@ public final class NativeKafkaSource
   @Override
   public SourceReader<ArrowBatch, KafkaPartitionSplit> createReader(SourceReaderContext context) {
     Supplier<SplitReader<NativeKafkaRecord, KafkaPartitionSplit>> splitReaderSupplier =
-        () ->
-            new NativeKafkaSplitReader(
-                configKeys,
-                configValues,
-                format,
-                outputType,
-                avroSchema,
-                readerAvroSchema,
-                schemaId,
-                protoDescriptor,
-                protoMessageName,
-                maxRecords,
-                pollTimeoutMillis,
-                rowtimeIndex,
-                formatOptions);
+        () -> new NativeKafkaSplitReader(configKeys, configValues, maxRecords, pollTimeoutMillis);
     return new NativeKafkaSourceReader(
         splitReaderSupplier, new NativeKafkaRecordEmitter(), toConfiguration(props), context);
   }

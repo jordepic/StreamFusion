@@ -1,0 +1,34 @@
+# 25 — Flink-style format artifacts over a private cross-DSO ABI
+
+## Reference pattern
+
+Flink distributes connector and format implementations as separate JARs. The table runtime discovers
+them through `META-INF/services/org.apache.flink.table.factories.Factory`, so a job installs only the
+connector and serialization formats it uses.
+
+## StreamFusion decision
+
+StreamFusion follows that deployment shape for native value decoding. `streamfusion-kafka` owns Kafka
+consumption and emits Arrow batches containing raw Kafka value bodies. `streamfusion-json`,
+`streamfusion-csv`, `streamfusion-raw`, `streamfusion-avro`,
+`streamfusion-avro-confluent-registry`, and `streamfusion-protobuf` register
+`NativeFormatProvider` implementations through Java `ServiceLoader`. The planner selects a provider
+only when its artifact and supported options are present; otherwise it leaves the table on stock Flink.
+
+## Why not let Kafka call every format directly?
+
+An earlier native Kafka source owned the message decoder. That made its DSO link Kafka plus every
+format dependency and made the base deployment unable to follow Flink's optional-format convention.
+Passing a Rust decoder handle from the Kafka DSO to a format DSO would exchange Rust-owned objects and
+allocator state across dynamic-library boundaries, which is not a stable ABI.
+
+Arrow's C Data Interface is already the ownership-safe JNI boundary in this project. The Kafka DSO
+exports a body batch to Java and the format DSO imports that batch through the same interface; each
+handle remains private to its creator. This adds a DSO boundary at source ingest, but keeps the format
+installable, testable, and fallback-safe. A future fused ABI is acceptable only after benchmarks show
+the boundary is material and it can preserve these ownership rules.
+
+Kafka source watermark regeneration is intentionally not carried over: format decoding now happens
+after the source, so computing a rowtime maximum inside the connector would re-couple it to formats.
+Watermarked Kafka tables therefore fall back to Flink until an Arrow-level, per-split watermark
+contract is designed and parity-tested.

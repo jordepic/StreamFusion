@@ -259,7 +259,11 @@ decode removed that build/copy of unread fields). **Protobuf** is also build/cop
 `memmove` + ~16% ptars decode); pruning via a **pruned descriptor** (ptars builds a column per
 descriptor field and skips wire tags it has no field for) flipped it from 0.88–0.94× to 1.26–1.36×.
 
-### The row→columnar ladder (Kafka)
+### The row→columnar ladder (Kafka, historical fused-source baseline)
+
+> The measurements in this section predate the format-artifact split. The current Kafka DSO emits Arrow
+> value bodies and a separately installed format DSO decodes them, so rerun this ladder before using any
+> source-rung value as a current release claim.
 
 How far into Rust the source-side work moves, on the same q0/q1/q2 over the same produced bytes, all vs
 stock Flink. Three rungs, each one layer more native (projection pushed in at every rung that can):
@@ -268,8 +272,8 @@ stock Flink. Three rungs, each one layer more native (projection pushed in at ev
    `RowData → Arrow` transpose feeds the native calc.
 2. **Rust transpose, JVM poll** — Flink's `KafkaSource` polls raw bytes, a native operator decodes them
    straight to Arrow (the shallow decode path).
-3. **Rust poll + Rust transpose** — the native rdkafka source: Rust owns the consume *and* the decode.
-   No Flink Kafka client, no `RowData`.
+3. **Rust poll + Rust transpose** — the former fused native rdkafka source: Rust owned the consume and
+   decode. It is retained here only as the comparison baseline for the new modular path.
 
 `SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features mimalloc"
 -Dtest=NexmarkKafkaLadderBenchmark`. 2 M events, ×vs stock Flink (best rung **bold**; the
@@ -288,8 +292,8 @@ stock Flink. Three rungs, each one layer more native (projection pushed in at ev
 | Protobuf q1 | 1.19 M | 1.03× | 1.29× | **2.36×** |
 | Protobuf q2 | 1.21 M | 1.18× | 1.38× | **2.34×** |
 
-**The full native source is the best rung on every format — 2.2–3.4× stock Flink** and 1.7–1.9×
-the shallow decode rung. An earlier version of this table had the source rung *trailing* the
+**Historically, the full fused source was the best rung on every format — 2.2–3.4× stock Flink** and
+1.7–1.9× the shallow decode rung. An earlier version of this table had the source rung *trailing* the
 shallow rung on Avro/Protobuf, capped at a ~1.35 M ev/s ceiling; the consume fast path
 (divergences/19 — one-lock callback drain, inline decode instead of a decode thread, metadata
 warm-up before assign, the `check.crcs` default, and the `mimalloc` allocator rebind) removed
@@ -318,8 +322,8 @@ see [.claude/wontdos/39-nexmark-q6-exclusion.md](../.claude/wontdos/39-nexmark-q
 source it can be fed by** — the rowwise generator, a local Parquet file, and Kafka json/avro/protobuf
 across the ladder — all vs stock Flink, same steelmanned perimeter. 500K events.
 
-`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features mimalloc"
--Dtest=NexmarkMatrixBenchmark` (Testcontainers Kafka; the `kafka` feature is a build default, and
+`SF_BENCHMARK=true mvn test -Pbench -Dnative.cargo.args="build --release --features mimalloc,kafka"
+-Dtest=NexmarkMatrixBenchmark` (Testcontainers Kafka; the Kafka test build enables its feature, and
 `mimalloc` — the recommended build — rebinds the library's allocator, divergences/19). Column
 toggles: `SF_MATRIX_GENERATOR` / `SF_MATRIX_PARQUET` / `SF_MATRIX_KAFKA` (`false` skips one), plus
 `SF_MATRIX_FLUSS` (`true` *adds* the opt-in Fluss rung — off by default; see below).
@@ -481,8 +485,8 @@ Flink baseline), sorted by the JSON speedup:
 | q3 | **1.97×** | **2.38×** | **1.80×** |
 | q16 § | **1.86×** | **1.87×** | **1.65×** |
 
-**Every Kafka row clears 1.65×, all but a handful clear 2×, and the peak is q11 at 3.9–5.6×.**
-These numbers include the source's per-partition watermark regeneration (the matrix tables declare a
+**Historically, every Kafka row cleared 1.65×, all but a handful cleared 2×, and the peak was q11 at
+3.9–5.6×.** These numbers include the former fused source's per-partition watermark regeneration (the matrix tables declare a
 `WATERMARK`, pushed into the scan): windows fire incrementally mid-stream exactly as on stock Flink,
 and the per-batch max-rowtime scan that feeds it costs nothing measurable. The same watermark work
 collapses the two middle rungs on these tables — the decode rung declines a watermarked table (it

@@ -42,8 +42,8 @@ public final class NativeConfig {
    * spark.comet.exec.<op>.enabled}. All operators default on — including {@code kafkaSource}, since
    * the consume fast path made the native rdkafka source decisively faster than the decode path
    * (divergences/19) and it is the only Kafka path that regenerates a pushed-down watermark; the
-   * planner still probes the build ({@code Native.kafkaFeatureBuilt}) so an opt-out
-   * {@code --no-default-features} library falls back cleanly.
+   * planner loads the Kafka extension before substituting the source, so a core-only deployment
+   * falls back cleanly without carrying rdkafka.
    */
   public static boolean operatorEnabled(String operator) {
     return Boolean.parseBoolean(

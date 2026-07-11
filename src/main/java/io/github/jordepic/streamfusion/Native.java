@@ -1,13 +1,115 @@
 package io.github.jordepic.streamfusion;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+import java.util.Locale;
+
 /** Entry point to the native data plane. Holds the methods backed by the Rust library. */
 public final class Native {
 
+  private static final String LIBRARY_NAME = "streamfusion";
+  private static final String NATIVE_RESOURCE_PREFIX =
+      "/io/github/jordepic/streamfusion/native/";
+
   static {
-    System.loadLibrary("streamfusion");
+    loadLibrary();
   }
 
   private Native() {}
+
+  private static void loadLibrary() {
+    try {
+      System.loadLibrary(LIBRARY_NAME);
+    } catch (UnsatisfiedLinkError libraryPathFailure) {
+      loadBundledLibrary(libraryPathFailure);
+    }
+  }
+
+  private static void loadBundledLibrary(UnsatisfiedLinkError libraryPathFailure) {
+    for (String resourcePath : bundledLibraryResourcePaths()) {
+      try (InputStream stream = Native.class.getResourceAsStream(resourcePath)) {
+        if (stream == null) {
+          continue;
+        }
+
+        String libraryFileName = System.mapLibraryName(LIBRARY_NAME);
+        String suffix = libraryFileName.substring(libraryFileName.lastIndexOf('.'));
+        Path extractedLibrary = Files.createTempFile("streamfusion-", suffix);
+        try {
+          Files.copy(stream, extractedLibrary, StandardCopyOption.REPLACE_EXISTING);
+          System.load(extractedLibrary.toAbsolutePath().toString());
+          return;
+        } finally {
+          extractedLibrary.toFile().deleteOnExit();
+        }
+      } catch (IOException e) {
+        UnsatisfiedLinkError error =
+            new UnsatisfiedLinkError("Unable to extract bundled StreamFusion native library: " + e);
+        error.initCause(e);
+        throw error;
+      }
+    }
+
+    UnsatisfiedLinkError error =
+        new UnsatisfiedLinkError(
+            "No bundled StreamFusion library for "
+                + nativePlatform()
+                + "/"
+                + nativeArchitecture()
+                + ". Tried "
+                + String.join(", ", bundledLibraryResourcePaths()));
+    error.initCause(libraryPathFailure);
+    throw error;
+  }
+
+  static String bundledLibraryResourcePath() {
+    return NATIVE_RESOURCE_PREFIX
+        + nativePlatform()
+        + "/"
+        + nativeArchitecture()
+        + "/"
+        + System.mapLibraryName(LIBRARY_NAME);
+  }
+
+  static List<String> bundledLibraryResourcePaths() {
+    return List.of(
+        bundledLibraryResourcePath(), NATIVE_RESOURCE_PREFIX + System.mapLibraryName(LIBRARY_NAME));
+  }
+
+  static String nativePlatform() {
+    return platformName(System.getProperty("os.name"));
+  }
+
+  static String nativeArchitecture() {
+    return architectureName(System.getProperty("os.arch"));
+  }
+
+  static String platformName(String osName) {
+    String normalized = osName.toLowerCase(Locale.ROOT);
+    if (normalized.contains("linux")) {
+      return "linux";
+    }
+    if (normalized.contains("mac") || normalized.contains("darwin")) {
+      return "darwin";
+    }
+    throw new UnsupportedOperationException("Unsupported StreamFusion operating system: " + osName);
+  }
+
+  static String architectureName(String architecture) {
+    String normalized = architecture.toLowerCase(Locale.ROOT);
+    if (normalized.equals("amd64") || normalized.equals("x86_64") || normalized.equals("x64")) {
+      return "x86_64";
+    }
+    if (normalized.equals("aarch64") || normalized.equals("arm64")) {
+      return "aarch64";
+    }
+    throw new UnsupportedOperationException(
+        "Unsupported StreamFusion architecture: " + architecture);
+  }
 
   /** Version reported by the loaded native library, proving the JVM↔Rust bridge is live. */
   public static native String version();
@@ -298,103 +400,6 @@ public final class Native {
 
   /** Releases a compiled Calc handle and its native state. */
   public static native void closeCalcExpression(long handle);
-
-  /**
-   * Creates a Parquet encoder for the sink and returns an opaque handle. The encoder owns no file:
-   * it encodes batches into an in-memory buffer
-   * that the JVM drains into whatever Flink output stream the part file lives behind, so the host
-   * keeps its filesystems, rolling, and exactly-once commit.
-   *
-   * @param schemaAddress address of an {@code ArrowSchema} C struct carrying the full row schema
-   * @param partitionColumns indices of columns written to the directory path, not the file
-   * @param configKeys resolved writer setting names from the sink's config translator
-   * @param configValues resolved writer setting values, parallel to {@code configKeys}
-   */
-  public static native long createParquetEncoder(
-      long schemaAddress, int[] partitionColumns, String[] configKeys, String[] configValues);
-
-  /**
-   * Encodes an Arrow batch the JVM exported into the open Parquet stream behind {@code handle}.
-   *
-   * @param handle a handle from {@link #createParquetEncoder}
-   * @param inArrayAddress address of the input {@code ArrowArray} C struct
-   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
-   */
-  public static native void parquetEncoderWrite(
-      long handle, long inArrayAddress, long inSchemaAddress);
-
-  /**
-   * Copies buffered encoded bytes into {@code chunk}, returning the count (0 = fully drained). The
-   * chunk is pinned critically for the duration of one memcpy — the only copy between the native
-   * encoder's buffer and the Flink output stream the caller writes it to.
-   *
-   * @param handle a handle from {@link #createParquetEncoder}
-   * @param chunk reusable buffer the caller hands to the output stream after each call
-   */
-  public static native int parquetEncoderDrain(long handle, byte[] chunk);
-
-  /**
-   * Writes the Parquet footer into the encoder's buffer. The handle stays open so the caller can
-   * drain the remaining bytes; release it with {@link #closeParquetEncoder}.
-   */
-  public static native void parquetEncoderFinish(long handle);
-
-  /** Releases a Parquet encoder handle; also the abort path for a part file that never finished. */
-  public static native void closeParquetEncoder(long handle);
-
-  /**
-   * Splits an Arrow batch the JVM exported by its partition-key columns, grouping rows in
-   * first-seen key order, and returns a handle to the groups. Each group keeps the full row schema
-   * and is single-keyed, so the caller routes it by its first row's partition values.
-   *
-   * @param inArrayAddress address of the input {@code ArrowArray} C struct
-   * @param inSchemaAddress address of the input {@code ArrowSchema} C struct
-   * @param partitionColumns indices of the partition-key columns in the row schema
-   */
-  public static native long splitByPartitionColumns(
-      long inArrayAddress, long inSchemaAddress, int[] partitionColumns);
-
-  /**
-   * Exports the next partition group into the consumer-allocated C structs, returning false once
-   * every group has been pulled.
-   *
-   * @param handle a handle from {@link #splitByPartitionColumns}
-   * @param outArrayAddress address of a consumer-allocated {@code ArrowArray} C struct
-   * @param outSchemaAddress address of a consumer-allocated {@code ArrowSchema} C struct
-   */
-  public static native boolean nextPartitionSlice(
-      long handle, long outArrayAddress, long outSchemaAddress);
-
-  /** Releases a partition split handle, dropping any groups the caller did not pull. */
-  public static native void closePartitionSplit(long handle);
-
-  /**
-   * Opens one Parquet split — the row groups of {@code path} starting within {@code [rangeStart,
-   * rangeStart + rangeLength)} — and returns an opaque handle. Flink's file source enumerates the
-   * directory and assigns each subtask file byte ranges; the handle yields batches one at a time via
-   * {@link #nextBatch} and must be released with {@link #closeSource}.
-   *
-   * @param path the Parquet file to read
-   * @param projection output column names, in the order the plan expects (honoring projection
-   *     pushdown); an empty array emits every column as read
-   * @param rangeStart first byte of the assigned split
-   * @param rangeLength length of the assigned split in bytes
-   */
-  public static native long openParquet(
-      String path, String[] projection, long rangeStart, long rangeLength);
-
-  /**
-   * Exports the next Arrow batch from a source handle into the consumer-allocated C structs.
-   *
-   * @param handle a handle from a native file source (e.g. {@link #openParquet})
-   * @param outArrayAddress address of the consumer-allocated output {@code ArrowArray} C struct
-   * @param outSchemaAddress address of the consumer-allocated output {@code ArrowSchema} C struct
-   * @return true if a batch was produced, false once the split is exhausted
-   */
-  public static native boolean nextBatch(long handle, long outArrayAddress, long outSchemaAddress);
-
-  /** Releases a native file source handle. */
-  public static native void closeSource(long handle);
 
   /**
    * Splits a batch the JVM exported using Flink's BinaryRow key hash and key-group assignment into up
@@ -1048,214 +1053,6 @@ public final class Native {
 
   /** Releases a message decoder handle. */
   public static native void closeDecoder(long handle);
-
-  /**
-   * Benchmark-only: consume an entire topic with a native rdkafka consumer and decode it to typed
-   * Arrow entirely in native code (payloads go from librdkafka straight into an Arrow builder — no JVM
-   * heap byte[] and no per-record JNI crossing), returning the decoded row count. The JVM times this
-   * one call to compare native consume+decode against the shallow path. Not the production source —
-   * no enumerator/offset/config-fidelity work (see the native-source todo).
-   *
-   * @param brokers bootstrap servers
-   * @param topic topic to consume from the beginning
-   * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the target schema
-   * @param schemaAddress address of the matching exported {@code ArrowSchema}
-   * @param maxMessages stop after consuming this many messages
-   */
-  public static native long benchmarkKafkaConsume(
-      String brokers, String topic, long schemaArrayAddress, long schemaAddress, long maxMessages);
-
-  /**
-   * Benchmark-only: drive the production split reader over a topic and count decoded rows entirely in
-   * Rust (no per-batch export to the JVM), as the source would feed a downstream native operator.
-   * Returns the row count.
-   */
-  public static native long benchmarkNativeConsume(
-      String[] configKeys,
-      String[] configValues,
-      String topic,
-      int format,
-      long schemaArrayAddress,
-      long schemaAddress,
-      String avroSchema,
-      int schemaId,
-      long maxMessages);
-
-  /**
-   * Benchmark-only: the serial counterpart to {@link #benchmarkNativeConsume} — same rdkafka consume and
-   * decoder, but decode runs inline on the consume thread (no decode thread). Returns the row count.
-   */
-  public static native long benchmarkNativeConsumeSerial(
-      String[] configKeys,
-      String[] configValues,
-      String topic,
-      int format,
-      long schemaArrayAddress,
-      long schemaAddress,
-      String avroSchema,
-      int schemaId,
-      long maxMessages);
-
-  /**
-   * Benchmark-only: measure librdkafka's raw delivery rate — batch-consume and count messages with no
-   * decode, to compare the consumer alone against the Java client's poll. Returns the message count.
-   */
-  public static native long benchmarkConsumeOnly(
-      String[] configKeys, String[] configValues, String topic, long maxMessages);
-
-  /**
-   * Whether the loaded native library was built with the {@code kafka} cargo feature (the default).
-   * The planner probes this before routing a table to the native Kafka source, so an opt-out build
-   * ({@code --no-default-features}) falls back cleanly instead of hitting a missing JNI symbol.
-   */
-  public static native boolean kafkaFeatureBuilt();
-
-  /** Whether the loaded native library was built with the {@code fluss} cargo feature. */
-  public static native boolean flussFeatureBuilt();
-
-  /**
-   * Opens a native Fluss log-table reader for one source subtask. Fluss' JVM enumerator assigns splits;
-   * this reader subscribes those concrete table buckets through fluss-rs and exports Arrow batches.
-   *
-   * @param configKeys translated fluss-rs config field names
-   * @param configValues values index-aligned with {@code configKeys}
-   * @param databaseName Fluss database name
-   * @param tableName Fluss table name
-   * @param projectedFields projected column indices, or empty for all columns
-   * @param rowtimeIndex index of the rowtime column in the projected batch, or -1 when the table
-   *     declares no watermark (per-batch max rowtimes feed the per-split source watermarks)
-   */
-  public static native long openFlussReader(
-      String[] configKeys,
-      String[] configValues,
-      String databaseName,
-      String tableName,
-      int[] projectedFields,
-      int rowtimeIndex);
-
-  /**
-   * Adds assigned log splits to the native Fluss reader. Index-aligned arrays; {@code Long.MIN_VALUE}
-   * marks a non-partitioned split or no stopping offset.
-   */
-  public static native void assignFlussSplits(
-      long handle,
-      String[] splitIds,
-      long[] tableIds,
-      long[] partitionIds,
-      long[] buckets,
-      long[] startOffsets,
-      long[] stoppingOffsets);
-
-  /**
-   * Removes finished Fluss splits from the native scanner's subscriptions so bounded tails don't keep
-   * polling completed buckets.
-   */
-  public static native void unassignFlussSplits(
-      long handle, long[] tableIds, long[] partitionIds, long[] buckets);
-
-  /**
-   * Polls one Fluss scanner cycle and returns the number of per-split Arrow batches ready to drain.
-   */
-  public static native int pollFlussBatch(long handle, long timeoutMillis);
-
-  /**
-   * Drains one pending Fluss batch, writes {@code [nextOffset, maxRowtimeMillis]} into
-   * {@code splitMeta} ({@code Long.MIN_VALUE} when the table has no watermark or the batch's rowtimes
-   * are all null), writes the split id into {@code outSplitId[0]}, exports Arrow into the consumer C
-   * structs, and returns the row count. Call it {@link #pollFlussBatch}'s return-value times.
-   */
-  public static native int drainFlussSplit(
-      long handle,
-      long[] splitMeta,
-      String[] outSplitId,
-      long outArrayAddress,
-      long outSchemaAddress);
-
-  /** Releases a native Fluss reader and closes its fluss-rs connection. */
-  public static native void closeFlussReader(long handle);
-
-  /**
-   * Opens a native Kafka split reader for one subtask and returns an opaque handle, released with
-   * {@link #closeKafkaConsumer}. One rdkafka consumer multiplexes the subtask's partitions; splits are
-   * added later with {@link #assignKafkaSplits} as the enumerator assigns them. The reader manually
-   * assigns + seeks (never subscribe/rebalance), mirroring Flink's {@code KafkaPartitionSplitReader}.
-   *
-   * @param configKeys translated librdkafka config keys (from {@code KafkaConfigTranslator})
-   * @param configValues values index-aligned with {@code configKeys}, applied verbatim
-   * @param format decoder: 0 = JSON (against the schema C structs), 1 = Confluent Avro, 4 = bare Avro,
-   *     5 = protobuf — the same codes the shallow decode path uses
-   * @param schemaArrayAddress address of an exported (empty) {@code ArrowArray} of the decoder's schema
-   * @param schemaAddress address of the matching exported {@code ArrowSchema}
-   * @param avroSchema writer-schema JSON for Avro (ignored for JSON/protobuf; pass "")
-   * @param readerAvroSchema narrowed reader-schema JSON for a projected bare-Avro decode (else "")
-   * @param schemaId Confluent schema id the Avro writer schema is registered under (ignored for JSON)
-   * @param descriptor encoded protobuf {@code FileDescriptorSet} for format 5 (else {@code null})
-   * @param messageName fully-qualified protobuf message type for format 5 (else "")
-   * @param rowtimeIndex decoded-batch column whose per-batch max (epoch millis) feeds per-split source
-   *     watermarks, or -1 when the table declares no watermark
-   * @param formatOptions decode-relevant format options as {@code key=value} lines (the JSON
-   *     family's timestamp-format; see {@code KafkaTables}); "" for defaults
-   */
-  public static native long openKafkaConsumer(
-      String[] configKeys,
-      String[] configValues,
-      int format,
-      long schemaArrayAddress,
-      long schemaAddress,
-      String avroSchema,
-      String readerAvroSchema,
-      int schemaId,
-      byte[] descriptor,
-      String messageName,
-      int rowtimeIndex,
-      String formatOptions);
-
-  /**
-   * Adds splits to the reader and re-assigns the consumer: each new partition seeks to its start
-   * offset, each already-assigned one keeps its tracked position. Index-aligned arrays.
-   *
-   * @param handle reader handle from {@link #openKafkaConsumer}
-   * @param topics split topics
-   * @param partitions split partition ids
-   * @param startOffsets offset to assign+seek each new split to (its checkpointed resume position)
-   */
-  public static native void assignKafkaSplits(
-      long handle, String[] topics, long[] partitions, long[] startOffsets);
-
-  /**
-   * Removes finished splits (reached their bounded stopping offset) from the consumer's assignment so
-   * it no longer fetches or blocks on them. Index-aligned {@code topics}/{@code partitions}.
-   */
-  public static native void unassignKafkaSplits(long handle, String[] topics, long[] partitions);
-
-  /**
-   * Polls one cycle, decoding one Arrow batch per partition that had messages. Returns the number of
-   * per-partition batches now pending; drain each with {@link #drainKafkaSplit}.
-   *
-   * @param handle reader handle from {@link #openKafkaConsumer}
-   * @param maxRecords cap on messages per poll (the native batch size; Java's {@code max.poll.records})
-   * @param timeoutMillis poll timeout; returns 0 if nothing arrives within it
-   */
-  public static native int pollKafkaBatch(long handle, int maxRecords, long timeoutMillis);
-
-  /**
-   * Drains one pending per-partition batch: exports typed Arrow into the consumer C structs, writes
-   * {@code [partition, nextOffset, maxRowtimeMillis]} into {@code splitMeta}, and the topic into
-   * {@code outTopic[0]} so the JVM can form the split id, advance that split's checkpoint offset, and
-   * timestamp the batch for per-split watermarks ({@code Long.MIN_VALUE} = no timestamp). Returns the
-   * decoded row count. Call it {@link #pollKafkaBatch}'s return-value times.
-   *
-   * @param handle reader handle from {@link #openKafkaConsumer}
-   * @param splitMeta output {@code long[3]}: partition id, next offset, and max rowtime millis
-   * @param outTopic output {@code String[1]}: the topic of the drained split
-   * @param outArrayAddress address of a consumer {@code ArrowArray} to receive the decoded batch
-   * @param outSchemaAddress address of the matching {@code ArrowSchema}
-   */
-  public static native int drainKafkaSplit(
-      long handle, long[] splitMeta, String[] outTopic, long outArrayAddress, long outSchemaAddress);
-
-  /** Releases a native Kafka split reader, closing the rdkafka consumer's connections. */
-  public static native void closeKafkaConsumer(long handle);
 
   /**
    * Creates an event-time INNER interval joiner and returns an opaque handle. It buffers both inputs

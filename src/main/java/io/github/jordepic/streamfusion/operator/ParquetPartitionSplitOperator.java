@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
-import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.parquet.NativeParquet;
 import io.github.jordepic.streamfusion.arrow.ArrowConversion;
 import java.util.List;
 import org.apache.arrow.c.ArrowArray;
@@ -82,7 +82,7 @@ public class ParquetPartitionSplitOperator extends AbstractStreamOperator<Partit
     try (ArrowArray array = ArrowArray.allocateNew(batchAllocator);
         ArrowSchema schema = ArrowSchema.allocateNew(batchAllocator)) {
       Data.exportVectorSchemaRoot(batchAllocator, batch, dictionaries, array, schema);
-      split = Native.splitByPartitionColumns(
+      split = NativeParquet.splitByPartitionColumns(
           array.memoryAddress(), schema.memoryAddress(), partitionColumns);
     } finally {
       batch.close();
@@ -93,7 +93,7 @@ public class ParquetPartitionSplitOperator extends AbstractStreamOperator<Partit
         VectorSchemaRoot group;
         try (ArrowArray outArray = ArrowArray.allocateNew(allocator);
             ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
-          if (!Native.nextPartitionSlice(
+          if (!NativeParquet.nextPartitionSlice(
               split, outArray.memoryAddress(), outSchema.memoryAddress())) {
             break;
           }
@@ -106,7 +106,7 @@ public class ParquetPartitionSplitOperator extends AbstractStreamOperator<Partit
         output.collect(new StreamRecord<>(new PartitionedArrowBatch(group, bucketId)));
       }
     } finally {
-      Native.closePartitionSplit(split);
+      NativeParquet.closePartitionSplit(split);
     }
   }
 }

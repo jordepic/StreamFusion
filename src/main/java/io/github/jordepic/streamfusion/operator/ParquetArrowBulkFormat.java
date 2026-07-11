@@ -1,6 +1,6 @@
 package io.github.jordepic.streamfusion.operator;
 
-import io.github.jordepic.streamfusion.Native;
+import io.github.jordepic.streamfusion.parquet.NativeParquet;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -22,7 +22,7 @@ public class ParquetArrowBulkFormat extends NativeFileArrowBulkFormat {
 
   @Override
   protected long open(String path, String[] projection, long rangeStart, long rangeLength) {
-    return Native.openParquet(path, projection, rangeStart, rangeLength);
+    return NativeParquet.openParquet(path, projection, rangeStart, rangeLength);
   }
 
   @Override

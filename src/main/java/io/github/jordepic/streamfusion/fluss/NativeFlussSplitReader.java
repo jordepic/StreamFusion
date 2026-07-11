@@ -1,6 +1,5 @@
 package io.github.jordepic.streamfusion.fluss;
 
-import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.operator.ArrowBatch;
 import io.github.jordepic.streamfusion.operator.NativeAllocator;
 import java.util.ArrayList;
@@ -50,7 +49,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       long pollTimeoutMillis) {
     this.pollTimeoutMillis = pollTimeoutMillis;
     this.handle =
-        Native.openFlussReader(
+        NativeFluss.openFlussReader(
             configKeys, configValues, databaseName, tableName, projectedFields, rowtimeIndex);
   }
 
@@ -62,14 +61,14 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       pendingFinishedSplits.clear();
       return finishedBuilder.build();
     }
-    int pending = Native.pollFlussBatch(handle, pollTimeoutMillis);
+    int pending = NativeFluss.pollFlussBatch(handle, pollTimeoutMillis);
     RecordsBySplits.Builder<NativeFlussRecord> builder = new RecordsBySplits.Builder<>();
     for (int i = 0; i < pending; i++) {
       try (ArrowArray outArray = ArrowArray.allocateNew(allocator);
           ArrowSchema outSchema = ArrowSchema.allocateNew(allocator)) {
         long[] meta = new long[2];
         String[] splitId = new String[1];
-        Native.drainFlussSplit(
+        NativeFluss.drainFlussSplit(
             handle, meta, splitId, outArray.memoryAddress(), outSchema.memoryAddress());
         VectorSchemaRoot root =
             Data.importVectorSchemaRoot(allocator, outArray, outSchema, NativeAllocator.DICTIONARIES);
@@ -89,7 +88,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       }
     }
     if (!justFinished.isEmpty()) {
-      Native.unassignFlussSplits(
+      NativeFluss.unassignFlussSplits(
           handle,
           tableIds(justFinished),
           partitionIds(justFinished),
@@ -119,7 +118,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       stoppingOffset.ifPresent(stop -> stoppingOffsets.put(nativeSplit.splitId(), stop));
     }
     if (!nativeSplits.isEmpty()) {
-      Native.assignFlussSplits(
+      NativeFluss.assignFlussSplits(
           handle,
           splitIds(nativeSplits),
           tableIds(nativeSplits),
@@ -158,7 +157,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       }
     }
     if (!removed.isEmpty()) {
-      Native.unassignFlussSplits(
+      NativeFluss.unassignFlussSplits(
           handle, tableIds(removed), partitionIds(removed), buckets(removed));
     }
     return buckets;
@@ -180,7 +179,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
       }
     }
     if (!nativeSplits.isEmpty()) {
-      Native.unassignFlussSplits(
+      NativeFluss.unassignFlussSplits(
           handle,
           tableIds(nativeSplits),
           partitionIds(nativeSplits),
@@ -195,7 +194,7 @@ final class NativeFlussSplitReader implements SplitReader<NativeFlussRecord, Sou
 
   @Override
   public void close() {
-    Native.closeFlussReader(handle);
+    NativeFluss.closeFlussReader(handle);
   }
 
   private static String[] splitIds(List<NativeFlussLogSplit> splits) {

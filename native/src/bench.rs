@@ -216,8 +216,10 @@ pub fn split_by_key(
 }
 
 /// A source-edge JSON decoder (one document per input row -> a typed columnar batch).
+#[cfg(any(feature = "json", test))]
 pub struct JsonDecode(JsonDecoder);
 
+#[cfg(any(feature = "json", test))]
 impl JsonDecode {
     pub fn new(schema: SchemaRef) -> Self {
         JsonDecode(JsonDecoder::new(schema, crate::json::JsonEnv::default()))

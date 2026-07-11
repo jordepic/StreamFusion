@@ -16,14 +16,8 @@ public final class NativePlanner {
 
   private NativePlanner() {}
 
-  /**
-   * Installs the native optimizer stage on a streaming table environment and returns it.
-   *
-   * <p>Must be called before the first query, since the planner reads its configuration when it
-   * first optimizes.
-   */
-  public static PhysicalPlanScan install(TableEnvironment tableEnv) {
-    TableConfig config = tableEnv.getConfig();
+  /** Installs the native optimizer stage into a streaming Table configuration. */
+  public static PhysicalPlanScan install(TableConfig config) {
     // Sub-plan reuse stays enabled, scoped away from the island by digests: reuse runs after this
     // program's substitution stage and merges subtrees by digest, and every native rel carries a
     // per-instance digest term (NativeRelDigests), so no columnar subtree can ever merge — an Arrow
@@ -38,6 +32,16 @@ public final class NativePlanner {
     config.setPlannerConfig(
         CalciteConfig$.MODULE$.createBuilder().replaceStreamProgram(program).build());
     return scan;
+  }
+
+  /**
+   * Installs the native optimizer stage on a streaming table environment and returns it.
+   *
+   * <p>Must be called before the first query, since the planner reads its configuration when it
+   * first optimizes.
+   */
+  public static PhysicalPlanScan install(TableEnvironment tableEnv) {
+    return install(tableEnv.getConfig());
   }
 
   /**

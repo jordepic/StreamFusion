@@ -208,10 +208,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
 - **Per-operator kill switch**: `-Dstreamfusion.operator.<name>.enabled=false` (e.g. `filter`,
   `groupAggregate`, `union`, `limit`, `expand`, `changelogNormalize`, `windowRank`,
   `localGroupAggregate`, `miniBatchAssigner`, `lookupJoin`, …). The two-phase global half reuses the
-  `groupAggregate` switch. All default on, `kafkaSource` included — the planner probes whether the
-  loaded native library carries the (default) `kafka` cargo feature and falls back to the decode
-  path on an opt-out build. `flussSource` probes the same way for the **opt-in** `fluss` cargo
-  feature and falls back to the stock Fluss connector when the library was built without it.
+  `groupAggregate` switch. All default on, `kafkaSource` included — it activates only when the
+  `streamfusion-kafka` extension (with its Kafka native library) and the matching StreamFusion value
+  format JAR are installed; otherwise the plan falls back to Flink's Kafka path. `flussSource`
+  behaves the same way for `streamfusion-fluss`.
 
 ### 2. Per-operator matcher declines (exact conditions)
 - **OVER** — a frame not of the form `… PRECEDING .. CURRENT ROW` (a `ROWS`/`RANGE` lower bound that
@@ -439,7 +439,8 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
     streaming-mode rejection.
   - A **changelog (retracting) input** — defense-in-depth; Flink's own validation rejects it first.
 - **Filesystem sink, non-Parquet format** — any non-Parquet sink format falls back.
-- **Kafka** — value format outside JSON/CSV/raw/bare-Avro/`avro-confluent`/protobuf; a `key.format`;
+- **Kafka** — missing `streamfusion-kafka` or the matching `streamfusion-*` format JAR; a value format
+  outside JSON/CSV/raw/bare-Avro/`avro-confluent`/protobuf; a `key.format`;
   a `scan.bounded.mode` other than unbounded/latest-offset; protobuf fields needing representation
   reconciliation (enum/unsigned/bytes/proto3-defaults/well-known types); **`ignore-parse-errors` on a
   protobuf table** (Flink skips malformed messages; that native decoder fails on them — the
@@ -455,7 +456,7 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   family — **ARRAY/ROW** (Jackson's `array-element-delimiter` layer) or any non-boundary type.
 - **Kafka JSON (and the CDC envelopes)** — the decode follows Flink's converters exactly
   (parity-pinned — `JsonDecodeParityTest`, divergences/21): both `timestamp-format.standard`
-  modes (`SQL`/`ISO-8601`) are native on every JSON-decoded path incl. the native source; the
+  modes (`SQL`/`ISO-8601`) are native on every JSON-decoded path; the
   scalar coercion envelope (string-encoded numbers with trimming, `Infinity`/`NaN`/suffix floats,
   never-failing booleans, strict `ISO_LOCAL_DATE`, integer/boolean/container echo under STRING) is
   Flink's; DECIMAL columns parse the exact raw literal with `BigDecimal`'s HALF_UP-or-NULL (the
@@ -472,20 +473,11 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   reused enumerator (`scan.topic-partition-discovery.interval` honored, including `0` to disable),
   so the native paths inherit its semantics; mid-job partition additions reach the native consumer
   as incremental split assignments.
-- **Kafka watermarks / event time** — Flink pushes a Kafka table's `WATERMARK` clause *into the scan*
-  (no assigner node survives), so whatever replaces the scan must regenerate the watermarks. Only the
-  **native source** (`kafkaSource` operator + the `kafka` build feature) does: it reuses Flink's own
-  per-split machinery — one generator per partition, min-combined, an assigned-but-silent partition
-  holds the watermark back, `scan.watermark.idle-timeout` / `table.exec.source.idle-timeout` honored,
-  periodic emit — feeding it each per-partition batch's max rowtime (equivalent to Flink's per-row max
-  fold, since the delay is constant). Supported watermark shapes: `rt` or `rt - INTERVAL const` over a
-  physical rowtime column, and the computed-rowtime idiom `TO_TIMESTAMP_LTZ(bigintMillis, 3)`
-  (± interval). Anything else falls back: another computed-rowtime expression,
-  `scan.watermark.emit.strategy = 'on-event'`, watermark alignment, `SOURCE_WATERMARK()`. The
-  **decode path never takes a watermarked table** — it regenerates no watermarks, and silently
-  dropping the pushed strategy would stall every event-time timer on an unbounded stream (bounded
-  runs masked this: the final MAX_WATERMARK closes all windows regardless) — so with the native
-  source off or unbuilt, a watermarked Kafka table runs entirely on Flink, with the reason recorded.
+- **Kafka watermarks / event time** — a Kafka table with a pushed `WATERMARK` clause stays on Flink.
+  The connector DSO deliberately emits only raw value bodies and the format DSO decodes them in a
+  subsequent transformation; neither DSO receives a cross-library rowtime handle. Reintroducing this
+  path requires a measured, explicit Arrow-level per-split watermark contract. This conservative gate
+  avoids silently dropping a pushed watermark strategy.
 - **CDC** — all four JSON dialects route natively: Debezium/OGG (full pre/post images, nested
   columns included) and Maxwell/Canal (post-image + partial `old`, whose UPDATE_BEFORE follows
   Flink's findValue key-presence rule via a native per-message key scan of the raw `old` — an
@@ -499,10 +491,10 @@ array`, is **not** here: Flink rejects it too, so we're at parity.)
   filters; and `debezium-avro-confluent` (Avro-bodied envelope).
 - **Fluss** — the native source (fluss-rs' `RecordBatchLogScanner`) replaces a Fluss **log-table**
   scan behind a two-level gate: the `flussSource` operator switch
-  (`-Dstreamfusion.operator.flussSource.enabled`, default on) **and** a native library built with
-  the **opt-in** `fluss` cargo feature (`-Dnative.cargo.args="build --features fluss"` — the planner
-  probes `flussFeatureBuilt` and records `the native library was built without the fluss feature`
-  on a build without it). Coordination stays on the JVM by design — split assignment, startup-offset
+  (`-Dstreamfusion.operator.flussSource.enabled`, default on) **and** the `streamfusion-fluss` JAR
+  with a native library for the deployment platform. The planner probes
+  `NativeFluss.featureBuilt` and records `the native Fluss extension is unavailable` when it cannot
+  load that extension. Coordination stays on the JVM by design — split assignment, startup-offset
   resolution, partition discovery/acknowledgement, snapshot leases, and checkpointing run in the
   Flink-side enumerator, so `scan.startup.mode`/`scan.startup.timestamp`,
   `scan.partition.discovery.interval`, and `scan.kv.snapshot.lease.*` are honored there and never

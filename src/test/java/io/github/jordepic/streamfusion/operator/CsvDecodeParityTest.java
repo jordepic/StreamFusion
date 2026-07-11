@@ -4,9 +4,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.csv.CsvFormatProvider;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
@@ -220,7 +224,13 @@ class CsvDecodeParityTest {
     try (OneInputStreamOperatorTestHarness<byte[], ArrowBatch> harness =
         new OneInputStreamOperatorTestHarness<>(
             new NativeBytesDecodeOperator(
-                ROW_TYPE, 100, 2, "", "", 0, null, null, null, skipErrors, 0, formatOptions),
+                ROW_TYPE,
+                100,
+                new CsvFormatProvider()
+                    .createDecoder(
+                        new NativeFormatContext(
+                            ROW_TYPE, ROW_TYPE, nativeOptions(formatOptions), skipErrors)),
+                0),
             BytePrimitiveArraySerializer.INSTANCE)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
@@ -239,6 +249,19 @@ class CsvDecodeParityTest {
       }
       return rows;
     }
+  }
+
+  private static Map<String, String> nativeOptions(String encoded) {
+    Map<String, String> options = new HashMap<>();
+    options.put("format", "csv");
+    for (String line : encoded.split("\\n")) {
+      if (line.isEmpty()) {
+        continue;
+      }
+      int separator = line.indexOf('=');
+      options.put(line.substring(0, separator), line.substring(separator + 1));
+    }
+    return options;
   }
 
   private static List<Object> fields(RowData row) {

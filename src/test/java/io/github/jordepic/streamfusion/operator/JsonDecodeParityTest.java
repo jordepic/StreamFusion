@@ -4,9 +4,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.json.JsonFormatProvider;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.typeutils.base.array.BytePrimitiveArraySerializer;
 import org.apache.flink.formats.common.TimestampFormat;
@@ -191,7 +194,13 @@ class JsonDecodeParityTest {
     try (OneInputStreamOperatorTestHarness<byte[], ArrowBatch> harness =
         new OneInputStreamOperatorTestHarness<>(
             new NativeBytesDecodeOperator(
-                rowType, 100, 0, "", "", 0, null, null, null, skipErrors, 0, formatOptions),
+                rowType,
+                100,
+                new JsonFormatProvider()
+                    .createDecoder(
+                        new NativeFormatContext(
+                            rowType, rowType, nativeOptions(formatOptions), skipErrors)),
+                0),
             BytePrimitiveArraySerializer.INSTANCE)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
@@ -210,6 +219,16 @@ class JsonDecodeParityTest {
       }
       return rows;
     }
+  }
+
+  private static Map<String, String> nativeOptions(String encoded) {
+    if (encoded.isEmpty()) {
+      return Map.of("format", "json");
+    }
+    if ("timestamp-format=ISO-8601\n".equals(encoded)) {
+      return Map.of("format", "json", "json.timestamp-format.standard", "ISO-8601");
+    }
+    throw new IllegalArgumentException("Unknown JSON option fixture: " + encoded);
   }
 
   private static List<Object> fields(RowType rowType, RowData row) {

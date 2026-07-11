@@ -4,9 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.NativeFormatProvider;
+import io.github.jordepic.streamfusion.format.json.CanalJsonFormatProvider;
+import io.github.jordepic.streamfusion.format.json.DebeziumJsonFormatProvider;
+import io.github.jordepic.streamfusion.format.json.MaxwellJsonFormatProvider;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeutils.base.array.BytePrimitiveArraySerializer;
@@ -176,7 +182,16 @@ class CdcDecodeParityTest {
     try (OneInputStreamOperatorTestHarness<byte[], ArrowBatch> harness =
         new OneInputStreamOperatorTestHarness<>(
             new NativeBytesDecodeOperator(
-                ROW_TYPE, 100, format, "", "", 0, null, null, null, skipErrors, 0, ""),
+                ROW_TYPE,
+                100,
+                provider(format)
+                    .createDecoder(
+                        new NativeFormatContext(
+                            ROW_TYPE,
+                            ROW_TYPE,
+                            Map.of("format", provider(format).formatIdentifier()),
+                            skipErrors)),
+                0),
             BytePrimitiveArraySerializer.INSTANCE)) {
       harness.setup(new ArrowBatchSerializer());
       harness.open();
@@ -195,6 +210,15 @@ class CdcDecodeParityTest {
       }
       return rows;
     }
+  }
+
+  private static NativeFormatProvider provider(int format) {
+    return switch (format) {
+      case MAXWELL -> new MaxwellJsonFormatProvider();
+      case CANAL -> new CanalJsonFormatProvider();
+      case DEBEZIUM -> new DebeziumJsonFormatProvider();
+      default -> throw new IllegalArgumentException("Unknown CDC format: " + format);
+    };
   }
 
   /** The row's kind plus each field rendered — what parity compares. */

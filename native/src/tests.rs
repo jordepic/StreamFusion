@@ -2627,6 +2627,7 @@ fn integer_arithmetic_wraps_in_declared_width() {
 
 // The native sink writes a batch to Parquet; reading it back yields the same rows.
 #[test]
+#[cfg(feature = "parquet")]
 fn writes_and_reads_parquet() {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let batch = sample_batch();

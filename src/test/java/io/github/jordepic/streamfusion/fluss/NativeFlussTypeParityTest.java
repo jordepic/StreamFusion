@@ -3,7 +3,6 @@ package io.github.jordepic.streamfusion.fluss;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.github.jordepic.streamfusion.Native;
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
 import java.time.LocalDateTime;
@@ -70,7 +69,11 @@ class NativeFlussTypeParityTest {
   }
 
   static boolean nativeFlussFeatureBuilt() {
-    return Native.flussFeatureBuilt();
+    try {
+      return NativeFluss.featureBuilt();
+    } catch (LinkageError ignored) {
+      return false;
+    }
   }
 
   private static void writeRows(String bootstrapServers, String tablePath) throws Exception {

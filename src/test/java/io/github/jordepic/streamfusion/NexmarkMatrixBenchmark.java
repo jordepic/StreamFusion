@@ -2,6 +2,7 @@ package io.github.jordepic.streamfusion;
 
 import io.github.jordepic.streamfusion.planner.NativePlanner;
 import io.github.jordepic.streamfusion.planner.PhysicalPlanScan;
+import io.github.jordepic.streamfusion.fluss.NativeFluss;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -491,7 +492,7 @@ class NexmarkMatrixBenchmark {
     String formatsEnv = System.getenv("SF_LADDER_FORMATS");
     String[] formats =
         formatsEnv != null ? formatsEnv.split(",") : new String[] {"json", "avro", "protobuf"};
-    if (runFluss && !Native.flussFeatureBuilt()) {
+    if (runFluss && !NativeFluss.featureBuilt()) {
       throw new IllegalArgumentException(
           "SF_MATRIX_FLUSS=true now reports native Fluss vs stock Flink-on-Fluss, so the native "
               + "library must be built with the fluss cargo feature.");

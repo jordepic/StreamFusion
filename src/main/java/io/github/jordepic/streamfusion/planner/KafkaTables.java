@@ -1,8 +1,11 @@
 package io.github.jordepic.streamfusion.planner;
 
-import io.github.jordepic.streamfusion.kafka.ConfluentSchemaRegistry;
 import io.github.jordepic.streamfusion.kafka.KafkaConfigTranslator;
+import io.github.jordepic.streamfusion.kafka.NativeKafka;
 import io.github.jordepic.streamfusion.kafka.NativeKafkaSource;
+import io.github.jordepic.streamfusion.format.NativeFormatContext;
+import io.github.jordepic.streamfusion.format.NativeFormatProvider;
+import io.github.jordepic.streamfusion.format.NativeFormatProviders;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -15,7 +18,6 @@ import org.apache.flink.connector.kafka.source.enumerator.initializer.NoStopping
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.enumerator.subscriber.KafkaSubscriber;
 import org.apache.flink.connector.kafka.source.reader.deserializer.KafkaRecordDeserializationSchema;
-import org.apache.flink.formats.avro.typeutils.AvroSchemaConverter;
 import org.apache.flink.table.planner.plan.nodes.physical.stream.StreamPhysicalTableSourceScan;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.util.TimeUtils;
@@ -41,57 +43,40 @@ final class KafkaTables {
   // with prefetch rarely waits on it (the queue is non-empty), so it only bounds tail latency.
   private static final int MAX_RECORDS = 8192;
   private static final long POLL_TIMEOUT_MILLIS = 100;
-  // MessageDecoder format codes the native source decodes in Rust (the codes decodeFormatCode emits).
-  private static final int BARE_AVRO = 4;
-  private static final int PROTOBUF = 5;
-
   /** Whether the native Kafka source can faithfully run this scan's table. */
   static boolean isNativeKafka(org.apache.calcite.rel.RelNode node) {
     if (!(node instanceof StreamPhysicalTableSourceScan)) {
       return false;
     }
-    // The kafka cargo feature is a default, but an opt-out library must fall back to the decode
-    // path rather than route to JNI symbols it doesn't carry.
-    if (!io.github.jordepic.streamfusion.Native.kafkaFeatureBuilt()) {
+    if (!nativeKafkaAvailable()) {
       return false;
     }
     StreamPhysicalTableSourceScan scan = (StreamPhysicalTableSourceScan) node;
-    // A watermarked table routes only when the pushed watermark is a shape the source regenerates
-    // (per-split bounded out-of-orderness); the scan replaces the host source, so an unreproducible
-    // watermark must leave the whole scan on Flink.
-    if (ScanWatermarkSpec.of(scan) == ScanWatermarkSpec.UNSUPPORTED) {
+    // The connector DSO now emits raw value bodies and deliberately knows nothing about rowtime. A
+    // pushed source watermark must therefore remain on Flink until a cross-DSO source watermark contract
+    // exists.
+    if (ScanWatermarkSpec.of(scan) != null) {
       return false;
     }
-    return supports(FilesystemTables.options(scan));
+    return isNativeKafkaDecode(node) && supports(FilesystemTables.options(scan));
   }
 
-  /** The shared gate, also used by {@code build} to assume a translatable, supported table. The native
-   * source decodes in Rust the same insert-only value formats the shallow decode path does — JSON (0),
-   * bare Avro (4), and protobuf (5) — over the consume/topic/offset prerequisites in {@link
-   * #decodeCommon}, plus a librdkafka-translatable consumer config (the native source owns the consume,
-   * so its config must render to librdkafka). A table with {@code ignore-parse-errors} set stays off
-   * the native source (its decoder fails on a bad message where Flink would skip it); a JSON one falls
-   * through to the decode path, which honors the skip mode. */
+  /** The native source owns only rdkafka consumption; an installed format provider decodes its Arrow
+   * body batches afterwards. A pushed source watermark remains on Flink because rowtime is no longer
+   * inspected inside the Kafka DSO. */
   private static boolean supports(Map<String, String> options) {
     if (!decodeCommon(options)) {
       return false;
     }
-    if (ignoreParseErrors(options)) {
+    return KafkaConfigTranslator.translate(consumerProperties(options)).isTranslated();
+  }
+
+  private static boolean nativeKafkaAvailable() {
+    try {
+      return NativeKafka.featureBuilt();
+    } catch (LinkageError ignored) {
       return false;
     }
-    if (encodeFormatOptions(options) == null) {
-      return false; // an unreproducible format option (e.g. fail-on-missing-field)
-    }
-    int code = decodeFormatCode(options);
-    if (code == PROTOBUF) {
-      String messageClass = options.get("protobuf.message-class-name");
-      if (messageClass == null || !ProtobufDescriptors.isSupportedMessage(messageClass)) {
-        return false;
-      }
-    } else if (code != 0 && code != BARE_AVRO) {
-      return false; // JSON / bare Avro / protobuf only — CSV/raw/Confluent-Avro/CDC stay on the decode path
-    }
-    return KafkaConfigTranslator.translate(consumerProperties(options)).isTranslated();
   }
 
   /** Whether the table's value format sets Flink's {@code ignore-parse-errors} (skip malformed
@@ -250,21 +235,8 @@ final class KafkaTables {
             });
   }
 
-  /** Builds the native source for a table {@link #isNativeKafka} accepted. The decode runs in Rust, so
-   * the format-specific schema inputs match the shallow decode path: bare Avro derives its writer schema
-   * from the row type (the same converter Flink's own {@code avro} format uses), protobuf carries the
-   * reflectively-extracted descriptor + message name, JSON decodes against the exported output schema.
-   *
-   * <p>{@code writerType} is the full table schema the decoder parses against; {@code outputType} is what
-   * the source emits — narrower when a downstream Calc's projection was pushed in. They drive the
-   * pruning: JSON decodes straight to {@code outputType} (arrow-json builds only those columns), bare
-   * Avro keeps {@code writerType} as the writer schema and applies {@code outputType} as a reader schema
-   * (Avro resolution), and protobuf prunes its descriptor to {@code outputType}'s fields natively.
-   *
-   * <p>{@code rowtimeIndex} is the output column whose per-batch max feeds per-split source watermarks
-   * (-1 when the table declares no watermark). */
-  static NativeKafkaSource build(
-      Map<String, String> options, RowType writerType, RowType outputType, int rowtimeIndex) {
+  /** Builds the native rdkafka source for a table {@link #isNativeKafka} accepted. */
+  static NativeKafkaSource build(Map<String, String> options) {
     Properties props = consumerProperties(options);
     Map<String, String> librdkafka =
         new java.util.HashMap<>(KafkaConfigTranslator.translate(props).config());
@@ -280,26 +252,6 @@ final class KafkaTables {
       values[i] = librdkafka.get(keys[i]);
     }
     boolean bounded = "latest-offset".equals(options.get("scan.bounded.mode"));
-    int format = decodeFormatCode(options);
-    boolean pruned = !writerType.equals(outputType);
-    // Bare Avro decodes against its writer schema (datums are schema-less): derive it from the full
-    // writer row type, forced non-null so the row is a record, not a ["null", record] union — matching
-    // Flink's `avro`. When the output is a narrowed subset, also derive a reader schema (the output) so
-    // Avro resolution materializes only the read fields.
-    String avroSchema =
-        format == BARE_AVRO ? AvroSchemaConverter.convertToSchema(writerType.copy(false)).toString() : "";
-    String readerAvroSchema =
-        format == BARE_AVRO && pruned
-            ? AvroSchemaConverter.convertToSchema(outputType.copy(false)).toString()
-            : "";
-    // Protobuf decodes against the generated message class's descriptor, extracted by reflection (no
-    // compile-time protobuf-java dependency — the class + runtime come from the Flink distribution). The
-    // native side prunes the descriptor to outputType's fields (a no-op when outputType is the full
-    // message), so ptars builds only the read columns.
-    String messageClass = options.get("protobuf.message-class-name");
-    byte[] protoDescriptor =
-        format == PROTOBUF ? ProtobufDescriptors.descriptorSet(messageClass) : null;
-    String protoMessageName = format == PROTOBUF ? ProtobufDescriptors.messageName(messageClass) : "";
     return new NativeKafkaSource(
         subscriber(options),
         mapStartupMode(options),
@@ -308,17 +260,8 @@ final class KafkaTables {
         props,
         keys,
         values,
-        format,
-        outputType,
-        avroSchema,
-        readerAvroSchema,
-        0,
-        protoDescriptor,
-        protoMessageName,
         MAX_RECORDS,
-        POLL_TIMEOUT_MILLIS,
-        rowtimeIndex,
-        encodeFormatOptions(options));
+        POLL_TIMEOUT_MILLIS);
   }
 
   // --- Shallow decode path (Phase 2/3): Flink's own KafkaSource consumes raw value bytes, a native
@@ -336,8 +279,7 @@ final class KafkaTables {
    * decode in full.
    */
   static boolean decodeHonorsProjection(Map<String, String> options) {
-    int code = decodeFormatCode(options);
-    return code == 0 || code == 1 || code == 4 || code == 5; // JSON, both Avros, protobuf
+    return formatProvider(options, null).map(NativeFormatProvider::honorsProjection).orElse(false);
   }
 
   /** The {@code MessageDecoder} format code for this table's value format, or -1 if not decodable here. */
@@ -409,11 +351,16 @@ final class KafkaTables {
     if (!decodeCommon(options)) {
       return false;
     }
+    NativeFormatProvider provider =
+        formatProvider(options, FilesystemTables.physicalRowType(scan)).orElse(null);
+    if (provider == null) {
+      return false; // format artifact not installed or its exact options are not native-compatible
+    }
     int code = decodeFormatCode(options);
     // Flink's ignore-parse-errors drops malformed data; the JSON decode honors the per-message skip
     // and the CSV decode reproduces Flink's per-field granularity natively. A protobuf table with
     // it set would fail where Flink skips — fall back.
-    if (ignoreParseErrors(options) && code != 0 && code != 2) {
+    if (ignoreParseErrors(options) && !provider.supportsIgnoreParseErrors()) {
       return false;
     }
     if (code == 2) {
@@ -424,19 +371,7 @@ final class KafkaTables {
     if (code == 0 && encodeFormatOptions(options) == null) {
       return false; // an unreproducible JSON option (e.g. fail-on-missing-field)
     }
-    if (code == 5) {
-      // Protobuf routes for any message whose fields (recursively — nested messages, repeated, maps) are
-      // types the decode reproduces identically to Flink; enums, unsigned/fixed ints, bytes, and
-      // well-known types still fall back (see ProtobufDescriptors).
-      String messageClass = options.get("protobuf.message-class-name");
-      return messageClass != null && ProtobufDescriptors.isSupportedMessage(messageClass);
-    }
-    if (code == 1) {
-      // Confluent Avro routes when the registry options translate to the native fetch (a plain URL);
-      // an explicit reader schema, registry auth/SSL, or pass-through client properties fall back.
-      return ConfluentSchemaRegistry.fromOptions(options) != null;
-    }
-    return code == 0 || code == 2 || code == 3 || code == 4;
+    return code == 0 || code == 1 || code == 2 || code == 3 || code == 4 || code == 5;
   }
 
   /** Whether this scan is a CDC changelog format the native decode reproduces <em>identically</em> to
@@ -459,6 +394,11 @@ final class KafkaTables {
     }
     Map<String, String> options = FilesystemTables.options(scan);
     if (!decodeCommon(options)) {
+      return false;
+    }
+    NativeFormatProvider provider =
+        formatProvider(options, FilesystemTables.physicalRowType(scan)).orElse(null);
+    if (provider == null || (ignoreParseErrors(options) && !provider.supportsIgnoreParseErrors())) {
       return false;
     }
     int code = decodeFormatCode(options);
@@ -487,6 +427,13 @@ final class KafkaTables {
       return false; // an unreproducible format option
     }
     return FilesystemTables.allPhysicalColumns(scan); // metadata/computed columns aren't decoded natively
+  }
+
+  /** Finds an installed format SPI provider without making this connector artifact depend on a format JAR. */
+  private static java.util.Optional<NativeFormatProvider> formatProvider(
+      Map<String, String> options, RowType rowType) {
+    return NativeFormatProviders.find(
+        new NativeFormatContext(rowType, rowType, options, ignoreParseErrors(options)));
   }
 
   /** Whether every physical column is non-nested (and the arity fits the native presence bitmask). */

@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.jordepic</groupId>
+        <artifactId>StreamFusion</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>streamfusion-core</artifactId>
+
+    <dependencies>
+        <!-- The development runtime remains the source artifact for all extension bytecode. This
+             deployable variant filters every connector-specific class out before shading the core. -->
+        <dependency>
+            <groupId>io.github.jordepic</groupId>
+            <artifactId>streamfusion-runtime</artifactId>
+            <version>${project.version}</version>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <!-- The loader copies this artifact during process-resources. Produce the
+                         unshaded input before the core shade execution, then let shade replace
+                         it in the same lifecycle phase. -->
+                    <execution>
+                        <id>default-jar</id>
+                        <phase>process-classes</phase>
+                        <goals><goal>jar</goal></goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <id>attach-runtime-payload</id>
+                        <configuration><skip>true</skip></configuration>
+                    </execution>
+                    <execution>
+                        <phase>process-classes</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>io.github.jordepic:streamfusion-runtime</artifact>
+                                    <excludes>
+                                        <exclude>io/github/jordepic/streamfusion/kafka/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/fluss/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/parquet/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/avro/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/avroconfluent/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/csv/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/json/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/protobuf/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/format/raw/**</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/NativeFileArrowBulkFormat*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/NativeParquetBulkWriterFactory*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/NativeParquetRollingPolicy*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/ParquetArrowBulkFormat*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/ParquetPartitionSplitOperator*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/operator/ParquetSourceTimestamps*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/KafkaTables*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/ProtobufDescriptors*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/NativeKafkaDecodeExecNode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/NativeKafkaSourceExecNode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/StreamPhysicalNativeKafkaDecode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/StreamPhysicalNativeKafkaSource*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/FlussTables*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/NativeFlussSourceExecNode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/StreamPhysicalNativeFlussSource*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/NativeParquetSinkExecNode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/NativeParquetSourceExecNode*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/ParquetSinkMatcher*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/ParquetSinkTranslator*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/ParquetSourceMatcher*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/StreamPhysicalNativeParquetSink*.class</exclude>
+                                        <exclude>io/github/jordepic/streamfusion/planner/StreamPhysicalNativeParquetSource*.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

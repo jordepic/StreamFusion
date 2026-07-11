@@ -5,9 +5,10 @@ const NO_PARTITION: i64 = i64::MIN;
 #[cfg(feature = "fluss")]
 const NO_STOPPING_OFFSET: i64 = i64::MIN;
 
-/// Whether this native library was built with the native Fluss reader feature.
+/// Whether this extension library was built with the native Fluss reader feature.
+#[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_flussFeatureBuilt<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_featureBuilt<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::sys::jboolean {
@@ -228,7 +229,7 @@ impl FlussSplitReader {
         if batch.num_rows() > 0 {
             batch = normalize_timestamp_units(batch)?;
             let max_rowtime = if self.rowtime_index >= 0 {
-                crate::kafka::max_rowtime_millis(&batch, self.rowtime_index as usize)
+                max_rowtime_millis(&batch, self.rowtime_index as usize)
             } else {
                 i64::MIN
             };
@@ -453,7 +454,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openFlussReader<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_openFlussReader<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_keys: JObjectArray<'local>,
@@ -488,7 +489,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_openFlussRead
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignFlussSplits<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_assignFlussSplits<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -520,7 +521,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_assignFlussSp
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unassignFlussSplits<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_unassignFlussSplits<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -539,7 +540,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_unassignFluss
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pollFlussBatch<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_pollFlussBatch<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -553,7 +554,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_pollFlussBatc
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSplit<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_drainFlussSplit<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -583,7 +584,7 @@ pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_drainFlussSpl
 
 #[cfg(feature = "fluss")]
 #[no_mangle]
-pub extern "system" fn Java_io_github_jordepic_streamfusion_Native_closeFlussReader<'local>(
+pub extern "system" fn Java_io_github_jordepic_streamfusion_fluss_NativeFluss_closeFlussReader<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
